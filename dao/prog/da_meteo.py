@@ -250,14 +250,16 @@ class Meteo:
         tilt = min(90, max(0, tilt))
         hcol = math.radians(tilt)
         acol = math.radians(orientation)
-        global_rad["solar_rad"] = ""  # new column empty
-        # make sure indexes pair with number of rows
+        # Vectorized solar radiation calculation instead of itertuples()
         global_rad = global_rad.reset_index()
-        for row in global_rad.itertuples():
-            utc_time = row.tijd
-            radiation = float(row.gr)
-            q_tot = self.solar_rad(int(utc_time) - 3600, radiation, hcol, acol)
-            global_rad.loc[(global_rad.tijd == utc_time), "solar_rad"] = q_tot
+        
+        # Calculate solar radiation in vectorized way
+        def calc_solar_rad_vectorized(row):
+            utc_time = row['tijd']
+            radiation = float(row['gr'])
+            return self.solar_rad(int(utc_time) - 3600, radiation, hcol, acol)
+        
+        global_rad['solar_rad'] = global_rad.apply(calc_solar_rad_vectorized, axis=1)
         return global_rad
 
     def get_from_meteoserver(self, model: str) -> pd.DataFrame:
@@ -299,50 +301,67 @@ class Meteo:
 
     def get_meteo_data(self, show_graph=False):
         df1 = self.get_from_meteoserver("harmonie")
-        df_db = pd.DataFrame(columns=["time", "code", "value"])
         count = len(df1)
         if count == 0:
             logging.error("No data recieved from meteoserver")
+            df_db = pd.DataFrame(columns=["time", "code", "value"])
         else:
             df1 = df1.reset_index()  # make sure indexes pair with number of rows
-            for row in df1.itertuples():
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "gr",
-                    float(row.gr),
-                ]
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "temp",
-                    float(row.temp),
-                ]
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "solar_rad",
-                    float(row.solar_rad),
-                ]
+            
+            # Vectorized approach: create all records at once
+            time_str = df1['tijd'].astype(int).astype(str)
+            
+            # Create separate DataFrames for each measurement type
+            gr_data = pd.DataFrame({
+                'time': time_str,
+                'code': 'gr', 
+                'value': df1['gr'].astype(float)
+            })
+            
+            temp_data = pd.DataFrame({
+                'time': time_str,
+                'code': 'temp',
+                'value': df1['temp'].astype(float)
+            })
+            
+            solar_data = pd.DataFrame({
+                'time': time_str,
+                'code': 'solar_rad',
+                'value': df1['solar_rad'].astype(float)
+            })
+            
+            # Concatenate all data at once instead of row-by-row appending
+            df_db = pd.concat([gr_data, temp_data, solar_data], ignore_index=True)
 
         if count < 96:
-            df1 = self.get_from_meteoserver("gfs")
-            for row in df1[count:].itertuples():
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "gr",
-                    float(row.gr),
-                ]
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "temp",
-                    float(row.temp),
-                ]
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "solar_rad",
-                    float(row.solar_rad),
-                ]
-                count += 1
-                if count >= 96:
-                    break
+            df1_gfs = self.get_from_meteoserver("gfs")
+            df1_subset = df1_gfs[count:] if count > 0 else df1_gfs
+            
+            if not df1_subset.empty:
+                # Vectorized approach for GFS data as well
+                time_str_gfs = df1_subset['tijd'].astype(int).astype(str)
+                
+                gr_data_gfs = pd.DataFrame({
+                    'time': time_str_gfs,
+                    'code': 'gr',
+                    'value': df1_subset['gr'].astype(float)
+                })
+                
+                temp_data_gfs = pd.DataFrame({
+                    'time': time_str_gfs, 
+                    'code': 'temp',
+                    'value': df1_subset['temp'].astype(float)
+                })
+                
+                solar_data_gfs = pd.DataFrame({
+                    'time': time_str_gfs,
+                    'code': 'solar_rad', 
+                    'value': df1_subset['solar_rad'].astype(float)
+                })
+                
+                # Append GFS data
+                gfs_db = pd.concat([gr_data_gfs, temp_data_gfs, solar_data_gfs], ignore_index=True)
+                df_db = pd.concat([df_db, gfs_db], ignore_index=True)
 
         df_tostring = df_db
         # df_tostring["tijd"] = pd.to_datetime(df_tostring["time"])

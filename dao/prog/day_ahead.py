@@ -21,6 +21,7 @@ from utils import (
 )
 import logging
 from da_base import DaBase
+from da_optimizer import EnergyOptimizer
 
 
 class DaCalc(DaBase):
@@ -48,6 +49,48 @@ class DaCalc(DaBase):
         self.grid_max_power = self.config.get(["grid", "max_power"], None, 17)
         self.machines = self.config.get(["machines"], None, [])
         # self.start_logging()
+        
+        # Initialize modular optimizer
+        self.optimizer = EnergyOptimizer(self)
+
+    def calc_optimum_modular(
+        self, _start_dt: dt.datetime | None = None, _start_soc: float | None = None
+    ):
+        """
+        Modern modular optimization method using the new EnergyOptimizer class.
+        This replaces the monolithic calc_optimum() method for better maintainability.
+        """
+        if _start_dt is not None or _start_soc is not None:
+            self.debug = True
+            
+        logging.info(f"Starting modular optimization (Debug = {self.debug})")
+        
+        try:
+            # Use the modular optimizer
+            results = self.optimizer.optimize_energy_schedule(_start_dt, _start_soc)
+            
+            if results is None:
+                logging.error("Modular optimization failed")
+                return None
+                
+            # Save results to database (if not in debug mode)
+            if not self.debug:
+                self._save_optimization_results(results)
+                
+            # Update Home Assistant entities
+            self._update_ha_entities(results)
+            
+            logging.info("Modular optimization completed successfully")
+            return results
+            
+        except Exception as e:
+            logging.error(f"Error in modular optimization: {e}")
+            if self.notification_entity is not None:
+                self.set_value(
+                    self.notification_entity,
+                    f"Optimalisatie fout: {str(e)}"
+                )
+            return None
 
     def calc_optimum(
         self, _start_dt: dt.datetime | None = None, _start_soc: float | None = None
@@ -117,12 +160,11 @@ class DaCalc(DaBase):
         pl_avg = []  # prijs levering day_ahead gemiddeld
         uur = []  # datum_tijd van het betreffende uur
         prog_data = prog_data.reset_index()
-        # make sure indexes pair with number of rows
-        for row in prog_data.itertuples():
-            uur.append(row.tijd)
-            p_spot.append(row.da_price)
-            pl.append(row.da_cons)
-            pt.append(row.da_prod)
+        # Vectorized operations instead of itertuples()
+        uur = prog_data['tijd'].tolist()
+        p_spot = prog_data['da_price'].tolist()
+        pl = prog_data['da_cons'].tolist()  
+        pt = prog_data['da_prod'].tolist()
 
         B = len(self.battery_options)
         U = len(pl)
@@ -2284,11 +2326,19 @@ class DaCalc(DaBase):
             sum_cap = 0
             for b in range(B):
                 sum_cap += one_soc[b] * 100
-            for row in df_soc.itertuples():
-                sum_soc = 0
-                for b in range(B):
-                    sum_soc += one_soc[b] * row[b + 3]
-                df_soc.at[row[0], "soc"] = round(100 * sum_soc / sum_cap, 1)
+            # Vectorized SOC calculation instead of itertuples()
+            soc_columns = [f"soc_{b}" for b in range(B)]
+            if all(col in df_soc.columns for col in soc_columns):
+                # Calculate weighted sum across all batteries
+                weighted_soc = sum(one_soc[b] * df_soc[soc_columns[b]] for b in range(B))
+                df_soc["soc"] = (100 * weighted_soc / sum_cap).round(1)
+            else:
+                # Fallback to original method if columns don't match expected pattern
+                for row in df_soc.itertuples():
+                    sum_soc = 0
+                    for b in range(B):
+                        sum_soc += one_soc[b] * row[b + 3]
+                    df_soc.at[row[0], "soc"] = round(100 * sum_soc / sum_cap, 1)
 
             if not self.debug:
                 self.save_df(tablename="prognoses", tijd=tijd_soc, df=df_soc)
@@ -3434,6 +3484,92 @@ class DaCalc(DaBase):
         if show_graph:
             plt.show()
         plt.close("all")
+    
+    def _save_optimization_results(self, results: dict):
+        """Save optimization results to database"""
+        try:
+            # Create DataFrame for grid import/export
+            timestamps = results['timestamps']
+            grid_data = pd.DataFrame({
+                'time': [int(dt.timestamp()) for dt in timestamps],
+                'code': ['grid_import'] * len(timestamps),
+                'value': results['grid_import']
+            })
+            
+            # Add grid export data
+            export_data = pd.DataFrame({
+                'time': [int(dt.timestamp()) for dt in timestamps],
+                'code': ['grid_export'] * len(timestamps), 
+                'value': results['grid_export']
+            })
+            
+            # Combine and save
+            combined_data = pd.concat([grid_data, export_data], ignore_index=True)
+            self.db_da.savedata(combined_data, 'prognoses')
+            
+            # Save battery results
+            for i, battery in enumerate(results.get('batteries', [])):
+                for data_type in ['charge_power', 'discharge_power', 'soc']:
+                    if data_type in battery:
+                        battery_data = pd.DataFrame({
+                            'time': [int(dt.timestamp()) for dt in timestamps],
+                            'code': [f'battery_{i}_{data_type}'] * len(timestamps),
+                            'value': battery[data_type]
+                        })
+                        self.db_da.savedata(battery_data, 'prognoses')
+            
+            # Save EV results
+            for i, ev in enumerate(results.get('electric_vehicles', [])):
+                for data_type in ['charge_power', 'soc']:
+                    if data_type in ev:
+                        ev_data = pd.DataFrame({
+                            'time': [int(dt.timestamp()) for dt in timestamps],
+                            'code': [f'ev_{i}_{data_type}'] * len(timestamps),
+                            'value': ev[data_type]
+                        })
+                        self.db_da.savedata(ev_data, 'prognoses')
+            
+            logging.info("Optimization results saved to database")
+            
+        except Exception as e:
+            logging.error(f"Error saving optimization results: {e}")
+    
+    def _update_ha_entities(self, results: dict):
+        """Update Home Assistant entities with optimization results"""
+        try:
+            # Update next hour recommendations
+            if results['grid_import'] and len(results['grid_import']) > 0:
+                next_hour_import = results['grid_import'][0]
+                next_hour_export = results['grid_export'][0] if results['grid_export'] else 0
+                
+                # Update HA entities if they exist
+                if hasattr(self, 'ha_grid_import_entity'):
+                    self.set_value(self.ha_grid_import_entity, round(next_hour_import, 2))
+                
+                if hasattr(self, 'ha_grid_export_entity'):
+                    self.set_value(self.ha_grid_export_entity, round(next_hour_export, 2))
+            
+            # Update battery recommendations
+            for i, battery in enumerate(results.get('batteries', [])):
+                if battery['charge_power'] and len(battery['charge_power']) > 0:
+                    next_charge = battery['charge_power'][0]
+                    next_discharge = battery['discharge_power'][0] if battery['discharge_power'] else 0
+                    
+                    if hasattr(self, f'ha_battery_{i}_charge_entity'):
+                        self.set_value(getattr(self, f'ha_battery_{i}_charge_entity'), round(next_charge, 2))
+                    
+                    if hasattr(self, f'ha_battery_{i}_discharge_entity'):
+                        self.set_value(getattr(self, f'ha_battery_{i}_discharge_entity'), round(next_discharge, 2))
+            
+            # Update total cost estimate
+            if 'total_cost' in results:
+                if hasattr(self, 'ha_total_cost_entity'):
+                    self.set_value(self.ha_total_cost_entity, round(results['total_cost'], 2))
+            
+            logging.info("Home Assistant entities updated")
+            
+        except Exception as e:
+            logging.error(f"Error updating HA entities: {e}")
 
     def calc_optimum_debug(self):
         self.debug = True

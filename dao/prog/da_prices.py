@@ -107,17 +107,22 @@ class DaPrices:
                 logging.error(ex)
                 logging.error(f"Geen data van Entsoe: tussen {start} en {end}")
             if len(da_prices.index) > 0:
-                df_db = pd.DataFrame(columns=["time", "code", "value"])
-                da_prices = (
-                    da_prices.reset_index()
-                )  # make sure indexes pair with number of rows
+                da_prices = da_prices.reset_index()
                 logging.info(
                     f"Day ahead prijzen van Entsoe: \n{da_prices.to_string(index=False)}"
                 )
-                last_time = start
-                for row in da_prices.itertuples():
-                    last_time = int(datetime.datetime.timestamp(row[1]))
-                    df_db.loc[df_db.shape[0]] = [str(last_time), "da", row[2] / 1000]
+                
+                # Vectorized operations instead of itertuples()
+                timestamps = da_prices.iloc[:, 0].apply(lambda x: int(datetime.datetime.timestamp(x)))
+                values = da_prices.iloc[:, 1] / 1000
+                
+                df_db = pd.DataFrame({
+                    'time': timestamps.astype(str),
+                    'code': 'da',
+                    'value': values
+                })
+                
+                last_time = timestamps.iloc[-1] if not timestamps.empty else start
                 logging.debug(
                     f"Day ahead prijzen (source: entsoe, db-records): \n"
                     f"{df_db.to_string(index=False)}"
@@ -201,14 +206,19 @@ class DaPrices:
             logging.info(
                 f"Day ahead prijzen van Easyenergy:\n {df.to_string(index=False)}"
             )
-            # datetime.datetime.strptime('Tue Jun 22 12:10:20 2010 EST', '%a %b %d %H:%M:%S %Y %Z')
-            df_db = pd.DataFrame(columns=["time", "code", "value"])
-            df = df.reset_index()  # make sure indexes pair with number of rows
-            for row in df.itertuples():
-                dtime = str(
-                    int(datetime.datetime.fromisoformat(row.Timestamp).timestamp())
-                )
-                df_db.loc[df_db.shape[0]] = [dtime, "da", row.TariffReturn]
+            # Vectorized operations instead of itertuples()
+            df = df.reset_index()
+            
+            # Convert timestamps in vectorized way
+            timestamps = df['Timestamp'].apply(
+                lambda x: str(int(datetime.datetime.fromisoformat(x).timestamp()))
+            )
+            
+            df_db = pd.DataFrame({
+                'time': timestamps,
+                'code': 'da',
+                'value': df['TariffReturn']
+            })
 
             logging.debug(
                 f"Day ahead prijzen (source: easy energy, db-records): \n "
