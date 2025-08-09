@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='dao_modern_enhanced',
-    version='1.2.0',
+    version='1.2.1',
     packages=['dao', 'dao.prog', 'dao.webserver', 'dao.webserver.app'],
     url='https://github.com/miclnl/day-ahead',
     license='Apache License, Version 2.0',

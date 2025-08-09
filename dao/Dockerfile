@@ -60,7 +60,7 @@ RUN pip3 install uv
 RUN uv pip install --prerelease=allow -r /tmp/requirements.txt
 COPY run /root/dao/prog/
 
-EXPOSE 5000
+EXPOSE 5001
 WORKDIR /root/dao/prog
 RUN chmod a+x run.sh
 ENTRYPOINT  ["/bin/bash", "./run.sh"]

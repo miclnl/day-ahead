@@ -23,7 +23,7 @@ cryptography>=45.0.6
 tzlocal>=5.3.1
 aiohttp>=3.11.11
 asyncio-mqtt>=0.16.2
-apscheduler>=3.11.0
+APScheduler>=3.10.4
 openai>=1.58.1
 anthropic>=0.40.0
 # ML libraries optimized for Raspberry Pi 8GB

@@ -29,10 +29,11 @@ class HomeAssistantIntegration:
             return
             
         # Clean URL
-        if not self.ha_url.startswith(('http://', 'https://')):
-            self.ha_url = 'http://' + self.ha_url
-        if self.ha_url.endswith('/'):
-            self.ha_url = self.ha_url[:-1]
+        if self.ha_url:
+            if not self.ha_url.startswith(('http://', 'https://')):
+                self.ha_url = 'http://' + self.ha_url
+            if self.ha_url.endswith('/'):
+                self.ha_url = self.ha_url[:-1]
             
         self.headers = {
             'Authorization': f'Bearer {self.ha_token}',

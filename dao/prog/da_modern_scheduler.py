@@ -10,11 +10,20 @@ import sys
 import signal
 from typing import Dict, List, Callable, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.date import DateTrigger
-from apscheduler.triggers.interval import IntervalTrigger
-from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
+# APScheduler imports with fallback
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.date import DateTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+    from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
+    APSCHEDULER_AVAILABLE = True
+except ImportError as e:
+    APSCHEDULER_AVAILABLE = False
+    logging.error(f"APScheduler not available: {e}. Falling back to original scheduler.")
+    # Import original scheduler instead
+    import subprocess
+    import sys
 from da_base import DaBase
 from da_async_fetcher import AsyncDataFetcher, fetch_and_save_all_data
 
@@ -557,6 +566,12 @@ class ModernDaScheduler(DaBase):
 
 async def main():
     """Main entry point for the modern scheduler"""
+    if not APSCHEDULER_AVAILABLE:
+        logging.error("APScheduler not available, falling back to original scheduler")
+        # Use original scheduler instead
+        subprocess.call([sys.executable, "da_scheduler.py"])
+        return
+    
     scheduler = ModernDaScheduler("../data/options.json")
     
     try:
