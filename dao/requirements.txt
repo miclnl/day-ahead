@@ -26,9 +26,12 @@ asyncio-mqtt>=0.16.2
 apscheduler>=3.11.0
 openai>=1.58.1
 anthropic>=0.40.0
-scikit-learn>=1.6.0
-tensorflow>=2.18.0
-torch>=2.6.0
-xgboost>=2.1.3
+# ML libraries optimized for Raspberry Pi 8GB
+scikit-learn>=1.5.0
+tensorflow-lite>=2.13.0
+xgboost>=1.7.3
+joblib>=1.3.2
+# Optional: lightgbm for faster training
+lightgbm>=4.1.0
 websockets>=14.1
 psutil>=6.2.0

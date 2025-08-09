@@ -6,6 +6,8 @@ Focus op real-world kostenbesparingen door betere voorspellingen en automatische
 import logging
 import pandas as pd
 import numpy as np
+import platform
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 import asyncio
@@ -17,30 +19,60 @@ from dao.prog.da_config import Config
 from dao.prog.da_ha_integration import HomeAssistantIntegration
 
 
+def is_raspberry_pi() -> bool:
+    """Detecteer of we draaien op een Raspberry Pi"""
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            cpuinfo = f.read()
+        return 'BCM' in cpuinfo or 'Raspberry Pi' in cpuinfo
+    except:
+        return platform.machine().startswith('arm') or platform.machine().startswith('aarch64')
+
+
 class SmartOptimizationEngine:
     """Geavanceerde optimalisatie engine voor kosten minimalisatie"""
     
     def __init__(self, config: Config, ha_integration: HomeAssistantIntegration):
         self.config = config
         self.ha = ha_integration
+        self.is_pi = is_raspberry_pi()
         self.settings = self._load_smart_settings()
         
-        # Prediction models
+        if self.is_pi:
+            logging.info("Raspberry Pi gedetecteerd - lightweight optimalisaties actief")
+        
+        # Prediction models (Pi-optimized)
         self.consumption_model = None
         self.pv_model = None
-        self.load_detector = HighLoadDetector(config, ha_integration)
+        self.load_detector = HighLoadDetector(config, ha_integration, lightweight=self.is_pi)
         self.device_scheduler = SmartDeviceScheduler(config, ha_integration)
         self.battery_manager = AdaptiveBatteryManager(config, ha_integration)
         
-        # Historical data cache
+        # Historical data cache (optimized for Pi with 8GB)
+        if self.is_pi:
+            # With 8GB Pi we can handle more data
+            cache_size = 300
+            logging.info("Pi met voldoende RAM gedetecteerd - verhoogde cache size")
+        else:
+            cache_size = 500
+        
         self.consumption_history = pd.DataFrame()
         self.weather_history = pd.DataFrame()
         self.price_history = pd.DataFrame()
+        self.max_cache_size = cache_size
         
-        logging.info("Smart Optimization Engine geïnitialiseerd")
+        logging.info(f"Smart Optimization Engine geïnitialiseerd (Pi mode: {self.is_pi})")
     
     def _load_smart_settings(self) -> Dict[str, Any]:
         """Laad smart optimization instellingen"""
+        # Pi-specific optimizations (8GB variant can handle more)
+        if self.is_pi:
+            prediction_horizon = self.config.get(['smart_optimization', 'prediction_horizon'], 60)  # Good for 8GB Pi
+            forecast_days = self.config.get(['smart_optimization', 'weather_forecast_days'], 6)  # Good for 8GB Pi
+        else:
+            prediction_horizon = self.config.get(['smart_optimization', 'prediction_horizon'], 72)
+            forecast_days = self.config.get(['smart_optimization', 'weather_forecast_days'], 7)
+        
         return {
             # Core Features
             'advanced_prediction_enabled': self.config.get(['smart_optimization', 'advanced_prediction', 'enabled'], True),
@@ -48,10 +80,11 @@ class SmartOptimizationEngine:
             'high_load_detection_enabled': self.config.get(['smart_optimization', 'high_load_detection', 'enabled'], True),
             'adaptive_battery_enabled': self.config.get(['smart_optimization', 'adaptive_battery', 'enabled'], True),
             
-            # Advanced Prediction Settings
-            'prediction_horizon_hours': self.config.get(['smart_optimization', 'prediction_horizon'], 72),
-            'weather_forecast_days': self.config.get(['smart_optimization', 'weather_forecast_days'], 7),
+            # Advanced Prediction Settings (Pi-optimized)
+            'prediction_horizon_hours': prediction_horizon,
+            'weather_forecast_days': forecast_days,
             'consumption_pattern_learning': self.config.get(['smart_optimization', 'consumption_learning'], True),
+            'lightweight_models': self.is_pi,
             
             # Device Scheduling Settings
             'auto_schedule_dishwasher': self.config.get(['smart_optimization', 'devices', 'dishwasher'], True),
