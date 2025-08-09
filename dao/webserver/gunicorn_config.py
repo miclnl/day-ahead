@@ -4,7 +4,7 @@ sys.path.append("../../")
 from dao.prog.da_config import get_config
 
 app_datapath = "app/static/data/"
-port = get_config(app_datapath + "options.json", ["dashboard", "port"], 5000)
+port = get_config(app_datapath + "options.json", ["dashboard", "port"], 5001)
 workers = 2
 bind = f"0.0.0.0:{port}"
 forwarded_allow_ips = "*"

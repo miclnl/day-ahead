@@ -1,8 +1,8 @@
 ---
-name: 刀 Day Ahead Optimizer
-version: 2025.8.0
-slug: day_ahead_opt
-description: Home Assistant Community Add-ons for day ahead optimizations
+name: ⚡ DAO Modern (AI/ML Enhanced)
+version: 2025.8.1
+slug: dao_modern_enhanced
+description: Modern high-performance DAO with AI/ML optimization and real-time responsiveness
 url: https://github.com/corneel27/day-ahead
 codenotary: cees.van.beek@xs4all.nl
 arch:
@@ -10,9 +10,9 @@ arch:
   - amd64
 init: false
 ingress: true
-ingress_port: 5000
+ingress_port: 5001
 panel_admin: false
-panel_icon: mdi:home-battery-outline
+panel_icon: mdi:lightning-bolt
 apparmor: true
 legacy: true
 map:
@@ -21,5 +21,5 @@ map:
   - homeassistant_config:rw
 homeassistant_api: true
 ports:
-  5000/tcp: 5000
-image: "ghcr.io/corneel27/dao-{arch}"
+  5001/tcp: 5001
+image: "ghcr.io/corneel27/dao-modern-{arch}"
