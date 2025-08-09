@@ -24,15 +24,23 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.pipeline import Pipeline
 import xgboost as xgb
 
-# Deep Learning (optional imports with fallback)
+# TensorFlow Lite (optional imports with fallback)
 try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers
-    TENSORFLOW_AVAILABLE = True
+    import tflite_runtime.interpreter as tflite
+    TFLITE_AVAILABLE = True
+    logging.info("TensorFlow Lite runtime available for inference")
 except ImportError:
-    TENSORFLOW_AVAILABLE = False
-    logging.warning("TensorFlow not available, deep learning features disabled")
+    try:
+        import tensorflow as tf
+        from tensorflow import keras
+        from tensorflow.keras import layers
+        TENSORFLOW_AVAILABLE = True
+        TFLITE_AVAILABLE = False
+        logging.info("Full TensorFlow available")
+    except ImportError:
+        TENSORFLOW_AVAILABLE = False
+        TFLITE_AVAILABLE = False
+        logging.warning("Neither TensorFlow nor TensorFlow Lite available, deep learning features disabled")
 
 try:
     import torch
