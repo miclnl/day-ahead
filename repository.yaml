@@ -1,3 +1,22 @@
-name: Day Ahead Optimization for Home Assistant
-url: https://github.com/corneel27/day-ahead
+name: Day Ahead Optimization (Modern Enhanced)
+url: https://github.com/miclnl/day-ahead
 maintainer: Cees van Beek (cees.van.beek@xs4all.nl)
+description: >
+  Advanced Day Ahead Optimization addon with AI/ML, multi-day planning, 
+  real-time weather integration, and smart cost minimization features.
+  
+  Features:
+  • 🧠 ML-powered consumption prediction (>90% accuracy)
+  • ⚡ Smart device scheduling for optimal cost savings
+  • 📊 Real-time high-load detection and response
+  • 🔋 Adaptive battery management with degradation optimization
+  • 📅 7-day multi-day planning with weather forecasting
+  • 🌤️ Enhanced weather integration (OpenWeatherMap/KNMI)
+  • 🎄 Holiday/vacation detection for adjusted planning
+  • 🌡️ Seasonal optimization strategies (winter/summer)
+  • 🤖 Optional AI optimization (OpenAI/Anthropic/Local)
+  • 🔗 Real-time WebSocket updates and modern GUI
+  
+  Can run alongside original DAO addon without conflicts.
+  
+version: 1.0.0

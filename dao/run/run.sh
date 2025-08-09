@@ -48,6 +48,16 @@ cd /root/dao/webserver/
 gunicorn --config gunicorn_config.py app:app &
 
 cd /root/dao/prog
+
+# Start smart services in background
+if [ -f "start_smart_services.py" ]; then
+  echo "=> Starting smart services (WebSocket + Smart Optimization)"
+  chmod +x start_smart_services.py
+  python3 start_smart_services.py &
+  SMART_PID=$!
+  echo "Smart services started with PID: $SMART_PID"
+fi
+
 # Use modern scheduler by default, fallback to original if needed
 if [ -f "da_modern_scheduler.py" ]; then
   echo "=> Starting modern event-driven scheduler"

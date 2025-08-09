@@ -1,0 +1,945 @@
+{% extends "base.html" %}
+
+{% block selectie %}{% endblock %}
+
+{% block content %}
+<div class="run-container">
+    <h1>🚀 Operaties & Bewerkingen</h1>
+    
+    <div class="operation-categories">
+        <!-- Optimalisatie Operaties -->
+        <div class="category-card">
+            <h2>⚡ Optimalisatie</h2>
+            <div class="operations-grid">
+                <div class="operation-card optimization" data-operation="calc_met_debug">
+                    <div class="operation-icon">🔍</div>
+                    <h3>Debug Optimalisatie</h3>
+                    <p>Voer een volledige optimalisatie uit met uitgebreide debug informatie</p>
+                    <div class="operation-meta">
+                        <span class="time-estimate">⏱️ ~2-5 min</span>
+                        <span class="complexity high">🔥 Hoog</span>
+                    </div>
+                    <button class="run-btn" onclick="runOperation('calc_met_debug')">🚀 Starten</button>
+                </div>
+                
+                <div class="operation-card optimization" data-operation="calc_zonder_debug">
+                    <div class="operation-icon">⚡</div>
+                    <h3>Snelle Optimalisatie</h3>
+                    <p>Voer optimalisatie uit zonder debug output voor snelle resultaten</p>
+                    <div class="operation-meta">
+                        <span class="time-estimate">⏱️ ~30-60 sec</span>
+                        <span class="complexity medium">🟡 Gemiddeld</span>
+                    </div>
+                    <button class="run-btn" onclick="runOperation('calc_zonder_debug')">⚡ Starten</button>
+                </div>
+                
+                <div class="operation-card calculation" data-operation="calc_baseloads">
+                    <div class="operation-icon">📊</div>
+                    <h3>Baseload Berekening</h3>
+                    <p>Bereken de baseloads op basis van historische verbruiksdata</p>
+                    <div class="operation-meta">
+                        <span class="time-estimate">⏱️ ~10-30 sec</span>
+                        <span class="complexity low">🟢 Laag</span>
+                    </div>
+                    <button class="run-btn" onclick="runOperation('calc_baseloads')">📊 Starten</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Data Operaties -->
+        <div class="category-card">
+            <h2>📡 Data Ophalen</h2>
+            <div class="operations-grid">
+                <div class="operation-card data-fetch" data-operation="get_prices">
+                    <div class="operation-icon">💰</div>
+                    <h3>Day Ahead Prijzen</h3>
+                    <p>Haal de nieuwste energieprijzen op van de geconfigureerde bron</p>
+                    <div class="operation-meta">
+                        <span class="time-estimate">⏱️ ~5-15 sec</span>
+                        <span class="complexity low">🟢 Laag</span>
+                    </div>
+                    
+                    <div class="parameters">
+                        <div class="param-group">
+                            <label for="prijzen_start">Start Datum:</label>
+                            <input type="date" id="prijzen_start" name="prijzen_start" value="{{ (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d') }}">
+                        </div>
+                        <div class="param-group">
+                            <label for="prijzen_tot">Eind Datum:</label>
+                            <input type="date" id="prijzen_tot" name="prijzen_tot" value="{{ (datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d') }}">
+                        </div>
+                    </div>
+                    
+                    <button class="run-btn" onclick="runOperation('get_prices')">💰 Ophalen</button>
+                </div>
+                
+                <div class="operation-card data-fetch" data-operation="get_meteo">
+                    <div class="operation-icon">🌤️</div>
+                    <h3>Weer Prognoses</h3>
+                    <p>Download actuele weerprognoses voor zonnestraling en temperatuur</p>
+                    <div class="operation-meta">
+                        <span class="time-estimate">⏱️ ~5-10 sec</span>
+                        <span class="complexity low">🟢 Laag</span>
+                    </div>
+                    <button class="run-btn" onclick="runOperation('get_meteo')">🌤️ Ophalen</button>
+                </div>
+                
+                <div class="operation-card data-fetch" data-operation="get_tibber">
+                    <div class="operation-icon">📈</div>
+                    <h3>Tibber Verbruik</h3>
+                    <p>Haal verbruiksgegevens op van Tibber voor analyse en optimalisatie</p>
+                    <div class="operation-meta">
+                        <span class="time-estimate">⏱️ ~10-20 sec</span>
+                        <span class="complexity medium">🟡 Gemiddeld</span>
+                    </div>
+                    <button class="run-btn" onclick="runOperation('get_tibber')">📈 Ophalen</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Quick Actions -->
+        <div class="category-card">
+            <h2>⚡ Snelle Acties</h2>
+            <div class="quick-actions">
+                <button class="quick-btn emergency" onclick="emergencyStop()">
+                    <span class="icon">🛑</span>
+                    <span class="text">Noodstop</span>
+                </button>
+                
+                <button class="quick-btn status" onclick="getSystemStatus()">
+                    <span class="icon">📊</span>
+                    <span class="text">Status</span>
+                </button>
+                
+                <button class="quick-btn restart" onclick="restartScheduler()">
+                    <span class="icon">🔄</span>
+                    <span class="text">Herstart</span>
+                </button>
+                
+                <button class="quick-btn health" onclick="healthCheck()">
+                    <span class="icon">💊</span>
+                    <span class="text">Health Check</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Operation Progress Modal -->
+    <div id="progressModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="progressTitle">🚀 Operatie wordt uitgevoerd...</h3>
+                <button class="close-btn" onclick="closeProgressModal()">&times;</button>
+            </div>
+            
+            <div class="progress-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="progress-text" id="progressText">Voorbereiden...</div>
+            </div>
+            
+            <div class="operation-details">
+                <div class="detail-item">
+                    <strong>Operatie:</strong> <span id="operationName">-</span>
+                </div>
+                <div class="detail-item">
+                    <strong>Geschatte tijd:</strong> <span id="estimatedTime">-</span>
+                </div>
+                <div class="detail-item">
+                    <strong>Status:</strong> <span id="operationStatus">Starten...</span>
+                </div>
+            </div>
+            
+            <div class="live-log">
+                <h4>🔍 Live Log:</h4>
+                <div id="liveLogContent" class="log-content"></div>
+            </div>
+            
+            <div class="modal-actions">
+                <button class="btn btn-danger" onclick="cancelOperation()" id="cancelBtn">❌ Annuleren</button>
+                <button class="btn btn-success" onclick="closeProgressModal()" id="closeBtn" style="display:none;">✅ Sluiten</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Results Modal -->
+    <div id="resultsModal" class="modal">
+        <div class="modal-content large">
+            <div class="modal-header">
+                <h3 id="resultsTitle">📋 Operatie Resultaat</h3>
+                <button class="close-btn" onclick="closeResultsModal()">&times;</button>
+            </div>
+            
+            <div class="results-summary">
+                <div class="result-item success">
+                    <span class="icon">✅</span>
+                    <span class="label">Status:</span>
+                    <span class="value" id="resultStatus">Voltooid</span>
+                </div>
+                <div class="result-item">
+                    <span class="icon">⏱️</span>
+                    <span class="label">Duur:</span>
+                    <span class="value" id="resultDuration">-</span>
+                </div>
+                <div class="result-item">
+                    <span class="icon">📊</span>
+                    <span class="label">Output grootte:</span>
+                    <span class="value" id="resultSize">-</span>
+                </div>
+            </div>
+            
+            <div class="results-content">
+                <h4>📄 Volledige Output:</h4>
+                <pre id="fullLogContent" class="log-content"></pre>
+            </div>
+            
+            <div class="modal-actions">
+                <button class="btn" onclick="downloadLog()">💾 Log Opslaan</button>
+                <button class="btn btn-secondary" onclick="closeResultsModal()">❌ Sluiten</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- System Status Panel -->
+    <div id="systemStatus" class="status-panel">
+        <h3>🖥️ Systeem Status</h3>
+        <div class="status-grid">
+            <div class="status-item">
+                <span class="status-label">Scheduler:</span>
+                <span class="status-value" id="schedulerStatus">🔄 Actief</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Laatste Optimalisatie:</span>
+                <span class="status-value" id="lastOptimization">⏰ 15 min geleden</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Database:</span>
+                <span class="status-value" id="databaseStatus">✅ Verbonden</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Home Assistant:</span>
+                <span class="status-value" id="haStatus">✅ Online</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.run-container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.run-container h1 {
+    text-align: center;
+    color: #2196f3;
+    margin-bottom: 30px;
+    font-size: 2.5em;
+}
+
+.operation-categories {
+    display: flex;
+    flex-direction: column;
+    gap: 30px;
+}
+
+.category-card {
+    background: white;
+    padding: 25px;
+    border-radius: 12px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    border-left: 5px solid #2196f3;
+}
+
+.category-card h2 {
+    color: #1976d2;
+    margin-bottom: 20px;
+    font-size: 1.5em;
+}
+
+.operations-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 20px;
+}
+
+.operation-card {
+    background: #f8f9fa;
+    padding: 20px;
+    border-radius: 8px;
+    border: 2px solid #e9ecef;
+    transition: all 0.3s ease;
+    position: relative;
+}
+
+.operation-card:hover {
+    border-color: #2196f3;
+    box-shadow: 0 4px 12px rgba(33, 150, 243, 0.15);
+    transform: translateY(-2px);
+}
+
+.operation-card.optimization {
+    border-left: 4px solid #4caf50;
+}
+
+.operation-card.data-fetch {
+    border-left: 4px solid #2196f3;
+}
+
+.operation-card.calculation {
+    border-left: 4px solid #ff9800;
+}
+
+.operation-icon {
+    font-size: 2.5em;
+    text-align: center;
+    margin-bottom: 15px;
+}
+
+.operation-card h3 {
+    color: #333;
+    margin-bottom: 10px;
+    font-size: 1.2em;
+}
+
+.operation-card p {
+    color: #666;
+    margin-bottom: 15px;
+    line-height: 1.4;
+}
+
+.operation-meta {
+    display: flex;
+    gap: 15px;
+    margin-bottom: 15px;
+    flex-wrap: wrap;
+}
+
+.time-estimate {
+    background: #e3f2fd;
+    color: #1976d2;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.85em;
+}
+
+.complexity {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.85em;
+    font-weight: bold;
+}
+
+.complexity.low {
+    background: #e8f5e8;
+    color: #2e7d32;
+}
+
+.complexity.medium {
+    background: #fff3e0;
+    color: #f57c00;
+}
+
+.complexity.high {
+    background: #ffebee;
+    color: #c62828;
+}
+
+.parameters {
+    background: #f0f0f0;
+    padding: 15px;
+    border-radius: 6px;
+    margin-bottom: 15px;
+}
+
+.param-group {
+    margin-bottom: 10px;
+}
+
+.param-group:last-child {
+    margin-bottom: 0;
+}
+
+.param-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: bold;
+    color: #333;
+}
+
+.param-group input {
+    width: 100%;
+    padding: 8px;
+    border: 2px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+}
+
+.run-btn {
+    width: 100%;
+    background: #2196f3;
+    color: white;
+    border: none;
+    padding: 12px 20px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+}
+
+.run-btn:hover {
+    background: #1976d2;
+}
+
+.quick-actions {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 15px;
+}
+
+.quick-btn {
+    background: white;
+    border: 2px solid #ddd;
+    padding: 20px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+}
+
+.quick-btn:hover {
+    border-color: #2196f3;
+    box-shadow: 0 2px 8px rgba(33, 150, 243, 0.2);
+}
+
+.quick-btn.emergency {
+    border-color: #f44336;
+}
+
+.quick-btn.emergency:hover {
+    background: #ffebee;
+    border-color: #d32f2f;
+}
+
+.quick-btn .icon {
+    font-size: 2em;
+}
+
+.quick-btn .text {
+    font-weight: bold;
+    color: #333;
+}
+
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0,0,0,0.5);
+    animation: fadeIn 0.3s ease;
+}
+
+.modal-content {
+    background: white;
+    margin: 5% auto;
+    padding: 0;
+    border-radius: 8px;
+    width: 80%;
+    max-width: 800px;
+    max-height: 80vh;
+    overflow: hidden;
+    animation: slideIn 0.3s ease;
+}
+
+.modal-content.large {
+    max-width: 1000px;
+}
+
+.modal-header {
+    background: #2196f3;
+    color: white;
+    padding: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.close-btn {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 24px;
+    cursor: pointer;
+}
+
+.progress-container {
+    padding: 20px;
+}
+
+.progress-bar {
+    background: #e0e0e0;
+    border-radius: 10px;
+    height: 20px;
+    overflow: hidden;
+    margin-bottom: 10px;
+}
+
+.progress-fill {
+    background: #4caf50;
+    height: 100%;
+    width: 0%;
+    transition: width 0.3s ease;
+    border-radius: 10px;
+}
+
+.progress-text {
+    text-align: center;
+    font-weight: bold;
+    color: #666;
+}
+
+.operation-details {
+    padding: 0 20px 20px;
+    border-bottom: 1px solid #eee;
+}
+
+.detail-item {
+    margin-bottom: 10px;
+    display: flex;
+    justify-content: space-between;
+}
+
+.live-log,
+.results-content {
+    padding: 20px;
+}
+
+.log-content {
+    background: #1e1e1e;
+    color: #fff;
+    padding: 15px;
+    border-radius: 4px;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+
+.modal-actions {
+    padding: 20px;
+    text-align: right;
+    border-top: 1px solid #eee;
+}
+
+.btn {
+    background: #2196f3;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    margin-left: 10px;
+    transition: background-color 0.3s ease;
+}
+
+.btn:hover {
+    background: #1976d2;
+}
+
+.btn-success {
+    background: #4caf50;
+}
+
+.btn-success:hover {
+    background: #45a049;
+}
+
+.btn-danger {
+    background: #f44336;
+}
+
+.btn-danger:hover {
+    background: #d32f2f;
+}
+
+.btn-secondary {
+    background: #757575;
+}
+
+.btn-secondary:hover {
+    background: #616161;
+}
+
+.results-summary {
+    padding: 20px;
+    background: #f8f9fa;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+}
+
+.result-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.result-item.success .value {
+    color: #4caf50;
+    font-weight: bold;
+}
+
+.status-panel {
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    margin-top: 20px;
+}
+
+.status-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 15px;
+}
+
+.status-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px;
+    background: #f8f9fa;
+    border-radius: 6px;
+}
+
+.status-label {
+    font-weight: bold;
+    color: #333;
+}
+
+.status-value {
+    color: #4caf50;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes slideIn {
+    from { transform: translateY(-50px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+}
+
+@media (max-width: 768px) {
+    .operations-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .modal-content {
+        width: 95%;
+        margin: 2% auto;
+    }
+    
+    .quick-actions {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+</style>
+
+<script>
+let currentOperation = null;
+let progressInterval = null;
+
+// Operation definitions
+const operations = {
+    'calc_met_debug': {
+        name: 'Debug Optimalisatie',
+        estimate: '2-5 minuten',
+        description: 'Volledige optimalisatie met debug output'
+    },
+    'calc_zonder_debug': {
+        name: 'Snelle Optimalisatie', 
+        estimate: '30-60 seconden',
+        description: 'Optimalisatie zonder debug output'
+    },
+    'calc_baseloads': {
+        name: 'Baseload Berekening',
+        estimate: '10-30 seconden', 
+        description: 'Bereken baseloads van historische data'
+    },
+    'get_prices': {
+        name: 'Day Ahead Prijzen',
+        estimate: '5-15 seconden',
+        description: 'Ophalen van energieprijzen'
+    },
+    'get_meteo': {
+        name: 'Weer Prognoses',
+        estimate: '5-10 seconden',
+        description: 'Ophalen van weerdata'
+    },
+    'get_tibber': {
+        name: 'Tibber Verbruik',
+        estimate: '10-20 seconden',
+        description: 'Ophalen van Tibber data'
+    }
+};
+
+function runOperation(operationId) {
+    currentOperation = operationId;
+    const operation = operations[operationId];
+    
+    // Show progress modal
+    document.getElementById('progressModal').style.display = 'block';
+    document.getElementById('progressTitle').textContent = `🚀 ${operation.name} wordt uitgevoerd...`;
+    document.getElementById('operationName').textContent = operation.name;
+    document.getElementById('estimatedTime').textContent = operation.estimate;
+    document.getElementById('operationStatus').textContent = 'Starten...';
+    document.getElementById('liveLogContent').textContent = '';
+    
+    // Reset progress
+    document.getElementById('progressFill').style.width = '0%';
+    document.getElementById('progressText').textContent = 'Voorbereiden...';
+    document.getElementById('cancelBtn').style.display = 'block';
+    document.getElementById('closeBtn').style.display = 'none';
+    
+    // Collect parameters for operations that need them
+    let params = {};
+    if (operationId === 'get_prices') {
+        params.prijzen_start = document.getElementById('prijzen_start').value;
+        params.prijzen_tot = document.getElementById('prijzen_tot').value;
+    }
+    
+    // Start the operation
+    startOperation(operationId, params);
+}
+
+function startOperation(operationId, params = {}) {
+    const startTime = Date.now();
+    
+    // Simulate progress
+    let progress = 0;
+    progressInterval = setInterval(() => {
+        progress += Math.random() * 10;
+        if (progress > 95) progress = 95;
+        
+        document.getElementById('progressFill').style.width = progress + '%';
+        
+        if (progress < 20) {
+            document.getElementById('progressText').textContent = 'Initialiseren...';
+            document.getElementById('operationStatus').textContent = 'Bezig met voorbereiden';
+        } else if (progress < 40) {
+            document.getElementById('progressText').textContent = 'Data ophalen...';
+            document.getElementById('operationStatus').textContent = 'Data verzamelen';
+        } else if (progress < 70) {
+            document.getElementById('progressText').textContent = 'Verwerken...';
+            document.getElementById('operationStatus').textContent = 'Berekeningen uitvoeren';
+        } else if (progress < 90) {
+            document.getElementById('progressText').textContent = 'Resultaten opslaan...';
+            document.getElementById('operationStatus').textContent = 'Resultaten wegschrijven';
+        } else {
+            document.getElementById('progressText').textContent = 'Afronden...';
+            document.getElementById('operationStatus').textContent = 'Laatste stappen';
+        }
+    }, 500);
+    
+    // Simulate live log updates
+    const logMessages = [
+        'Starting operation...',
+        'Loading configuration...',
+        'Connecting to database...',
+        'Fetching data from Home Assistant...',
+        'Processing energy data...',
+        'Running optimization algorithms...',
+        'Calculating optimal schedules...',
+        'Saving results to database...',
+        'Updating Home Assistant entities...',
+        'Operation completed successfully!'
+    ];
+    
+    let logIndex = 0;
+    const logInterval = setInterval(() => {
+        if (logIndex < logMessages.length) {
+            const timestamp = new Date().toLocaleTimeString();
+            const logContent = document.getElementById('liveLogContent');
+            logContent.textContent += `[${timestamp}] ${logMessages[logIndex]}\n`;
+            logContent.scrollTop = logContent.scrollHeight;
+            logIndex++;
+        }
+    }, 1000);
+    
+    // Make actual API call
+    const formData = new FormData();
+    Object.keys(params).forEach(key => {
+        formData.append(key, params[key]);
+    });
+    
+    fetch(`/api/run/${operationId}`, {
+        method: 'POST',
+        body: formData
+    })
+    .then(response => response.text())
+    .then(data => {
+        // Operation completed
+        clearInterval(progressInterval);
+        clearInterval(logInterval);
+        
+        const duration = Math.round((Date.now() - startTime) / 1000);
+        
+        // Show completion
+        document.getElementById('progressFill').style.width = '100%';
+        document.getElementById('progressText').textContent = 'Voltooid!';
+        document.getElementById('operationStatus').textContent = 'Succesvol afgerond';
+        document.getElementById('cancelBtn').style.display = 'none';
+        document.getElementById('closeBtn').style.display = 'block';
+        
+        // Update final log
+        const timestamp = new Date().toLocaleTimeString();
+        const logContent = document.getElementById('liveLogContent');
+        logContent.textContent += `[${timestamp}] Operation completed in ${duration} seconds\n`;
+        
+        // Prepare results modal
+        document.getElementById('resultsTitle').textContent = `📋 ${operations[operationId].name} - Resultaat`;
+        document.getElementById('resultStatus').textContent = 'Voltooid';
+        document.getElementById('resultDuration').textContent = `${duration} seconden`;
+        document.getElementById('resultSize').textContent = `${data.length} karakters`;
+        document.getElementById('fullLogContent').textContent = data;
+        
+        // Auto-close progress modal after 2 seconds
+        setTimeout(() => {
+            closeProgressModal();
+            showResultsModal();
+        }, 2000);
+    })
+    .catch(error => {
+        clearInterval(progressInterval);
+        clearInterval(logInterval);
+        
+        document.getElementById('progressText').textContent = 'Fout opgetreden!';
+        document.getElementById('operationStatus').textContent = 'Fout: ' + error.message;
+        document.getElementById('cancelBtn').style.display = 'none';
+        document.getElementById('closeBtn').style.display = 'block';
+        
+        const timestamp = new Date().toLocaleTimeString();
+        const logContent = document.getElementById('liveLogContent');
+        logContent.textContent += `[${timestamp}] ERROR: ${error.message}\n`;
+    });
+}
+
+function cancelOperation() {
+    if (progressInterval) {
+        clearInterval(progressInterval);
+    }
+    
+    document.getElementById('progressText').textContent = 'Geannuleerd';
+    document.getElementById('operationStatus').textContent = 'Door gebruiker geannuleerd';
+    document.getElementById('cancelBtn').style.display = 'none';
+    document.getElementById('closeBtn').style.display = 'block';
+}
+
+function closeProgressModal() {
+    document.getElementById('progressModal').style.display = 'none';
+}
+
+function showResultsModal() {
+    document.getElementById('resultsModal').style.display = 'block';
+}
+
+function closeResultsModal() {
+    document.getElementById('resultsModal').style.display = 'none';
+}
+
+function downloadLog() {
+    const logContent = document.getElementById('fullLogContent').textContent;
+    const blob = new Blob([logContent], { type: 'text/plain' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.style.display = 'none';
+    a.href = url;
+    a.download = `dao_operation_${currentOperation}_${new Date().toISOString().slice(0,19).replace(/[:.]/g, '-')}.log`;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+}
+
+// Quick action functions
+function emergencyStop() {
+    if (confirm('⚠️ Weet je zeker dat je alle operaties wilt stoppen?')) {
+        fetch('/api/emergency-stop', { method: 'POST' })
+        .then(response => response.json())
+        .then(data => {
+            alert(data.success ? '✅ Noodstop uitgevoerd' : '❌ Fout: ' + data.error);
+            updateSystemStatus();
+        });
+    }
+}
+
+function getSystemStatus() {
+    updateSystemStatus();
+}
+
+function restartScheduler() {
+    if (confirm('🔄 Scheduler herstarten?')) {
+        fetch('/api/restart-scheduler', { method: 'POST' })
+        .then(response => response.json())
+        .then(data => {
+            alert(data.success ? '✅ Scheduler herstart' : '❌ Fout: ' + data.error);
+            updateSystemStatus();
+        });
+    }
+}
+
+function healthCheck() {
+    fetch('/api/health-check')
+    .then(response => response.json())
+    .then(data => {
+        const status = data.healthy ? '✅ Systeem OK' : '⚠️ Problemen gedetecteerd';
+        alert(status + '\n\nDetails:\n' + JSON.stringify(data.details, null, 2));
+    });
+}
+
+function updateSystemStatus() {
+    fetch('/api/system-status')
+    .then(response => response.json())
+    .then(data => {
+        document.getElementById('schedulerStatus').textContent = data.scheduler.active ? '🔄 Actief' : '⏸️ Gestopt';
+        document.getElementById('lastOptimization').textContent = `⏰ ${data.lastOptimization}`;
+        document.getElementById('databaseStatus').textContent = data.database.connected ? '✅ Verbonden' : '❌ Niet verbonden';
+        document.getElementById('haStatus').textContent = data.homeassistant.online ? '✅ Online' : '❌ Offline';
+    })
+    .catch(error => {
+        console.error('Error updating status:', error);
+    });
+}
+
+// Initialize system status on load
+document.addEventListener('DOMContentLoaded', function() {
+    updateSystemStatus();
+    setInterval(updateSystemStatus, 30000); // Update every 30 seconds
+});
+
+// Close modals when clicking outside
+window.onclick = function(event) {
+    const progressModal = document.getElementById('progressModal');
+    const resultsModal = document.getElementById('resultsModal');
+    
+    if (event.target === progressModal) {
+        closeProgressModal();
+    }
+    if (event.target === resultsModal) {
+        closeResultsModal();
+    }
+}
+</script>
+
+{% endblock %}

@@ -1,9 +1,9 @@
 ---
 name: ⚡ DAO Modern (AI/ML Enhanced)
-version: 2025.8.1
+version: 1.0.0
 slug: dao_modern_enhanced
 description: Modern high-performance DAO with AI/ML optimization and real-time responsiveness
-url: https://github.com/corneel27/day-ahead
+url: https://github.com/miclnl/day-ahead
 codenotary: cees.van.beek@xs4all.nl
 arch:
   - aarch64
@@ -22,4 +22,5 @@ map:
 homeassistant_api: true
 ports:
   5001/tcp: 5001
-image: "ghcr.io/corneel27/dao-modern-{arch}"
+# Image wordt lokaal gebouwd via Dockerfile
+# image: "ghcr.io/miclnl/dao-modern-{arch}"
