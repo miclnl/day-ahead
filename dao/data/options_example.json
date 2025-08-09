@@ -93,6 +93,48 @@
     "average consumption": "True"
   },
   "strategy": "minimize cost",
+  "optimization": {
+    "engine": "hybrid",
+    "ai": {
+      "enabled": false,
+      "provider": "openai",
+      "fallback_to_local": true,
+      "cost_threshold": 0.10,
+      "openai": {
+        "api_key": "!secret openai_key",
+        "model": "gpt-4o",
+        "endpoint": "https://api.openai.com/v1",
+        "max_tokens": 4000,
+        "timeout": 60
+      },
+      "anthropic": {
+        "api_key": "!secret anthropic_key", 
+        "model": "claude-3-5-sonnet-20241022",
+        "endpoint": "https://api.anthropic.com/v1",
+        "max_tokens": 4000,
+        "timeout": 60
+      },
+      "local": {
+        "endpoint": "http://localhost:11434",
+        "model": "llama3",
+        "timeout": 120
+      }
+    }
+  },
+  "machine_learning": {
+    "enabled": true,
+    "consumption_predictor": {
+      "algorithm": "ensemble",
+      "lookback_hours": 168,
+      "prediction_horizon": 48,
+      "model_path": "../data/models/"
+    },
+    "pattern_recognizer": {
+      "n_clusters": 5,
+      "pattern_length": 24,
+      "model_path": "../data/models/"
+    }
+  },
   "notifications": {
     "notification entity": "input_text.dao_notificatie",
     "opstarten": "False",
