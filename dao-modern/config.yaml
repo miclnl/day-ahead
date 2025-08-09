@@ -1,0 +1,26 @@
+---
+name: ⚡ DAO Modern (AI/ML Enhanced)
+version: 1.3.0
+slug: dao_modern_enhanced
+description: Modern high-performance DAO with AI/ML optimization and real-time responsiveness
+url: https://github.com/miclnl/day-ahead
+codenotary: cees.van.beek@xs4all.nl
+arch:
+  - aarch64
+  - amd64
+init: false
+ingress: true
+ingress_port: 5001
+panel_admin: false
+panel_icon: mdi:lightning-bolt
+apparmor: true
+legacy: true
+map:
+  - ssl:rw
+  - addon_config:rw
+  - homeassistant_config:rw
+homeassistant_api: true
+ports:
+  5001/tcp: 5001
+# Image wordt lokaal gebouwd via Dockerfile
+# image: "ghcr.io/miclnl/dao-modern-{arch}"

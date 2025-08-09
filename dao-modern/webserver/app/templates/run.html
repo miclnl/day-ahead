@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block selectie %}
+<form method="post" name="bewerk_form" id="bewerk_form">
+<h3>Voer een bewerking, berekening of actie uit door een van onderstaande onderdelen aan te klikken</h3>
+  <input type="hidden" id="current_menu" name="current_menu" value="run">
+  {% for key, value in bewerkingen.items() %}
+    {% set id_= "id_" ~ key %}
+    {% if key == bewerking  %}
+    <input type="checkbox" id= "{{ id_ }}" name= "{{ key }}" checked onchange="this.form.submit()"/>
+    {% else %}
+    <input type="checkbox" id= "{{ id_ }}" name= "{{ key }}" onchange="this.form.submit()"/>
+    {% endif %}
+    <label for= "{{ id_ }}"> {{ value["name"] }} </label>
+    {% for parameter in value["parameters"] %}
+      {% set id_p= "id_p" ~ parameter %}
+      {% set value = parameters[parameter] %}
+          <label for= "{{ id_p }}"> {{ parameter }} </label>
+          <input type="text" id="{{ id_p }}" name="{{ parameter }}" required minlength="10" placeholder="jjjj-mm-dd" maxlength="12" size="10" value="{{ value }}" />
+    {% endfor %}
+  <br />
+  {% endfor %}
+  {% if not (bewerking == '') %}
+    <input type="hidden" id="current_bewerking" name="current_bewerking" value="{{bewerking}}">
+  {% endif %}
+  <div class="clear"></div>
+</form>
+{% endblock %}
+
+{% block content %}
+<div>
+<hr>
+{% if not (bewerking == '') %}
+  <h2>Bewerking "{{ bewerkingen[bewerking]["name"] }}" wordt uitgevoerd</h2>
+  <script>
+    window.onload=function(){
+      window.setTimeout(document.bewerk_form.submit.bind(document.bewerk_form), {{ bewerkingen[bewerking]["wait"] }});
+    };
+  </script>
+
+{% endif %}
+
+{% if current_bewerking != "" %}
+  <h2> Logging van bewerking "{{ bewerkingen[current_bewerking]["name"] }}":</h2>
+    <pre class="log_content">{{ log_content }}</pre>
+{% endif %}
+
+</div>
+<hr>
+
+{% endblock %}
+
+
+

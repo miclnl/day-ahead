@@ -1,0 +1,1140 @@
+{% extends "base.html" %}
+{% block selectie %}{% endblock %}
+{% block content %}
+
+<div class="settings-container">
+    <div class="settings-tabs">
+        <div class="tab-buttons">
+            <button class="tab-btn active" data-tab="basic">📊 Basis Instellingen</button>
+            <button class="tab-btn" data-tab="energy">⚡ Energie & Prijzen</button>
+            <button class="tab-btn" data-tab="battery">🔋 Batterijen</button>
+            <button class="tab-btn" data-tab="ev">🚗 Elektrische Auto's</button>
+            <button class="tab-btn" data-tab="solar">☀️ Zonnepanelen</button>
+            <button class="tab-btn" data-tab="ai">🤖 AI/ML Opties</button>
+            <button class="tab-btn" data-tab="advanced">⚙️ Geavanceerd</button>
+        </div>
+
+        <!-- Basis Instellingen Tab -->
+        <div class="tab-content active" id="basic">
+            <h2>📊 Basis Instellingen</h2>
+            
+            <div class="form-section">
+                <h3>🏠 Home Assistant</h3>
+                <div class="form-group">
+                    <label for="ha_url">Home Assistant URL:</label>
+                    <input type="url" id="ha_url" name="homeassistant.url" value="{{ config.get('homeassistant', {}).get('url', '') }}" 
+                           placeholder="http://homeassistant.local:8123">
+                </div>
+                <div class="form-group">
+                    <label for="ha_token">Access Token:</label>
+                    <input type="password" id="ha_token" name="homeassistant.token" value="{{ config.get('homeassistant', {}).get('token', '') }}"
+                           placeholder="Long-lived access token">
+                </div>
+            </div>
+
+            <div class="form-section">
+                <h3>🗄️ Database</h3>
+                <div class="form-group">
+                    <label for="db_engine">Database Engine:</label>
+                    <select id="db_engine" name="database_ha.engine">
+                        <option value="sqlite" {% if config.get('database ha', {}).get('engine') == 'sqlite' %}selected{% endif %}>SQLite</option>
+                        <option value="mysql" {% if config.get('database ha', {}).get('engine') == 'mysql' %}selected{% endif %}>MySQL</option>
+                        <option value="postgresql" {% if config.get('database ha', {}).get('engine') == 'postgresql' %}selected{% endif %}>PostgreSQL</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="db_path">Database Pad:</label>
+                    <input type="text" id="db_path" name="database_ha.db_path" value="{{ config.get('database ha', {}).get('db_path', '/homeassistant') }}">
+                </div>
+            </div>
+
+            <div class="form-section">
+                <h3>📡 API Keys</h3>
+                <div class="form-group">
+                    <label for="meteo_key">MeteoServer API Key:</label>
+                    <input type="password" id="meteo_key" name="meteoserver-key" value="{{ config.get('meteoserver-key', '') }}"
+                           placeholder="API key voor weer data">
+                </div>
+            </div>
+        </div>
+
+        <!-- Energie & Prijzen Tab -->
+        <div class="tab-content" id="energy">
+            <h2>⚡ Energie & Prijzen</h2>
+            
+            <div class="form-section">
+                <h3>💰 Prijsbron</h3>
+                <div class="form-group">
+                    <label for="price_source">Day Ahead Prijsbron:</label>
+                    <select id="price_source" name="prices.source_day_ahead">
+                        <option value="nordpool" {% if config.get('prices', {}).get('source day ahead') == 'nordpool' %}selected{% endif %}>Nord Pool</option>
+                        <option value="entsoe" {% if config.get('prices', {}).get('source day ahead') == 'entsoe' %}selected{% endif %}>ENTSO-E</option>
+                        <option value="easyenergy" {% if config.get('prices', {}).get('source day ahead') == 'easyenergy' %}selected{% endif %}>EasyEnergy</option>
+                        <option value="tibber" {% if config.get('prices', {}).get('source day ahead') == 'tibber' %}selected{% endif %}>Tibber</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="regular_high">Regulier Tarief Hoog (€/kWh):</label>
+                    <input type="number" step="0.001" id="regular_high" name="prices.regular_high" 
+                           value="{{ config.get('prices', {}).get('regular high', 0.50) }}">
+                </div>
+                
+                <div class="form-group">
+                    <label for="regular_low">Regulier Tarief Laag (€/kWh):</label>
+                    <input type="number" step="0.001" id="regular_low" name="prices.regular_low"
+                           value="{{ config.get('prices', {}).get('regular low', 0.40) }}">
+                </div>
+
+                <div class="form-group">
+                    <label for="switch_to_low">Overschakeling naar laag tarief (uur):</label>
+                    <input type="number" min="0" max="23" id="switch_to_low" name="prices.switch_to_low"
+                           value="{{ config.get('prices', {}).get('switch to low', 23) }}">
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h3>🏛️ Belastingen & Kosten</h3>
+                <div class="form-group">
+                    <label for="energy_tax_consumption">Energiebelasting Verbruik (€/kWh):</label>
+                    <input type="number" step="0.00001" id="energy_tax_consumption" name="energy_tax_consumption"
+                           value="0.10154" readonly>
+                    <small>Automatisch bijgewerkt op basis van datum</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="supplier_cost_consumption">Leveringskosten Verbruik (€/kWh):</label>
+                    <input type="number" step="0.00001" id="supplier_cost_consumption" name="supplier_cost_consumption"
+                           value="0.020496" readonly>
+                    <small>Automatisch bijgewerkt op basis van datum</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="vat_consumption">BTW Verbruik (%):</label>
+                    <input type="number" step="1" id="vat_consumption" name="vat_consumption"
+                           value="21" readonly>
+                    <small>Automatisch bijgewerkt op basis van datum</small>
+                </div>
+            </div>
+        </div>
+
+        <!-- Batterijen Tab -->
+        <div class="tab-content" id="battery">
+            <h2>🔋 Batterijen</h2>
+            
+            <div class="battery-list">
+                <div class="form-section">
+                    <h3>Batterij Configuraties</h3>
+                    <button type="button" class="btn btn-add" onclick="addBattery()">➕ Nieuwe Batterij</button>
+                </div>
+                
+                <div id="battery-configs">
+                    {% for battery in config.get('battery', []) %}
+                    <div class="battery-config" data-index="{{ loop.index0 }}">
+                        <h4>🔋 {{ battery.get('name', 'Batterij ' + loop.index|string) }}</h4>
+                        
+                        <div class="form-group">
+                            <label for="battery_name_{{ loop.index0 }}">Naam:</label>
+                            <input type="text" id="battery_name_{{ loop.index0 }}" name="battery[{{ loop.index0 }}].name"
+                                   value="{{ battery.get('name', '') }}">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="battery_capacity_{{ loop.index0 }}">Capaciteit (kWh):</label>
+                            <input type="number" step="0.1" id="battery_capacity_{{ loop.index0 }}" 
+                                   name="battery[{{ loop.index0 }}].capacity"
+                                   value="{{ battery.get('capacity', 10) }}">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="battery_power_{{ loop.index0 }}">Max Vermogen (kW):</label>
+                            <input type="number" step="0.1" id="battery_power_{{ loop.index0 }}" 
+                                   name="battery[{{ loop.index0 }}].max_power"
+                                   value="{{ battery.get('max_power', 5) }}">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="battery_efficiency_{{ loop.index0 }}">Efficiency (%):</label>
+                            <input type="number" step="0.1" min="50" max="100" id="battery_efficiency_{{ loop.index0 }}" 
+                                   name="battery[{{ loop.index0 }}].efficiency"
+                                   value="{{ battery.get('efficiency', 95) }}">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="battery_entity_{{ loop.index0 }}">Home Assistant Entity:</label>
+                            <input type="text" id="battery_entity_{{ loop.index0 }}" 
+                                   name="battery[{{ loop.index0 }}].entity"
+                                   value="{{ battery.get('entity', '') }}"
+                                   placeholder="sensor.battery_soc">
+                        </div>
+                        
+                        <button type="button" class="btn btn-danger" onclick="removeBattery({{ loop.index0 }})">🗑️ Verwijderen</button>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Elektrische Auto's Tab -->
+        <div class="tab-content" id="ev">
+            <h2>🚗 Elektrische Auto's</h2>
+            
+            <div class="ev-list">
+                <div class="form-section">
+                    <h3>EV Configuraties</h3>
+                    <button type="button" class="btn btn-add" onclick="addEV()">➕ Nieuwe EV</button>
+                </div>
+                
+                <div id="ev-configs">
+                    {% for ev in config.get('electric_vehicle', []) %}
+                    <div class="ev-config" data-index="{{ loop.index0 }}">
+                        <h4>🚗 {{ ev.get('name', 'EV ' + loop.index|string) }}</h4>
+                        
+                        <div class="form-group">
+                            <label for="ev_name_{{ loop.index0 }}">Naam:</label>
+                            <input type="text" id="ev_name_{{ loop.index0 }}" name="electric_vehicle[{{ loop.index0 }}].name"
+                                   value="{{ ev.get('name', '') }}">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="ev_capacity_{{ loop.index0 }}">Batterij Capaciteit (kWh):</label>
+                            <input type="number" step="0.1" id="ev_capacity_{{ loop.index0 }}" 
+                                   name="electric_vehicle[{{ loop.index0 }}].battery_capacity"
+                                   value="{{ ev.get('battery_capacity', 50) }}">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="ev_charge_power_{{ loop.index0 }}">Laadvermogen (kW):</label>
+                            <input type="number" step="0.1" id="ev_charge_power_{{ loop.index0 }}" 
+                                   name="electric_vehicle[{{ loop.index0 }}].charge_power"
+                                   value="{{ ev.get('charge_power', 11) }}">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="ev_efficiency_{{ loop.index0 }}">Efficiëntie (kWh/100km):</label>
+                            <input type="number" step="0.1" id="ev_efficiency_{{ loop.index0 }}" 
+                                   name="electric_vehicle[{{ loop.index0 }}].efficiency"
+                                   value="{{ ev.get('efficiency', 18) }}">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="ev_entity_{{ loop.index0 }}">Home Assistant Entity:</label>
+                            <input type="text" id="ev_entity_{{ loop.index0 }}" 
+                                   name="electric_vehicle[{{ loop.index0 }}].entity"
+                                   value="{{ ev.get('entity', '') }}"
+                                   placeholder="sensor.ev_battery_level">
+                        </div>
+                        
+                        <button type="button" class="btn btn-danger" onclick="removeEV({{ loop.index0 }})">🗑️ Verwijderen</button>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Zonnepanelen Tab -->
+        <div class="tab-content" id="solar">
+            <h2>☀️ Zonnepanelen</h2>
+            
+            <div class="form-section">
+                <h3>🌞 Solar Configuratie</h3>
+                
+                <div class="form-group">
+                    <label for="solar_capacity">Geïnstalleerd Vermogen (kWp):</label>
+                    <input type="number" step="0.1" id="solar_capacity" name="solar.capacity"
+                           value="{{ config.get('solar', {}).get('capacity', 0) }}">
+                </div>
+                
+                <div class="form-group">
+                    <label for="solar_azimuth">Azimuth (graden, 0=Noord, 180=Zuid):</label>
+                    <input type="number" min="0" max="359" id="solar_azimuth" name="solar.azimuth"
+                           value="{{ config.get('solar', {}).get('azimuth', 180) }}">
+                </div>
+                
+                <div class="form-group">
+                    <label for="solar_tilt">Hellingshoek (graden):</label>
+                    <input type="number" min="0" max="90" id="solar_tilt" name="solar.tilt"
+                           value="{{ config.get('solar', {}).get('tilt', 35) }}">
+                </div>
+                
+                <div class="form-group">
+                    <label for="solar_efficiency">Panel Efficiëntie (%):</label>
+                    <input type="number" step="0.1" min="10" max="30" id="solar_efficiency" name="solar.efficiency"
+                           value="{{ config.get('solar', {}).get('efficiency', 20) }}">
+                </div>
+                
+                <div class="form-group">
+                    <label for="solar_entity">Home Assistant Entity:</label>
+                    <input type="text" id="solar_entity" name="solar.entity"
+                           value="{{ config.get('solar', {}).get('entity', '') }}"
+                           placeholder="sensor.solar_power">
+                </div>
+            </div>
+        </div>
+
+        <!-- AI/ML Opties Tab -->
+        <div class="tab-content" id="ai">
+            <h2>🤖 AI/ML Opties</h2>
+            
+            <div class="form-section">
+                <h3>🧠 AI Optimalisatie</h3>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="ai_enabled" name="optimization.ai.enabled"
+                               {% if config.get('optimization', {}).get('ai', {}).get('enabled') %}checked{% endif %}>
+                        AI Optimalisatie Inschakelen
+                    </label>
+                </div>
+                
+                <div class="form-group">
+                    <label for="ai_provider">AI Provider:</label>
+                    <select id="ai_provider" name="optimization.ai.provider">
+                        <option value="openai" {% if config.get('optimization', {}).get('ai', {}).get('provider') == 'openai' %}selected{% endif %}>OpenAI</option>
+                        <option value="anthropic" {% if config.get('optimization', {}).get('ai', {}).get('provider') == 'anthropic' %}selected{% endif %}>Anthropic</option>
+                        <option value="local" {% if config.get('optimization', {}).get('ai', {}).get('provider') == 'local' %}selected{% endif %}>Lokaal (Ollama)</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="ai_cost_threshold">Kosten Drempel (€ per optimalisatie):</label>
+                    <input type="number" step="0.01" min="0" max="1" id="ai_cost_threshold" 
+                           name="optimization.ai.cost_threshold"
+                           value="{{ config.get('optimization', {}).get('ai', {}).get('cost_threshold', 0.10) }}">
+                </div>
+                
+                <div class="form-group">
+                    <label for="openai_key">OpenAI API Key:</label>
+                    <input type="password" id="openai_key" name="optimization.ai.openai.api_key"
+                           value="{{ config.get('optimization', {}).get('ai', {}).get('openai', {}).get('api_key', '') }}"
+                           placeholder="!secret openai_key">
+                </div>
+                
+                <div class="form-group">
+                    <label for="openai_model">OpenAI Model:</label>
+                    <select id="openai_model" name="optimization.ai.openai.model">
+                        <option value="gpt-4o" {% if config.get('optimization', {}).get('ai', {}).get('openai', {}).get('model') == 'gpt-4o' %}selected{% endif %}>GPT-4o</option>
+                        <option value="gpt-4o-mini" {% if config.get('optimization', {}).get('ai', {}).get('openai', {}).get('model') == 'gpt-4o-mini' %}selected{% endif %}>GPT-4o Mini</option>
+                        <option value="gpt-4-turbo" {% if config.get('optimization', {}).get('ai', {}).get('openai', {}).get('model') == 'gpt-4-turbo' %}selected{% endif %}>GPT-4 Turbo</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h3>📊 Machine Learning</h3>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="ml_enabled" name="machine_learning.enabled"
+                               {% if config.get('machine_learning', {}).get('enabled', True) %}checked{% endif %}>
+                        Machine Learning Inschakelen
+                    </label>
+                </div>
+                
+                <div class="form-group">
+                    <label for="ml_algorithm">ML Algoritme:</label>
+                    <select id="ml_algorithm" name="machine_learning.consumption_predictor.algorithm">
+                        <option value="ensemble" {% if config.get('machine_learning', {}).get('consumption_predictor', {}).get('algorithm') == 'ensemble' %}selected{% endif %}>Ensemble (Meerdere modellen)</option>
+                        <option value="xgboost" {% if config.get('machine_learning', {}).get('consumption_predictor', {}).get('algorithm') == 'xgboost' %}selected{% endif %}>XGBoost</option>
+                        <option value="random_forest" {% if config.get('machine_learning', {}).get('consumption_predictor', {}).get('algorithm') == 'random_forest' %}selected{% endif %}>Random Forest</option>
+                        <option value="neural_network" {% if config.get('machine_learning', {}).get('consumption_predictor', {}).get('algorithm') == 'neural_network' %}selected{% endif %}>Neural Network</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="ml_history_days">Historische Data (dagen):</label>
+                    <input type="number" min="7" max="365" id="ml_history_days" 
+                           name="machine_learning.history_days"
+                           value="{{ config.get('machine_learning', {}).get('history_days', 90) }}">
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h3>🧠 Smart Optimalisatie</h3>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="advanced_prediction" name="smart_optimization.advanced_prediction.enabled"
+                               {% if config.get('smart_optimization', {}).get('advanced_prediction', {}).get('enabled', True) %}checked{% endif %}>
+                        Geavanceerde Verbruik Voorspelling
+                    </label>
+                    <small>Gebruikt ML voor nauwkeurigere verbruik voorspellingen</small>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="device_scheduling" name="smart_optimization.device_scheduling.enabled"
+                               {% if config.get('smart_optimization', {}).get('device_scheduling', {}).get('enabled', True) %}checked{% endif %}>
+                        Automatische Apparaat Planning
+                    </label>
+                    <small>Plant huishoudelijke apparaten automatisch op goedkope momenten</small>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="high_load_detection" name="smart_optimization.high_load_detection.enabled"
+                               {% if config.get('smart_optimization', {}).get('high_load_detection', {}).get('enabled', True) %}checked{% endif %}>
+                        Groot Verbruik Detectie
+                    </label>
+                    <small>Detecteert automatisch hoog verbruik en past batterij strategie aan</small>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="adaptive_battery" name="smart_optimization.adaptive_battery.enabled"
+                               {% if config.get('smart_optimization', {}).get('adaptive_battery', {}).get('enabled', True) %}checked{% endif %}>
+                        Adaptief Batterij Beheer
+                    </label>
+                    <small>Dynamische batterij strategie gebaseerd op prijzen en verbruik</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="prediction_horizon">Voorspelling Horizont (uren):</label>
+                    <input type="number" min="24" max="168" id="prediction_horizon" 
+                           name="smart_optimization.prediction_horizon"
+                           value="{{ config.get('smart_optimization', {}).get('prediction_horizon', 72) }}">
+                    <small>Hoe ver vooruit het systeem kijkt voor optimalisatie</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="high_load_threshold">Hoog Verbruik Drempel (multiplier):</label>
+                    <input type="number" step="0.1" min="1.5" max="5.0" id="high_load_threshold" 
+                           name="smart_optimization.high_load_threshold"
+                           value="{{ config.get('smart_optimization', {}).get('high_load_threshold', 2.5) }}">
+                    <small>Vermenigvuldiger van gemiddeld verbruik voor hoog verbruik detectie</small>
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h3>📅 Multi-day Optimization</h3>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="multiday_enabled" name="multiday_optimization.enabled"
+                               {% if config.get('multiday_optimization', {}).get('enabled', True) %}checked{% endif %}>
+                        7-Day Planning Inschakelen
+                    </label>
+                    <small>Gebruikt 7-day weather forecast voor betere langetermijn planning</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="planning_days">Planning Horizont (dagen):</label>
+                    <input type="number" min="3" max="14" id="planning_days" 
+                           name="multiday_optimization.planning_days"
+                           value="{{ config.get('multiday_optimization', {}).get('planning_days', 7) }}">
+                    <small>Aantal dagen vooruit plannen (3-14 dagen)</small>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="weather_forecast_enabled" name="multiday_optimization.weather_forecast"
+                               {% if config.get('multiday_optimization', {}).get('weather_forecast', True) %}checked{% endif %}>
+                        Weather Forecast Integration
+                    </label>
+                    <small>Gebruikt echte weather data voor nauwkeurigere PV voorspellingen</small>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="holiday_detection_enabled" name="multiday_optimization.holiday_detection"
+                               {% if config.get('multiday_optimization', {}).get('holiday_detection', True) %}checked{% endif %}>
+                        Holiday/Vacation Detection
+                    </label>
+                    <small>Detecteert automatisch feestdagen en vakanties voor aangepaste planning</small>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="seasonal_optimization_enabled" name="multiday_optimization.seasonal_optimization"
+                               {% if config.get('multiday_optimization', {}).get('seasonal_optimization', True) %}checked{% endif %}>
+                        Seasonal Optimization
+                    </label>
+                    <small>Past strategie aan voor winter/zomer verschillen</small>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="battery_degradation_enabled" name="multiday_optimization.battery_degradation"
+                               {% if config.get('multiday_optimization', {}).get('battery_degradation', True) %}checked{% endif %}>
+                        Battery Degradation Management
+                    </label>
+                    <small>Optimaliseert batterij levensduur vs kosten</small>
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h3>🌤️ Weather Integration</h3>
+                
+                <div class="form-group">
+                    <label for="weather_provider">Weather Provider:</label>
+                    <select id="weather_provider" name="weather.provider">
+                        <option value="openweathermap" {% if config.get('weather', {}).get('provider') == 'openweathermap' %}selected{% endif %}>OpenWeatherMap</option>
+                        <option value="knmi" {% if config.get('weather', {}).get('provider') == 'knmi' %}selected{% endif %}>KNMI (Nederland)</option>
+                    </select>
+                    <small>Kies weather data provider voor forecasts</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="weather_api_key">Weather API Key:</label>
+                    <input type="password" id="weather_api_key" name="weather.api_key"
+                           value="{{ config.get('weather', {}).get('api_key', '') }}"
+                           placeholder="API key voor weather service">
+                    <small>Gratis API key van OpenWeatherMap of andere provider</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="location_lat">Locatie Latitude:</label>
+                    <input type="number" step="0.000001" min="50" max="54" id="location_lat" 
+                           name="location.latitude"
+                           value="{{ config.get('location', {}).get('latitude', 52.0) }}">
+                    <small>GPS coordinaat voor nauwkeurige weather data</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="location_lon">Locatie Longitude:</label>
+                    <input type="number" step="0.000001" min="3" max="8" id="location_lon" 
+                           name="location.longitude"
+                           value="{{ config.get('location', {}).get('longitude', 5.0) }}">
+                    <small>GPS coordinaat voor nauwkeurige weather data</small>
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h3>🏠 Apparaat Instellingen</h3>
+                
+                <h4>Automatisch Te Plannen Apparaten</h4>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="auto_dishwasher" name="smart_optimization.devices.dishwasher"
+                               {% if config.get('smart_optimization', {}).get('devices', {}).get('dishwasher', True) %}checked{% endif %}>
+                        🍽️ Vaatwasser
+                    </label>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="auto_washing_machine" name="smart_optimization.devices.washing_machine"
+                               {% if config.get('smart_optimization', {}).get('devices', {}).get('washing_machine', True) %}checked{% endif %}>
+                        👕 Wasmachine
+                    </label>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="auto_dryer" name="smart_optimization.devices.dryer"
+                               {% if config.get('smart_optimization', {}).get('devices', {}).get('dryer', True) %}checked{% endif %}>
+                        🌪️ Droger
+                    </label>
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="auto_heat_pump" name="smart_optimization.devices.heat_pump"
+                               {% if config.get('smart_optimization', {}).get('devices', {}).get('heat_pump', True) %}checked{% endif %}>
+                        🔥 Warmtepomp
+                    </label>
+                </div>
+                
+                <h4>Apparaat Entities (Home Assistant)</h4>
+                
+                <div class="form-group">
+                    <label for="dishwasher_entity">Vaatwasser Entity:</label>
+                    <input type="text" id="dishwasher_entity" name="devices.dishwasher.entity"
+                           value="{{ config.get('devices', {}).get('dishwasher', {}).get('entity', '') }}"
+                           placeholder="sensor.dishwasher_state">
+                </div>
+                
+                <div class="form-group">
+                    <label for="washing_machine_entity">Wasmachine Entity:</label>
+                    <input type="text" id="washing_machine_entity" name="devices.washing_machine.entity"
+                           value="{{ config.get('devices', {}).get('washing_machine', {}).get('entity', '') }}"
+                           placeholder="sensor.washing_machine_state">
+                </div>
+                
+                <div class="form-group">
+                    <label for="dryer_entity">Droger Entity:</label>
+                    <input type="text" id="dryer_entity" name="devices.dryer.entity"
+                           value="{{ config.get('devices', {}).get('dryer', {}).get('entity', '') }}"
+                           placeholder="sensor.dryer_state">
+                </div>
+                
+                <div class="form-group">
+                    <label for="heat_pump_entity">Warmtepomp Entity:</label>
+                    <input type="text" id="heat_pump_entity" name="devices.heat_pump.entity"
+                           value="{{ config.get('devices', {}).get('heat_pump', {}).get('entity', '') }}"
+                           placeholder="climate.heat_pump">
+                </div>
+            </div>
+        </div>
+
+        <!-- Geavanceerd Tab -->
+        <div class="tab-content" id="advanced">
+            <h2>⚙️ Geavanceerde Instellingen</h2>
+            
+            <div class="form-section">
+                <h3>🔄 Scheduler</h3>
+                
+                <div class="form-group">
+                    <label for="scheduler_interval">Optimalisatie Interval (minuten):</label>
+                    <input type="number" min="1" max="60" id="scheduler_interval" 
+                           name="scheduler.interval_minutes"
+                           value="{{ config.get('scheduler', {}).get('interval_minutes', 15) }}">
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="realtime_enabled" name="scheduler.realtime_enabled"
+                               {% if config.get('scheduler', {}).get('realtime_enabled', True) %}checked{% endif %}>
+                        Real-time Monitoring
+                    </label>
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h3>📊 Dashboard</h3>
+                
+                <div class="form-group">
+                    <label for="dashboard_port">Dashboard Poort:</label>
+                    <input type="number" min="1024" max="65535" id="dashboard_port" 
+                           name="dashboard.port"
+                           value="{{ config.get('dashboard', {}).get('port', 5001) }}">
+                </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="debug_enabled" name="debug.enabled"
+                               {% if config.get('debug', {}).get('enabled', False) %}checked{% endif %}>
+                        Debug Logging
+                    </label>
+                </div>
+            </div>
+            
+            <div class="form-section">
+                <h3>🗄️ Opslag & Geschiedenis</h3>
+                
+                <div class="form-group">
+                    <label for="history_days">Bewaar Geschiedenis (dagen):</label>
+                    <input type="number" min="1" max="3650" id="history_days" 
+                           name="history.save_days"
+                           value="{{ config.get('history', {}).get('save days', 365) }}">
+                </div>
+            </div>
+            
+            <div class="form-section danger-zone">
+                <h3>⚠️ Gevaarlijke Zone</h3>
+                
+                <div class="form-group">
+                    <button type="button" class="btn btn-danger" onclick="resetToDefaults()">
+                        🔄 Reset naar Standaard Instellingen
+                    </button>
+                </div>
+                
+                <div class="form-group">
+                    <button type="button" class="btn btn-warning" onclick="exportConfig()">
+                        📤 Configuratie Exporteren
+                    </button>
+                </div>
+                
+                <div class="form-group">
+                    <label for="import_config">📥 Configuratie Importeren:</label>
+                    <input type="file" id="import_config" accept=".json">
+                    <button type="button" class="btn" onclick="importConfig()">Importeren</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Save Buttons -->
+    <div class="settings-actions">
+        <button type="button" class="btn btn-success" onclick="saveSettings()">💾 Opslaan</button>
+        <button type="button" class="btn" onclick="cancelSettings()">❌ Annuleren</button>
+        <button type="button" class="btn btn-secondary" onclick="testConnection()">🔗 Verbinding Testen</button>
+    </div>
+</div>
+
+<style>
+.settings-container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.settings-tabs {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.tab-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    background: #f5f5f5;
+    padding: 10px;
+    border-radius: 8px;
+}
+
+.tab-btn {
+    background: white;
+    border: 2px solid #ddd;
+    padding: 10px 15px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    font-size: 14px;
+    white-space: nowrap;
+}
+
+.tab-btn:hover {
+    background: #e8f4fd;
+    border-color: #2196f3;
+}
+
+.tab-btn.active {
+    background: #2196f3;
+    color: white;
+    border-color: #1976d2;
+}
+
+.tab-content {
+    display: none;
+    background: white;
+    padding: 30px;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+
+.tab-content.active {
+    display: block;
+}
+
+.form-section {
+    margin-bottom: 30px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid #eee;
+}
+
+.form-section:last-child {
+    border-bottom: none;
+}
+
+.form-section h3 {
+    color: #2196f3;
+    margin-bottom: 15px;
+    font-size: 18px;
+}
+
+.form-group {
+    margin-bottom: 15px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: bold;
+    color: #333;
+}
+
+.form-group input,
+.form-group select,
+.form-group textarea {
+    width: 100%;
+    max-width: 400px;
+    padding: 8px 12px;
+    border: 2px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+    transition: border-color 0.3s ease;
+}
+
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+    outline: none;
+    border-color: #2196f3;
+    box-shadow: 0 0 5px rgba(33, 150, 243, 0.3);
+}
+
+.form-group small {
+    display: block;
+    margin-top: 5px;
+    color: #666;
+    font-style: italic;
+}
+
+.checkbox-label {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+    width: auto !important;
+    margin-right: 0;
+}
+
+.battery-config,
+.ev-config {
+    background: #f8f9fa;
+    padding: 20px;
+    margin-bottom: 15px;
+    border-radius: 6px;
+    border-left: 4px solid #2196f3;
+}
+
+.battery-config h4,
+.ev-config h4 {
+    margin-top: 0;
+    color: #1976d2;
+}
+
+.btn {
+    background: #2196f3;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: background-color 0.3s ease;
+    display: inline-block;
+    text-decoration: none;
+}
+
+.btn:hover {
+    background: #1976d2;
+}
+
+.btn-success {
+    background: #4caf50;
+}
+
+.btn-success:hover {
+    background: #45a049;
+}
+
+.btn-danger {
+    background: #f44336;
+}
+
+.btn-danger:hover {
+    background: #d32f2f;
+}
+
+.btn-warning {
+    background: #ff9800;
+}
+
+.btn-warning:hover {
+    background: #f57c00;
+}
+
+.btn-secondary {
+    background: #757575;
+}
+
+.btn-secondary:hover {
+    background: #616161;
+}
+
+.btn-add {
+    background: #4caf50;
+    margin-bottom: 15px;
+}
+
+.settings-actions {
+    background: #f5f5f5;
+    padding: 20px;
+    border-radius: 8px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    margin-top: 20px;
+}
+
+.danger-zone {
+    background: #fff3e0;
+    border: 2px solid #ff9800;
+    border-radius: 6px;
+    padding: 20px;
+}
+
+.danger-zone h3 {
+    color: #f57c00 !important;
+}
+
+@media (max-width: 768px) {
+    .tab-buttons {
+        flex-direction: column;
+    }
+    
+    .tab-btn {
+        width: 100%;
+        text-align: center;
+    }
+    
+    .settings-actions {
+        flex-direction: column;
+    }
+    
+    .form-group input,
+    .form-group select {
+        max-width: 100%;
+    }
+}
+</style>
+
+<script>
+// Tab switching
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        // Remove active class from all tabs and content
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        
+        // Add active class to clicked tab
+        btn.classList.add('active');
+        document.getElementById(btn.dataset.tab).classList.add('active');
+    });
+});
+
+// Battery management
+function addBattery() {
+    const container = document.getElementById('battery-configs');
+    const index = container.children.length;
+    
+    const batteryHtml = `
+        <div class="battery-config" data-index="${index}">
+            <h4>🔋 Nieuwe Batterij</h4>
+            
+            <div class="form-group">
+                <label for="battery_name_${index}">Naam:</label>
+                <input type="text" id="battery_name_${index}" name="battery[${index}].name"
+                       value="Batterij ${index + 1}">
+            </div>
+            
+            <div class="form-group">
+                <label for="battery_capacity_${index}">Capaciteit (kWh):</label>
+                <input type="number" step="0.1" id="battery_capacity_${index}" 
+                       name="battery[${index}].capacity" value="10">
+            </div>
+            
+            <div class="form-group">
+                <label for="battery_power_${index}">Max Vermogen (kW):</label>
+                <input type="number" step="0.1" id="battery_power_${index}" 
+                       name="battery[${index}].max_power" value="5">
+            </div>
+            
+            <div class="form-group">
+                <label for="battery_efficiency_${index}">Efficiency (%):</label>
+                <input type="number" step="0.1" min="50" max="100" id="battery_efficiency_${index}" 
+                       name="battery[${index}].efficiency" value="95">
+            </div>
+            
+            <div class="form-group">
+                <label for="battery_entity_${index}">Home Assistant Entity:</label>
+                <input type="text" id="battery_entity_${index}" 
+                       name="battery[${index}].entity" placeholder="sensor.battery_soc">
+            </div>
+            
+            <button type="button" class="btn btn-danger" onclick="removeBattery(${index})">🗑️ Verwijderen</button>
+        </div>
+    `;
+    
+    container.insertAdjacentHTML('beforeend', batteryHtml);
+}
+
+function removeBattery(index) {
+    const batteryConfig = document.querySelector(`.battery-config[data-index="${index}"]`);
+    if (batteryConfig) {
+        batteryConfig.remove();
+    }
+}
+
+// EV management
+function addEV() {
+    const container = document.getElementById('ev-configs');
+    const index = container.children.length;
+    
+    const evHtml = `
+        <div class="ev-config" data-index="${index}">
+            <h4>🚗 Nieuwe EV</h4>
+            
+            <div class="form-group">
+                <label for="ev_name_${index}">Naam:</label>
+                <input type="text" id="ev_name_${index}" name="electric_vehicle[${index}].name"
+                       value="EV ${index + 1}">
+            </div>
+            
+            <div class="form-group">
+                <label for="ev_capacity_${index}">Batterij Capaciteit (kWh):</label>
+                <input type="number" step="0.1" id="ev_capacity_${index}" 
+                       name="electric_vehicle[${index}].battery_capacity" value="50">
+            </div>
+            
+            <div class="form-group">
+                <label for="ev_charge_power_${index}">Laadvermogen (kW):</label>
+                <input type="number" step="0.1" id="ev_charge_power_${index}" 
+                       name="electric_vehicle[${index}].charge_power" value="11">
+            </div>
+            
+            <div class="form-group">
+                <label for="ev_efficiency_${index}">Efficiëntie (kWh/100km):</label>
+                <input type="number" step="0.1" id="ev_efficiency_${index}" 
+                       name="electric_vehicle[${index}].efficiency" value="18">
+            </div>
+            
+            <div class="form-group">
+                <label for="ev_entity_${index}">Home Assistant Entity:</label>
+                <input type="text" id="ev_entity_${index}" 
+                       name="electric_vehicle[${index}].entity" placeholder="sensor.ev_battery_level">
+            </div>
+            
+            <button type="button" class="btn btn-danger" onclick="removeEV(${index})">🗑️ Verwijderen</button>
+        </div>
+    `;
+    
+    container.insertAdjacentHTML('beforeend', evHtml);
+}
+
+function removeEV(index) {
+    const evConfig = document.querySelector(`.ev-config[data-index="${index}"]`);
+    if (evConfig) {
+        evConfig.remove();
+    }
+}
+
+// Settings functions
+function saveSettings() {
+    const formData = new FormData();
+    const inputs = document.querySelectorAll('input, select, textarea');
+    
+    inputs.forEach(input => {
+        if (input.type === 'checkbox') {
+            formData.append(input.name, input.checked);
+        } else if (input.name && input.value) {
+            formData.append(input.name, input.value);
+        }
+    });
+    
+    fetch('/settings/save', {
+        method: 'POST',
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert('✅ Instellingen succesvol opgeslagen!');
+        } else {
+            alert('❌ Fout bij opslaan: ' + data.error);
+        }
+    })
+    .catch(error => {
+        alert('❌ Netwerkfout: ' + error);
+    });
+}
+
+function cancelSettings() {
+    if (confirm('❓ Weet je zeker dat je de wijzigingen wilt annuleren?')) {
+        location.reload();
+    }
+}
+
+function testConnection() {
+    const haUrl = document.getElementById('ha_url').value;
+    const haToken = document.getElementById('ha_token').value;
+    
+    if (!haUrl || !haToken) {
+        alert('⚠️ Vul eerst de Home Assistant URL en token in.');
+        return;
+    }
+    
+    fetch('/settings/test-connection', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            url: haUrl,
+            token: haToken
+        })
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert('✅ Verbinding succesvol getest!');
+        } else {
+            alert('❌ Verbindingsfout: ' + data.error);
+        }
+    })
+    .catch(error => {
+        alert('❌ Netwerkfout: ' + error);
+    });
+}
+
+function resetToDefaults() {
+    if (confirm('⚠️ Dit zal alle instellingen terugzetten naar de standaardwaarden. Weet je het zeker?')) {
+        fetch('/settings/reset', {
+            method: 'POST'
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert('✅ Instellingen gereset naar standaard.');
+                location.reload();
+            } else {
+                alert('❌ Fout bij reset: ' + data.error);
+            }
+        });
+    }
+}
+
+function exportConfig() {
+    fetch('/settings/export')
+    .then(response => response.blob())
+    .then(blob => {
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = 'dao_config_' + new Date().toISOString().slice(0,10) + '.json';
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+    });
+}
+
+function importConfig() {
+    const fileInput = document.getElementById('import_config');
+    const file = fileInput.files[0];
+    
+    if (!file) {
+        alert('⚠️ Selecteer eerst een configuratiebestand.');
+        return;
+    }
+    
+    const formData = new FormData();
+    formData.append('config_file', file);
+    
+    fetch('/settings/import', {
+        method: 'POST',
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert('✅ Configuratie succesvol geïmporteerd!');
+            location.reload();
+        } else {
+            alert('❌ Fout bij importeren: ' + data.error);
+        }
+    })
+    .catch(error => {
+        alert('❌ Netwerkfout: ' + error);
+    });
+}
+</script>
+
+{% endblock %}

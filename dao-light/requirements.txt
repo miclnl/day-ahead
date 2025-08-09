@@ -1,0 +1,34 @@
+# DAO Light - Minimal stable dependencies
+# Core libraries - Pi optimized versions
+pandas==2.0.3
+numpy==1.24.4
+requests==2.31.0
+python-dateutil==2.8.2
+
+# Database support
+sqlalchemy==2.0.21
+psycopg2-binary==2.9.7
+pymysql==1.1.0
+
+# Web framework
+flask==2.3.3
+gunicorn==21.2.0
+
+# Energy APIs
+beautifulsoup4==4.12.2
+pytz==2023.3
+tzlocal==5.2
+
+# Math/Optimization
+mip==1.15.0
+ephem==4.1.4
+
+# Essential only - no heavy ML, no async complexity
+cryptography==41.0.7
+
+# Energy data sources
+nordpool==0.4.2
+entsoe-py==0.6.9
+
+# Simple scheduler (no APScheduler)
+schedule==1.2.0
