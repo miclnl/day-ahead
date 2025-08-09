@@ -57,7 +57,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/
 RUN pip3 install uv
-RUN uv pip install -r /tmp/requirements.txt
+RUN uv pip install --prerelease=allow -r /tmp/requirements.txt
 COPY run /root/dao/prog/
 
 EXPOSE 5000
