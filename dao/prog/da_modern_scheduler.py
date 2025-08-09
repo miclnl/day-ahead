@@ -430,29 +430,35 @@ class ModernDaScheduler(DaBase):
         except Exception as e:
             logging.error(f"Error consolidating data: {e}")
     
-    def _parse_cron_pattern(self, pattern: str) -> CronTrigger:
+    def _parse_cron_pattern(self, pattern: str):
         """Parse cron-like patterns (e.g., '0 */2 * * *')"""
         # This would implement full cron parsing
         # For now, return None to use time patterns
         return None
     
-    def _parse_time_pattern(self, pattern: str) -> Optional[CronTrigger]:
+    def _parse_time_pattern(self, pattern: str):
         """Parse time patterns like '0215', 'xx15', '02xx'"""
         try:
             if len(pattern) == 4:
                 if pattern[:2] == 'xx':
                     # Every hour at specific minute (xx15)
                     minute = int(pattern[2:])
-                    return CronTrigger(minute=minute)
+                    if APSCHEDULER_AVAILABLE:
+                        return CronTrigger(minute=minute)
+                    return f"xx{minute:02d}"
                 elif pattern[2:] == 'xx':
                     # Every minute in specific hour (02xx)
                     hour = int(pattern[:2])
-                    return CronTrigger(hour=hour)
+                    if APSCHEDULER_AVAILABLE:
+                        return CronTrigger(hour=hour)
+                    return f"{hour:02d}xx"
                 else:
                     # Specific time (0215 = 02:15)
                     hour = int(pattern[:2])
                     minute = int(pattern[2:])
-                    return CronTrigger(hour=hour, minute=minute)
+                    if APSCHEDULER_AVAILABLE:
+                        return CronTrigger(hour=hour, minute=minute)
+                    return f"{hour:02d}{minute:02d}"
             
             return None
             
