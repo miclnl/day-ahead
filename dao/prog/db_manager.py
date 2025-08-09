@@ -238,82 +238,105 @@ class DBmanagerObj(object):
 
     def savedata(self, df: pd.DataFrame, tablename: str = "values"):
         """
-        save data in dateframe,
-        if id exist then update else insert
+        Save data in dataframe using bulk operations for optimal performance.
+        If record exists then update else insert.
+        
         Args:
             df: Dataframe that we wish to save in table tablename
-               columns
+               columns:
                code	string
-               calculated datetime, 0 if realised
+               calculated datetime, 0 if realised  
                time	timestamp in sec
                value	float
             tablename: values or prognoses
         """
-        logging.debug(f"Opslaan dataframe:\n{df.to_string()}")
+        logging.debug(f"Opslaan dataframe (bulk):\n{df.to_string()}")
         self.log_pool_status()
 
-        # with self.engine.connect() as connection:
-        connection = self.engine.connect()
-        try:
-            self.log_pool_status()
-            # Reflect existing tables from the database
-            values_table = Table(tablename, self.metadata, autoload_with=self.engine)
-            variabel_table = Table("variabel", self.metadata, autoload_with=self.engine)
-            df = df.reset_index()  # make sure indexes pair with number of rows
-            df["tijd"] = df["time"].apply(
-                lambda x: datetime.datetime.fromtimestamp(int(float(x))).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-            )
-            for index, dfrow in df.iterrows():
-                logging.debug(
-                    f"Save record: {dfrow['tijd']} {dfrow['code']} "
-                    f"{dfrow['time']} {dfrow['value']}"
-                )
-                code = dfrow["code"]
-                time = dfrow["time"]
-                value = dfrow["value"]
-                if not isinstance(value, (int, float)):
-                    continue
-                if value == float("inf"):
-                    continue
+        if df.empty:
+            logging.debug("Empty dataframe, nothing to save")
+            return
 
-                # Get the variabel_id
-                select_variabel = select(variabel_table.c.id).where(
-                    variabel_table.c.code == code
-                )
-                variabel_result = connection.execute(select_variabel).first()
-                if variabel_result:
-                    variabel_id = variabel_result[0]
-                else:
-                    logging.error(f"Onbekende code opslaan data: {code}")
-                    continue
+        with self.engine.begin() as connection:
+            try:
+                # Reflect existing tables from the database
+                values_table = Table(tablename, self.metadata, autoload_with=self.engine)
+                variabel_table = Table("variabel", self.metadata, autoload_with=self.engine)
+                
+                # Clean and prepare DataFrame
+                df_clean = df.copy().reset_index(drop=True)
+                
+                # Filter out invalid values in vectorized way
+                df_clean = df_clean[
+                    df_clean['value'].apply(lambda x: isinstance(x, (int, float)) and x != float('inf'))
+                ]
+                
+                if df_clean.empty:
+                    logging.debug("No valid data to save after filtering")
+                    return
 
-                # Query to check if the record exists
-                select_value = select(values_table.c.id).where(
-                    (values_table.c.variabel == variabel_id)
-                    & (values_table.c.time == time)
+                # Get all variabel mappings in one query
+                unique_codes = df_clean['code'].unique()
+                variabel_query = select(variabel_table.c.code, variabel_table.c.id).where(
+                    variabel_table.c.code.in_(unique_codes)
                 )
-                value_result = connection.execute(select_value).first()
-                if value_result:
-                    # Update existing record
-                    value_id = value_result[0]
-                    update_value = (
-                        update(values_table)
-                        .values(value=value)
-                        .where(values_table.c.id == value_id)
-                    )
-                    connection.execute(update_value)
-                else:
-                    # Record does not exist, perform insert
-                    insert_value = insert(values_table).values(
-                        variabel=variabel_id, time=time, value=value
-                    )
-                    connection.execute(insert_value)
-            connection.commit()
-        finally:
-            self.log_pool_status()
-            connection.close()
+                variabel_result = connection.execute(variabel_query).fetchall()
+                code_to_id = {row[0]: row[1] for row in variabel_result}
+                
+                # Filter out unknown codes
+                df_clean = df_clean[df_clean['code'].isin(code_to_id.keys())]
+                if df_clean.empty:
+                    logging.error("No valid codes found for data saving")
+                    return
+                
+                # Add variabel_id column
+                df_clean['variabel_id'] = df_clean['code'].map(code_to_id)
+                
+                # Check existing records in bulk using upsert pattern
+                records_to_process = []
+                for _, row in df_clean.iterrows():
+                    records_to_process.append({
+                        'time': int(row['time']),
+                        'variabel': int(row['variabel_id']),
+                        'value': float(row['value'])
+                    })
+                
+                if records_to_process:
+                    # Use database-specific upsert if available, otherwise fallback to insert/update
+                    if self.engine.dialect.name == 'postgresql':
+                        # PostgreSQL UPSERT
+                        from sqlalchemy.dialects.postgresql import insert as pg_insert
+                        stmt = pg_insert(values_table).values(records_to_process)
+                        stmt = stmt.on_conflict_do_update(
+                            index_elements=['time', 'variabel'],
+                            set_=dict(value=stmt.excluded.value)
+                        )
+                        connection.execute(stmt)
+                    elif self.engine.dialect.name == 'mysql':
+                        # MySQL REPLACE INTO
+                        from sqlalchemy import text
+                        for record in records_to_process:
+                            stmt = text(f"""
+                                REPLACE INTO {tablename} (time, variabel, value) 
+                                VALUES (:time, :variabel, :value)
+                            """)
+                            connection.execute(stmt, record)
+                    else:
+                        # SQLite fallback - use INSERT OR REPLACE
+                        from sqlalchemy import text
+                        for record in records_to_process:
+                            stmt = text(f"""
+                                INSERT OR REPLACE INTO {tablename} (time, variabel, value)
+                                VALUES (:time, :variabel, :value)
+                            """)
+                            connection.execute(stmt, record)
+                    
+                    logging.info(f"Bulk saved {len(records_to_process)} records using optimized upsert")
+                
+            except Exception as e:
+                logging.error(f"Error in bulk savedata: {e}")
+                raise
+        
         self.log_pool_status()
 
     def get_prognose_field(self, field: str, start, end=None, interval="hour"):
