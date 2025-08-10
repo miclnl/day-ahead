@@ -117,7 +117,7 @@ class DaoEntrypoint:
     
     def start_webserver(self):
         """Start the web server in background"""
-        logger.info("Starting web server on port 5001")
+        logger.info("Starting web server on port 8099 (Home Assistant ingress)")
         
         try:
             os.chdir(self.app_dir / "webserver")
