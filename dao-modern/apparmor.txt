@@ -1,0 +1,62 @@
+#include <tunables/global>
+
+profile dao_modern_enhanced flags=(attach_disconnected,mediate_deleted) {
+
+  #include <abstractions/base>
+  #include <abstractions/python>
+  #include <abstractions/ssl_certs>
+  #include <abstractions/nameservice>
+
+  # Capabilities - minimal required
+  capability net_bind_service,
+  capability setuid,
+  capability setgid,
+  file,
+  signal (send) set=(kill,term,int,hup,cont),
+
+  # S6-Overlay
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /run/{s6,s6-rc*,service}/** ix,
+  /package/** ix,
+  /command/** ix,
+  /etc/services.d/** rwix,
+  /etc/cont-init.d/** rwix,
+  /etc/cont-finish.d/** rwix,
+  /run/{,**} rwk,
+  /dev/tty rw,
+
+  # Bashio
+  /usr/lib/bashio/** ix,
+  /tmp/** rwk,
+
+  # Access to options.json and other files within your addon
+  /data/** rw,
+  /config/** rw,
+  /share/** rw,
+  /ssl/** rw,
+
+  # Python and application access
+  /usr/bin/python3* ix,
+  /app/dao/** rix,
+  /app/daodata/** rw,
+  
+  # Network access for API calls
+  network inet stream,
+  network inet6 stream,
+  
+  # Database access
+  /var/lib/mysql/** rw,
+  /var/lib/postgresql/** rw,
+  
+  # Logging
+  /proc/sys/kernel/printk r,
+  
+  # Deny dangerous operations
+  deny /proc/sys/kernel/core_pattern w,
+  deny /proc/sys/vm/panic_on_oom w,
+  deny /proc/sysrq-trigger w,
+  deny /sys/kernel/debug/** rw,
+
+}

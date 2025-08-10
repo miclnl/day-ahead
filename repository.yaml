@@ -1,3 +1,20 @@
-name: Day Ahead Optimization for Home Assistant
-url: https://github.com/corneel27/day-ahead
+name: Day Ahead Optimization Enhanced
+url: https://github.com/miclnl/day-ahead
 maintainer: Cees van Beek (cees.van.beek@xs4all.nl)
+description: >
+  Advanced Day Ahead Optimization with multiple versions to choose from.
+  
+  🚀 DAO Modern: Full-featured AI/ML enhanced version with real-time optimization
+  🪶 DAO Light: Minimal, stable version for Pi/low-resource systems
+  
+  Features:
+  • Automatic service discovery and configuration
+  • Real-time energy price optimization
+  • Machine learning consumption predictions
+  • Multi-database support (SQLite/MySQL/PostgreSQL)
+  • Advanced AppArmor security profiles
+  • Health monitoring and Home Assistant integration
+  
+  Both versions can run alongside each other for different use cases.
+  
+version: 1.1.0

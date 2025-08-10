@@ -15,5 +15,11 @@ whl
 __pycache__/
 ../CODEOWNERS
 
+# Test directories and temporary files
+/tmp/dao-test/
+**/test-data/
+**/temp/
+**/dao-test-*
+
 
 

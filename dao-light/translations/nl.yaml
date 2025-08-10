@@ -1,0 +1,10 @@
+configuration:
+  database_engine:
+    name: Database Type
+    description: Database voor optimalisatie gegevens (SQLite aanbevolen voor Light versie)
+  log_level:
+    name: Log Niveau
+    description: Stel de uitgebreidheid van logging in
+  homeassistant_token:
+    name: Home Assistant Token
+    description: Langdurige toegangstoken voor Home Assistant API (optioneel - automatisch gedetecteerd in addon modus)

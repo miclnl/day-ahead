@@ -1,0 +1,13 @@
+configuration:
+  database_engine:
+    name: Database Engine
+    description: Choose the database engine for storing optimization data
+  log_level:
+    name: Log Level
+    description: Set the logging verbosity level
+  homeassistant_url:
+    name: Home Assistant URL
+    description: URL to your Home Assistant instance (optional, auto-detected if empty)
+  homeassistant_token:
+    name: Home Assistant Token
+    description: Long-lived access token for Home Assistant API (optional - auto-detected in addon mode)

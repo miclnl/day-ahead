@@ -1,0 +1,10 @@
+configuration:
+  database_engine:
+    name: Database Engine
+    description: Choose database for storing optimization data (SQLite recommended for Light version)
+  log_level:
+    name: Log Level
+    description: Set the logging verbosity level
+  homeassistant_token:
+    name: Home Assistant Token
+    description: Long-lived access token for Home Assistant API (optional - auto-detected in addon mode)

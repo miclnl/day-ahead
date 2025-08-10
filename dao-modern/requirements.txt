@@ -1,0 +1,45 @@
+# Core data science (tested with Python 3.13 + Alpine)
+pandas>=2.1.0,<2.4.0
+pytz>=2023.3,<2026.0
+requests>=2.31.0,<3.0.0
+matplotlib>=3.7.0,<3.11.0  
+numpy>=1.24.0,<2.1.0
+mysql>=0.0.3
+mysql-connector-python>=9.4.0
+hassapi>=0.2.1
+# MIP optimization (may need native compilation)
+mip>=1.15.0,<1.17.0
+python-dateutil>=2.9.0.post0
+nordpool>=0.5.0
+entsoe-py>=0.7.1
+beautifulsoup4>=4.12.3
+sqlalchemy>=2.0.42
+SQLAlchemy-Utils>=0.41.2
+psycopg2-binary>=2.9.9
+pymysql>=1.1.1
+mariadb>=1.1.13
+flask>=3.1.1
+ephem>=4.2
+gunicorn>=23.0.0
+# Cryptography - stable Alpine-compatible version  
+cryptography>=3.4.8,<46.0.0
+tzlocal>=5.3.1
+aiohttp>=3.11.11
+asyncio-mqtt>=0.16.2
+APScheduler>=3.10.4,<4.0.0
+openai>=1.58.1
+anthropic>=0.40.0
+dspy-ai>=2.4.0
+# ML libraries - CPU-only versions for Home Assistant compatibility
+scikit-learn>=1.3.0,<1.6.0
+# NOTE: PyTorch CPU-only installed via separate command in Dockerfile
+# torch and torchvision will be installed with CPU-only index
+# XGBoost - works on CPU
+xgboost>=1.7.3,<2.1.0
+joblib>=1.3.2
+# TensorFlow Lite - CPU optimized
+tflite-runtime>=2.8.0,<2.15.0
+# LightGBM - CPU version
+lightgbm>=4.2.0,<4.6.0
+websockets>=14.1
+psutil>=6.2.0
