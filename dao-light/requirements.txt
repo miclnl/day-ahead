@@ -7,6 +7,7 @@ python-dateutil>=2.9.0.post0
 
 # Database support - recent versions
 sqlalchemy>=2.0.20,<2.1.0
+sqlalchemy-utils>=0.41.0
 psycopg2-binary>=2.9.7
 pymysql>=1.1.0
 
