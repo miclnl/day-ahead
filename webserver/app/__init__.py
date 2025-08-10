@@ -1,27 +1,82 @@
-from flask import Flask
+#!/usr/bin/env python3
+"""
+DAO Flask application with debug WSGI loading
+"""
 import sys
 import os
+import traceback
+
+# Debug information
+print(f"DEBUG: Initializing Flask app from {__file__}")
+print(f"DEBUG: Working directory: {os.getcwd()}")
+print(f"DEBUG: Python version: {sys.version}")
 
 # Add parent directory to Python path to access prog modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(os.path.dirname(current_dir))
 prog_dir = os.path.join(parent_dir, 'prog')
-if prog_dir not in sys.path:
+
+print(f"DEBUG: Current dir: {current_dir}")
+print(f"DEBUG: Parent dir: {parent_dir}")  
+print(f"DEBUG: Prog dir: {prog_dir}")
+
+if os.path.exists(prog_dir) and prog_dir not in sys.path:
     sys.path.insert(0, prog_dir)
+    print(f"DEBUG: Added {prog_dir} to Python path")
 
-app = Flask(__name__)
-
-# Import routes after setting up path
+# Import Flask
 try:
-    from . import routes
+    from flask import Flask
+    print("DEBUG: Flask import successful")
 except ImportError as e:
-    print(f"Failed to import routes: {e}")
-    # Try alternative import method
-    from dao.webserver.app import routes
+    print(f"CRITICAL: Flask import failed: {e}")
+    traceback.print_exc()
+    raise
 
+# Create Flask app
+try:
+    app = Flask(__name__)
+    print("DEBUG: Flask app created successfully")
+except Exception as e:
+    print(f"CRITICAL: Flask app creation failed: {e}")
+    traceback.print_exc()
+    raise
 
-#  if __name__ == '__main__':
-#      app.run()
-#  app.run(port=5000, host='0.0.0.0')
-#  if __name__ == '__main__':
-#      app.run(port=5000, host='0.0.0.0')
+# Import routes AFTER app is created to avoid circular import
+print("DEBUG: Attempting to import routes...")
+try:
+    # Import the routes module which will register routes with app
+    from . import routes
+    print("DEBUG: Routes import successful")
+except Exception as e:
+    print(f"CRITICAL: Routes import failed: {e}")
+    traceback.print_exc()
+    
+    # Try fallback minimal routes
+    print("DEBUG: Adding minimal fallback routes...")
+    from flask import jsonify, redirect
+    
+    @app.route('/')
+    def index():
+        return redirect('/health')
+    
+    @app.route('/health')  
+    def health():
+        return jsonify({
+            'status': 'healthy',
+            'version': '1.3.9',
+            'webserver': 'running',
+            'error': 'Routes import failed - minimal mode active'
+        })
+    
+    @app.errorhandler(404)
+    def not_found(e):
+        return jsonify({'error': 'Not found', 'message': str(e)}), 404
+    
+    @app.errorhandler(500)
+    def server_error(e):
+        return jsonify({'error': 'Server error', 'message': str(e)}), 500
+    
+    print("DEBUG: Fallback routes added")
+
+print("DEBUG: Flask app initialization complete")

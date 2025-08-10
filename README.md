@@ -43,7 +43,7 @@ If you find bugs, have improvements, or want to adapt the code for other energy 
 
 Feel free to fork, modify, and make it your own - that's the beauty of open source! 🚀
 
-## 🆕 Version 1.3.8 Features - Complete Statistical Intelligence Suite
+## 🆕 Version 1.3.9 Features - Complete Statistical Intelligence Suite
 
 ✨ **Core Statistical Intelligence:**
 - 🧠 **ML-free Optimization** - Intelligent statistical methods replace all ML dependencies
@@ -90,7 +90,14 @@ Feel free to fork, modify, and make it your own - that's the beauty of open sour
 - 🔄 **Cloud AI Fallback** - Statistical methods always available as primary/fallback
 - 🛡️ **Privacy First** - All core functionality works without cloud dependencies
 
-🛠️ **Robust WSGI & Import Handling (NEW v1.3.8):**
+🐛 **Advanced WSGI Debugging & Error Detection (NEW v1.3.9):**
+- 🔍 **Detailed Debug Logging** - Comprehensive error tracking tijdens Flask initialization
+- 🛡️ **Fallback Route System** - Minimal routes als hoofdsysteem faalt
+- 📊 **Circular Import Prevention** - Smart import ordering om dependency loops te voorkomen
+- 🔧 **Runtime Error Recovery** - Graceful degradation met diagnostic information
+- 📝 **Full Traceback Reporting** - Complete error context voor troubleshooting
+
+🛠️ **Robust WSGI & Import Handling (v1.3.8):**
 - 🔧 **Container-Compatible Imports** - Intelligent module loading with fallback paths
 - 📂 **Multi-Path Config Resolution** - Automatic config discovery across environments
 - 🛡️ **Safe Report Initialization** - Graceful handling of missing config files
@@ -199,7 +206,7 @@ See the original DAO documentation for configuration details:
 
 ---
 
-**Version:** 1.3.8 - Complete Statistical Intelligence Suite  
+**Version:** 1.3.9 - Complete Statistical Intelligence Suite  
 **Author:** Cees van Beek  
 **Enhanced by:** Claude Code  
 
@@ -212,7 +219,7 @@ See the original DAO documentation for configuration details:
 ✅ **Startup Speed:** 10x faster  
 ✅ **Explainable AI:** Traceable decision logic  
 
-## 🚀 New in v1.3.8 - Revolutionary Energy Management
+## 🚀 New in v1.3.9 - Revolutionary Energy Management
 
 ✅ **ML-Free Operation:** Complete removal of problematic ML dependencies  
 ✅ **Weather Reactive:** Real-time adaptation to weather changes  
@@ -225,5 +232,6 @@ See the original DAO documentation for configuration details:
 ✅ **Interactive Analytics:** Chart.js visualizations with prediction confidence tracking
 ✅ **Webserver Reliability:** Automatic startup with robust error handling and debugging tools
 ✅ **Container Stability:** WSGI-compatible imports with intelligent fallback handling
+✅ **Debug Capabilities:** Advanced error detection with comprehensive diagnostic logging
 
 **Complete energy optimization suite with transparent decision-making and comprehensive analytics.**

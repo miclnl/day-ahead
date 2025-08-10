@@ -1,4 +1,4 @@
-# DAO v1.3.8 - Pure Statistical Intelligence (ML-free)
+# DAO v1.3.9 - Pure Statistical Intelligence (ML-free)
 # Core libraries - Alpine/Pi compatible  
 pandas>=2.1.0,<2.3.0
 numpy>=1.25.0,<1.27.0

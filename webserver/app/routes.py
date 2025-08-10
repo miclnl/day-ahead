@@ -38,7 +38,7 @@ except ImportError:
         from dao.prog.version import __version__
     except ImportError:
         print("Warning: Could not import version")
-        __version__ = "1.3.8"
+        __version__ = "1.3.9"
 
 web_datapath = "static/data/"
 app_datapath = "app/static/data/"
