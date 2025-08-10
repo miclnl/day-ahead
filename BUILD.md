@@ -5,15 +5,15 @@
 ### Standard Build (Recommended)
 ```bash
 # DAO Modern
-podman build --build-arg BUILD_FROM=python:3.11-bookworm --build-arg BUILD_ARCH=amd64 --build-arg BUILD_VERSION=1.0.2 -t dao-modern dao-modern/
+podman build --build-arg BUILD_FROM=python:3.11-bookworm --build-arg BUILD_ARCH=amd64 --build-arg BUILD_VERSION=1.0.3 -t dao-modern dao-modern/
 
 # DAO Light  
-podman build --build-arg BUILD_FROM=python:3.11-bookworm --build-arg BUILD_ARCH=amd64 --build-arg BUILD_VERSION=1.0.2 -t dao-light dao-light/
+podman build --build-arg BUILD_FROM=python:3.11-bookworm --build-arg BUILD_ARCH=amd64 --build-arg BUILD_VERSION=1.0.3 -t dao-light dao-light/
 ```
 
 ### Fast Parallel Build Script
 ```bash
-./build-fast.sh 1.0.2
+./build-fast.sh 1.0.3
 ```
 
 ## Build Optimizations Implemented

@@ -156,6 +156,6 @@ See the original DAO documentation for configuration details:
 
 ---
 
-**Version:** 1.0.2  
+**Version:** 1.0.3  
 **Author:** Cees van Beek  
 **Enhanced by:** Claude Code

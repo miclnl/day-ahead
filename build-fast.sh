@@ -3,7 +3,7 @@
 # Fast build script with optimizations
 set -e
 
-VERSION="${1:-1.0.2}"
+VERSION="${1:-1.0.3}"
 ARCHITECTURES=("amd64" "aarch64")
 
 echo "🚀 Starting fast parallel builds for version $VERSION"
