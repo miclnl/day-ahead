@@ -344,14 +344,26 @@ def get_file_list(path: str, pattern: str) -> list:
 def menu():
     """Main dashboard with modern interface - redirect to dashboard"""
     from flask import redirect, request
+    import logging
+    
+    # Enhanced debug logging
+    logging.info(f"ROOT ROUTE DEBUG: Request from {request.remote_addr}")
+    logging.info(f"ROOT ROUTE DEBUG: Request path: {request.path}")
+    logging.info(f"ROOT ROUTE DEBUG: Request headers: {dict(request.headers)}")
     
     # Home Assistant ingress-aware redirect
+    ingress_path = request.headers.get('X-Ingress-Path')
+    forwarded_for = request.headers.get('X-Forwarded-For')
+    
+    logging.info(f"ROOT ROUTE DEBUG: X-Ingress-Path: {ingress_path}")
+    logging.info(f"ROOT ROUTE DEBUG: X-Forwarded-For: {forwarded_for}")
+    
     # Check if we're behind Home Assistant ingress proxy
-    if request.headers.get('X-Ingress-Path') or request.headers.get('X-Forwarded-For'):
-        # Use relative redirect for ingress compatibility
+    if ingress_path or forwarded_for:
+        logging.info("ROOT ROUTE DEBUG: Using ingress-compatible redirect to /dashboard")
         return redirect('/dashboard')
     else:
-        # Use Flask url_for for direct access
+        logging.info("ROOT ROUTE DEBUG: Using Flask url_for redirect")
         from flask import url_for
         return redirect(url_for('dashboard'))
 
@@ -360,15 +372,28 @@ def dashboard():
     """Modern DAO Dashboard - central hub for all functionality"""
     import datetime
     from datetime import timedelta
+    import logging
+    from flask import request
     
-    return render_template(
-        "dashboard.html",
-        title="DAO Dashboard",
-        active_menu="dashboard",
-        datetime=datetime.datetime,
-        timedelta=timedelta,
-        version=__version__,
-    )
+    # Enhanced debug logging
+    logging.info(f"DASHBOARD ROUTE DEBUG: Request from {request.remote_addr}")
+    logging.info(f"DASHBOARD ROUTE DEBUG: Request path: {request.path}")
+    logging.info(f"DASHBOARD ROUTE DEBUG: Template path check...")
+    
+    try:
+        result = render_template(
+            "dashboard.html",
+            title="DAO Dashboard",
+            active_menu="dashboard",
+            datetime=datetime.datetime,
+            timedelta=timedelta,
+            version=__version__,
+        )
+        logging.info("DASHBOARD ROUTE DEBUG: Template rendered successfully")
+        return result
+    except Exception as e:
+        logging.error(f"DASHBOARD ROUTE ERROR: Template rendering failed: {e}")
+        return f"Dashboard template error: {e}", 500
 
 @app.route("/statistics", methods=["GET"])
 def statistics():
