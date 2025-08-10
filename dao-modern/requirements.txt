@@ -1,7 +1,7 @@
 # Core data science (tested with Python 3.13 + Alpine)
 pandas>=2.1.0,<2.4.0
-pytz>=2023.3
-requests>=2.31.0
+pytz>=2023.3,<2026.0
+requests>=2.31.0,<3.0.0
 matplotlib>=3.7.0,<3.11.0  
 numpy>=1.24.0,<2.1.0
 mysql>=0.0.3

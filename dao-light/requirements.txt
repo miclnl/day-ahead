@@ -2,7 +2,7 @@
 # Core libraries - Alpine/Pi compatible
 pandas>=2.1.0,<2.3.0
 numpy>=1.25.0,<1.27.0
-requests>=2.32.3
+requests>=2.32.3,<3.0.0
 python-dateutil>=2.9.0.post0
 
 # Database support - recent versions

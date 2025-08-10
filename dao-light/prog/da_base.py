@@ -45,7 +45,9 @@ class DaBase(hass.Hass):
     def __init__(self, file_name: str = None):
         self.file_name = file_name
         path = os.getcwd()
-        new_path = "/".join(list(path.split("/")[0:-2]))
+        # Use pathlib for robust cross-platform path handling
+        from pathlib import Path
+        new_path = str(Path(path).parent.parent)
         if new_path not in sys.path:
             sys.path.append(new_path)
         self.make_data_path()

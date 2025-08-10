@@ -287,7 +287,16 @@ def home():
     if action == "last":
         index = len(flist) - 1
     if action == "delete" and confirm_delete:
-        os.remove(app_datapath + active_map + flist[index]["name"])
+        # Security: Validate file path to prevent path traversal
+        filename = flist[index]["name"]
+        if ".." in filename or "/" in filename or "\\" in filename:
+            return {"error": "Invalid filename"}, 400
+        file_path = os.path.join(app_datapath, active_map, filename)
+        # Ensure the file is within the expected directory
+        if not os.path.commonpath([file_path, app_datapath]) == app_datapath:
+            return {"error": "Access denied"}, 403
+        if os.path.exists(file_path):
+            os.remove(file_path)
         flist = get_file_list(app_datapath + active_map, active_filter)
         index = min(len(flist) - 1, index)
     if len(flist) > 0:
@@ -621,6 +630,12 @@ def save_settings():
         
         for key, value in form_data.items():
             if not key or not value:
+                continue
+            
+            # Security: Validate key to prevent injection
+            if not key.replace('.', '').replace('_', '').isalnum():
+                continue  # Skip invalid keys
+            if len(key) > 100:  # Reasonable key length limit
                 continue
                 
             # Handle nested keys

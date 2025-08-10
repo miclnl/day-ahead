@@ -45,7 +45,9 @@ class DaBase(hass.Hass):
     def __init__(self, file_name: str = None):
         self.file_name = file_name
         path = os.getcwd()
-        new_path = "/".join(list(path.split("/")[0:-2]))
+        # Use pathlib for robust cross-platform path handling
+        from pathlib import Path
+        new_path = str(Path(path).parent.parent)
         if new_path not in sys.path:
             sys.path.append(new_path)
         self.make_data_path()
@@ -75,12 +77,17 @@ class DaBase(hass.Hass):
 
         ha_options = self.config.get(["homeassistant"])
         if "ip adress" in ha_options:
-            self.ip_address = self.config.get(
-                ["homeassistant", "ip adress"], default="supervisor"
-            )
+            # Auto-migrate deprecated configuration
+            deprecated_value = self.config.get(["homeassistant", "ip adress"], default="supervisor")
+            self.ip_address = deprecated_value
+            
+            # Update configuration to use new key
+            self.config.set(["homeassistant", "host"], deprecated_value)
+            self.config.remove(["homeassistant", "ip adress"])
+            
             logging.warning(
-                f"the use of 'ip adress' is deprecated, change it to 'host' "
-                f"in the near future 'ip adress' cannot be used any more."
+                f"Configuration migrated: 'ip adress' -> 'host'. "
+                f"Please update your configuration file to avoid this migration."
             )
         else:
             self.ip_address = self.config.get(

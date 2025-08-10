@@ -50,7 +50,14 @@ class DaScheduler(DaBase):
                             sys.exit()
                             pass
                         except Exception as e:
-                            print(e)
+                            # Proper logging instead of print
+                            import logging
+                            logging.error(f"Scheduler task {key_task} failed: {e}", exc_info=True)
+                            # Add notification for critical failures
+                            try:
+                                self.log(f"Critical: Scheduler task {key_task} failed", level="ERROR")
+                            except:
+                                pass  # Don't let logging failures crash the scheduler
                             continue
                         break
 
