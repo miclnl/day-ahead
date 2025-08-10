@@ -10,7 +10,40 @@ This repository contains enhanced versions of the Day Ahead Optimizer (DAO) for 
 
 [![Open your Home Assistant instance and show the add-on store.](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/)
 
-## 🆕 Version 1.0.0 Features
+## 🏠 About This Project
+
+This project started as a personal energy optimization solution for my own Home Assistant setup, driven by the need for intelligent battery management and cost-effective energy usage. What began as a custom solution for optimizing solar panels, home batteries, and dynamic electricity pricing has evolved into a comprehensive energy management system.
+
+**Built on Excellent Foundations:**
+I want to emphasize that this enhanced version is built upon an already excellent and well-functioning original DAO project. I was extremely satisfied with the original implementation - it worked beautifully for energy optimization and saved significant costs on my electricity bills. I claim no credit for the brilliant core algorithms, mathematical optimization, or the fundamental architecture that made this possible.
+
+This enhanced repository represents extensions and modernizations developed with the assistance of AI coding tools (Claude Code) to add Home Assistant integration features, security improvements, and deployment optimizations. The core energy optimization intelligence remains the work of the original developers.
+
+**Personal Origins, Open Source Spirit:**
+While this repository is primarily developed and maintained for my own use case, I believe in the power of open source collaboration. Everyone is welcome to use this code, adapt it to their needs, learn from it, or contribute improvements back to the community.
+
+**Why Share This?**
+- **Transparency**: Energy optimization should be accessible and understandable
+- **Community Learning**: Others might benefit from the approaches and solutions developed here
+- **Collaborative Improvement**: Different use cases and perspectives make the software better
+- **Knowledge Sharing**: The intersection of Home Assistant, energy management, and machine learning offers valuable learning opportunities
+
+**Use at Your Own Risk:**
+This is a personal project that works well for my specific setup (Dutch energy market with dynamic pricing, solar panels, home battery, electric vehicle charging). While I've made efforts to make it configurable and robust, you may need to adapt certain aspects for your environment:
+
+- **Energy Markets**: Primarily tested with Dutch/European energy providers (Nord Pool, ENTSO-E)
+- **Hardware**: Optimized for common EU solar/battery setups
+- **Regulations**: Tax calculations and grid limitations based on Dutch regulations
+- **Language**: Interface supports Dutch and English
+
+I welcome feedback, bug reports, and contributions, but keep in mind that my time for extensive support is limited.
+
+**Contributing:**
+If you find bugs, have improvements, or want to adapt the code for other energy markets or hardware configurations, pull requests are very welcome! Even if it's just documentation improvements or configuration examples for different setups.
+
+Feel free to fork, modify, and make it your own - that's the beauty of open source! 🚀
+
+## 🆕 Version 1.1.0 Features
 
 ✨ **New Home Assistant Integrations:**
 - 🔧 **Automatic Service Discovery** - Auto-detects MariaDB, MySQL, MQTT, and other HA services
