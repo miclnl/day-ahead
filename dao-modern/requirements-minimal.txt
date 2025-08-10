@@ -1,39 +1,56 @@
-# Core dependencies - stable versions voor Raspberry Pi
-pandas==2.0.3
-numpy==1.24.4
-requests==2.31.0
-python-dateutil==2.8.2
+# Core dependencies - piwheels compatible voor Raspberry Pi
+pandas>=2.0.3,<2.4.0
+numpy>=1.24.0,<2.0.0
+requests>=2.31.0,<3.0.0
+python-dateutil>=2.8.2
 
-# Database 
-sqlalchemy==2.0.21
-psycopg2-binary==2.9.7
-pymysql==1.1.0
+# Database (stabiele versies)
+sqlalchemy>=2.0.21,<2.1.0
+psycopg2-binary>=2.9.7
+pymysql>=1.1.0
 
-# Web
-flask==2.3.3
-gunicorn==21.2.0
-websockets==12.0
+# Web (geen APScheduler - veroorzaakt SIGILL)
+flask>=2.3.3,<3.0.0
+gunicorn>=21.2.0
+websockets>=12.0
 
 # Energy APIs
-beautifulsoup4==4.12.2
-pytz==2023.3
-tzlocal==5.2
+beautifulsoup4>=4.12.2
+pytz>=2023.3
+tzlocal>=5.2
 
-# Math/Optimization - lightweight
-mip==1.15.0
-
-# Built-in scheduler replacement (geen APScheduler nodig)
-# schedule==1.2.0  # veel simpeler dan APScheduler
+# Math/Optimization - lightweight (ALLEEN MIP)
+mip>=1.15.0,<1.17.0
 
 # Async (stabiele versies)
-aiohttp==3.8.6
+aiohttp>=3.8.6,<4.0.0
 
 # Security
-cryptography==41.0.7
+cryptography>=41.0.7,<46.0.0
 
-# ML - only essentials
-scikit-learn==1.3.2
-joblib==1.3.2
+# ML - UITGESCHAKELD wegens SIGILL op Pi
+# scikit-learn==1.3.2  # Veroorzaakt SIGILL 
+# joblib==1.3.2        # Niet nodig zonder scikit-learn
+# xgboost              # Veroorzaakt SIGILL
+# torch                # Veroorzaakt SIGILL
+# lightgbm             # Veroorzaakt SIGILL
 
-# Home Assistant
-# hassapi==0.2.1  # alleen als absoluut nodig
+# Home Assistant - essentieel voor DAO
+hassapi>=0.2.1
+
+# Ephem voor sun calculations  
+ephem>=4.1.0
+
+# Nord Pool API
+nordpool>=0.5.0
+
+# ENTSO-E API
+entsoe-py>=0.7.1
+
+# Database connectors (minimale set)
+mysql>=0.0.3
+mysql-connector-python>=9.4.0
+mariadb>=1.1.13
+
+# SQLAlchemy Utils
+SQLAlchemy-Utils>=0.41.2

@@ -1,0 +1,65 @@
+ARG BUILD_FROM=python:3.11-bookworm
+FROM $BUILD_FROM
+
+# Build arguments
+ARG BUILD_ARCH
+ARG BUILD_VERSION
+ARG BUILD_DATE
+
+# Labels for add-on
+LABEL \
+    io.hass.name="DAO Modern Minimal" \
+    io.hass.description="Day Ahead Optimizer - Minimal ML-free version" \
+    io.hass.arch="${BUILD_ARCH}" \
+    io.hass.type="addon" \
+    io.hass.version="${BUILD_VERSION}" \
+    maintainer="Cees van Beek" \
+    org.opencontainers.image.title="DAO Modern Minimal" \
+    org.opencontainers.image.description="Day Ahead Optimizer - Minimal ML-free version" \
+    org.opencontainers.image.version="${BUILD_VERSION}" \
+    org.opencontainers.image.created="${BUILD_DATE}"
+
+# Set working directory
+WORKDIR /app/dao
+
+# Environment variables
+ENV PYTHONPATH=/app/dao/prog:/app/dao/webserver
+ENV FLASK_APP=da_server
+ENV LANG=C.UTF-8
+
+# System dependencies (minimal set)
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better caching
+COPY requirements-minimal.txt /tmp/
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir --index-url https://piwheels.org/simple --extra-index-url https://pypi.org/simple -r /tmp/requirements-minimal.txt
+
+# Copy static configuration files (cached layer)
+COPY config.yaml /app/dao/
+COPY CHANGELOG.md README.md /app/dao/
+
+# Copy application code
+COPY prog/ /app/dao/prog/
+COPY webserver/ /app/dao/webserver/
+COPY run/ /app/dao/run/
+
+# Create required directories
+RUN mkdir -p /app/dao/data/log
+
+# Set permissions
+RUN chmod +x /app/dao/run/*.sh
+RUN chmod +x /app/dao/prog/*.py
+
+# Expose ports
+EXPOSE 5001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python3 -c "import requests; requests.get('http://localhost:5001/health', timeout=5)"
+
+# Use simple scheduler entry point (geen APScheduler)
+CMD ["python3", "/app/dao/prog/da_scheduler.py"]
