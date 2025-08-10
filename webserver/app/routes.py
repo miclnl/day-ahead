@@ -1,10 +1,15 @@
+print("DEBUG: routes.py - Starting imports...")
+
 import datetime
 import math
 import random
 
 # from sqlalchemy.sql.coercions import expect_col_expression_collection
 
+print("DEBUG: routes.py - Basic imports done, importing app...")
 from . import app
+print("DEBUG: routes.py - App imported successfully")
+
 from flask import render_template, request
 import fnmatch
 import os
@@ -12,44 +17,61 @@ from subprocess import PIPE, run
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
+print("DEBUG: routes.py - Core imports done, starting module imports...")
+
 # Try to import required modules with fallbacks
+print("DEBUG: routes.py - Importing Config...")
 try:
     from da_config import Config
+    print("DEBUG: routes.py - Config imported via da_config")
 except ImportError:
     try:
         from dao.prog.da_config import Config
+        print("DEBUG: routes.py - Config imported via dao.prog.da_config")
     except ImportError:
         print("Warning: Could not import Config class")
         Config = None
 
+print("DEBUG: routes.py - Importing Report...")
 try:
     from da_report import Report
+    print("DEBUG: routes.py - Report imported via da_report")
 except ImportError:
     try:
-        from dao.prog.da_report import Report
+        from dao.prog.da_report import Report  
+        print("DEBUG: routes.py - Report imported via dao.prog.da_report")
     except ImportError:
         print("Warning: Could not import Report class")
         Report = None
 
+print("DEBUG: routes.py - Importing version...")
 try:
     from version import __version__
+    print("DEBUG: routes.py - Version imported via version")
 except ImportError:
     try:
         from dao.prog.version import __version__
+        print("DEBUG: routes.py - Version imported via dao.prog.version")
     except ImportError:
         print("Warning: Could not import version")
-        __version__ = "1.3.10"
+        __version__ = "1.3.11"
+
+print("DEBUG: routes.py - Module imports completed")
 
 web_datapath = "static/data/"
 app_datapath = "app/static/data/"
 images_folder = os.path.join(web_datapath, "images")
 
 # Initialize config with fallbacks
+print("DEBUG: routes.py - Initializing config...")
 config = None
 if Config is not None:
     try:
+        print(f"DEBUG: routes.py - Trying config path: {app_datapath}options.json")
         config = Config(app_datapath + "options.json")
+        print("DEBUG: routes.py - Config loaded successfully")
     except (ValueError, FileNotFoundError) as ex:
+        print(f"DEBUG: routes.py - Config error with path {app_datapath}: {ex}")
         logging.error(f"Config error with path {app_datapath}: {ex}")
         try:
             # Try alternative paths
@@ -58,14 +80,23 @@ if Config is not None:
                 "/config/dao_modern_data/options.json",
                 "../../data/options.json"
             ]
+            print(f"DEBUG: routes.py - Trying alternative paths: {alt_paths}")
             for alt_path in alt_paths:
+                print(f"DEBUG: routes.py - Checking path: {alt_path}")
                 if os.path.exists(alt_path):
+                    print(f"DEBUG: routes.py - Path exists, loading config from: {alt_path}")
                     config = Config(alt_path)
                     logging.info(f"Using config from: {alt_path}")
+                    print(f"DEBUG: routes.py - Config loaded from: {alt_path}")
                     break
         except Exception as e:
+            print(f"DEBUG: routes.py - Failed to load config from alternative paths: {e}")
             logging.error(f"Failed to load config from alternative paths: {e}")
             config = None
+else:
+    print("DEBUG: routes.py - Config class is None, skipping config initialization")
+
+print("DEBUG: routes.py - Config initialization completed")
 
 # Setup logging with fallback
 logname = "dashboard.log"
@@ -313,12 +344,6 @@ def dashboard():
         timedelta=timedelta,
         version=__version__,
     )
-
-@app.errorhandler(404)
-def page_not_found(e):
-    """Handle 404 errors by redirecting to dashboard"""
-    from flask import redirect, url_for
-    return redirect(url_for('dashboard'))
 
 @app.route("/statistics", methods=["GET"])
 def statistics():

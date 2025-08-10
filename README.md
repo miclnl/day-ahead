@@ -43,7 +43,7 @@ If you find bugs, have improvements, or want to adapt the code for other energy 
 
 Feel free to fork, modify, and make it your own - that's the beauty of open source! 🚀
 
-## 🆕 Version 1.3.10 Features - Complete Statistical Intelligence Suite
+## 🆕 Version 1.3.11 Features - Complete Statistical Intelligence Suite
 
 ✨ **Core Statistical Intelligence:**
 - 🧠 **ML-free Optimization** - Intelligent statistical methods replace all ML dependencies
@@ -90,7 +90,14 @@ Feel free to fork, modify, and make it your own - that's the beauty of open sour
 - 🔄 **Cloud AI Fallback** - Statistical methods always available as primary/fallback
 - 🛡️ **Privacy First** - All core functionality works without cloud dependencies
 
-✅ **Critical Route Conflict Resolution (NEW v1.3.10):**
+🔍 **Worker Deadlock Detection & Resolution (NEW v1.3.11):**
+- ⏰ **Import Timeout Protection** - 10-second timeout om deadlocks tijdens routes import te detecteren
+- 🐛 **Duplicate Error Handler Fix** - Eliminated conflicting 404 error handlers causing worker hangs
+- 🔧 **Comprehensive Debug Logging** - Detailed tracing van routes import process in gunicorn workers
+- 🛡️ **Worker Stability** - Prevents infinite loops en deadlocks in multi-worker environments
+- ⚡ **Graceful Fallback** - Fallback routes als main import proces faalt
+
+✅ **Critical Route Conflict Resolution (v1.3.10):**
 - 🔧 **Duplicate Route Fix** - Eliminated Flask AssertionError van conflicting endpoint registrations
 - 🌐 **404 Error Resolution** - Root cause fix voor alle missing page errors
 - 🛠️ **WSGI Worker Stability** - Workers starten nu succesvol zonder route conflicts
@@ -213,7 +220,7 @@ See the original DAO documentation for configuration details:
 
 ---
 
-**Version:** 1.3.10 - Complete Statistical Intelligence Suite  
+**Version:** 1.3.11 - Complete Statistical Intelligence Suite  
 **Author:** Cees van Beek  
 **Enhanced by:** Claude Code  
 
@@ -226,7 +233,7 @@ See the original DAO documentation for configuration details:
 ✅ **Startup Speed:** 10x faster  
 ✅ **Explainable AI:** Traceable decision logic  
 
-## 🚀 New in v1.3.10 - Revolutionary Energy Management
+## 🚀 New in v1.3.11 - Revolutionary Energy Management
 
 ✅ **ML-Free Operation:** Complete removal of problematic ML dependencies  
 ✅ **Weather Reactive:** Real-time adaptation to weather changes  
@@ -241,5 +248,6 @@ See the original DAO documentation for configuration details:
 ✅ **Container Stability:** WSGI-compatible imports with intelligent fallback handling
 ✅ **Debug Capabilities:** Advanced error detection with comprehensive diagnostic logging
 ✅ **Production Stability:** Critical route conflicts resolved, webserver fully operational
+✅ **Worker Reliability:** Gunicorn worker deadlocks eliminated, consistent startup across environments
 
 **Complete energy optimization suite with transparent decision-making and comprehensive analytics.**

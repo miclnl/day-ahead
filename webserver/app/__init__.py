@@ -44,11 +44,34 @@ except Exception as e:
 
 # Import routes AFTER app is created to avoid circular import
 print("DEBUG: Attempting to import routes...")
+import sys
+import time
+import signal
+
+def timeout_handler(signum, frame):
+    print("CRITICAL: Routes import timeout - deadlock detected!")
+    raise TimeoutError("Routes import timed out")
+
 try:
+    # Set a timeout for routes import to detect deadlocks
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(10)  # 10 second timeout
+    
+    print("DEBUG: Starting routes import with timeout protection...")
+    
     # Import the routes module which will register routes with app
     from . import routes
+    
+    # Cancel the timeout
+    signal.alarm(0)
+    
     print("DEBUG: Routes import successful")
+except TimeoutError as e:
+    signal.alarm(0)
+    print(f"CRITICAL: Routes import timed out: {e}")
+    traceback.print_exc()
 except Exception as e:
+    signal.alarm(0)
     print(f"CRITICAL: Routes import failed: {e}")
     traceback.print_exc()
     
@@ -64,7 +87,7 @@ except Exception as e:
     def health():
         return jsonify({
             'status': 'healthy',
-            'version': '1.3.10',
+            'version': '1.3.11',
             'webserver': 'running',
             'error': 'Routes import failed - minimal mode active'
         })
