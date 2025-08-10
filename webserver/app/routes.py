@@ -11,34 +11,122 @@ import os
 from subprocess import PIPE, run
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from da_config import Config
-from da_report import Report
-from version import __version__
+
+# Try to import required modules with fallbacks
+try:
+    from da_config import Config
+except ImportError:
+    try:
+        from dao.prog.da_config import Config
+    except ImportError:
+        print("Warning: Could not import Config class")
+        Config = None
+
+try:
+    from da_report import Report
+except ImportError:
+    try:
+        from dao.prog.da_report import Report
+    except ImportError:
+        print("Warning: Could not import Report class")
+        Report = None
+
+try:
+    from version import __version__
+except ImportError:
+    try:
+        from dao.prog.version import __version__
+    except ImportError:
+        print("Warning: Could not import version")
+        __version__ = "1.3.8"
 
 web_datapath = "static/data/"
 app_datapath = "app/static/data/"
 images_folder = os.path.join(web_datapath, "images")
-try:
-    config = Config(app_datapath + "options.json")
-except ValueError as ex:
-    logging.error(app_datapath)
-    logging.error(ex)
-    config = None
 
+# Initialize config with fallbacks
+config = None
+if Config is not None:
+    try:
+        config = Config(app_datapath + "options.json")
+    except (ValueError, FileNotFoundError) as ex:
+        logging.error(f"Config error with path {app_datapath}: {ex}")
+        try:
+            # Try alternative paths
+            alt_paths = [
+                "/app/dao/data/options.json",
+                "/config/dao_modern_data/options.json",
+                "../../data/options.json"
+            ]
+            for alt_path in alt_paths:
+                if os.path.exists(alt_path):
+                    config = Config(alt_path)
+                    logging.info(f"Using config from: {alt_path}")
+                    break
+        except Exception as e:
+            logging.error(f"Failed to load config from alternative paths: {e}")
+            config = None
+
+# Setup logging with fallback
 logname = "dashboard.log"
-handler = TimedRotatingFileHandler(
-    "../data/log/" + logname,
-    when="midnight",
-    backupCount=1 if config is None else config.get(["history", "save days"]),
-)
-handler.suffix = "%Y%m%d"
-handler.setLevel(logging.INFO)
-logging.basicConfig(
-    level=logging.DEBUG,
-    handlers=[handler],
-    format=f"%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s",
-)
+log_paths = [
+    "../data/log/",
+    "/app/dao/data/log/",
+    "/config/dao_modern_data/log/",
+    "/tmp/"
+]
+
+handler = None
+for log_path in log_paths:
+    try:
+        os.makedirs(log_path, exist_ok=True)
+        handler = TimedRotatingFileHandler(
+            os.path.join(log_path, logname),
+            when="midnight",
+            backupCount=1 if config is None else config.get(["history", "save days"]),
+        )
+        handler.suffix = "%Y%m%d"
+        handler.setLevel(logging.INFO)
+        break
+    except Exception:
+        continue
+
+# Configure logging
+if handler:
+    logging.basicConfig(
+        level=logging.DEBUG,
+        handlers=[handler],
+        format=f"%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s",
+    )
+else:
+    # Fallback to console logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format=f"%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s",
+    )
 browse = {}
+
+def get_safe_report():
+    """Get a Report instance with safe fallback handling"""
+    if Report is None:
+        return None
+    
+    config_paths = [
+        app_datapath + "options.json",
+        "/app/dao/data/options.json", 
+        "/config/dao_modern_data/options.json"
+    ]
+    
+    for config_path in config_paths:
+        try:
+            if os.path.exists(config_path):
+                return Report(config_path)
+        except Exception as e:
+            logging.error(f"Failed to create Report with {config_path}: {e}")
+            continue
+    
+    logging.warning("Could not create Report instance - no valid config found")
+    return None
 
 views = {
     "tabel": {"name": "Tabel", "icon": "tabel.png"},
@@ -252,7 +340,9 @@ def api_statistics_decisions():
     """API endpoint for decision analysis data"""
     try:
         # Initialize Report and get real data
-        report = Report(app_datapath + "options.json")
+        report = get_safe_report()
+        if report is None:
+            return {"error": "Could not initialize reporting system"}, 500
         
         # Get real data from database using existing Report methods
         now = datetime.datetime.now()
@@ -485,7 +575,9 @@ def api_statistics_forecast():
     """API endpoint for forecast data with history comparison"""
     try:
         # Initialize Report to get real data
-        report = Report(app_datapath + "options.json")
+        report = get_safe_report()
+        if report is None:
+            return {"error": "Could not initialize reporting system"}, 500
         
         hours = 24
         current_time = datetime.datetime.now()
@@ -906,7 +998,9 @@ def run_modern():
 
 @app.route("/reports", methods=["POST", "GET"])
 def reports(active_menu: str):
-    report = Report(app_datapath + "/options.json")
+    report = get_safe_report()
+    if report is None:
+        return {"error": "Could not initialize reporting system"}, 500
     menu_dict = web_menu[active_menu]
     title = menu_dict["name"]
     subjects_lst = list(menu_dict["submenu"].keys())
@@ -1365,7 +1459,9 @@ def api_report(fld: str, periode: str):
     :return: de gevraagde data in json formaat
     """
     cumulate = request.args.get("cumulate")
-    report = Report(app_datapath + "/options.json")
+    report = get_safe_report()
+    if report is None:
+        return {"error": "Could not initialize reporting system"}, 500
     # start = request.args.get('start')
     # end = request.args.get('end')
     if cumulate is None:
