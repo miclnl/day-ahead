@@ -76,7 +76,7 @@ class DaBase(hass.Hass):
         )
 
         ha_options = self.config.get(["homeassistant"])
-        if "ip adress" in ha_options:
+        if ha_options and "ip adress" in ha_options:
             # Auto-migrate deprecated configuration
             deprecated_value = self.config.get(["homeassistant", "ip adress"], default="supervisor")
             self.ip_address = deprecated_value
@@ -162,11 +162,13 @@ class DaBase(hass.Hass):
             self.ol_t_def = self.config.get(
                 ["cost supplier redelivery"], self.prices_options, None
             )
-        if "vat consumption" in self.prices_options:
+        if self.prices_options and "vat consumption" in self.prices_options:
             self.btw_l_def = self.prices_options["vat consumption"]
-        else:
+        elif self.prices_options and "vat" in self.prices_options:
             self.btw_l_def = self.prices_options["vat"]
-        if "vat production" in self.prices_options:
+        else:
+            self.btw_l_def = 0.21  # Default 21% VAT
+        if self.prices_options and "vat production" in self.prices_options:
             self.btw_t_def = self.prices_options["vat production"]
         else:
             self.btw_t_def = self.btw_l_def.copy()

@@ -10,4 +10,4 @@ configuration:
     description: URL to your Home Assistant instance (optional, auto-detected if empty)
   homeassistant_token:
     name: Home Assistant Token
-    description: Long-lived access token for Home Assistant API (required for operation)
+    description: Long-lived access token for Home Assistant API (optional - auto-detected in addon mode)

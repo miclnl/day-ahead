@@ -7,4 +7,4 @@ configuration:
     description: Stel de uitgebreidheid van logging in
   homeassistant_token:
     name: Home Assistant Token
-    description: Langdurige toegangstoken voor Home Assistant API (vereist voor werking)
+    description: Langdurige toegangstoken voor Home Assistant API (optioneel - automatisch gedetecteerd in addon modus)
