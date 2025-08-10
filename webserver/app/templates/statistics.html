@@ -10,7 +10,7 @@
         <div class="header-controls">
             <button class="btn-refresh" onclick="refreshAllData()">🔄 Ververs Data</button>
             <button class="btn-export" onclick="exportData()">📥 Export CSV</button>
-            <a href="/dashboard" class="btn-back">⬅️ Terug naar Dashboard</a>
+            <a href="dashboard" class="btn-back">⬅️ Terug naar Dashboard</a>
         </div>
     </div>
     
@@ -818,10 +818,13 @@ function initializeCharts() {
                 label: 'Batterij Target %',
                 data: [],
                 backgroundColor: function(context) {
-                    const value = context.parsed.y;
-                    if (value < 30) return '#f44336';
-                    if (value < 70) return '#FF9800';
-                    return '#4CAF50';
+                    if (context && context.parsed && typeof context.parsed.y !== 'undefined') {
+                        const value = context.parsed.y;
+                        if (value < 30) return '#f44336';
+                        if (value < 70) return '#FF9800';
+                        return '#4CAF50';
+                    }
+                    return '#2196F3'; // Default color
                 },
                 borderColor: '#333',
                 borderWidth: 1
@@ -877,7 +880,7 @@ function loadAllData() {
     console.log('Loading statistics data...');
     
     // Load decision data
-    fetch('/api/statistics/decisions')
+    fetch('api/statistics/decisions')
         .then(response => response.json())
         .then(data => {
             updateDecisionAnalysis(data);
@@ -890,7 +893,7 @@ function loadAllData() {
         });
     
     // Load forecast data
-    fetch('/api/statistics/forecast')
+    fetch('api/statistics/forecast')
         .then(response => response.json())
         .then(data => {
             updateForecastChart(data);

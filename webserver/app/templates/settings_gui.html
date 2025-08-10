@@ -18,33 +18,13 @@
         <div class="tab-content active" id="basic">
             <h2>📊 Basis Instellingen</h2>
             
-            <div class="form-section">
-                <h3>🏠 Home Assistant</h3>
-                <div class="form-group">
-                    <label for="ha_url">Home Assistant URL:</label>
-                    <input type="url" id="ha_url" name="homeassistant.url" value="{{ config.get('homeassistant', {}).get('url', '') }}" 
-                           placeholder="http://homeassistant.local:8123">
-                </div>
-                <div class="form-group">
-                    <label for="ha_token">Access Token:</label>
-                    <input type="password" id="ha_token" name="homeassistant.token" value="{{ config.get('homeassistant', {}).get('token', '') }}"
-                           placeholder="Long-lived access token">
-                </div>
-            </div>
 
             <div class="form-section">
-                <h3>🗄️ Database</h3>
-                <div class="form-group">
-                    <label for="db_engine">Database Engine:</label>
-                    <select id="db_engine" name="database_ha.engine">
-                        <option value="sqlite" {% if config.get('database ha', {}).get('engine') == 'sqlite' %}selected{% endif %}>SQLite</option>
-                        <option value="mysql" {% if config.get('database ha', {}).get('engine') == 'mysql' %}selected{% endif %}>MySQL</option>
-                        <option value="postgresql" {% if config.get('database ha', {}).get('engine') == 'postgresql' %}selected{% endif %}>PostgreSQL</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label for="db_path">Database Pad:</label>
-                    <input type="text" id="db_path" name="database_ha.db_path" value="{{ config.get('database ha', {}).get('db_path', '/homeassistant') }}">
+                <h3>🗄️ Database Status</h3>
+                <div class="info-box">
+                    <p><strong>Database:</strong> Configuratie wordt overgenomen van Home Assistant addon instellingen</p>
+                    <p><strong>Engine:</strong> {{ addon_options.database_engine or 'sqlite' }}</p>
+                    <p><strong>Status:</strong> <span class="status-connected">✅ Verbonden</span></p>
                 </div>
             </div>
 
@@ -55,6 +35,16 @@
                     <input type="password" id="meteo_key" name="meteoserver-key" value="{{ config.get('meteoserver-key', '') }}"
                            placeholder="API key voor weer data">
                 </div>
+                <div class="form-group">
+                    <label for="nordpool_key">NordPool API Key:</label>
+                    <input type="password" id="nordpool_key" name="nordpool-key" value="{{ config.get('nordpool-key', '') }}"
+                           placeholder="Optioneel - voor direct NordPool toegang">
+                </div>
+                <div class="form-group">
+                    <label for="entsoe_key">ENTSO-E API Key:</label>
+                    <input type="password" id="entsoe_key" name="entsoe-key" value="{{ config.get('entsoe-key', '') }}"
+                           placeholder="API key voor ENTSO-E transparantie platform">
+                </div>
             </div>
         </div>
 
@@ -63,7 +53,19 @@
             <h2>⚡ Energie & Prijzen</h2>
             
             <div class="form-section">
-                <h3>💰 Prijsbron</h3>
+                <h3>📋 Contract Type</h3>
+                <div class="form-group">
+                    <label for="contract_type">Energie Contract:</label>
+                    <select id="contract_type" name="prices.contract_type" onchange="toggleContractFields()">
+                        <option value="dynamic" {% if config.get('prices', {}).get('contract_type', 'dynamic') == 'dynamic' %}selected{% endif %}>Dynamisch Contract</option>
+                        <option value="fixed" {% if config.get('prices', {}).get('contract_type') == 'fixed' %}selected{% endif %}>Vast/Variabel Contract</option>
+                    </select>
+                    <small>Dynamisch: prijzen volgen day-ahead markt | Vast/Variabel: vaste tarieven met piek/dal</small>
+                </div>
+            </div>
+            
+            <div class="form-section" id="dynamic-pricing">
+                <h3>💰 Dynamische Prijsbron</h3>
                 <div class="form-group">
                     <label for="price_source">Day Ahead Prijsbron:</label>
                     <select id="price_source" name="prices.source_day_ahead">
@@ -73,23 +75,36 @@
                         <option value="tibber" {% if config.get('prices', {}).get('source day ahead') == 'tibber' %}selected{% endif %}>Tibber</option>
                     </select>
                 </div>
-                
+            </div>
+            
+            <div class="form-section" id="fixed-pricing">
+                <h3>⚖️ Reguliere Tarieven (Vast/Variabel Contract)</h3>
                 <div class="form-group">
-                    <label for="regular_high">Regulier Tarief Hoog (€/kWh):</label>
+                    <label for="regular_high">Piek Tarief (€/kWh):</label>
                     <input type="number" step="0.001" id="regular_high" name="prices.regular_high" 
                            value="{{ config.get('prices', {}).get('regular high', 0.50) }}">
+                    <small>Hoog tarief tijdens piekuren</small>
                 </div>
                 
                 <div class="form-group">
-                    <label for="regular_low">Regulier Tarief Laag (€/kWh):</label>
+                    <label for="regular_low">Dal Tarief (€/kWh):</label>
                     <input type="number" step="0.001" id="regular_low" name="prices.regular_low"
                            value="{{ config.get('prices', {}).get('regular low', 0.40) }}">
+                    <small>Laag tarief tijdens daluren</small>
                 </div>
 
                 <div class="form-group">
-                    <label for="switch_to_low">Overschakeling naar laag tarief (uur):</label>
+                    <label for="switch_to_low">Overschakeling naar dal tarief (uur):</label>
                     <input type="number" min="0" max="23" id="switch_to_low" name="prices.switch_to_low"
                            value="{{ config.get('prices', {}).get('switch to low', 23) }}">
+                    <small>Uur waarop tarief omschakelt naar dalperiode</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="switch_to_high">Overschakeling naar piek tarief (uur):</label>
+                    <input type="number" min="0" max="23" id="switch_to_high" name="prices.switch_to_high"
+                           value="{{ config.get('prices', {}).get('switch to high', 7) }}">
+                    <small>Uur waarop tarief omschakelt naar piekperiode</small>
                 </div>
             </div>
             
@@ -98,22 +113,19 @@
                 <div class="form-group">
                     <label for="energy_tax_consumption">Energiebelasting Verbruik (€/kWh):</label>
                     <input type="number" step="0.00001" id="energy_tax_consumption" name="energy_tax_consumption"
-                           value="0.10154" readonly>
-                    <small>Automatisch bijgewerkt op basis van datum</small>
+                           value="0.10154">
                 </div>
                 
                 <div class="form-group">
                     <label for="supplier_cost_consumption">Leveringskosten Verbruik (€/kWh):</label>
                     <input type="number" step="0.00001" id="supplier_cost_consumption" name="supplier_cost_consumption"
-                           value="0.020496" readonly>
-                    <small>Automatisch bijgewerkt op basis van datum</small>
+                           value="0.020496">
                 </div>
                 
                 <div class="form-group">
                     <label for="vat_consumption">BTW Verbruik (%):</label>
                     <input type="number" step="1" id="vat_consumption" name="vat_consumption"
-                           value="21" readonly>
-                    <small>Automatisch bijgewerkt op basis van datum</small>
+                           value="21">
                 </div>
             </div>
         </div>
@@ -154,10 +166,57 @@
                         </div>
                         
                         <div class="form-group">
-                            <label for="battery_efficiency_{{ loop.index0 }}">Efficiency (%):</label>
+                            <label for="battery_efficiency_{{ loop.index0 }}">Basisefficiency (%):</label>
                             <input type="number" step="0.1" min="50" max="100" id="battery_efficiency_{{ loop.index0 }}" 
                                    name="battery[{{ loop.index0 }}].efficiency"
                                    value="{{ battery.get('efficiency', 95) }}">
+                            <small>Baseline efficiency, wordt aangepast met efficientiecurves</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="battery_curves_{{ loop.index0 }}" 
+                                       name="battery[{{ loop.index0 }}].use_efficiency_curves"
+                                       {% if battery.get('use_efficiency_curves', False) %}checked{% endif %}>
+                                Geavanceerde Efficientiecurves
+                            </label>
+                            <small>Gebruikt realistische efficiency curves gebaseerd op SoC en vermogen</small>
+                        </div>
+                        
+                        <div class="efficiency-curves" id="curves_{{ loop.index0 }}" 
+                             style="{% if not battery.get('use_efficiency_curves', False) %}display: none;{% endif %}">
+                            
+                            <div class="form-group">
+                                <label for="battery_charge_curve_{{ loop.index0 }}">Laad Efficientie Curve:</label>
+                                <textarea id="battery_charge_curve_{{ loop.index0 }}" 
+                                          name="battery[{{ loop.index0 }}].charge_efficiency_curve"
+                                          rows="4" placeholder="0:85,10:90,20:93,50:95,80:92,90:88,95:82">{{ battery.get('charge_efficiency_curve', '0:85,10:90,20:93,50:95,80:92,90:88,95:82') }}</textarea>
+                                <small>Format: SoC:efficiency,SoC:efficiency (bijv. 0:85,50:95,100:80)</small>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="battery_discharge_curve_{{ loop.index0 }}">Ontlaad Efficientie Curve:</label>
+                                <textarea id="battery_discharge_curve_{{ loop.index0 }}" 
+                                          name="battery[{{ loop.index0 }}].discharge_efficiency_curve"
+                                          rows="4" placeholder="0:75,10:88,20:92,50:95,80:94,90:91,100:85">{{ battery.get('discharge_efficiency_curve', '0:75,10:88,20:92,50:95,80:94,90:91,100:85') }}</textarea>
+                                <small>Ontlaadcurve - meestal iets lager dan laadcurve</small>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="battery_power_curve_{{ loop.index0 }}">Vermogen Derating Curve:</label>
+                                <textarea id="battery_power_curve_{{ loop.index0 }}" 
+                                          name="battery[{{ loop.index0 }}].power_derating_curve"
+                                          rows="4" placeholder="0:60,10:85,20:95,80:100,90:90,95:70,100:40">{{ battery.get('power_derating_curve', '0:60,10:85,20:95,80:100,90:90,95:70,100:40') }}</textarea>
+                                <small>Maximaal beschikbaar vermogen per SoC niveau (%)</small>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="battery_temp_coefficient_{{ loop.index0 }}">Temperatuur Correctie (%/°C):</label>
+                                <input type="number" step="0.01" min="-1" max="1" id="battery_temp_coefficient_{{ loop.index0 }}" 
+                                       name="battery[{{ loop.index0 }}].temperature_coefficient"
+                                       value="{{ battery.get('temperature_coefficient', -0.1) }}">
+                                <small>Efficiency correctie per graad van referentietemperatuur (meestal negatief)</small>
+                            </div>
                         </div>
                         
                         <div class="form-group">
@@ -269,6 +328,80 @@
                            value="{{ config.get('solar', {}).get('entity', '') }}"
                            placeholder="sensor.solar_power">
                 </div>
+                
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="solar_switch_enabled" name="solar.dynamic_control.enabled"
+                               {% if config.get('solar', {}).get('dynamic_control', {}).get('enabled', False) %}checked{% endif %}>
+                        Dynamische Zonnepaneel Controle
+                    </label>
+                    <small>Schakel zonnepanelen automatisch aan/uit op basis van teruglevering rendabiliteit</small>
+                </div>
+                
+                <div class="solar-control" id="solar-control-settings" 
+                     style="{% if not config.get('solar', {}).get('dynamic_control', {}).get('enabled', False) %}display: none;{% endif %}">
+                    
+                    <div class="form-group">
+                        <label for="solar_switch_entity">Schakelaar Entity:</label>
+                        <input type="text" id="solar_switch_entity" name="solar.dynamic_control.switch_entity"
+                               value="{{ config.get('solar', {}).get('dynamic_control', {}).get('switch_entity', '') }}"
+                               placeholder="switch.solar_inverter_production">
+                        <small>Home Assistant schakelaar om zonnepanelen aan/uit te zetten</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="solar_min_price">Minimum Teruglevering Prijs (€/kWh):</label>
+                        <input type="number" step="0.001" id="solar_min_price" 
+                               name="solar.dynamic_control.minimum_return_price"
+                               value="{{ config.get('solar', {}).get('dynamic_control', {}).get('minimum_return_price', 0.05) }}">
+                        <small>Onder deze prijs worden panelen uitgeschakeld om netkosten te vermijden</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="solar_switch_delay">Schakel Vertraging (minuten):</label>
+                        <input type="number" min="1" max="60" id="solar_switch_delay" 
+                               name="solar.dynamic_control.switch_delay_minutes"
+                               value="{{ config.get('solar', {}).get('dynamic_control', {}).get('switch_delay_minutes', 15) }}">
+                        <small>Wachttijd voor het schakelen om oscillatie te voorkomen</small>
+                    </div>
+                </div>
+                
+                <div class="form-section">
+                    <h3>🌤️ Weather Integration</h3>
+                    
+                    <div class="form-group">
+                        <label for="weather_provider">Weather Provider:</label>
+                        <select id="weather_provider" name="weather.provider">
+                            <option value="openweathermap" {% if config.get('weather', {}).get('provider') == 'openweathermap' %}selected{% endif %}>OpenWeatherMap</option>
+                            <option value="knmi" {% if config.get('weather', {}).get('provider') == 'knmi' %}selected{% endif %}>KNMI (Nederland)</option>
+                        </select>
+                        <small>Kies weather data provider voor forecasts</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="weather_api_key">Weather API Key:</label>
+                        <input type="password" id="weather_api_key" name="weather.api_key"
+                               value="{{ config.get('weather', {}).get('api_key', '') }}"
+                               placeholder="API key voor weather service">
+                        <small>Gratis API key van OpenWeatherMap of andere provider</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="location_lat">Locatie Latitude:</label>
+                        <input type="number" step="0.000001" min="50" max="54" id="location_lat" 
+                               name="location.latitude"
+                               value="{{ config.get('location', {}).get('latitude', 52.0) }}">
+                        <small>GPS coordinaat voor nauwkeurige weather data</small>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="location_lon">Locatie Longitude:</label>
+                        <input type="number" step="0.000001" min="3" max="8" id="location_lon" 
+                               name="location.longitude"
+                               value="{{ config.get('location', {}).get('longitude', 5.0) }}">
+                        <small>GPS coordinaat voor nauwkeurige weather data</small>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -320,34 +453,6 @@
                 </div>
             </div>
             
-            <div class="form-section">
-                <h3>📊 Machine Learning</h3>
-                
-                <div class="form-group">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="ml_enabled" name="machine_learning.enabled"
-                               {% if config.get('machine_learning', {}).get('enabled', True) %}checked{% endif %}>
-                        Machine Learning Inschakelen
-                    </label>
-                </div>
-                
-                <div class="form-group">
-                    <label for="ml_algorithm">ML Algoritme:</label>
-                    <select id="ml_algorithm" name="machine_learning.consumption_predictor.algorithm">
-                        <option value="ensemble" {% if config.get('machine_learning', {}).get('consumption_predictor', {}).get('algorithm') == 'ensemble' %}selected{% endif %}>Ensemble (Meerdere modellen)</option>
-                        <option value="xgboost" {% if config.get('machine_learning', {}).get('consumption_predictor', {}).get('algorithm') == 'xgboost' %}selected{% endif %}>XGBoost</option>
-                        <option value="random_forest" {% if config.get('machine_learning', {}).get('consumption_predictor', {}).get('algorithm') == 'random_forest' %}selected{% endif %}>Random Forest</option>
-                        <option value="neural_network" {% if config.get('machine_learning', {}).get('consumption_predictor', {}).get('algorithm') == 'neural_network' %}selected{% endif %}>Neural Network</option>
-                    </select>
-                </div>
-                
-                <div class="form-group">
-                    <label for="ml_history_days">Historische Data (dagen):</label>
-                    <input type="number" min="7" max="365" id="ml_history_days" 
-                           name="machine_learning.history_days"
-                           value="{{ config.get('machine_learning', {}).get('history_days', 90) }}">
-                </div>
-            </div>
             
             <div class="form-section">
                 <h3>🧠 Smart Optimalisatie</h3>
@@ -462,42 +567,6 @@
                 </div>
             </div>
             
-            <div class="form-section">
-                <h3>🌤️ Weather Integration</h3>
-                
-                <div class="form-group">
-                    <label for="weather_provider">Weather Provider:</label>
-                    <select id="weather_provider" name="weather.provider">
-                        <option value="openweathermap" {% if config.get('weather', {}).get('provider') == 'openweathermap' %}selected{% endif %}>OpenWeatherMap</option>
-                        <option value="knmi" {% if config.get('weather', {}).get('provider') == 'knmi' %}selected{% endif %}>KNMI (Nederland)</option>
-                    </select>
-                    <small>Kies weather data provider voor forecasts</small>
-                </div>
-                
-                <div class="form-group">
-                    <label for="weather_api_key">Weather API Key:</label>
-                    <input type="password" id="weather_api_key" name="weather.api_key"
-                           value="{{ config.get('weather', {}).get('api_key', '') }}"
-                           placeholder="API key voor weather service">
-                    <small>Gratis API key van OpenWeatherMap of andere provider</small>
-                </div>
-                
-                <div class="form-group">
-                    <label for="location_lat">Locatie Latitude:</label>
-                    <input type="number" step="0.000001" min="50" max="54" id="location_lat" 
-                           name="location.latitude"
-                           value="{{ config.get('location', {}).get('latitude', 52.0) }}">
-                    <small>GPS coordinaat voor nauwkeurige weather data</small>
-                </div>
-                
-                <div class="form-group">
-                    <label for="location_lon">Locatie Longitude:</label>
-                    <input type="number" step="0.000001" min="3" max="8" id="location_lon" 
-                           name="location.longitude"
-                           value="{{ config.get('location', {}).get('longitude', 5.0) }}">
-                    <small>GPS coordinaat voor nauwkeurige weather data</small>
-                </div>
-            </div>
             
             <div class="form-section">
                 <h3>🏠 Apparaat Instellingen</h3>
@@ -775,6 +844,33 @@
     margin-right: 0;
 }
 
+.info-box {
+    background: #e7f3ff;
+    border: 1px solid #b3d9ff;
+    border-radius: 6px;
+    padding: 15px;
+    margin: 10px 0;
+}
+
+.info-box p {
+    margin: 5px 0;
+    font-size: 14px;
+}
+
+.status-connected {
+    color: #4CAF50;
+    font-weight: bold;
+}
+
+.efficiency-curves,
+.solar-control {
+    background: #f9f9f9;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 15px;
+    margin: 10px 0;
+}
+
 .battery-config,
 .ev-config {
     background: #f8f9fa;
@@ -953,6 +1049,60 @@ function removeBattery(index) {
     }
 }
 
+// Contract type toggle
+function toggleContractFields() {
+    const contractType = document.getElementById('contract_type').value;
+    const dynamicPricing = document.getElementById('dynamic-pricing');
+    const fixedPricing = document.getElementById('fixed-pricing');
+    
+    if (contractType === 'dynamic') {
+        dynamicPricing.style.display = 'block';
+        fixedPricing.style.display = 'none';
+    } else {
+        dynamicPricing.style.display = 'none';
+        fixedPricing.style.display = 'block';
+    }
+}
+
+// Solar control toggle
+document.addEventListener('DOMContentLoaded', function() {
+    const solarSwitchEnabled = document.getElementById('solar_switch_enabled');
+    const solarControlSettings = document.getElementById('solar-control-settings');
+    
+    if (solarSwitchEnabled && solarControlSettings) {
+        function toggleSolarControl() {
+            if (solarSwitchEnabled.checked) {
+                solarControlSettings.style.display = 'block';
+            } else {
+                solarControlSettings.style.display = 'none';
+            }
+        }
+        
+        solarSwitchEnabled.addEventListener('change', toggleSolarControl);
+        toggleSolarControl(); // Initial state
+    }
+    
+    // Battery efficiency curves toggle
+    document.querySelectorAll('[id^="battery_curves_"]').forEach(checkbox => {
+        const index = checkbox.id.split('_')[2];
+        const curvesDiv = document.getElementById(`curves_${index}`);
+        
+        function toggleCurves() {
+            if (checkbox.checked) {
+                curvesDiv.style.display = 'block';
+            } else {
+                curvesDiv.style.display = 'none';
+            }
+        }
+        
+        checkbox.addEventListener('change', toggleCurves);
+        toggleCurves(); // Initial state
+    });
+    
+    // Initialize contract type display
+    toggleContractFields();
+});
+
 // EV management
 function addEV() {
     const container = document.getElementById('ev-configs');
@@ -1019,7 +1169,7 @@ function saveSettings() {
         }
     });
     
-    fetch('/settings/save', {
+    fetch('settings/save', {
         method: 'POST',
         body: formData
     })
@@ -1051,7 +1201,7 @@ function testConnection() {
         return;
     }
     
-    fetch('/settings/test-connection', {
+    fetch('settings/test-connection', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -1076,7 +1226,7 @@ function testConnection() {
 
 function resetToDefaults() {
     if (confirm('⚠️ Dit zal alle instellingen terugzetten naar de standaardwaarden. Weet je het zeker?')) {
-        fetch('/settings/reset', {
+        fetch('settings/reset', {
             method: 'POST'
         })
         .then(response => response.json())
@@ -1092,7 +1242,7 @@ function resetToDefaults() {
 }
 
 function exportConfig() {
-    fetch('/settings/export')
+    fetch('settings/export')
     .then(response => response.blob())
     .then(blob => {
         const url = window.URL.createObjectURL(blob);
@@ -1118,7 +1268,7 @@ function importConfig() {
     const formData = new FormData();
     formData.append('config_file', file);
     
-    fetch('/settings/import', {
+    fetch('settings/import', {
         method: 'POST',
         body: formData
     })

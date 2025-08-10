@@ -24,7 +24,7 @@
         <div class="dashboard-card quick-actions">
             <h2>🚀 Snelle Acties</h2>
             <div class="actions-grid">
-                <button class="action-btn optimization" onclick="window.location.href='/run-modern'">
+                <button class="action-btn optimization" onclick="window.location.href='run-modern'">
                     <div class="btn-icon">⚡</div>
                     <div class="btn-content">
                         <h3>Optimalisatie</h3>
@@ -32,7 +32,7 @@
                     </div>
                 </button>
                 
-                <button class="action-btn reports" onclick="window.location.href='/reports'">
+                <button class="action-btn reports" onclick="window.location.href='reports'">
                     <div class="btn-icon">📊</div>
                     <div class="btn-content">
                         <h3>Rapporten</h3>
@@ -40,7 +40,7 @@
                     </div>
                 </button>
                 
-                <button class="action-btn settings" onclick="window.location.href='/settings-gui'">
+                <button class="action-btn settings" onclick="window.location.href='settings-gui'">
                     <div class="btn-icon">⚙️</div>
                     <div class="btn-content">
                         <h3>Instellingen</h3>
@@ -48,7 +48,7 @@
                     </div>
                 </button>
                 
-                <button class="action-btn monitoring" onclick="window.location.href='/statistics'">
+                <button class="action-btn monitoring" onclick="window.location.href='statistics'">
                     <div class="btn-icon">📊</div>
                     <div class="btn-content">
                         <h3>Statistieken</h3>
@@ -140,37 +140,42 @@
         <div class="dashboard-card navigation">
             <h2>🧭 Navigatie</h2>
             <div class="nav-links">
-                <a href="/home" class="nav-link">
+                <a href="home" class="nav-link">
                     <span class="nav-icon">🏠</span>
                     <span class="nav-text">Home (Legacy)</span>
                 </a>
                 
-                <a href="/run-modern" class="nav-link">
+                <a href="run-modern" class="nav-link">
                     <span class="nav-icon">🚀</span>
                     <span class="nav-text">Operaties</span>
                 </a>
                 
-                <a href="/reports" class="nav-link">
+                <a href="reports" class="nav-link">
                     <span class="nav-icon">📊</span>
                     <span class="nav-text">Rapporten</span>
                 </a>
                 
-                <a href="/settings-gui" class="nav-link">
+                <a href="settings-gui" class="nav-link">
                     <span class="nav-icon">⚙️</span>
                     <span class="nav-text">Instellingen</span>
                 </a>
                 
-                <a href="/statistics" class="nav-link">
+                <a href="daily-usage" class="nav-link">
                     <span class="nav-icon">📊</span>
+                    <span class="nav-text">Dagelijks Gebruik</span>
+                </a>
+                
+                <a href="statistics" class="nav-link">
+                    <span class="nav-icon">📈</span>
                     <span class="nav-text">Statistieken & Analyses</span>
                 </a>
                 
-                <a href="/api/health-check" class="nav-link">
+                <a href="api/health-check" class="nav-link">
                     <span class="nav-icon">❤️</span>
                     <span class="nav-text">Health Check</span>
                 </a>
                 
-                <a href="/debug/routes" class="nav-link">
+                <a href="debug/routes" class="nav-link">
                     <span class="nav-icon">🐛</span>
                     <span class="nav-text">Debug Info</span>
                 </a>
@@ -281,7 +286,7 @@
 
 .actions-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
     gap: 15px;
 }
 
@@ -316,12 +321,17 @@
 .btn-content h3 {
     margin: 0 0 5px 0;
     font-size: 1.1em;
+    word-wrap: break-word;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .btn-content p {
     margin: 0;
     opacity: 0.9;
     font-size: 0.9em;
+    word-wrap: break-word;
 }
 
 .status-grid, .metrics-grid {
@@ -477,7 +487,7 @@
 // Load system status and metrics
 function loadDashboardData() {
     // Load system status
-    fetch('/api/health-check')
+    fetch('api/health-check')
         .then(response => response.json())
         .then(data => {
             updateSystemStatus(data);

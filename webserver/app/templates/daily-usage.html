@@ -1,0 +1,1524 @@
+{% extends "base.html" %}
+
+{% block selectie %}{% endblock %}
+
+{% block content %}
+<div class="daily-usage-container">
+    <div class="daily-header">
+        <h1>📊 Dagelijks Energiegebruik</h1>
+        <p class="subtitle">Gedetailleerd overzicht van energie flow, weer en optimalisatie beslissingen</p>
+        
+        <div class="date-controls">
+            <button class="btn-secondary" onclick="loadYesterday()">⬅️ Gisteren</button>
+            <input type="date" id="selected-date" value="{{ today }}" onchange="loadSelectedDate()">
+            <button class="btn-secondary" onclick="loadToday()">Vandaag ➡️</button>
+        </div>
+        
+        <div class="quick-stats">
+            <div class="stat-card consumption">
+                <div class="stat-icon">⚡</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="total-consumption">-- kWh</div>
+                    <div class="stat-label">Totaal Verbruik</div>
+                </div>
+            </div>
+            
+            <div class="stat-card production">
+                <div class="stat-icon">☀️</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="total-production">-- kWh</div>
+                    <div class="stat-label">Zonne Productie</div>
+                </div>
+            </div>
+            
+            <div class="stat-card battery">
+                <div class="stat-icon">🔋</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="battery-cycles">-- kWh</div>
+                    <div class="stat-label">Batterij Cyclus</div>
+                </div>
+            </div>
+            
+            <div class="stat-card cost">
+                <div class="stat-icon">💰</div>
+                <div class="stat-content">
+                    <div class="stat-value" id="daily-cost">€--</div>
+                    <div class="stat-label">Totale Kosten</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Main Energy Flow Chart -->
+    <div class="chart-section">
+        <div class="main-chart-card">
+            <div class="chart-header">
+                <h2>⚡ Energie Flow Overzicht</h2>
+                <div class="chart-controls">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-weather" checked onchange="toggleWeatherOverlay()">
+                        🌤️ Weer Overlay
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-prices" checked onchange="togglePricesOverlay()">
+                        💰 Prijzen Overlay
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-predictions" onchange="togglePredictions()">
+                        🔮 Voorspellingen
+                    </label>
+                </div>
+            </div>
+            <div class="chart-container-large">
+                <canvas id="energyFlowChart" width="1200" height="400"></canvas>
+            </div>
+            <div class="chart-legend-extended">
+                <div class="legend-group">
+                    <h4>Energie</h4>
+                    <span class="legend-item">🟦 Verbruik</span>
+                    <span class="legend-item">🟨 Productie</span>
+                    <span class="legend-item">🟩 Batterij SoC</span>
+                    <span class="legend-item">🟪 Net Import/Export</span>
+                </div>
+                <div class="legend-group">
+                    <h4>Weer</h4>
+                    <span class="legend-item">☀️ Zonnestraling</span>
+                    <span class="legend-item">🌡️ Temperatuur</span>
+                    <span class="legend-item">☁️ Bewolking</span>
+                </div>
+                <div class="legend-group">
+                    <h4>Economisch</h4>
+                    <span class="legend-item">💰 Energieprijs</span>
+                    <span class="legend-item">💸 Kosten</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Detailed Charts Grid -->
+    <div class="charts-grid">
+        <!-- Battery Performance -->
+        <div class="chart-card">
+            <div class="chart-header">
+                <h3>🔋 Batterij Prestaties</h3>
+            </div>
+            <div class="chart-container">
+                <canvas id="batteryChart" width="500" height="300"></canvas>
+            </div>
+            <div class="battery-stats">
+                <div class="battery-stat">
+                    <span class="stat-name">Geladen:</span>
+                    <span class="stat-value" id="battery-charged">-- kWh</span>
+                </div>
+                <div class="battery-stat">
+                    <span class="stat-name">Ontladen:</span>
+                    <span class="stat-value" id="battery-discharged">-- kWh</span>
+                </div>
+                <div class="battery-stat">
+                    <span class="stat-name">Efficiency:</span>
+                    <span class="stat-value" id="battery-efficiency">--%</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Solar Performance -->
+        <div class="chart-card">
+            <div class="chart-header">
+                <h3>☀️ Zonnepaneel Prestaties</h3>
+            </div>
+            <div class="chart-container">
+                <canvas id="solarChart" width="500" height="300"></canvas>
+            </div>
+            <div class="solar-stats">
+                <div class="solar-stat">
+                    <span class="stat-name">Productie:</span>
+                    <span class="stat-value" id="solar-production">-- kWh</span>
+                </div>
+                <div class="solar-stat">
+                    <span class="stat-name">Peak Tijd:</span>
+                    <span class="stat-value" id="solar-peak-time">--:--</span>
+                </div>
+                <div class="solar-stat">
+                    <span class="stat-name">Efficiency:</span>
+                    <span class="stat-value" id="solar-efficiency">--%</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Weather Conditions -->
+        <div class="chart-card">
+            <div class="chart-header">
+                <h3>🌤️ Weersomstandigheden</h3>
+            </div>
+            <div class="chart-container">
+                <canvas id="weatherChart" width="500" height="300"></canvas>
+            </div>
+            <div class="weather-summary" id="weather-summary">
+                <div class="weather-item">
+                    <span class="weather-icon">☀️</span>
+                    <span class="weather-desc">Laden...</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Cost Analysis -->
+        <div class="chart-card">
+            <div class="chart-header">
+                <h3>💰 Kosten Analyse</h3>
+            </div>
+            <div class="chart-container">
+                <canvas id="costChart" width="500" height="300"></canvas>
+            </div>
+            <div class="cost-breakdown">
+                <div class="cost-item">
+                    <span class="cost-label">Inkoop:</span>
+                    <span class="cost-value" id="cost-import">€--</span>
+                </div>
+                <div class="cost-item">
+                    <span class="cost-label">Verkoop:</span>
+                    <span class="cost-value" id="cost-export">€--</span>
+                </div>
+                <div class="cost-item">
+                    <span class="cost-label">Netto:</span>
+                    <span class="cost-value" id="cost-net">€--</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Detailed Tables -->
+    <div class="tables-section">
+        <div class="table-tabs">
+            <button class="tab-btn active" onclick="showTable('hourly')">📊 Uurlijks Overzicht</button>
+            <button class="tab-btn" onclick="showTable('actions')">🎯 Optimalisatie Acties</button>
+            <button class="tab-btn" onclick="showTable('weather')">🌤️ Weer Details</button>
+            <button class="tab-btn" onclick="showTable('costs')">💰 Kosten Details</button>
+        </div>
+        
+        <div class="table-container">
+            <!-- Hourly Overview Table -->
+            <div id="table-hourly" class="data-table active">
+                <div class="table-header">
+                    <h3>📊 Uurlijks Energie Overzicht</h3>
+                    <button class="btn-export" onclick="exportTable('hourly')">📥 Export CSV</button>
+                </div>
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Tijd</th>
+                                <th>Verbruik<br><small>(kWh)</small></th>
+                                <th>Productie<br><small>(kWh)</small></th>
+                                <th>Batterij SoC<br><small>(%)</small></th>
+                                <th>Net Import<br><small>(kWh)</small></th>
+                                <th>Prijs<br><small>(€/kWh)</small></th>
+                                <th>Kosten<br><small>(€)</small></th>
+                                <th>Weer</th>
+                            </tr>
+                        </thead>
+                        <tbody id="hourly-table-body">
+                            <!-- Dynamically filled -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Actions Table -->
+            <div id="table-actions" class="data-table">
+                <div class="table-header">
+                    <h3>🎯 Optimalisatie Acties</h3>
+                    <button class="btn-export" onclick="exportTable('actions')">📥 Export CSV</button>
+                </div>
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Tijd</th>
+                                <th>Actie Type</th>
+                                <th>Target</th>
+                                <th>Werkelijk</th>
+                                <th>Verschil</th>
+                                <th>Reden</th>
+                                <th>Effect</th>
+                            </tr>
+                        </thead>
+                        <tbody id="actions-table-body">
+                            <!-- Dynamically filled -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Weather Details Table -->
+            <div id="table-weather" class="data-table">
+                <div class="table-header">
+                    <h3>🌤️ Weer Details</h3>
+                    <button class="btn-export" onclick="exportTable('weather')">📥 Export CSV</button>
+                </div>
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Tijd</th>
+                                <th>Temp<br><small>(°C)</small></th>
+                                <th>Zonnestraling<br><small>(W/m²)</small></th>
+                                <th>Bewolking<br><small>(%)</small></th>
+                                <th>Wind<br><small>(km/h)</small></th>
+                                <th>Neerslag<br><small>(mm)</small></th>
+                                <th>UV Index</th>
+                                <th>Omschrijving</th>
+                            </tr>
+                        </thead>
+                        <tbody id="weather-table-body">
+                            <!-- Dynamically filled -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Cost Details Table -->
+            <div id="table-costs" class="data-table">
+                <div class="table-header">
+                    <h3>💰 Kosten Details</h3>
+                    <button class="btn-export" onclick="exportTable('costs')">📥 Export CSV</button>
+                </div>
+                <div class="table-scroll">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Tijd</th>
+                                <th>Energie Prijs<br><small>(€/kWh)</small></th>
+                                <th>Inkoop<br><small>(kWh)</small></th>
+                                <th>Verkoop<br><small>(kWh)</small></th>
+                                <th>Inkoop Kosten<br><small>(€)</small></th>
+                                <th>Verkoop Opbrengst<br><small>(€)</small></th>
+                                <th>Belastingen<br><small>(€)</small></th>
+                                <th>Netto<br><small>(€)</small></th>
+                            </tr>
+                        </thead>
+                        <tbody id="costs-table-body">
+                            <!-- Dynamically filled -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Summary Cards -->
+    <div class="summary-section">
+        <div class="summary-card optimization">
+            <h3>🎯 Optimalisatie Samenvatting</h3>
+            <div class="optimization-metrics">
+                <div class="metric-row">
+                    <span class="metric-label">Acties Gepland:</span>
+                    <span class="metric-value" id="actions-planned">--</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Acties Uitgevoerd:</span>
+                    <span class="metric-value" id="actions-executed">--</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Gemiddelde Accuratesse:</span>
+                    <span class="metric-value" id="average-accuracy">--%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Geschatte Besparing:</span>
+                    <span class="metric-value savings" id="estimated-savings">€--</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="summary-card comparison">
+            <h3>📈 Vergelijking met Vorige Dag</h3>
+            <div class="comparison-metrics">
+                <div class="metric-row">
+                    <span class="metric-label">Verbruik:</span>
+                    <span class="metric-value" id="consumption-change">-- kWh</span>
+                    <span class="metric-trend" id="consumption-trend">📊</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Productie:</span>
+                    <span class="metric-value" id="production-change">-- kWh</span>
+                    <span class="metric-trend" id="production-trend">📊</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Kosten:</span>
+                    <span class="metric-value" id="cost-change">€--</span>
+                    <span class="metric-trend" id="cost-trend">📊</span>
+                </div>
+                <div class="metric-row">
+                    <span class="metric-label">Zelfvoorzienendheid:</span>
+                    <span class="metric-value" id="self-sufficiency">--%</span>
+                    <span class="metric-trend" id="sufficiency-trend">📊</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.daily-usage-container {
+    max-width: 1600px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.daily-header {
+    text-align: center;
+    margin-bottom: 30px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 30px;
+    border-radius: 15px;
+}
+
+.daily-header h1 {
+    margin: 0;
+    font-size: 2.5em;
+    font-weight: bold;
+}
+
+.subtitle {
+    margin: 10px 0 20px 0;
+    opacity: 0.9;
+    font-size: 1.1em;
+}
+
+.date-controls {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 15px;
+    margin: 20px 0;
+}
+
+.date-controls input[type="date"] {
+    padding: 8px 12px;
+    border: none;
+    border-radius: 6px;
+    font-size: 16px;
+    background: rgba(255,255,255,0.9);
+}
+
+.quick-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+    margin-top: 20px;
+}
+
+.stat-card {
+    background: rgba(255,255,255,0.15);
+    border-radius: 10px;
+    padding: 15px;
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    backdrop-filter: blur(10px);
+}
+
+.stat-icon {
+    font-size: 2em;
+    min-width: 50px;
+    text-align: center;
+}
+
+.stat-content {
+    flex: 1;
+}
+
+.stat-value {
+    font-size: 1.5em;
+    font-weight: bold;
+    margin-bottom: 5px;
+}
+
+.stat-label {
+    font-size: 0.9em;
+    opacity: 0.9;
+}
+
+.chart-section {
+    margin-bottom: 30px;
+}
+
+.main-chart-card {
+    background: white;
+    border-radius: 12px;
+    padding: 25px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+}
+
+.chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #f0f0f0;
+    flex-wrap: wrap;
+    gap: 15px;
+}
+
+.chart-controls {
+    display: flex;
+    gap: 15px;
+    flex-wrap: wrap;
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.9em;
+    cursor: pointer;
+}
+
+.checkbox-label input[type="checkbox"] {
+    margin: 0;
+}
+
+.chart-container-large {
+    position: relative;
+    height: 400px;
+    margin: 20px 0;
+}
+
+.chart-container {
+    position: relative;
+    height: 300px;
+    margin: 15px 0;
+}
+
+.chart-legend-extended {
+    display: flex;
+    justify-content: space-around;
+    margin-top: 15px;
+    flex-wrap: wrap;
+    gap: 20px;
+}
+
+.legend-group {
+    text-align: center;
+}
+
+.legend-group h4 {
+    margin: 0 0 8px 0;
+    color: #333;
+    font-size: 0.9em;
+}
+
+.legend-item {
+    display: block;
+    font-size: 0.8em;
+    margin: 3px 0;
+}
+
+.charts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+    gap: 25px;
+    margin-bottom: 30px;
+}
+
+.chart-card {
+    background: white;
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+}
+
+.chart-card h3 {
+    margin: 0 0 15px 0;
+    color: #333;
+    font-size: 1.2em;
+    border-bottom: 2px solid #f0f0f0;
+    padding-bottom: 8px;
+}
+
+.battery-stats, .solar-stats, .cost-breakdown {
+    display: flex;
+    justify-content: space-around;
+    margin-top: 15px;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.battery-stat, .solar-stat, .cost-item {
+    text-align: center;
+    font-size: 0.9em;
+}
+
+.stat-name, .cost-label {
+    display: block;
+    color: #666;
+    margin-bottom: 3px;
+}
+
+.stat-value, .cost-value {
+    font-weight: bold;
+    color: #333;
+}
+
+.weather-summary {
+    text-align: center;
+    padding: 15px;
+}
+
+.weather-item {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    font-size: 1.1em;
+}
+
+.weather-icon {
+    font-size: 1.5em;
+}
+
+.tables-section {
+    margin-bottom: 30px;
+}
+
+.table-tabs {
+    display: flex;
+    gap: 5px;
+    margin-bottom: 20px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.tab-btn {
+    padding: 10px 20px;
+    border: none;
+    background: #f8f9fa;
+    color: #666;
+    cursor: pointer;
+    border-radius: 20px;
+    transition: all 0.2s;
+}
+
+.tab-btn.active, .tab-btn:hover {
+    background: #2196F3;
+    color: white;
+}
+
+.table-container {
+    background: white;
+    border-radius: 12px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    overflow: hidden;
+}
+
+.table-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px;
+    background: #f8f9fa;
+    border-bottom: 1px solid #e0e0e0;
+}
+
+.table-header h3 {
+    margin: 0;
+    color: #333;
+}
+
+.btn-export {
+    background: #4CAF50;
+    color: white;
+    border: none;
+    padding: 8px 15px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.btn-export:hover {
+    background: #45a049;
+}
+
+.data-table {
+    display: none;
+}
+
+.data-table.active {
+    display: block;
+}
+
+.table-scroll {
+    overflow-x: auto;
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+.data-table table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 800px;
+}
+
+.data-table th {
+    background: #f8f9fa;
+    padding: 12px 8px;
+    text-align: left;
+    font-weight: bold;
+    color: #333;
+    border-bottom: 2px solid #e0e0e0;
+    position: sticky;
+    top: 0;
+    font-size: 0.9em;
+}
+
+.data-table td {
+    padding: 10px 8px;
+    border-bottom: 1px solid #f0f0f0;
+    font-size: 0.9em;
+}
+
+.data-table tr:hover {
+    background: #f8f9fa;
+}
+
+.summary-section {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 25px;
+}
+
+.summary-card {
+    background: white;
+    border-radius: 12px;
+    padding: 25px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+}
+
+.summary-card h3 {
+    margin: 0 0 20px 0;
+    color: #333;
+    border-bottom: 2px solid #f0f0f0;
+    padding-bottom: 10px;
+}
+
+.optimization-metrics, .comparison-metrics {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.metric-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+}
+
+.metric-label {
+    color: #666;
+    flex: 1;
+}
+
+.metric-value {
+    font-weight: bold;
+    color: #333;
+    min-width: 80px;
+    text-align: right;
+}
+
+.metric-value.savings {
+    color: #4CAF50;
+}
+
+.metric-trend {
+    margin-left: 10px;
+    min-width: 25px;
+    text-align: center;
+}
+
+.btn-secondary {
+    background: #6c757d;
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.btn-secondary:hover {
+    background: #5a6268;
+}
+
+@media (max-width: 768px) {
+    .charts-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .quick-stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+    
+    .chart-header {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    
+    .legend-group {
+        min-width: 150px;
+    }
+    
+    .date-controls {
+        flex-direction: column;
+        gap: 10px;
+    }
+    
+    .table-header {
+        flex-direction: column;
+        gap: 10px;
+        align-items: flex-start;
+    }
+}
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+let energyFlowChart, batteryChart, solarChart, weatherChart, costChart;
+let currentDate = new Date();
+let chartData = {};
+
+// Initialize page
+document.addEventListener('DOMContentLoaded', function() {
+    initializeCharts();
+    loadToday();
+    
+    // Set today's date
+    document.getElementById('selected-date').value = formatDate(currentDate);
+});
+
+function initializeCharts() {
+    // Main Energy Flow Chart
+    const energyFlowCtx = document.getElementById('energyFlowChart').getContext('2d');
+    energyFlowChart = new Chart(energyFlowCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Verbruik (kWh)',
+                    data: [],
+                    borderColor: '#2196F3',
+                    backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                    tension: 0.4,
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Productie (kWh)',
+                    data: [],
+                    borderColor: '#FFC107',
+                    backgroundColor: 'rgba(255, 193, 7, 0.1)',
+                    tension: 0.4,
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Batterij SoC (%)',
+                    data: [],
+                    borderColor: '#4CAF50',
+                    backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                    tension: 0.4,
+                    yAxisID: 'y1'
+                },
+                {
+                    label: 'Net Import (kWh)',
+                    data: [],
+                    borderColor: '#9C27B0',
+                    backgroundColor: 'rgba(156, 39, 176, 0.1)',
+                    tension: 0.4,
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Zonnestraling (W/m²)',
+                    data: [],
+                    borderColor: '#FF9800',
+                    backgroundColor: 'rgba(255, 152, 0, 0.1)',
+                    tension: 0.4,
+                    yAxisID: 'y2',
+                    hidden: false
+                },
+                {
+                    label: 'Energieprijs (ct/kWh)',
+                    data: [],
+                    borderColor: '#f44336',
+                    backgroundColor: 'rgba(244, 67, 54, 0.1)',
+                    tension: 0.4,
+                    yAxisID: 'y3',
+                    hidden: false
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                intersect: false,
+                mode: 'index'
+            },
+            scales: {
+                x: {
+                    title: {
+                        display: true,
+                        text: 'Tijd'
+                    }
+                },
+                y: {
+                    type: 'linear',
+                    display: true,
+                    position: 'left',
+                    title: {
+                        display: true,
+                        text: 'Energie (kWh)'
+                    }
+                },
+                y1: {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: 'Batterij SoC (%)'
+                    },
+                    grid: {
+                        drawOnChartArea: false,
+                    },
+                    min: 0,
+                    max: 100
+                },
+                y2: {
+                    type: 'linear',
+                    display: false,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: 'Zonnestraling (W/m²)'
+                    },
+                    grid: {
+                        drawOnChartArea: false,
+                    }
+                },
+                y3: {
+                    type: 'linear',
+                    display: false,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: 'Prijs (ct/kWh)'
+                    },
+                    grid: {
+                        drawOnChartArea: false,
+                    }
+                }
+            },
+            plugins: {
+                legend: {
+                    display: false
+                },
+                tooltip: {
+                    callbacks: {
+                        afterLabel: function(context) {
+                            const datasetLabel = context.dataset.label;
+                            if (datasetLabel.includes('Prijs')) {
+                                return 'Werkelijke prijs: €' + (context.parsed.y / 100).toFixed(3) + '/kWh';
+                            }
+                            return '';
+                        }
+                    }
+                }
+            }
+        }
+    });
+    
+    // Battery Chart
+    const batteryCtx = document.getElementById('batteryChart').getContext('2d');
+    batteryChart = new Chart(batteryCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'SoC (%)',
+                    data: [],
+                    borderColor: '#4CAF50',
+                    backgroundColor: 'rgba(76, 175, 80, 0.2)',
+                    tension: 0.4,
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Vermogen (kW)',
+                    data: [],
+                    borderColor: '#2196F3',
+                    backgroundColor: 'rgba(33, 150, 243, 0.2)',
+                    tension: 0.4,
+                    yAxisID: 'y1'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    title: {
+                        display: true,
+                        text: 'SoC (%)'
+                    }
+                },
+                y1: {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: 'Vermogen (kW)'
+                    },
+                    grid: {
+                        drawOnChartArea: false,
+                    }
+                }
+            }
+        }
+    });
+    
+    // Solar Chart
+    const solarCtx = document.getElementById('solarChart').getContext('2d');
+    solarChart = new Chart(solarCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Productie (kWh)',
+                    data: [],
+                    borderColor: '#FFC107',
+                    backgroundColor: 'rgba(255, 193, 7, 0.3)',
+                    fill: true,
+                    tension: 0.4
+                },
+                {
+                    label: 'Theoretisch Max (kWh)',
+                    data: [],
+                    borderColor: '#FF9800',
+                    backgroundColor: 'rgba(255, 152, 0, 0.1)',
+                    borderDash: [5, 5],
+                    tension: 0.4
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    title: {
+                        display: true,
+                        text: 'Productie (kWh)'
+                    }
+                }
+            }
+        }
+    });
+    
+    // Weather Chart
+    const weatherCtx = document.getElementById('weatherChart').getContext('2d');
+    weatherChart = new Chart(weatherCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Temperatuur (°C)',
+                    data: [],
+                    borderColor: '#f44336',
+                    backgroundColor: 'rgba(244, 67, 54, 0.1)',
+                    tension: 0.4,
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Zonnestraling (W/m²)',
+                    data: [],
+                    borderColor: '#FF9800',
+                    backgroundColor: 'rgba(255, 152, 0, 0.2)',
+                    tension: 0.4,
+                    yAxisID: 'y1',
+                    fill: true
+                },
+                {
+                    label: 'Bewolking (%)',
+                    data: [],
+                    borderColor: '#607D8B',
+                    backgroundColor: 'rgba(96, 125, 139, 0.1)',
+                    tension: 0.4,
+                    yAxisID: 'y2'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    title: {
+                        display: true,
+                        text: 'Temperatuur (°C)'
+                    }
+                },
+                y1: {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: 'Zonnestraling (W/m²)'
+                    },
+                    grid: {
+                        drawOnChartArea: false,
+                    }
+                },
+                y2: {
+                    type: 'linear',
+                    display: false,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: 'Bewolking (%)'
+                    },
+                    min: 0,
+                    max: 100
+                }
+            }
+        }
+    });
+    
+    // Cost Chart
+    const costCtx = document.getElementById('costChart').getContext('2d');
+    costChart = new Chart(costCtx, {
+        type: 'bar',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Inkoop (€)',
+                    data: [],
+                    backgroundColor: '#f44336',
+                    borderColor: '#d32f2f',
+                    borderWidth: 1
+                },
+                {
+                    label: 'Verkoop (€)',
+                    data: [],
+                    backgroundColor: '#4CAF50',
+                    borderColor: '#388E3C',
+                    borderWidth: 1
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    title: {
+                        display: true,
+                        text: 'Kosten/Opbrengst (€)'
+                    }
+                }
+            }
+        }
+    });
+}
+
+function loadToday() {
+    currentDate = new Date();
+    document.getElementById('selected-date').value = formatDate(currentDate);
+    loadData(formatDate(currentDate));
+}
+
+function loadYesterday() {
+    currentDate.setDate(currentDate.getDate() - 1);
+    document.getElementById('selected-date').value = formatDate(currentDate);
+    loadData(formatDate(currentDate));
+}
+
+function loadSelectedDate() {
+    const selectedDateStr = document.getElementById('selected-date').value;
+    currentDate = new Date(selectedDateStr + 'T12:00:00');
+    loadData(selectedDateStr);
+}
+
+function loadData(dateStr) {
+    console.log('Loading data for date:', dateStr);
+    
+    // Load daily usage data
+    fetch(`api/daily-usage/${dateStr}`)
+        .then(response => response.json())
+        .then(data => {
+            updateCharts(data);
+            updateStats(data);
+            updateTables(data);
+            updateSummary(data);
+        })
+        .catch(error => {
+            console.error('Error loading daily data:', error);
+            loadMockData(dateStr);
+        });
+}
+
+function loadMockData(dateStr) {
+    // Generate mock data for demonstration
+    const hours = [];
+    const consumption = [];
+    const production = [];
+    const batterySoC = [];
+    const netImport = [];
+    const solarRadiation = [];
+    const energyPrice = [];
+    const temperature = [];
+    const cloudCover = [];
+    
+    for (let i = 0; i < 24; i++) {
+        hours.push(i.toString().padStart(2, '0') + ':00');
+        
+        // Mock consumption - higher during day and evening
+        const baseConsumption = 1.2 + Math.sin((i - 6) * Math.PI / 12) * 0.5;
+        consumption.push(Math.max(0.3, baseConsumption + (Math.random() - 0.5) * 0.3));
+        
+        // Mock solar production - peak around noon
+        const solarHours = Math.max(0, Math.sin((i - 6) * Math.PI / 12));
+        const cloudFactor = 0.7 + Math.random() * 0.3;
+        production.push(solarHours * 4.5 * cloudFactor);
+        
+        // Mock battery SoC
+        batterySoC.push(30 + Math.sin(i * Math.PI / 12) * 40 + Math.random() * 10);
+        
+        // Mock net import
+        netImport.push(consumption[i] - production[i] + (Math.random() - 0.5) * 0.2);
+        
+        // Mock solar radiation
+        solarRadiation.push(solarHours * 800 * cloudFactor);
+        
+        // Mock energy price (in ct/kWh)
+        energyPrice.push(15 + Math.sin((i - 3) * Math.PI / 12) * 10 + Math.random() * 5);
+        
+        // Mock temperature
+        temperature.push(18 + Math.sin((i - 6) * Math.PI / 12) * 8 + Math.random() * 2);
+        
+        // Mock cloud cover
+        cloudCover.push((1 - cloudFactor) * 100);
+    }
+    
+    const mockData = {
+        date: dateStr,
+        hourly_data: hours.map((hour, i) => ({
+            time: hour,
+            consumption: consumption[i],
+            production: production[i],
+            battery_soc: batterySoC[i],
+            net_import: netImport[i],
+            solar_radiation: solarRadiation[i],
+            energy_price: energyPrice[i],
+            temperature: temperature[i],
+            cloud_cover: cloudCover[i],
+            cost: netImport[i] * energyPrice[i] / 100
+        })),
+        summary: {
+            total_consumption: consumption.reduce((a, b) => a + b, 0).toFixed(1),
+            total_production: production.reduce((a, b) => a + b, 0).toFixed(1),
+            battery_cycles: 15.2,
+            daily_cost: (netImport.reduce((a, b) => a + b, 0) * 0.20).toFixed(2),
+            actions_planned: 18,
+            actions_executed: 16,
+            average_accuracy: 94,
+            estimated_savings: 3.45
+        }
+    };
+    
+    updateCharts(mockData);
+    updateStats(mockData);
+    updateTables(mockData);
+    updateSummary(mockData);
+}
+
+function updateCharts(data) {
+    const hourlyData = data.hourly_data || [];
+    const labels = hourlyData.map(item => item.time);
+    
+    // Update main energy flow chart
+    energyFlowChart.data.labels = labels;
+    energyFlowChart.data.datasets[0].data = hourlyData.map(item => item.consumption);
+    energyFlowChart.data.datasets[1].data = hourlyData.map(item => item.production);
+    energyFlowChart.data.datasets[2].data = hourlyData.map(item => item.battery_soc);
+    energyFlowChart.data.datasets[3].data = hourlyData.map(item => item.net_import);
+    energyFlowChart.data.datasets[4].data = hourlyData.map(item => item.solar_radiation);
+    energyFlowChart.data.datasets[5].data = hourlyData.map(item => item.energy_price);
+    energyFlowChart.update();
+    
+    // Update battery chart
+    batteryChart.data.labels = labels;
+    batteryChart.data.datasets[0].data = hourlyData.map(item => item.battery_soc);
+    batteryChart.data.datasets[1].data = hourlyData.map(item => (item.battery_power || 0));
+    batteryChart.update();
+    
+    // Update solar chart
+    solarChart.data.labels = labels;
+    solarChart.data.datasets[0].data = hourlyData.map(item => item.production);
+    solarChart.data.datasets[1].data = hourlyData.map(item => (item.theoretical_max || item.production * 1.2));
+    solarChart.update();
+    
+    // Update weather chart
+    weatherChart.data.labels = labels;
+    weatherChart.data.datasets[0].data = hourlyData.map(item => item.temperature);
+    weatherChart.data.datasets[1].data = hourlyData.map(item => item.solar_radiation);
+    weatherChart.data.datasets[2].data = hourlyData.map(item => item.cloud_cover);
+    weatherChart.update();
+    
+    // Update cost chart
+    costChart.data.labels = labels;
+    costChart.data.datasets[0].data = hourlyData.map(item => Math.max(0, item.cost || 0));
+    costChart.data.datasets[1].data = hourlyData.map(item => Math.min(0, item.cost || 0));
+    costChart.update();
+}
+
+function updateStats(data) {
+    const summary = data.summary || {};
+    
+    document.getElementById('total-consumption').textContent = summary.total_consumption + ' kWh';
+    document.getElementById('total-production').textContent = summary.total_production + ' kWh';
+    document.getElementById('battery-cycles').textContent = summary.battery_cycles + ' kWh';
+    document.getElementById('daily-cost').textContent = '€' + summary.daily_cost;
+    
+    // Battery stats
+    document.getElementById('battery-charged').textContent = (summary.battery_cycles * 0.6).toFixed(1) + ' kWh';
+    document.getElementById('battery-discharged').textContent = (summary.battery_cycles * 0.4).toFixed(1) + ' kWh';
+    document.getElementById('battery-efficiency').textContent = '94%';
+    
+    // Solar stats
+    document.getElementById('solar-production').textContent = summary.total_production + ' kWh';
+    document.getElementById('solar-peak-time').textContent = '13:30';
+    document.getElementById('solar-efficiency').textContent = '87%';
+    
+    // Cost breakdown
+    const totalCost = parseFloat(summary.daily_cost);
+    document.getElementById('cost-import').textContent = '€' + (totalCost * 1.2).toFixed(2);
+    document.getElementById('cost-export').textContent = '€' + (-totalCost * 0.2).toFixed(2);
+    document.getElementById('cost-net').textContent = '€' + summary.daily_cost;
+}
+
+function updateTables(data) {
+    const hourlyData = data.hourly_data || [];
+    
+    // Update hourly table
+    const hourlyTableBody = document.getElementById('hourly-table-body');
+    hourlyTableBody.innerHTML = hourlyData.map(item => `
+        <tr>
+            <td>${item.time}</td>
+            <td>${item.consumption.toFixed(2)}</td>
+            <td>${item.production.toFixed(2)}</td>
+            <td>${item.battery_soc.toFixed(1)}%</td>
+            <td>${item.net_import.toFixed(2)}</td>
+            <td>€${(item.energy_price / 100).toFixed(3)}</td>
+            <td>€${(item.cost || 0).toFixed(2)}</td>
+            <td>${getWeatherIcon(item.cloud_cover)} ${item.temperature.toFixed(1)}°C</td>
+        </tr>
+    `).join('');
+    
+    // Mock actions table
+    const actionsTableBody = document.getElementById('actions-table-body');
+    actionsTableBody.innerHTML = hourlyData.slice(0, 10).map((item, i) => `
+        <tr>
+            <td>${item.time}</td>
+            <td>${['Batterij Laden', 'Batterij Ontladen', 'Standby'][i % 3]}</td>
+            <td>${(item.battery_soc + 5).toFixed(1)}%</td>
+            <td>${item.battery_soc.toFixed(1)}%</td>
+            <td>${(Math.random() * 5 - 2.5).toFixed(1)}%</td>
+            <td>${['Lage prijs', 'Hoge prijs', 'Optimaal'][i % 3]}</td>
+            <td>€${(Math.random() * 0.5).toFixed(2)}</td>
+        </tr>
+    `).join('');
+    
+    // Weather details table
+    const weatherTableBody = document.getElementById('weather-table-body');
+    weatherTableBody.innerHTML = hourlyData.map(item => `
+        <tr>
+            <td>${item.time}</td>
+            <td>${item.temperature.toFixed(1)}</td>
+            <td>${item.solar_radiation.toFixed(0)}</td>
+            <td>${item.cloud_cover.toFixed(0)}</td>
+            <td>${(Math.random() * 20 + 5).toFixed(1)}</td>
+            <td>${(Math.random() * 2).toFixed(1)}</td>
+            <td>${Math.floor(item.solar_radiation / 100)}</td>
+            <td>${getWeatherDescription(item.cloud_cover)}</td>
+        </tr>
+    `).join('');
+    
+    // Costs table
+    const costsTableBody = document.getElementById('costs-table-body');
+    costsTableBody.innerHTML = hourlyData.map(item => `
+        <tr>
+            <td>${item.time}</td>
+            <td>€${(item.energy_price / 100).toFixed(3)}</td>
+            <td>${Math.max(0, item.net_import).toFixed(2)}</td>
+            <td>${Math.max(0, -item.net_import).toFixed(2)}</td>
+            <td>€${(Math.max(0, item.net_import) * item.energy_price / 100).toFixed(2)}</td>
+            <td>€${(Math.max(0, -item.net_import) * item.energy_price / 100 * 0.7).toFixed(2)}</td>
+            <td>€${(Math.max(0, item.net_import) * 0.10154).toFixed(2)}</td>
+            <td>€${(item.cost || 0).toFixed(2)}</td>
+        </tr>
+    `).join('');
+}
+
+function updateSummary(data) {
+    const summary = data.summary || {};
+    
+    // Optimization summary
+    document.getElementById('actions-planned').textContent = summary.actions_planned || '--';
+    document.getElementById('actions-executed').textContent = summary.actions_executed || '--';
+    document.getElementById('average-accuracy').textContent = summary.average_accuracy + '%' || '--%';
+    document.getElementById('estimated-savings').textContent = '€' + summary.estimated_savings || '€--';
+    
+    // Comparison with previous day (mock data)
+    document.getElementById('consumption-change').textContent = '+2.1 kWh';
+    document.getElementById('consumption-trend').textContent = '📈';
+    document.getElementById('production-change').textContent = '-1.5 kWh';
+    document.getElementById('production-trend').textContent = '📉';
+    document.getElementById('cost-change').textContent = '-€0.85';
+    document.getElementById('cost-trend').textContent = '📉';
+    document.getElementById('self-sufficiency').textContent = '73%';
+    document.getElementById('sufficiency-trend').textContent = '📈';
+    
+    // Update weather summary
+    document.getElementById('weather-summary').innerHTML = `
+        <div class="weather-item">
+            <span class="weather-icon">⛅</span>
+            <span class="weather-desc">Wisselend bewolkt, 19°C gemiddeld</span>
+        </div>
+    `;
+}
+
+function toggleWeatherOverlay() {
+    const checked = document.getElementById('show-weather').checked;
+    energyFlowChart.data.datasets[4].hidden = !checked;
+    energyFlowChart.options.scales.y2.display = checked;
+    energyFlowChart.update();
+}
+
+function togglePricesOverlay() {
+    const checked = document.getElementById('show-prices').checked;
+    energyFlowChart.data.datasets[5].hidden = !checked;
+    energyFlowChart.options.scales.y3.display = checked;
+    energyFlowChart.update();
+}
+
+function togglePredictions() {
+    const checked = document.getElementById('show-predictions').checked;
+    // Add prediction datasets when implemented
+    console.log('Predictions toggle:', checked);
+}
+
+function showTable(tableName) {
+    // Hide all tables
+    document.querySelectorAll('.data-table').forEach(table => {
+        table.classList.remove('active');
+    });
+    
+    // Remove active class from all tabs
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+    });
+    
+    // Show selected table
+    document.getElementById('table-' + tableName).classList.add('active');
+    
+    // Activate corresponding tab
+    event.target.classList.add('active');
+}
+
+function exportTable(tableType) {
+    // Mock CSV export
+    const filename = `daily-${tableType}-${formatDate(currentDate)}.csv`;
+    let csvContent = "data:text/csv;charset=utf-8,";
+    
+    switch(tableType) {
+        case 'hourly':
+            csvContent += "Tijd,Verbruik(kWh),Productie(kWh),Batterij SoC(%),Net Import(kWh),Prijs(€/kWh),Kosten(€),Weer\n";
+            break;
+        case 'actions':
+            csvContent += "Tijd,Actie Type,Target,Werkelijk,Verschil,Reden,Effect\n";
+            break;
+        case 'weather':
+            csvContent += "Tijd,Temp(°C),Zonnestraling(W/m²),Bewolking(%),Wind(km/h),Neerslag(mm),UV Index,Omschrijving\n";
+            break;
+        case 'costs':
+            csvContent += "Tijd,Energie Prijs(€/kWh),Inkoop(kWh),Verkoop(kWh),Inkoop Kosten(€),Verkoop Opbrengst(€),Belastingen(€),Netto(€)\n";
+            break;
+    }
+    
+    // Add some sample data
+    csvContent += "00:00,1.2,0.0,45.2,1.2,0.18,0.22,☀️ 15°C\n";
+    csvContent += "01:00,1.1,0.0,43.1,1.1,0.17,0.19,⛅ 14°C\n";
+    
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    
+    showNotification(`${tableType} data geëxporteerd!`, 'success');
+}
+
+function getWeatherIcon(cloudCover) {
+    if (cloudCover < 25) return '☀️';
+    if (cloudCover < 50) return '⛅';
+    if (cloudCover < 75) return '☁️';
+    return '☁️';
+}
+
+function getWeatherDescription(cloudCover) {
+    if (cloudCover < 25) return 'Helder';
+    if (cloudCover < 50) return 'Licht bewolkt';
+    if (cloudCover < 75) return 'Bewolkt';
+    return 'Zwaar bewolkt';
+}
+
+function formatDate(date) {
+    return date.toISOString().split('T')[0];
+}
+
+function showNotification(message, type) {
+    // Simple notification system
+    const notification = document.createElement('div');
+    notification.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 15px 25px;
+        background: ${type === 'success' ? '#4CAF50' : '#f44336'};
+        color: white;
+        border-radius: 5px;
+        z-index: 1000;
+        font-size: 14px;
+    `;
+    notification.textContent = message;
+    
+    document.body.appendChild(notification);
+    
+    setTimeout(() => {
+        notification.remove();
+    }, 3000);
+}
+</script>
+{% endblock %}

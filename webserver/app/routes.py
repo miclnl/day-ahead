@@ -360,8 +360,8 @@ def menu():
     
     # Check if we're behind Home Assistant ingress proxy
     if ingress_path or forwarded_for:
-        logging.info("ROOT ROUTE DEBUG: Using ingress-compatible redirect to /dashboard")
-        return redirect('/dashboard')
+        logging.info("ROOT ROUTE DEBUG: Using ingress-compatible redirect to dashboard (relative)")
+        return redirect('dashboard')  # Relative redirect without leading slash
     else:
         logging.info("ROOT ROUTE DEBUG: Using Flask url_for redirect")
         from flask import url_for
@@ -1072,7 +1072,8 @@ def run_modern():
     )
 
 @app.route("/reports", methods=["POST", "GET"])
-def reports(active_menu: str):
+def reports():
+    active_menu = "reports"  # Set default active menu
     report = get_safe_report()
     if report is None:
         return {"error": "Could not initialize reporting system"}, 500
@@ -1658,7 +1659,7 @@ def not_found_error(error):
         return {"error": "Not found", "path": request.path}, 404
     # Otherwise redirect to dashboard with ingress awareness
     if request.headers.get('X-Ingress-Path') or request.headers.get('X-Forwarded-For'):
-        return redirect('/dashboard')
+        return redirect('dashboard')  # Relative redirect without leading slash
     else:
         from flask import url_for
         return redirect(url_for('dashboard'))
@@ -1705,3 +1706,90 @@ def system_status():
             "homeassistant": {"online": False},
             "system": {"error": str(e)}
         }
+
+@app.route("/daily-usage", methods=["GET"])
+def daily_usage():
+    """Daily energy usage with detailed charts and analysis"""
+    import datetime
+    from datetime import timedelta
+    
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    return render_template(
+        "daily-usage.html",
+        title="Dagelijks Energiegebruik",
+        active_menu="daily-usage",
+        today=today,
+        datetime=datetime.datetime,
+        timedelta=timedelta
+    )
+
+@app.route("/api/daily-usage/<date_str>", methods=["GET"])
+def api_daily_usage(date_str):
+    """API endpoint for daily usage data"""
+    try:
+        # Parse date
+        from datetime import datetime, timedelta
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        
+        # Mock data for now - replace with real data from Report class
+        import json
+        import math
+        
+        hours = []
+        hourly_data = []
+        
+        for i in range(24):
+            hour_str = f"{i:02d}:00"
+            hours.append(hour_str)
+            
+            # Mock realistic data patterns
+            base_consumption = 1.2 + math.sin((i - 6) * math.pi / 12) * 0.5
+            consumption = max(0.3, base_consumption + (hash(f"{date_str}-{i}") % 100 - 50) / 1000)
+            
+            solar_hours = max(0, math.sin((i - 6) * math.pi / 12))
+            cloud_factor = 0.7 + (hash(f"{date_str}-cloud-{i}") % 30) / 100
+            production = solar_hours * 4.5 * cloud_factor
+            
+            battery_soc = 30 + math.sin(i * math.pi / 12) * 40 + (hash(f"{date_str}-bat-{i}") % 20 - 10)
+            net_import = consumption - production + (hash(f"{date_str}-net-{i}") % 40 - 20) / 100
+            
+            solar_radiation = solar_hours * 800 * cloud_factor
+            energy_price = 15 + math.sin((i - 3) * math.pi / 12) * 10 + (hash(f"{date_str}-price-{i}") % 10)
+            temperature = 18 + math.sin((i - 6) * math.pi / 12) * 8 + (hash(f"{date_str}-temp-{i}") % 4)
+            cloud_cover = (1 - cloud_factor) * 100
+            
+            hourly_data.append({
+                "time": hour_str,
+                "consumption": round(consumption, 2),
+                "production": round(production, 2),
+                "battery_soc": round(battery_soc, 1),
+                "net_import": round(net_import, 2),
+                "solar_radiation": round(solar_radiation, 0),
+                "energy_price": round(energy_price, 1),
+                "temperature": round(temperature, 1),
+                "cloud_cover": round(cloud_cover, 0),
+                "cost": round(net_import * energy_price / 100, 2)
+            })
+        
+        total_consumption = sum(item["consumption"] for item in hourly_data)
+        total_production = sum(item["production"] for item in hourly_data)
+        daily_cost = sum(item["cost"] for item in hourly_data)
+        
+        return {
+            "date": date_str,
+            "hourly_data": hourly_data,
+            "summary": {
+                "total_consumption": round(total_consumption, 1),
+                "total_production": round(total_production, 1),
+                "battery_cycles": round(total_consumption * 0.6, 1),
+                "daily_cost": round(daily_cost, 2),
+                "actions_planned": 18,
+                "actions_executed": 16,
+                "average_accuracy": 94,
+                "estimated_savings": round(daily_cost * 0.15, 2)
+            }
+        }
+        
+    except Exception as e:
+        logging.error(f"Daily usage API error: {e}")
+        return {"error": str(e)}, 500

@@ -12,43 +12,54 @@
             <h2>⚡ Optimalisatie</h2>
             <div class="operations-grid">
                 <div class="operation-card optimization" data-operation="calc_met_debug">
-                    <div class="operation-icon">🔍</div>
-                    <h3>Debug Optimalisatie</h3>
-                    <p>Voer een volledige optimalisatie uit met uitgebreide debug informatie</p>
+                    <div class="operation-icon">🧠</div>
+                    <h3>Statistical Intelligence (Debug)</h3>
+                    <p>Voer volledige statistische optimalisatie uit met uitgebreide analyse en debug informatie</p>
                     <div class="operation-meta">
                         <span class="time-estimate">⏱️ ~2-5 min</span>
                         <span class="complexity high">🔥 Hoog</span>
                     </div>
-                    <button class="run-btn" onclick="runOperation('calc_met_debug')">🚀 Starten</button>
+                    <button class="run-btn" onclick="runOperation('calc_met_debug')">🧠 Analyseren</button>
                 </div>
                 
                 <div class="operation-card optimization" data-operation="calc_zonder_debug">
                     <div class="operation-icon">⚡</div>
-                    <h3>Snelle Optimalisatie</h3>
-                    <p>Voer optimalisatie uit zonder debug output voor snelle resultaten</p>
+                    <h3>Snelle Statistical Intelligence</h3>
+                    <p>Voer statistische optimalisatie uit zonder debug output voor snelle resultaten</p>
                     <div class="operation-meta">
                         <span class="time-estimate">⏱️ ~30-60 sec</span>
                         <span class="complexity medium">🟡 Gemiddeld</span>
                     </div>
-                    <button class="run-btn" onclick="runOperation('calc_zonder_debug')">⚡ Starten</button>
+                    <button class="run-btn" onclick="runOperation('calc_zonder_debug')">⚡ Optimaliseren</button>
                 </div>
                 
                 <div class="operation-card calculation" data-operation="calc_baseloads">
                     <div class="operation-icon">📊</div>
-                    <h3>Baseload Berekening</h3>
-                    <p>Bereken de baseloads op basis van historische verbruiksdata</p>
+                    <h3>Baseload Analyse</h3>
+                    <p>Analyseer baseloads gebaseerd op historische verbruikspatronen en statistieken</p>
                     <div class="operation-meta">
                         <span class="time-estimate">⏱️ ~10-30 sec</span>
                         <span class="complexity low">🟢 Laag</span>
                     </div>
-                    <button class="run-btn" onclick="runOperation('calc_baseloads')">📊 Starten</button>
+                    <button class="run-btn" onclick="runOperation('calc_baseloads')">📊 Analyseren</button>
+                </div>
+                
+                <div class="operation-card calculation" data-operation="schedule_actions">
+                    <div class="operation-icon">📅</div>
+                    <h3>Acties Plannen</h3>
+                    <p>Plan batterij- en apparaat acties op basis van statistische voorspellingen</p>
+                    <div class="operation-meta">
+                        <span class="time-estimate">⏱️ ~15-45 sec</span>
+                        <span class="complexity medium">🟡 Gemiddeld</span>
+                    </div>
+                    <button class="run-btn" onclick="runOperation('schedule_actions')">📅 Plannen</button>
                 </div>
             </div>
         </div>
 
-        <!-- Data Operaties -->
+        <!-- Data & Analyse Operaties -->
         <div class="category-card">
-            <h2>📡 Data Ophalen</h2>
+            <h2>📡 Data & Analyses</h2>
             <div class="operations-grid">
                 <div class="operation-card data-fetch" data-operation="get_prices">
                     <div class="operation-icon">💰</div>
@@ -75,13 +86,13 @@
                 
                 <div class="operation-card data-fetch" data-operation="get_meteo">
                     <div class="operation-icon">🌤️</div>
-                    <h3>Weer Prognoses</h3>
-                    <p>Download actuele weerprognoses voor zonnestraling en temperatuur</p>
+                    <h3>Weather Analyse</h3>
+                    <p>Download en analyseer weerprognoses voor statistische zonneproductie voorspelling</p>
                     <div class="operation-meta">
                         <span class="time-estimate">⏱️ ~5-10 sec</span>
                         <span class="complexity low">🟢 Laag</span>
                     </div>
-                    <button class="run-btn" onclick="runOperation('get_meteo')">🌤️ Ophalen</button>
+                    <button class="run-btn" onclick="runOperation('get_meteo')">🌤️ Analyseren</button>
                 </div>
                 
                 <div class="operation-card data-fetch" data-operation="get_tibber">
@@ -784,7 +795,7 @@ function startOperation(operationId, params = {}) {
         formData.append(key, params[key]);
     });
     
-    fetch(`/api/run/${operationId}`, {
+    fetch(`api/run/${operationId}`, {
         method: 'POST',
         body: formData
     })
@@ -875,7 +886,7 @@ function downloadLog() {
 // Quick action functions
 function emergencyStop() {
     if (confirm('⚠️ Weet je zeker dat je alle operaties wilt stoppen?')) {
-        fetch('/api/emergency-stop', { method: 'POST' })
+        fetch('api/emergency-stop', { method: 'POST' })
         .then(response => response.json())
         .then(data => {
             alert(data.success ? '✅ Noodstop uitgevoerd' : '❌ Fout: ' + data.error);
@@ -890,7 +901,7 @@ function getSystemStatus() {
 
 function restartScheduler() {
     if (confirm('🔄 Scheduler herstarten?')) {
-        fetch('/api/restart-scheduler', { method: 'POST' })
+        fetch('api/restart-scheduler', { method: 'POST' })
         .then(response => response.json())
         .then(data => {
             alert(data.success ? '✅ Scheduler herstart' : '❌ Fout: ' + data.error);
@@ -900,7 +911,7 @@ function restartScheduler() {
 }
 
 function healthCheck() {
-    fetch('/api/health-check')
+    fetch('api/health-check')
     .then(response => response.json())
     .then(data => {
         const status = data.healthy ? '✅ Systeem OK' : '⚠️ Problemen gedetecteerd';
@@ -909,7 +920,7 @@ function healthCheck() {
 }
 
 function updateSystemStatus() {
-    fetch('/api/system-status')
+    fetch('api/system-status')
     .then(response => response.json())
     .then(data => {
         document.getElementById('schedulerStatus').textContent = data.scheduler.active ? '🔄 Actief' : '⏸️ Gestopt';
