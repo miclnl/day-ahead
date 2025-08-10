@@ -1,5 +1,30 @@
-# Changelog 刀 DAO
-# Day Ahead Optimizer
+# Changelog 刀 DAO Light
+# Day Ahead Optimizer - Lightweight Version
+
+## Version 1.1.0 (2025-08-10)
+
+**🏠 Home Assistant Integration:**
+- Proper ingress support with security restrictions (port 8099)
+- Configuration schema with user-friendly validation
+- Multi-language support (Dutch/English translations)
+- Simplified configuration options for lightweight usage
+
+**🛡️ Security & Stability:**
+- Enhanced path handling with pathlib for cross-platform compatibility
+- Improved dependency management with version bounds
+- Debian base images for maximum package compatibility
+
+**🔧 Performance Optimizations:**
+- Minimal resource footprint for Raspberry Pi deployments
+- Essential dependencies only (no ML overhead)
+- Optimized Docker builds with proper caching
+
+## Version 1.0.0 (2025-08-10)
+- Initial release as lightweight alternative to DAO Modern
+- Minimal dependencies for stable operation
+- Core optimization functionality without ML features
+
+# Previous Changelog (Legacy DAO)
 # 2025.8.0
 - Clear error message when no data present from Nordpool 
 - Supplement documentation instant start

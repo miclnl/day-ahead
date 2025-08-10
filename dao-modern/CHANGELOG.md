@@ -1,5 +1,40 @@
-# Changelog 刀 DAO
-# Day Ahead Optimizer
+# Changelog 刀 DAO Modern
+# Day Ahead Optimizer - Enhanced Version
+
+## Version 1.1.0 (2025-08-10)
+
+**🏠 Home Assistant Integration Enhancements:**
+- Automatic MariaDB/MySQL service discovery and configuration
+- Health monitoring with real-time sensor data to Home Assistant
+- Proper ingress support with security restrictions
+- Configuration schema with user-friendly validation
+- Multi-language support (Dutch/English translations)
+
+**🛡️ Security Improvements:**
+- Enhanced AppArmor security profiles with specific permissions
+- Ingress proxy security (172.30.32.2 host binding)
+- Minimal capability requirements and dangerous operation denials
+- Path traversal vulnerability fixes in web interface
+
+**🔧 Code Quality & Performance:**
+- Robust cross-platform path handling with pathlib
+- Improved exception handling with proper logging
+- Automatic configuration migration for deprecated keys
+- Multi-stage Docker builds for smaller production images
+- Dependency version optimization with upper bounds
+
+**🚀 New Features:**
+- Service discovery for MQTT, MariaDB, MySQL addons
+- Real-time system monitoring (CPU, memory, disk usage)
+- API connectivity health checks (Nord Pool, Home Assistant)
+- Comprehensive error tracking and notification system
+
+## Version 1.0.0 (2025-08-10)
+- Initial release with Modern/Light architecture split
+- Debian base images for maximum compatibility
+- ML fallback mechanisms for optional dependencies
+
+# Previous Changelog (Legacy DAO)
 # 2025.8.0
 - Clear error message when no data present from Nordpool 
 - Supplement documentation instant start
