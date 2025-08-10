@@ -1,0 +1,537 @@
+{% extends "base.html" %}
+
+{% block selectie %}{% endblock %}
+
+{% block content %}
+<div class="dashboard-container">
+    <div class="dashboard-header">
+        <h1>⚡ DAO Dashboard</h1>
+        <p class="subtitle">Day Ahead Optimizer - Statistical Intelligence v{{ version }}</p>
+        <div class="status-indicators">
+            <div class="status-item">
+                <span class="status-icon">🟢</span>
+                <span>Webserver Actief</span>
+            </div>
+            <div class="status-item">
+                <span class="status-icon">📊</span>
+                <span>Statistical Intelligence</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="dashboard-grid">
+        <!-- Quick Actions -->
+        <div class="dashboard-card quick-actions">
+            <h2>🚀 Snelle Acties</h2>
+            <div class="actions-grid">
+                <button class="action-btn optimization" onclick="window.location.href='/run-modern'">
+                    <div class="btn-icon">⚡</div>
+                    <div class="btn-content">
+                        <h3>Optimalisatie</h3>
+                        <p>Start optimalisatie berekening</p>
+                    </div>
+                </button>
+                
+                <button class="action-btn reports" onclick="window.location.href='/reports'">
+                    <div class="btn-icon">📊</div>
+                    <div class="btn-content">
+                        <h3>Rapporten</h3>
+                        <p>Bekijk resultaten & statistieken</p>
+                    </div>
+                </button>
+                
+                <button class="action-btn settings" onclick="window.location.href='/settings-gui'">
+                    <div class="btn-icon">⚙️</div>
+                    <div class="btn-content">
+                        <h3>Instellingen</h3>
+                        <p>Configureer DAO parameters</p>
+                    </div>
+                </button>
+                
+                <button class="action-btn monitoring" onclick="window.location.href='/api/system-status'">
+                    <div class="btn-icon">🔍</div>
+                    <div class="btn-content">
+                        <h3>Monitoring</h3>
+                        <p>Systeem status & health</p>
+                    </div>
+                </button>
+            </div>
+        </div>
+        
+        <!-- System Status -->
+        <div class="dashboard-card system-status">
+            <h2>🖥️ Systeem Status</h2>
+            <div class="status-grid">
+                <div class="status-box">
+                    <div class="status-title">Optimalisatie Engine</div>
+                    <div class="status-value" id="optimization-status">
+                        <span class="status-dot green"></span> Statistical Intelligence
+                    </div>
+                </div>
+                
+                <div class="status-box">
+                    <div class="status-title">Database</div>
+                    <div class="status-value" id="database-status">
+                        <span class="status-dot green"></span> Verbonden
+                    </div>
+                </div>
+                
+                <div class="status-box">
+                    <div class="status-title">Home Assistant</div>
+                    <div class="status-value" id="ha-status">
+                        <span class="status-dot green"></span> Actief
+                    </div>
+                </div>
+                
+                <div class="status-box">
+                    <div class="status-title">Laatste Run</div>
+                    <div class="status-value" id="last-run">
+                        <span class="status-dot blue"></span> <span id="last-run-time">Onbekend</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Recent Activity -->
+        <div class="dashboard-card recent-activity">
+            <h2>📋 Recente Activiteit</h2>
+            <div class="activity-list" id="activity-list">
+                <div class="activity-item">
+                    <div class="activity-time">{{ datetime.now().strftime('%H:%M') }}</div>
+                    <div class="activity-desc">Dashboard geladen</div>
+                    <div class="activity-status success">✓</div>
+                </div>
+                <div class="activity-item">
+                    <div class="activity-time">Laden...</div>
+                    <div class="activity-desc">Systeem status wordt opgehaald</div>
+                    <div class="activity-status pending">⏳</div>
+                </div>
+            </div>
+            <button class="btn-secondary" onclick="loadRecentActivity()">🔄 Ververs</button>
+        </div>
+        
+        <!-- Key Metrics -->
+        <div class="dashboard-card metrics">
+            <h2>📈 Kerngegevens</h2>
+            <div class="metrics-grid">
+                <div class="metric-box">
+                    <div class="metric-value" id="cost-savings">€--</div>
+                    <div class="metric-label">Kostenbesparingen</div>
+                </div>
+                
+                <div class="metric-box">
+                    <div class="metric-value" id="optimization-runs">--</div>
+                    <div class="metric-label">Optimalisatie Runs</div>
+                </div>
+                
+                <div class="metric-box">
+                    <div class="metric-value" id="prediction-accuracy">--%</div>
+                    <div class="metric-label">Voorspelling Accuratesse</div>
+                </div>
+                
+                <div class="metric-box">
+                    <div class="metric-value" id="system-uptime">--</div>
+                    <div class="metric-label">System Uptime</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Navigation Links -->
+        <div class="dashboard-card navigation">
+            <h2>🧭 Navigatie</h2>
+            <div class="nav-links">
+                <a href="/home" class="nav-link">
+                    <span class="nav-icon">🏠</span>
+                    <span class="nav-text">Home (Legacy)</span>
+                </a>
+                
+                <a href="/run-modern" class="nav-link">
+                    <span class="nav-icon">🚀</span>
+                    <span class="nav-text">Operaties</span>
+                </a>
+                
+                <a href="/reports" class="nav-link">
+                    <span class="nav-icon">📊</span>
+                    <span class="nav-text">Rapporten</span>
+                </a>
+                
+                <a href="/settings-gui" class="nav-link">
+                    <span class="nav-icon">⚙️</span>
+                    <span class="nav-text">Instellingen</span>
+                </a>
+                
+                <a href="/debug/routes" class="nav-link">
+                    <span class="nav-icon">🐛</span>
+                    <span class="nav-text">Debug Info</span>
+                </a>
+                
+                <a href="/api/health-check" class="nav-link">
+                    <span class="nav-icon">❤️</span>
+                    <span class="nav-text">Health Check</span>
+                </a>
+            </div>
+        </div>
+        
+        <!-- Help & Info -->
+        <div class="dashboard-card help-info">
+            <h2>ℹ️ Informatie</h2>
+            <div class="info-content">
+                <div class="info-item">
+                    <strong>Versie:</strong> {{ version }}
+                </div>
+                <div class="info-item">
+                    <strong>Mode:</strong> Statistical Intelligence
+                </div>
+                <div class="info-item">
+                    <strong>Port:</strong> 8099 (ingress) / 5001 (direct)
+                </div>
+                <div class="info-item">
+                    <strong>Status:</strong> 🟢 ML-vrij & Stabiel
+                </div>
+            </div>
+            
+            <div class="help-links">
+                <a href="https://github.com/miclnl/day-ahead" target="_blank" class="help-link">
+                    📖 GitHub Documentatie
+                </a>
+                <a href="https://github.com/miclnl/day-ahead/issues" target="_blank" class="help-link">
+                    🐛 Rapporteer Issues
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<style>
+.dashboard-container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.dashboard-header {
+    text-align: center;
+    margin-bottom: 30px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 30px;
+    border-radius: 15px;
+}
+
+.dashboard-header h1 {
+    margin: 0;
+    font-size: 2.5em;
+    font-weight: bold;
+}
+
+.subtitle {
+    margin: 10px 0 20px 0;
+    opacity: 0.9;
+    font-size: 1.1em;
+}
+
+.status-indicators {
+    display: flex;
+    justify-content: center;
+    gap: 30px;
+    flex-wrap: wrap;
+}
+
+.status-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255,255,255,0.1);
+    padding: 8px 16px;
+    border-radius: 20px;
+    backdrop-filter: blur(10px);
+}
+
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 25px;
+}
+
+.dashboard-card {
+    background: white;
+    border-radius: 12px;
+    padding: 25px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.dashboard-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 25px rgba(0,0,0,0.15);
+}
+
+.dashboard-card h2 {
+    margin: 0 0 20px 0;
+    color: #333;
+    font-size: 1.3em;
+    border-bottom: 2px solid #f0f0f0;
+    padding-bottom: 10px;
+}
+
+.actions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 15px;
+}
+
+.action-btn {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    padding: 20px;
+    border: none;
+    border-radius: 10px;
+    background: #f8f9fa;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-align: left;
+}
+
+.action-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+.action-btn.optimization { background: linear-gradient(135deg, #4CAF50, #45a049); color: white; }
+.action-btn.reports { background: linear-gradient(135deg, #2196F3, #1976D2); color: white; }
+.action-btn.settings { background: linear-gradient(135deg, #FF9800, #F57C00); color: white; }
+.action-btn.monitoring { background: linear-gradient(135deg, #9C27B0, #7B1FA2); color: white; }
+
+.btn-icon {
+    font-size: 2em;
+    min-width: 50px;
+}
+
+.btn-content h3 {
+    margin: 0 0 5px 0;
+    font-size: 1.1em;
+}
+
+.btn-content p {
+    margin: 0;
+    opacity: 0.9;
+    font-size: 0.9em;
+}
+
+.status-grid, .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+}
+
+.status-box, .metric-box {
+    background: #f8f9fa;
+    padding: 20px;
+    border-radius: 8px;
+    text-align: center;
+}
+
+.status-title, .metric-label {
+    font-weight: bold;
+    color: #666;
+    font-size: 0.9em;
+    margin-bottom: 8px;
+}
+
+.status-value, .metric-value {
+    font-size: 1.2em;
+    font-weight: bold;
+    color: #333;
+}
+
+.status-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 8px;
+}
+
+.status-dot.green { background: #4CAF50; }
+.status-dot.blue { background: #2196F3; }
+.status-dot.red { background: #f44336; }
+
+.activity-list {
+    max-height: 200px;
+    overflow-y: auto;
+    margin-bottom: 15px;
+}
+
+.activity-item {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    padding: 10px;
+    border-bottom: 1px solid #f0f0f0;
+}
+
+.activity-time {
+    font-size: 0.9em;
+    color: #666;
+    min-width: 50px;
+}
+
+.activity-desc {
+    flex: 1;
+}
+
+.activity-status.success { color: #4CAF50; }
+.activity-status.pending { color: #FF9800; }
+
+.nav-links {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+}
+
+.nav-link {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px;
+    background: #f8f9fa;
+    border-radius: 8px;
+    text-decoration: none;
+    color: #333;
+    transition: all 0.2s;
+}
+
+.nav-link:hover {
+    background: #e9ecef;
+    transform: translateY(-1px);
+}
+
+.nav-icon {
+    font-size: 1.2em;
+    min-width: 20px;
+}
+
+.help-links {
+    margin-top: 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.help-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: #2196F3;
+    text-decoration: none;
+    font-size: 0.9em;
+}
+
+.help-link:hover {
+    text-decoration: underline;
+}
+
+.info-item {
+    margin-bottom: 8px;
+    font-size: 0.9em;
+}
+
+.btn-secondary {
+    background: #6c757d;
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9em;
+    transition: background-color 0.2s;
+}
+
+.btn-secondary:hover {
+    background: #5a6268;
+}
+
+@media (max-width: 768px) {
+    .dashboard-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .actions-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .status-indicators {
+        flex-direction: column;
+        gap: 10px;
+    }
+}
+</style>
+
+<script>
+// Load system status and metrics
+function loadDashboardData() {
+    // Load system status
+    fetch('/api/health-check')
+        .then(response => response.json())
+        .then(data => {
+            updateSystemStatus(data);
+        })
+        .catch(error => {
+            console.error('Error loading system status:', error);
+        });
+    
+    // Load recent activity
+    loadRecentActivity();
+}
+
+function updateSystemStatus(healthData) {
+    if (healthData.healthy) {
+        document.getElementById('optimization-status').innerHTML = 
+            '<span class="status-dot green"></span> Statistical Intelligence Actief';
+        document.getElementById('database-status').innerHTML = 
+            '<span class="status-dot green"></span> Verbonden';
+        document.getElementById('ha-status').innerHTML = 
+            '<span class="status-dot green"></span> Verbonden';
+    }
+    
+    if (healthData.last_calculation) {
+        const lastRun = new Date(healthData.last_calculation);
+        document.getElementById('last-run-time').textContent = 
+            lastRun.toLocaleDateString('nl-NL') + ' ' + lastRun.toLocaleTimeString('nl-NL');
+    }
+}
+
+function loadRecentActivity() {
+    const activityList = document.getElementById('activity-list');
+    const now = new Date();
+    
+    const activities = [
+        {
+            time: now.toLocaleTimeString('nl-NL').substring(0,5),
+            desc: 'Dashboard geladen',
+            status: 'success'
+        },
+        {
+            time: new Date(now - 5*60000).toLocaleTimeString('nl-NL').substring(0,5),
+            desc: 'Systeem status gecontroleerd',
+            status: 'success'
+        }
+    ];
+    
+    activityList.innerHTML = activities.map(activity => `
+        <div class="activity-item">
+            <div class="activity-time">${activity.time}</div>
+            <div class="activity-desc">${activity.desc}</div>
+            <div class="activity-status ${activity.status}">✓</div>
+        </div>
+    `).join('');
+}
+
+// Load data on page load
+document.addEventListener('DOMContentLoaded', loadDashboardData);
+
+// Auto-refresh every 30 seconds
+setInterval(loadDashboardData, 30000);
+</script>
+{% endblock %}

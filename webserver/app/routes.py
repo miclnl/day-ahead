@@ -205,33 +205,24 @@ def get_file_list(path: str, pattern: str) -> list:
 
 @app.route("/", methods=["POST", "GET"])
 def menu():
-    lst = request.form.to_dict(flat=False)
-    if "current_menu" in lst:
-        current_menu = lst["current_menu"][0]
-        if current_menu == "home":
-            return home()
-        elif current_menu == "run":
-            return run_process()
-        elif current_menu == "reports" or current_menu == "savings":
-            return reports(current_menu)
-        elif current_menu == "settings":
-            return settings()
-        else:
-            return home()
-    else:
-        if "menu_home" in lst:
-            return home()
-        elif "menu_run" in lst:
-            return run_process()
-        elif "menu_reports" in lst:
-            return reports("reports")
-        elif "menu_savings" in lst:
-            return reports("savings")
-        elif "menu_settings" in lst:
-            return settings()
-        else:
-            return home()
+    """Main dashboard with modern interface"""
+    from flask import redirect, url_for
+    return redirect(url_for('dashboard'))
 
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    """Modern DAO Dashboard - central hub for all functionality"""
+    import datetime
+    from datetime import timedelta
+    
+    return render_template(
+        "dashboard.html",
+        title="DAO Dashboard",
+        active_menu="dashboard",
+        datetime=datetime.datetime,
+        timedelta=timedelta,
+        version=__version__,
+    )
 
 @app.route("/home", methods=["POST", "GET"])
 def home():
@@ -934,6 +925,7 @@ def restart_scheduler():
         return {"success": False, "error": str(e)}, 500
 
 
+@app.route("/health")
 @app.route("/api/health-check")
 def health_check():
     """System health check"""
@@ -966,6 +958,29 @@ def health_check():
             "details": {"error": "Health check failed"}
         }
 
+
+@app.route("/debug/routes")
+def debug_routes():
+    """Debug: List all available routes"""
+    from flask import current_app
+    routes = []
+    for rule in current_app.url_map.iter_rules():
+        routes.append({
+            'endpoint': rule.endpoint,
+            'methods': list(rule.methods),
+            'rule': rule.rule
+        })
+    return {"routes": sorted(routes, key=lambda x: x['rule'])}
+
+@app.errorhandler(404)
+def not_found_error(error):
+    """Handle 404 errors by redirecting to dashboard"""
+    from flask import redirect, url_for, request
+    # If it's an API call, return JSON
+    if request.path.startswith('/api/'):
+        return {"error": "Not found", "path": request.path}, 404
+    # Otherwise redirect to dashboard
+    return redirect(url_for('dashboard'))
 
 @app.route("/api/system-status")
 def system_status():
