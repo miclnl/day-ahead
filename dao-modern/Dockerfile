@@ -63,8 +63,8 @@ RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/
-RUN pip3 install uv
-RUN uv pip install --prerelease=allow -r /tmp/requirements.txt
+RUN $VIRTUAL_ENV/bin/pip install uv
+RUN $VIRTUAL_ENV/bin/uv pip install --prerelease=allow -r /tmp/requirements.txt
 COPY run /app/dao/prog/
 
 # Using root user for Home Assistant compatibility

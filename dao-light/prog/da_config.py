@@ -31,7 +31,7 @@ class Config:
     ) -> str | dict | list | None:
         if options is None:
             options = self.options
-        if keys[0] in options:
+        if options and keys[0] in options:
             result = options[keys[0]]
             if str(result).lower().find("!secret", 0) == 0:
                 result = self.secrets[result[8:]]

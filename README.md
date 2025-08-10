@@ -4,7 +4,7 @@
 
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
-[version-shield]: https://img.shields.io/badge/version-1.1.3-blue.svg
+[version-shield]: https://img.shields.io/badge/version-1.1.4-blue.svg
 
 This repository contains enhanced versions of the Day Ahead Optimizer (DAO) for Home Assistant with modern integration features, automatic service discovery, and advanced security.
 
