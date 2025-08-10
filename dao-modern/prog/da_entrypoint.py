@@ -195,46 +195,99 @@ class DaoEntrypoint:
         try:
             os.chdir(self.app_dir / "prog")
             
-            # Try modern scheduler first, fallback to simple
-            scheduler_file = "da_modern_scheduler.py"
-            if not Path(scheduler_file).exists():
-                scheduler_file = "da_simple_scheduler.py"
+            # Try schedulers in order of preference with fallback
+            scheduler_files = [
+                ("da_simple_scheduler.py", "Simple scheduler (reliable)"),
+                ("da_scheduler.py", "Basic scheduler (fallback)"),
+                ("da_modern_scheduler.py", "Modern scheduler (advanced)")
+            ]
             
-            if not Path(scheduler_file).exists():
-                scheduler_file = "da_scheduler.py"
+            scheduler_file = None
+            scheduler_desc = None
             
-            logger.info(f"Using scheduler: {scheduler_file}")
+            for sched_file, sched_desc in scheduler_files:
+                if Path(sched_file).exists():
+                    scheduler_file = sched_file
+                    scheduler_desc = sched_desc
+                    break
             
-            # Use subprocess for all schedulers to avoid import issues
-            logger.info(f"Starting scheduler: {scheduler_file}")
+            if not scheduler_file:
+                logger.error("No scheduler found!")
+                return
             
-            # Use virtual environment python if available
-            venv_python = Path("/app/dao/venv/day_ahead/bin/python3")
-            python_cmd = str(venv_python) if venv_python.exists() else sys.executable
+            logger.info(f"Using scheduler: {scheduler_file} ({scheduler_desc})")
             
-            process = subprocess.Popen([python_cmd, scheduler_file],
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT,
-                                     universal_newlines=True)
-            
-            # Stream output
-            while self.running and process.poll() is None:
-                line = process.stdout.readline()
-                if line:
-                    print(line.strip(), flush=True)
-                time.sleep(0.1)
-            
-            if process.poll() is not None:
-                logger.error(f"Scheduler exited with code: {process.returncode}")
-                # Read remaining output
-                remaining_output = process.stdout.read()
-                if remaining_output:
-                    print(remaining_output.strip(), flush=True)
+            # Try multiple schedulers with automatic fallback on failure
+            for attempt, (sched_file, sched_desc) in enumerate(scheduler_files):
+                if not Path(sched_file).exists():
+                    continue
                     
-                # Keep container alive by waiting
-                logger.info("Scheduler stopped, but keeping container alive for web services")
-                while self.running:
-                    time.sleep(60)
+                logger.info(f"Attempt {attempt + 1}: Starting {sched_file} ({sched_desc})")
+                
+                try:
+                    # Use system Python for better compatibility
+                    python_cmd = sys.executable
+                    
+                    process = subprocess.Popen([python_cmd, sched_file],
+                                             stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT,
+                                             universal_newlines=True,
+                                             cwd=str(self.app_dir / "prog"))
+                    
+                    # Stream output with timeout
+                    start_time = time.time()
+                    stable_time = 10  # Consider stable after 10 seconds
+                    
+                    while self.running and process.poll() is None:
+                        line = process.stdout.readline()
+                        if line:
+                            print(line.strip(), flush=True)
+                        time.sleep(0.1)
+                        
+                        # If running stable for enough time, consider it successful
+                        if time.time() - start_time > stable_time:
+                            logger.info(f"Scheduler {sched_file} running stable")
+                            break
+                    
+                    # If we get here and process is still running, it's successful
+                    if process.poll() is None:
+                        # Continue streaming until process ends
+                        while self.running and process.poll() is None:
+                            line = process.stdout.readline()
+                            if line:
+                                print(line.strip(), flush=True)
+                            time.sleep(0.1)
+                    
+                    exit_code = process.returncode
+                    logger.error(f"Scheduler {sched_file} exited with code: {exit_code}")
+                    
+                    # Read remaining output
+                    remaining_output = process.stdout.read()
+                    if remaining_output:
+                        print(remaining_output.strip(), flush=True)
+                    
+                    # If this was not the last scheduler, try the next one
+                    if attempt < len(scheduler_files) - 1:
+                        logger.info(f"Trying next scheduler due to exit code {exit_code}")
+                        time.sleep(2)  # Brief delay before retry
+                        continue
+                    else:
+                        logger.error("All schedulers failed, keeping container alive for web services")
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"Failed to start {sched_file}: {e}")
+                    if attempt < len(scheduler_files) - 1:
+                        logger.info("Trying next scheduler due to startup error")
+                        continue
+                    else:
+                        logger.error("All schedulers failed to start")
+                        break
+            
+            # Keep container alive for web services
+            logger.info("Scheduler management complete, keeping container alive for web services")
+            while self.running:
+                time.sleep(60)
                 
         except KeyboardInterrupt:
             logger.info("Scheduler stopped by user")
