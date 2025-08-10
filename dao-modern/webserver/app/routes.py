@@ -2,16 +2,16 @@ import datetime
 
 # from sqlalchemy.sql.coercions import expect_col_expression_collection
 
-from dao.webserver.app import app
+from . import app
 from flask import render_template, request
 import fnmatch
 import os
 from subprocess import PIPE, run
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from dao.prog.da_config import Config
-from dao.prog.da_report import Report
-from dao.prog.version import __version__
+from da_config import Config
+from da_report import Report
+from version import __version__
 
 web_datapath = "static/data/"
 app_datapath = "app/static/data/"
