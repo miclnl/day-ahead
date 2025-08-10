@@ -10,7 +10,7 @@ arch:
   - amd64
 init: false
 ingress: true
-ingress_port: 5002
+ingress_port: 8099
 panel_admin: false
 panel_icon: mdi:feather
 apparmor: true
@@ -23,4 +23,17 @@ homeassistant_api: true
 ports:
   5002/tcp: 5002
 # Image wordt lokaal gebouwd via Dockerfile
-# image: "ghcr.io/miclnl/dao-modern-{arch}"
+# image: "ghcr.io/miclnl/dao-light-{arch}"
+
+# Simplified configuration schema for Light version
+options:
+  database_engine: sqlite
+  log_level: info
+  optimization_interval: 60
+schema:
+  database_engine: list(sqlite|mysql)
+  log_level: list(debug|info|warning|error)
+  optimization_interval: int(30,3600)
+  homeassistant_token: password?
+  energy_tax_rate: float(0.0,1.0)?
+  battery_capacity: float(0.0,100.0)?

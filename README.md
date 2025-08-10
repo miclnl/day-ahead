@@ -5,7 +5,19 @@
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
 
-This repository contains enhanced versions of the Day Ahead Optimizer (DAO) for Home Assistant.
+This repository contains enhanced versions of the Day Ahead Optimizer (DAO) for Home Assistant with modern integration features, automatic service discovery, and advanced security.
+
+[![Open your Home Assistant instance and show the add-on store.](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/)
+
+## 🆕 Version 1.0.0 Features
+
+✨ **New Home Assistant Integrations:**
+- 🔧 **Automatic Service Discovery** - Auto-detects MariaDB, MySQL, MQTT, and other HA services
+- 📊 **Health Monitoring** - Real-time system status reported to Home Assistant sensors
+- 🛡️ **Enhanced Security** - Modern AppArmor profiles and ingress integration
+- 🌐 **Proper Ingress Support** - Seamless web interface integration
+- 📝 **Configuration Schema** - User-friendly configuration with validation
+- 🗣️ **Multi-language Support** - Dutch and English translations
 
 ## 🚀 Available Addons
 

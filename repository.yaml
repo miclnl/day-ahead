@@ -4,9 +4,17 @@ maintainer: Cees van Beek (cees.van.beek@xs4all.nl)
 description: >
   Advanced Day Ahead Optimization with multiple versions to choose from.
   
-  🚀 DAO Modern: Full-featured AI/ML enhanced version
+  🚀 DAO Modern: Full-featured AI/ML enhanced version with real-time optimization
   🪶 DAO Light: Minimal, stable version for Pi/low-resource systems
   
-  Both can run alongside each other or the original DAO addon.
+  Features:
+  • Automatic service discovery and configuration
+  • Real-time energy price optimization
+  • Machine learning consumption predictions
+  • Multi-database support (SQLite/MySQL/PostgreSQL)
+  • Advanced AppArmor security profiles
+  • Health monitoring and Home Assistant integration
   
-version: 1.3.4
+  Both versions can run alongside each other for different use cases.
+  
+version: 1.0.0

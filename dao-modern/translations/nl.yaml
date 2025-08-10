@@ -1,0 +1,37 @@
+configuration:
+  database_engine:
+    name: Database Type
+    description: Kies het database systeem voor het opslaan van optimalisatie gegevens
+  log_level:
+    name: Log Niveau
+    description: Stel de uitgebreidheid van logging in
+  optimization_interval:
+    name: Optimalisatie Interval
+    description: Hoe vaak optimalisatie berekeningen uitvoeren (in minuten)
+  enable_ml_predictions:
+    name: Machine Learning Voorspellingen
+    description: Gebruik machine learning voor betere verbruiksvoorspellingen
+  enable_realtime_optimization:
+    name: Real-time Optimalisatie
+    description: Schakel real-time optimalisatie in op basis van huidige energieprijzen
+  homeassistant_url:
+    name: Home Assistant URL
+    description: URL naar uw Home Assistant instantie (optioneel, wordt automatisch gedetecteerd)
+  homeassistant_token:
+    name: Home Assistant Token
+    description: Langdurige toegangstoken voor Home Assistant API
+  entsoe_api_key:
+    name: ENTSO-E API Sleutel
+    description: API sleutel voor Europese energieprijsgegevens (verkrijg via transparency.entsoe.eu)
+  nordpool_region:
+    name: Nord Pool Regio
+    description: Uw elektriciteitsregio voor Nord Pool prijsgegevens (Nederland gebruikt meestal DK1 of DE)
+  energy_tax_rate:
+    name: Energiebelasting Tarief
+    description: Lokaal energiebelasting tarief per kWh (bijv. 0.10 voor 10 cent)
+  battery_capacity:
+    name: Batterij Capaciteit (kWh)
+    description: Totale capaciteit van uw thuisbatterij systeem
+  solar_panel_capacity:
+    name: Zonnepaneel Capaciteit (kWp)
+    description: Piekvermogen capaciteit van uw zonnepanelen

@@ -1,0 +1,19 @@
+configuration:
+  database_engine:
+    name: Database Engine
+    description: Choose database for storing optimization data (SQLite recommended for Light version)
+  log_level:
+    name: Log Level
+    description: Set the logging verbosity level
+  optimization_interval:
+    name: Optimization Interval
+    description: How often to run optimization calculations (in minutes)
+  homeassistant_token:
+    name: Home Assistant Token
+    description: Long-lived access token for Home Assistant API (optional, auto-detected if empty)
+  energy_tax_rate:
+    name: Energy Tax Rate
+    description: Local energy tax rate per kWh (e.g., 0.10 for 10 cents)
+  battery_capacity:
+    name: Battery Capacity (kWh)
+    description: Total capacity of your home battery system

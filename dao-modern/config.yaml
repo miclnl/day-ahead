@@ -10,7 +10,7 @@ arch:
   - amd64
 init: false
 ingress: true
-ingress_port: 5001
+ingress_port: 8099
 panel_admin: false
 panel_icon: mdi:lightning-bolt
 apparmor: true
@@ -24,3 +24,24 @@ ports:
   5001/tcp: 5001
 # Image wordt lokaal gebouwd via Dockerfile
 # image: "ghcr.io/miclnl/dao-modern-{arch}"
+
+# Configuration schema for better UX and validation
+options:
+  database_engine: sqlite
+  log_level: info
+  optimization_interval: 60
+  enable_ml_predictions: true
+  enable_realtime_optimization: true
+schema:
+  database_engine: list(sqlite|mysql|postgresql)
+  log_level: list(debug|info|warning|error)
+  optimization_interval: int(30,3600)
+  enable_ml_predictions: bool
+  enable_realtime_optimization: bool
+  homeassistant_url: str?
+  homeassistant_token: password?
+  entsoe_api_key: password?
+  nordpool_region: list(DK1|DK2|DE|FI|LT|LV|Oslo|Kr.sand|Bergen|Molde|Tr.heim|Tromsø|SE1|SE2|SE3|SE4)?
+  energy_tax_rate: float(0.0,1.0)?
+  battery_capacity: float(0.0,100.0)?
+  solar_panel_capacity: float(0.0,50.0)?

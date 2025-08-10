@@ -1,0 +1,19 @@
+configuration:
+  database_engine:
+    name: Database Type
+    description: Database voor optimalisatie gegevens (SQLite aanbevolen voor Light versie)
+  log_level:
+    name: Log Niveau
+    description: Stel de uitgebreidheid van logging in
+  optimization_interval:
+    name: Optimalisatie Interval
+    description: Hoe vaak optimalisatie berekeningen uitvoeren (in minuten)
+  homeassistant_token:
+    name: Home Assistant Token
+    description: Langdurige toegangstoken voor Home Assistant API (optioneel, automatische detectie)
+  energy_tax_rate:
+    name: Energiebelasting Tarief
+    description: Lokaal energiebelasting tarief per kWh (bijv. 0.10 voor 10 cent)
+  battery_capacity:
+    name: Batterij Capaciteit (kWh)
+    description: Totale capaciteit van uw thuisbatterij systeem
