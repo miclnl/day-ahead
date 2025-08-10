@@ -38,7 +38,7 @@ except ImportError:
         from dao.prog.version import __version__
     except ImportError:
         print("Warning: Could not import version")
-        __version__ = "1.3.9"
+        __version__ = "1.3.10"
 
 web_datapath = "static/data/"
 app_datapath = "app/static/data/"
@@ -1573,20 +1573,6 @@ def health_check():
             "error": str(e),
             "details": {"error": "Health check failed"}
         }
-
-
-@app.route("/debug/routes")
-def debug_routes():
-    """Debug: List all available routes"""
-    from flask import current_app
-    routes = []
-    for rule in current_app.url_map.iter_rules():
-        routes.append({
-            'endpoint': rule.endpoint,
-            'methods': list(rule.methods),
-            'rule': rule.rule
-        })
-    return {"routes": sorted(routes, key=lambda x: x['rule'])}
 
 @app.errorhandler(404)
 def not_found_error(error):
