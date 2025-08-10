@@ -64,6 +64,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/
 RUN $VIRTUAL_ENV/bin/pip install uv
+# Install PyTorch CPU-only first (no CUDA for Home Assistant)
+RUN $VIRTUAL_ENV/bin/uv pip install --index-url https://download.pytorch.org/whl/cpu torch>=2.0.0,\<2.3.0 torchvision>=0.15.0,\<0.18.0
+# Install remaining requirements
 RUN $VIRTUAL_ENV/bin/uv pip install --prerelease=allow -r /tmp/requirements.txt
 COPY run /app/dao/prog/
 
