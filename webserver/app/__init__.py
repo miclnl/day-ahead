@@ -87,7 +87,7 @@ except Exception as e:
     def health():
         return jsonify({
             'status': 'healthy',
-            'version': '1.3.11',
+            'version': '1.3.12',
             'webserver': 'running',
             'error': 'Routes import failed - minimal mode active'
         })

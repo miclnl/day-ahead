@@ -19,30 +19,43 @@ from logging.handlers import TimedRotatingFileHandler
 
 print("DEBUG: routes.py - Core imports done, starting module imports...")
 
-# Try to import required modules with fallbacks
-print("DEBUG: routes.py - Importing Config...")
-try:
-    from da_config import Config
-    print("DEBUG: routes.py - Config imported via da_config")
-except ImportError:
-    try:
-        from dao.prog.da_config import Config
-        print("DEBUG: routes.py - Config imported via dao.prog.da_config")
-    except ImportError:
-        print("Warning: Could not import Config class")
-        Config = None
+# LAZY IMPORT: Don't import database modules during initialization
+# This prevents SQLAlchemy circular import issues in gunicorn workers
+print("DEBUG: routes.py - Skipping immediate Config/Report imports to prevent SQLAlchemy circular imports")
+Config = None
+Report = None
 
-print("DEBUG: routes.py - Importing Report...")
-try:
-    from da_report import Report
-    print("DEBUG: routes.py - Report imported via da_report")
-except ImportError:
-    try:
-        from dao.prog.da_report import Report  
-        print("DEBUG: routes.py - Report imported via dao.prog.da_report")
-    except ImportError:
-        print("Warning: Could not import Report class")
-        Report = None
+def get_config_class():
+    """Lazy import Config class to avoid SQLAlchemy circular imports"""
+    global Config
+    if Config is None:
+        try:
+            from da_config import Config
+            print("DEBUG: Lazy loaded Config via da_config")
+        except ImportError:
+            try:
+                from dao.prog.da_config import Config
+                print("DEBUG: Lazy loaded Config via dao.prog.da_config")
+            except ImportError:
+                print("Warning: Could not lazy load Config class")
+                Config = None
+    return Config
+
+def get_report_class():
+    """Lazy import Report class to avoid SQLAlchemy circular imports"""
+    global Report
+    if Report is None:
+        try:
+            from da_report import Report
+            print("DEBUG: Lazy loaded Report via da_report")
+        except ImportError:
+            try:
+                from dao.prog.da_report import Report  
+                print("DEBUG: Lazy loaded Report via dao.prog.da_report")
+            except ImportError:
+                print("Warning: Could not lazy load Report class")
+                Report = None
+    return Report
 
 print("DEBUG: routes.py - Importing version...")
 try:
@@ -54,7 +67,7 @@ except ImportError:
         print("DEBUG: routes.py - Version imported via dao.prog.version")
     except ImportError:
         print("Warning: Could not import version")
-        __version__ = "1.3.11"
+        __version__ = "1.3.12"
 
 print("DEBUG: routes.py - Module imports completed")
 
@@ -62,41 +75,42 @@ web_datapath = "static/data/"
 app_datapath = "app/static/data/"
 images_folder = os.path.join(web_datapath, "images")
 
-# Initialize config with fallbacks
-print("DEBUG: routes.py - Initializing config...")
+# LAZY CONFIG: Don't initialize config during module import to prevent SQLAlchemy issues
+print("DEBUG: routes.py - Skipping immediate config initialization")
 config = None
-if Config is not None:
-    try:
-        print(f"DEBUG: routes.py - Trying config path: {app_datapath}options.json")
-        config = Config(app_datapath + "options.json")
-        print("DEBUG: routes.py - Config loaded successfully")
-    except (ValueError, FileNotFoundError) as ex:
-        print(f"DEBUG: routes.py - Config error with path {app_datapath}: {ex}")
-        logging.error(f"Config error with path {app_datapath}: {ex}")
-        try:
-            # Try alternative paths
-            alt_paths = [
-                "/app/dao/data/options.json",
-                "/config/dao_modern_data/options.json",
-                "../../data/options.json"
-            ]
-            print(f"DEBUG: routes.py - Trying alternative paths: {alt_paths}")
-            for alt_path in alt_paths:
-                print(f"DEBUG: routes.py - Checking path: {alt_path}")
-                if os.path.exists(alt_path):
-                    print(f"DEBUG: routes.py - Path exists, loading config from: {alt_path}")
-                    config = Config(alt_path)
-                    logging.info(f"Using config from: {alt_path}")
-                    print(f"DEBUG: routes.py - Config loaded from: {alt_path}")
-                    break
-        except Exception as e:
-            print(f"DEBUG: routes.py - Failed to load config from alternative paths: {e}")
-            logging.error(f"Failed to load config from alternative paths: {e}")
-            config = None
-else:
-    print("DEBUG: routes.py - Config class is None, skipping config initialization")
 
-print("DEBUG: routes.py - Config initialization completed")
+def get_safe_config():
+    """Lazy initialize config to avoid SQLAlchemy circular import issues"""
+    global config
+    if config is None:
+        Config = get_config_class()
+        if Config is not None:
+            try:
+                print(f"DEBUG: Lazy config - Trying config path: {app_datapath}options.json")
+                config = Config(app_datapath + "options.json")
+                print("DEBUG: Lazy config - Config loaded successfully")
+            except (ValueError, FileNotFoundError) as ex:
+                print(f"DEBUG: Lazy config - Config error with path {app_datapath}: {ex}")
+                try:
+                    # Try alternative paths
+                    alt_paths = [
+                        "/app/dao/data/options.json",
+                        "/config/dao_modern_data/options.json",
+                        "../../data/options.json"
+                    ]
+                    for alt_path in alt_paths:
+                        if os.path.exists(alt_path):
+                            print(f"DEBUG: Lazy config - Loading from: {alt_path}")
+                            config = Config(alt_path)
+                            break
+                except Exception as e:
+                    print(f"DEBUG: Lazy config - Failed alternative paths: {e}")
+                    config = None
+        else:
+            print("DEBUG: Lazy config - Config class is None")
+    return config
+
+print("DEBUG: routes.py - Lazy config setup completed")
 
 # Setup logging with fallback
 logname = "dashboard.log"
@@ -114,7 +128,7 @@ for log_path in log_paths:
         handler = TimedRotatingFileHandler(
             os.path.join(log_path, logname),
             when="midnight",
-            backupCount=1 if config is None else config.get(["history", "save days"]),
+            backupCount=1,  # Default to 1, config will be loaded lazy when needed
         )
         handler.suffix = "%Y%m%d"
         handler.setLevel(logging.INFO)
@@ -138,7 +152,8 @@ else:
 browse = {}
 
 def get_safe_report():
-    """Get a Report instance with safe fallback handling"""
+    """Get a Report instance with lazy loading to avoid SQLAlchemy circular imports"""
+    Report = get_report_class()
     if Report is None:
         return None
     
@@ -151,12 +166,13 @@ def get_safe_report():
     for config_path in config_paths:
         try:
             if os.path.exists(config_path):
+                print(f"DEBUG: Lazy Report - Creating Report from {config_path}")
                 return Report(config_path)
         except Exception as e:
-            logging.error(f"Failed to create Report with {config_path}: {e}")
+            print(f"DEBUG: Lazy Report - Failed to create Report with {config_path}: {e}")
             continue
     
-    logging.warning("Could not create Report instance - no valid config found")
+    print("DEBUG: Lazy Report - Could not create Report instance - no valid config found")
     return None
 
 views = {
