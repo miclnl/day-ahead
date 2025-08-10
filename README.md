@@ -43,7 +43,7 @@ If you find bugs, have improvements, or want to adapt the code for other energy 
 
 Feel free to fork, modify, and make it your own - that's the beauty of open source! 🚀
 
-## 🆕 Version 1.3.6 Features - Complete Statistical Intelligence Suite
+## 🆕 Version 1.3.7 Features - Complete Statistical Intelligence Suite
 
 ✨ **Core Statistical Intelligence:**
 - 🧠 **ML-free Optimization** - Intelligent statistical methods replace all ML dependencies
@@ -89,6 +89,13 @@ Feel free to fork, modify, and make it your own - that's the beauty of open sour
 - 💡 **Natural Language Insights** - Human-readable optimization explanations
 - 🔄 **Cloud AI Fallback** - Statistical methods always available as primary/fallback
 - 🛡️ **Privacy First** - All core functionality works without cloud dependencies
+
+🔧 **Enhanced Webserver Integration (NEW v1.3.7):**
+- 🌐 **Automatic Startup** - Webserver starts reliably in all container environments
+- 🔄 **Smart Route Handling** - Automatic 404 error handling with dashboard redirect
+- 🐛 **Debug Endpoints** - Built-in route debugging for troubleshooting
+- ⚡ **Improved Stability** - Enhanced startup timing and error recovery
+- 📊 **Modern Dashboard** - Direct loading of statistical intelligence interface
 
 ✨ **Enhanced Integration Features:**
 - 🔧 **Automatic Service Discovery** - Auto-detects MariaDB, MySQL, MQTT, and other HA services
@@ -185,7 +192,7 @@ See the original DAO documentation for configuration details:
 
 ---
 
-**Version:** 1.3.6 - Complete Statistical Intelligence Suite  
+**Version:** 1.3.7 - Complete Statistical Intelligence Suite  
 **Author:** Cees van Beek  
 **Enhanced by:** Claude Code  
 
@@ -198,7 +205,7 @@ See the original DAO documentation for configuration details:
 ✅ **Startup Speed:** 10x faster  
 ✅ **Explainable AI:** Traceable decision logic  
 
-## 🚀 New in v1.3.6 - Revolutionary Energy Management
+## 🚀 New in v1.3.7 - Revolutionary Energy Management
 
 ✅ **ML-Free Operation:** Complete removal of problematic ML dependencies  
 ✅ **Weather Reactive:** Real-time adaptation to weather changes  
@@ -209,5 +216,6 @@ See the original DAO documentation for configuration details:
 ✅ **Performance Learning:** Continuous statistical optimization improvement  
 ✅ **Decision Transparency:** Complete statistics dashboard with real-data analysis
 ✅ **Interactive Analytics:** Chart.js visualizations with prediction confidence tracking
+✅ **Webserver Reliability:** Automatic startup with robust error handling and debugging tools
 
 **Complete energy optimization suite with transparent decision-making and comprehensive analytics.**
