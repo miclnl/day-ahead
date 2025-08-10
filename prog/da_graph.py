@@ -1,7 +1,15 @@
-import matplotlib
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-from matplotlib.patches import Patch
+# Optional matplotlib import for lightweight deployments
+try:
+    import matplotlib
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+    from matplotlib.patches import Patch
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    import logging
+    logging.warning("matplotlib not available - graphing disabled")
+
 import pandas as pd
 import numpy as np
 import math
@@ -10,6 +18,12 @@ import logging
 
 class GraphBuilder:
     def __init__(self, backend=None):
+        if not MATPLOTLIB_AVAILABLE:
+            logging.warning("GraphBuilder initialized without matplotlib - graphs disabled")
+            self.available = False
+            return
+            
+        self.available = True
         plt.set_loglevel(level="warning")
         pil_logger = logging.getLogger("PIL")
         # override the logger logging level to INFO
@@ -28,6 +42,9 @@ class GraphBuilder:
         :param title: titel grafiek
         :return:
         """
+        if not self.available:
+            logging.warning("draw_waterfall called but matplotlib not available")
+            return None
         y = options["series"][0]["column"]
         df = pd.DataFrame(columns=[y])
         df[y] = dr_df[y]
@@ -93,6 +110,9 @@ class GraphBuilder:
         return plot
 
     def build(self, df, options, show=True):
+        if not self.available:
+            logging.warning("build called but matplotlib not available")
+            return None
         plt.style.use(options["style"])
         graphs = options["graphs"]
         num_graphs = len(graphs)
