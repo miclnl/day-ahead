@@ -13,16 +13,12 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip python3-dev python3-venv \
     # Database clients and dev headers
     mariadb-client libmariadb-dev postgresql-client sqlite3 \
-    # Compilation tools
-    gcc g++ libc6-dev linux-libc-dev build-essential cmake \
-    # Graphics and image processing
-    libjpeg-dev libpng-dev libfreetype6-dev \
-    # Math libraries for numpy/scipy
-    libopenblas-dev liblapack-dev \
+    # Basic compilation tools
+    gcc g++ libc6-dev linux-libc-dev build-essential \
     # Crypto libraries
     libffi-dev libssl-dev \
-    # Other common dependencies  
-    gfortran pkg-config \
+    # Network tools
+    pkg-config \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
@@ -72,8 +68,7 @@ RUN $VIRTUAL_ENV/bin/pip install uv
 COPY requirements-base.txt /tmp/
 RUN $VIRTUAL_ENV/bin/uv pip install --prerelease=allow -r /tmp/requirements-base.txt
 
-# Install PyTorch CPU-only separately (large, cacheable layer)
-RUN $VIRTUAL_ENV/bin/uv pip install --index-url https://download.pytorch.org/whl/cpu torch>=2.0.0,\<2.3.0 torchvision>=0.15.0,\<0.18.0
+# ML dependencies removed - using statistical intelligence only
 
 # Install remaining requirements
 RUN $VIRTUAL_ENV/bin/uv pip install --prerelease=allow -r /tmp/requirements.txt

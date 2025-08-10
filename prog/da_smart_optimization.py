@@ -11,12 +11,28 @@ import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 import asyncio
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler
 import json
 import aiohttp
-from dao.prog.da_config import Config
-from dao.prog.da_ha_integration import HomeAssistantIntegration
+
+# Statistical replacements for ML libraries
+from collections import defaultdict
+from statistics import mean, median, stdev
+
+# Optional cloud AI support
+try:
+    import openai
+    CLOUD_AI_AVAILABLE = True
+except ImportError:
+    CLOUD_AI_AVAILABLE = False
+
+# Import local modules
+try:
+    from dao.prog.da_config import Config
+    from dao.prog.da_ha_integration import HomeAssistantIntegration
+except ImportError:
+    # Fallback for testing
+    Config = dict
+    HomeAssistantIntegration = object
 
 
 def is_raspberry_pi() -> bool:
@@ -41,9 +57,9 @@ class SmartOptimizationEngine:
         if self.is_pi:
             logging.info("Raspberry Pi gedetecteerd - lightweight optimalisaties actief")
         
-        # Prediction models (Pi-optimized)
-        self.consumption_model = None
-        self.pv_model = None
+        # Statistical prediction models (ML-free)
+        self.consumption_stats = defaultdict(list)
+        self.pv_stats = defaultdict(list)
         self.load_detector = HighLoadDetector(config, ha_integration, lightweight=self.is_pi)
         self.device_scheduler = SmartDeviceScheduler(config, ha_integration)
         self.battery_manager = AdaptiveBatteryManager(config, ha_integration)

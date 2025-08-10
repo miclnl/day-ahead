@@ -1,20 +1,15 @@
-# DAO Modern - Statistical Intelligence + Optional ML
-# Core libraries - Alpine/Pi compatible
+# DAO v1.3.5 - Pure Statistical Intelligence (ML-free)
+# Core libraries - Alpine/Pi compatible  
 pandas>=2.1.0,<2.3.0
 numpy>=1.25.0,<1.27.0
 requests>=2.32.3,<3.0.0
 python-dateutil>=2.9.0.post0
-
-# Statistical optimization dependencies (OPTIONAL)
-# mip>=1.15.0,<1.17.0  # Optional - pure rule-based works without this
-# ephem>=4.1.4         # Optional - statistical fallback available
 
 # Database support - recent versions
 sqlalchemy>=2.0.20,<2.1.0
 sqlalchemy-utils>=0.41.0
 psycopg2-binary>=2.9.7
 pymysql>=1.1.0
-mariadb>=1.1.8
 
 # Web framework - recent versions
 flask>=2.3.0,<3.0.0
@@ -34,12 +29,8 @@ APScheduler>=3.10.4,<4.0.0
 cryptography>=3.4.8,<46.0.0
 aiohttp>=3.11.11
 websockets>=14.1
-psutil>=6.2.0
 
-# AI/ML Support (OPTIONAL - statistical works without these)
-# Install only when ML mode is desired
-# These libraries can cause SIGILL crashes on ARM containers
-# Default mode uses statistical intelligence instead
+# Cloud AI Support (optional - only if API keys configured)
+# No local ML dependencies - cloud services only
 openai>=1.58.1
 anthropic>=0.40.0
-dspy-ai>=2.4.0
