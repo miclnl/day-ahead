@@ -43,7 +43,7 @@ If you find bugs, have improvements, or want to adapt the code for other energy 
 
 Feel free to fork, modify, and make it your own - that's the beauty of open source! 🚀
 
-## 🆕 Version 1.3.5 Features - Complete Statistical Intelligence Suite
+## 🆕 Version 1.3.6 Features - Complete Statistical Intelligence Suite
 
 ✨ **Core Statistical Intelligence:**
 - 🧠 **ML-free Optimization** - Intelligent statistical methods replace all ML dependencies
@@ -53,14 +53,14 @@ Feel free to fork, modify, and make it your own - that's the beauty of open sour
 - 🎯 **Explainable Intelligence** - Traceable statistical decisions vs "black box" ML
 - 🔄 **Adaptive Learning** - Statistical patterns improve through performance feedback
 
-🌤️ **Weather Reactive Optimization (NEW v1.3.5):**
+🌤️ **Weather Reactive Optimization (NEW v1.3.6):**
 - 🌩️ **Real-time Weather Response** - Instant adaptation to sudden weather changes
 - ☀️ **Solar Event Detection** - Automatic response to SUDDEN_CLOUDS, CLEAR_SKIES
 - 🌡️ **Temperature Reactive** - Dynamic heating/cooling demand adjustments
 - 💨 **Wind & Storm Preparation** - Proactive energy management for extreme weather
 - 🔄 **Continuous Weather Monitoring** - 15-minute interval weather change detection
 
-☀️ **Enhanced Solar Intelligence (NEW v1.3.5):**
+☀️ **Enhanced Solar Intelligence (NEW v1.3.6):**
 - 🌍 **3D Solar Geometry** - Accurate sun position calculations with ephem integration
 - 📐 **Panel Orientation Optimization** - Precise tilt/azimuth angle calculations
 - 🔆 **DNI/DHI Solar Modeling** - Direct Normal + Diffuse Horizontal Irradiance
@@ -68,13 +68,21 @@ Feel free to fork, modify, and make it your own - that's the beauty of open sour
 - 📅 **Seasonal Tilt Correction** - Automatic optimization throughout the year
 - 🌤️ **Weather-Corrected Solar** - Cloud cover impact on production forecasting
 
-📅 **7-Day Extended Planning (NEW v1.3.5):**
+📅 **7-Day Extended Planning (NEW v1.3.6):**
 - 📆 **Multi-day Optimization** - Extended 7-day energy planning horizon
 - 🎄 **Holiday Detection** - Dutch holidays + vacation mode integration
 - 🏠 **Weekend Pattern Recognition** - Different consumption patterns detection
 - 🌱 **Seasonal Strategy Adaptation** - Winter/spring/summer/autumn optimization
 - 🔋 **Battery Degradation Management** - Longevity vs. cycling cost analysis
 - 📊 **Advanced Consumption Forecasting** - Weather-corrected multi-day predictions
+
+📈 **Comprehensive Statistics & Decision Analysis (NEW v1.3.6):**
+- 🧠 **Decision Transparency** - Complete reasoning for all optimization choices
+- 💰 **Expected Savings Calculator** - Real-time cost benefit analysis per strategy
+- 🎯 **Prediction Accuracy Tracking** - Historical performance monitoring with confidence metrics
+- 📊 **Interactive Visualizations** - Chart.js powered graphs for consumption, production, prices
+- 📋 **Detailed Data Tables** - Exportable CSV data with forecasts and historical comparison
+- 🔍 **Real-time System Status** - Live monitoring of optimization performance and battery health
 
 🤖 **Optional Cloud AI Integration (Available):**
 - 💬 **OpenAI/Anthropic Integration** - Optional GPT/Claude-powered optimization insights  
@@ -177,7 +185,7 @@ See the original DAO documentation for configuration details:
 
 ---
 
-**Version:** 1.3.5 - Complete Statistical Intelligence Suite  
+**Version:** 1.3.6 - Complete Statistical Intelligence Suite  
 **Author:** Cees van Beek  
 **Enhanced by:** Claude Code  
 
@@ -190,7 +198,7 @@ See the original DAO documentation for configuration details:
 ✅ **Startup Speed:** 10x faster  
 ✅ **Explainable AI:** Traceable decision logic  
 
-## 🚀 New in v1.3.5 - Revolutionary Energy Management
+## 🚀 New in v1.3.6 - Revolutionary Energy Management
 
 ✅ **ML-Free Operation:** Complete removal of problematic ML dependencies  
 ✅ **Weather Reactive:** Real-time adaptation to weather changes  
@@ -199,5 +207,7 @@ See the original DAO documentation for configuration details:
 ✅ **Battery Intelligence:** Degradation-aware cycling optimization  
 ✅ **Seasonal Adaptation:** Winter/summer strategy switching  
 ✅ **Performance Learning:** Continuous statistical optimization improvement  
+✅ **Decision Transparency:** Complete statistics dashboard with real-data analysis
+✅ **Interactive Analytics:** Chart.js visualizations with prediction confidence tracking
 
-**Complete energy optimization suite with pure statistical intelligence - superior reliability while matching ML performance.**
+**Complete energy optimization suite with transparent decision-making and comprehensive analytics.**
