@@ -1,6 +1,8 @@
 """
 AI-powered optimization module for Day Ahead Optimizer.
 Provides configurable AI integration for advanced optimization strategies.
+
+Now enhanced with DSPy for better structured AI interactions.
 """
 
 import asyncio
@@ -13,6 +15,20 @@ from abc import ABC, abstractmethod
 import pandas as pd
 
 from dao.prog.da_config import Config
+
+# Import DSPy optimizer if available
+try:
+    from dao.prog.da_dspy_optimizer import (
+        DSPyAIOptimizer, 
+        EnergySystemData, 
+        OptimizationResult,
+        create_dspy_optimizer
+    )
+    DSPY_AVAILABLE = True
+    logging.info("DSPy AI optimization available")
+except ImportError as e:
+    DSPY_AVAILABLE = False
+    logging.warning(f"DSPy not available, falling back to basic AI: {e}")
 
 
 class AIOptimizerBase(ABC):
@@ -481,7 +497,7 @@ Minimize cost. Return JSON with grid_import, grid_export arrays and total_cost."
 
 
 class AIOptimizationManager:
-    """Main AI optimization manager with fallback strategies"""
+    """Main AI optimization manager with DSPy and fallback strategies"""
     
     def __init__(self, config: Config):
         self.config = config
@@ -490,15 +506,30 @@ class AIOptimizationManager:
         self.provider = self.ai_config.get('provider', 'openai').lower()
         self.fallback_to_local = self.ai_config.get('fallback_to_local', True)
         self.cost_threshold = self.ai_config.get('cost_threshold', 0.10)  # Max cost per optimization
+        self.use_dspy = self.ai_config.get('use_dspy', True)  # Prefer DSPy when available
         
         self.optimizer = None
+        self.dspy_optimizer = None
         self._initialize_optimizer()
     
     def _initialize_optimizer(self):
-        """Initialize the appropriate AI optimizer"""
+        """Initialize the appropriate AI optimizer (DSPy first, then fallback)"""
         if not self.enabled:
             return
         
+        # Try DSPy first if available and preferred
+        if DSPY_AVAILABLE and self.use_dspy:
+            try:
+                self.dspy_optimizer = DSPyAIOptimizer(self.config)
+                if self.dspy_optimizer.validate_configuration():
+                    logging.info(f"DSPy optimizer initialized successfully with {self.provider}")
+                    return
+                else:
+                    logging.warning("DSPy optimizer validation failed, falling back to legacy")
+            except Exception as e:
+                logging.warning(f"DSPy initialization failed: {e}, falling back to legacy")
+        
+        # Fallback to legacy optimizers
         try:
             if self.provider == 'openai':
                 self.optimizer = OpenAIOptimizer(self.ai_config.get('openai', {}))
@@ -544,27 +575,181 @@ class AIOptimizationManager:
                 logging.warning(f"AI optimization cost ${estimated_cost:.3f} exceeds threshold ${self.cost_threshold:.3f}")
                 return None
             
-            # Perform AI optimization
-            result = await self.optimizer.optimize(optimization_data)
+            # Use DSPy optimizer if available
+            if self.dspy_optimizer:
+                result = await self._optimize_with_dspy(optimization_data)
+                if result:
+                    logging.info("DSPy AI optimization completed successfully")
+                    return result
+                else:
+                    logging.warning("DSPy optimization failed, trying legacy")
             
-            if result:
-                logging.info("AI optimization completed successfully")
-                return result
-            else:
-                logging.error("AI optimization failed")
+            # Fallback to legacy optimizer
+            if self.optimizer:
+                result = await self.optimizer.optimize(optimization_data)
                 
-                # Try fallback to local AI if configured
-                if self.fallback_to_local and self.provider != 'local':
-                    logging.info("Attempting fallback to local AI")
-                    local_optimizer = LocalAIOptimizer(self.ai_config.get('local', {}))
-                    return await local_optimizer.optimize(optimization_data)
-                
-                return None
+                if result:
+                    logging.info("Legacy AI optimization completed successfully")
+                    return result
+                else:
+                    logging.error("AI optimization failed")
+                    
+                    # Try fallback to local AI if configured
+                    if self.fallback_to_local and self.provider != 'local':
+                        logging.info("Attempting fallback to local AI")
+                        local_optimizer = LocalAIOptimizer(self.ai_config.get('local', {}))
+                        return await local_optimizer.optimize(optimization_data)
+            
+            return None
                 
         except Exception as e:
             logging.error(f"AI optimization error: {e}")
             return None
     
+    async def _optimize_with_dspy(self, optimization_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Use DSPy optimizer for structured AI optimization"""
+        try:
+            # Convert optimization data to EnergySystemData format
+            system_data = self._convert_to_energy_system_data(optimization_data)
+            
+            # Perform DSPy optimization
+            result = await self.dspy_optimizer.optimize_energy_system(
+                system_data=system_data,
+                objective="minimize_cost"
+            )
+            
+            if result and result.battery_schedule:
+                # Convert DSPy result back to legacy format
+                return self._convert_dspy_result_to_legacy(result, optimization_data)
+            else:
+                logging.warning("DSPy optimization returned no valid result")
+                return None
+                
+        except Exception as e:
+            logging.error(f"DSPy optimization failed: {e}")
+            return None
+    
+    def _convert_to_energy_system_data(self, data: Dict[str, Any]) -> EnergySystemData:
+        """Convert legacy optimization data to EnergySystemData format"""
+        time_periods = data.get('time_periods', 24)
+        start_dt = data.get('start_dt', datetime.datetime.now().isoformat())
+        
+        # Extract price data
+        price_data = data.get('price_data', {})
+        electricity_prices = price_data.get('consumption_prices', [0.20] * time_periods)
+        
+        # Extract solar forecast
+        solar_data = data.get('solar_data', {})
+        solar_forecasts = solar_data.get('production_forecasts', [])
+        solar_forecast = []
+        for hour_forecasts in solar_forecasts:
+            if hour_forecasts:
+                solar_forecast.append(sum(hour_forecasts))
+            else:
+                solar_forecast.append(0.0)
+        
+        # Pad or truncate to correct length
+        while len(solar_forecast) < time_periods:
+            solar_forecast.append(0.0)
+        solar_forecast = solar_forecast[:time_periods]
+        
+        # Extract consumption forecast
+        baseload_data = data.get('baseload_data', {})
+        consumption_forecast = baseload_data.get('baseload_consumption', [1.5] * time_periods)
+        
+        # Extract battery configuration
+        battery_data = data.get('battery_data', {})
+        batteries = battery_data.get('batteries', [])
+        battery_config = {}
+        if batteries:
+            # Use first battery for now
+            battery = batteries[0]
+            battery_config = {
+                "capacity": battery.get('capacity', 10.0),
+                "max_charge_power": battery.get('max_charge_power', 5.0),
+                "max_discharge_power": battery.get('max_discharge_power', 5.0),
+                "start_soc": battery.get('start_soc', 0.5),
+                "min_soc": battery.get('min_soc', 0.1),
+                "max_soc": battery.get('max_soc', 0.9),
+                "efficiency": battery.get('efficiency', 0.95)
+            }
+        
+        # Extract EV configuration
+        ev_data = data.get('ev_data', {})
+        ev_config = None
+        if ev_data.get('electric_vehicles'):
+            evs = ev_data['electric_vehicles']
+            if evs:
+                ev = evs[0]
+                ev_config = {
+                    "capacity": ev.get('capacity', 50.0),
+                    "charge_power": ev.get('charge_power', 11.0),
+                    "start_soc": ev.get('start_soc', 0.3),
+                    "target_soc": ev.get('target_soc', 0.8),
+                    "departure_time": ev.get('departure_time', '08:00')
+                }
+        
+        # Extract heating configuration
+        heating_data = data.get('heating_data', {})
+        heating_config = None
+        if heating_data:
+            heating_config = {
+                "boiler_enabled": heating_data.get('boiler_enabled', False),
+                "heat_pump_enabled": heating_data.get('heat_pump_enabled', False),
+                "boiler_power": heating_data.get('boiler_power', 2000),
+                "heat_pump_power": heating_data.get('heat_pump_power', 3000),
+                "heat_pump_cop": heating_data.get('heat_pump_cop', 3.5)
+            }
+        
+        return EnergySystemData(
+            time_periods=time_periods,
+            start_dt=start_dt,
+            electricity_prices=electricity_prices,
+            solar_forecast=solar_forecast,
+            consumption_forecast=consumption_forecast,
+            battery_config=battery_config,
+            ev_config=ev_config,
+            heating_config=heating_config
+        )
+    
+    def _convert_dspy_result_to_legacy(self, result: OptimizationResult, original_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert DSPy optimization result to legacy format"""
+        time_periods = original_data.get('time_periods', 24)
+        timestamps = original_data.get('price_data', {}).get('timestamps', [])
+        
+        # Build legacy format result
+        legacy_result = {
+            'grid_import': [max(0, val) for val in result.battery_schedule],
+            'grid_export': [max(0, -val) for val in result.battery_schedule],
+            'total_cost': result.expected_cost,
+            'optimization_notes': result.optimization_strategy,
+            'timestamps': timestamps
+        }
+        
+        # Add battery information
+        if result.battery_schedule:
+            legacy_result['batteries'] = [{
+                'charge_power': [max(0, val) for val in result.battery_schedule],
+                'discharge_power': [max(0, -val) for val in result.battery_schedule],
+                'soc': [50.0] * time_periods  # Simplified SoC calculation
+            }]
+        
+        # Add EV information
+        if result.ev_charging_schedule:
+            legacy_result['electric_vehicles'] = [{
+                'charge_power': result.ev_charging_schedule,
+                'soc': [30.0 + (i * 2.0) for i in range(time_periods)]  # Simplified
+            }]
+        
+        # Add heating information
+        if result.heating_schedule:
+            legacy_result['heating'] = {
+                'boiler_heating': [1 if val > 0 else 0 for val in result.heating_schedule],
+                'heat_pump_power': result.heating_schedule
+            }
+        
+        return legacy_result
+
     def _estimate_optimization_cost(self, data: Dict[str, Any]) -> float:
         """Estimate the cost of AI optimization"""
         if self.provider == 'local':

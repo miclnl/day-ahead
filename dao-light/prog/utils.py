@@ -267,8 +267,13 @@ def get_version():
 
 
 def version_number(version_str: str) -> int:
-    lst = [x for x in version_str.split(".")]
+    # Clean version string by removing non-numeric suffixes like "-test", "-alpha", etc.
+    clean_version = version_str.split("-")[0]  # Take only the part before any dash
+    lst = [x for x in clean_version.split(".")]
     lst = lst[:3]
+    # Pad with zeros if needed
+    while len(lst) < 3:
+        lst.append("0")
     lst.reverse()
     result = sum(int(x) * (100**i) for i, x in enumerate(lst))
     return result
