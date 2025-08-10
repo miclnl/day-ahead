@@ -125,3 +125,4 @@ Structured logging to:
 - `data/log/`: Application logs with rotation
 - Home Assistant notification entities for alerts
 - Web dashboard for real-time status monitoring
+- Test de docker builds voordat je aangeeft dat de functionaliteit werkt

@@ -4,66 +4,75 @@ FROM ${BUILD_FROM}
 ARG BUILD_ARCH
 ENV ENV_BUILD_ARCH=$BUILD_ARCH
 
-# Set shell
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Create non-root user for security
+RUN useradd --system --no-create-home --shell /sbin/nologin --home-dir /app daouser
 
-RUN apt-get update -y
-RUN apt-get upgrade -y
+# Add development tools needed for Python packages with C extensions
+RUN apt-get update && apt-get install -y \
+    # Python and development tools
+    python3 python3-pip python3-dev python3-venv \
+    # Database clients and dev headers
+    mariadb-client libmariadb-dev postgresql-client sqlite3 \
+    # Compilation tools
+    gcc g++ libc6-dev linux-libc-dev build-essential cmake \
+    # Graphics and image processing
+    libjpeg-dev libpng-dev libfreetype6-dev \
+    # Math libraries for numpy/scipy
+    libopenblas-dev liblapack-dev \
+    # Crypto libraries
+    libffi-dev libssl-dev \
+    # Other common dependencies  
+    gfortran pkg-config \
+    # Clean up
+    && rm -rf /var/lib/apt/lists/*
 
-#handige tools
-RUN apt-get install -y pkgconf nano file mariadb-client inotify-tools procps gunicorn libmariadb3 libmariadb-dev
-RUN apt-get install -y postgresql-client sqlite3 gcc libjpeg-dev
-
-# Copy software for add-on
-RUN mkdir /root/dao
-COPY __init__.py /root/dao
-COPY prog /root/dao/prog/
-COPY webserver /root/dao/webserver/
-# COPY dao/__init__.py /root/dao
-COPY data /tmp/daodata/
+# Copy software for add-on to non-root location
+RUN mkdir -p /app/dao && chown -R daouser:daouser /app
+COPY --chown=daouser:daouser __init__.py /app/dao/
+COPY --chown=daouser:daouser prog /app/dao/prog/
+COPY --chown=daouser:daouser webserver /app/dao/webserver/
+COPY --chown=daouser:daouser data /app/daodata/
 
 #version
 ARG BUILD_VERSION
 ENV DAO_VERSION=$BUILD_VERSION
-RUN printf  '__version__ ="%s"\n' "$DAO_VERSION" > /root/dao/prog/version.py
+RUN printf  '__version__ ="%s"\n' "$DAO_VERSION" > /app/dao/prog/version.py
 
-#benodigde libraries voor mip
-RUN apt-get install -y wget libnauty2-dev coinor-libcgl-dev libcholmod3
+#benodigde libraries voor mip (some may not exist in Alpine)
+RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/* || true
 
-COPY miplib.tar.gz /tmp/
-WORKDIR /root/dao/prog
-RUN echo 'platform: "$ENV_BUILD_ARCH"' \
-  && export BUILD_ARCH="$ENV_BUILD_ARCH" \
-  && echo 'export BUILD_ARCH="$ENV_BUILD_ARCH"' >> ~/.bashrc \
-  && export PYTHONPATH="/root:/root/dao:/root/dao/prog" \
-  && echo 'export PYTHONPATH="/root:/root/dao:/root/dao/prog"' >> ~/.bashrc
+COPY --chown=daouser:daouser miplib.tar.gz /tmp/
+WORKDIR /app/dao/prog
+ENV BUILD_ARCH="$ENV_BUILD_ARCH"
+ENV PYTHONPATH="/app:/app/dao:/app/dao/prog"
 
 RUN if [ "${BUILD_ARCH}" = "aarch64" ]; then \
-      tar -xvf /tmp/miplib.tar.gz -C /root/dao/prog && \
-      export PMIP_CBC_LIBRARY="/root/dao/prog/miplib/lib/libCbc.so" && \
-      export LD_LIBRARY_PATH="/root/dao/prog/miplib/lib/"  && \
-      echo 'export PMIP_CBC_LIBRARY="/root/dao/prog/miplib/lib/libCbc.so"' >> ~/.bashrc  && \
-      echo 'export LD_LIBRARY_PATH="/root/dao/prog/miplib/lib/"' >> ~/.bashrc \
+      tar -xvf /tmp/miplib.tar.gz -C /app/dao/prog && \
+      chown -R daouser:daouser /app/dao/prog/miplib \
    ; fi
 
-#installeer python en pip
-RUN apt-get install python3 -y\
-    python3-pip -y\
-    python3-venv -y
+# Set environment variables for runtime
+ENV PMIP_CBC_LIBRARY="/app/dao/prog/miplib/lib/libCbc.so"
+ENV LD_LIBRARY_PATH="/app/dao/prog/miplib/lib/"
 
-ENV VIRTUAL_ENV=/root/dao/venv/day_ahead
-RUN python3 -m venv $VIRTUAL_ENV
+# Python is already installed in debian-base image
+# Just ensure pip and venv are available
+RUN python3 -m pip install --break-system-packages --upgrade pip
+
+ENV VIRTUAL_ENV=/app/dao/venv/day_ahead
+RUN python3 -m venv $VIRTUAL_ENV && chown -R daouser:daouser $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/
-RUN pip3 install uv
+RUN pip3 install --break-system-packages uv
 RUN uv pip install --prerelease=allow -r /tmp/requirements.txt
-COPY run /root/dao/prog/
+COPY --chown=daouser:daouser run /app/dao/prog/
 
+# Switch to non-root user
+USER daouser
 EXPOSE 5001
-WORKDIR /root/dao/prog
-RUN chmod a+x run.sh
-ENTRYPOINT  ["/bin/bash", "./run.sh"]
+WORKDIR /app/dao/prog
+ENTRYPOINT ["python3", "da_entrypoint.py"]
 
 # Labels
 LABEL \

@@ -20,10 +20,13 @@ try:
     APSCHEDULER_AVAILABLE = True
 except ImportError as e:
     APSCHEDULER_AVAILABLE = False
-    logging.error(f"APScheduler not available: {e}. Falling back to original scheduler.")
-    # Import original scheduler instead
-    import subprocess
-    import sys
+    logging.warning(f"APScheduler not available: {e}. Falling back to simple scheduler.")
+    # Define dummy classes to prevent NameError
+    class CronTrigger: pass
+    class DateTrigger: pass
+    class IntervalTrigger: pass
+    EVENT_JOB_EXECUTED = None
+    EVENT_JOB_ERROR = None
 from da_base import DaBase
 from da_async_fetcher import AsyncDataFetcher, fetch_and_save_all_data
 
@@ -37,14 +40,17 @@ class ModernDaScheduler(DaBase):
     def __init__(self, file_name: str = None):
         super().__init__(file_name)
         
-        self.scheduler = AsyncIOScheduler(
-            timezone='Europe/Amsterdam',
-            job_defaults={
-                'coalesce': True,  # Combine multiple pending executions
-                'max_instances': 1,  # Prevent overlapping executions
-                'misfire_grace_time': 300  # 5 minute grace period
-            }
-        )
+        if APSCHEDULER_AVAILABLE:
+            self.scheduler = AsyncIOScheduler(
+                timezone='Europe/Amsterdam',
+                job_defaults={
+                    'coalesce': True,  # Combine multiple pending executions
+                    'max_instances': 1,  # Prevent overlapping executions
+                    'misfire_grace_time': 300  # 5 minute grace period
+                }
+            )
+        else:
+            self.scheduler = None
         
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="DAO-Worker")
         self.event_queue = asyncio.Queue()
@@ -63,15 +69,28 @@ class ModernDaScheduler(DaBase):
             self.active = not (self.tasks_config["active"].lower() == "false")
             
         # Setup event listeners
-        self.scheduler.add_listener(self._job_executed, EVENT_JOB_EXECUTED)
-        self.scheduler.add_listener(self._job_error, EVENT_JOB_ERROR)
+        if APSCHEDULER_AVAILABLE and self.scheduler:
+            self.scheduler.add_listener(self._job_executed, EVENT_JOB_EXECUTED)
+            self.scheduler.add_listener(self._job_error, EVENT_JOB_ERROR)
     
     async def start_scheduler(self):
         """
         Start the modern scheduler with all configured tasks.
         Replaces the old infinite loop with proper async event handling.
         """
-        logging.info("Starting modern DAO scheduler")
+        if not APSCHEDULER_AVAILABLE:
+            logging.error("APScheduler not available, falling back to simple scheduler")
+            # Import and use simple scheduler
+            from da_simple_scheduler import SimpleScheduler
+            simple_scheduler = SimpleScheduler(self.file_name)
+            simple_scheduler.start()
+            
+            # Keep running
+            while True:
+                await asyncio.sleep(1)
+            return
+            
+        logging.info("Starting modern DAO scheduler with APScheduler")
         
         try:
             # Setup signal handlers for graceful shutdown
@@ -79,7 +98,8 @@ class ModernDaScheduler(DaBase):
             signal.signal(signal.SIGINT, self._signal_handler)
             
             # Start the scheduler
-            self.scheduler.start()
+            if self.scheduler:
+                self.scheduler.start()
             
             # Schedule configured tasks
             self._schedule_configured_tasks()
@@ -96,6 +116,9 @@ class ModernDaScheduler(DaBase):
     
     def _schedule_configured_tasks(self):
         """Schedule tasks based on configuration"""
+        if not APSCHEDULER_AVAILABLE or not self.scheduler:
+            return
+            
         logging.info("Scheduling configured tasks")
         
         for time_key, task_name in self.tasks_config.items():
@@ -126,6 +149,9 @@ class ModernDaScheduler(DaBase):
     
     def _schedule_realtime_monitoring(self):
         """Schedule real-time monitoring tasks"""
+        if not APSCHEDULER_AVAILABLE or not self.scheduler:
+            return
+            
         logging.info("Setting up real-time monitoring")
         
         # Monitor for urgent events every 30 seconds
@@ -241,26 +267,34 @@ class ModernDaScheduler(DaBase):
         data_type = data.get('data_type')
         if data_type in ['weather', 'prices']:
             # Schedule optimization in 1 minute to allow other data to arrive
-            self.scheduler.add_job(
-                self._run_optimization,
-                DateTrigger(run_date=datetime.datetime.now() + datetime.timedelta(minutes=1)),
-                id='delayed_optimization',
-                name='Delayed Optimization after Data Update',
-                replace_existing=True
-            )
+            if APSCHEDULER_AVAILABLE and self.scheduler:
+                self.scheduler.add_job(
+                    self._run_optimization,
+                    DateTrigger(run_date=datetime.datetime.now() + datetime.timedelta(minutes=1)),
+                    id='delayed_optimization',
+                    name='Delayed Optimization after Data Update',
+                    replace_existing=True
+                )
+            else:
+                # Run directly if no APScheduler
+                await self._run_optimization()
     
     async def _trigger_urgent_optimization(self, reason: str):
         """Trigger urgent optimization with high priority"""
         logging.info(f"Triggering urgent optimization: {reason}")
         
         # Run optimization immediately
-        self.scheduler.add_job(
-            self._run_optimization,
-            DateTrigger(run_date=datetime.datetime.now()),
-            id='urgent_optimization',
-            name=f'Urgent Optimization: {reason}',
-            replace_existing=True
-        )
+        if APSCHEDULER_AVAILABLE and self.scheduler:
+            self.scheduler.add_job(
+                self._run_optimization,
+                DateTrigger(run_date=datetime.datetime.now()),
+                id='urgent_optimization',
+                name=f'Urgent Optimization: {reason}',
+                replace_existing=True
+            )
+        else:
+            # Run directly if no APScheduler
+            await self._run_optimization()
     
     async def _check_urgent_conditions(self):
         """Check for conditions requiring urgent attention"""
@@ -500,7 +534,7 @@ class ModernDaScheduler(DaBase):
         
         try:
             # Shutdown scheduler
-            if self.scheduler.running:
+            if APSCHEDULER_AVAILABLE and self.scheduler and self.scheduler.running:
                 self.scheduler.shutdown(wait=False)
             
             # Shutdown executor
@@ -572,12 +606,6 @@ class ModernDaScheduler(DaBase):
 
 async def main():
     """Main entry point for the modern scheduler"""
-    if not APSCHEDULER_AVAILABLE:
-        logging.error("APScheduler not available, falling back to original scheduler")
-        # Use original scheduler instead
-        subprocess.call([sys.executable, "da_scheduler.py"])
-        return
-    
     scheduler = ModernDaScheduler("../data/options.json")
     
     try:

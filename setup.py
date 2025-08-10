@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='dao_enhanced_repository', 
-    version='1.2.2',
+    version='1.3.4',
     packages=['dao-modern', 'dao-light'],
     url='https://github.com/miclnl/day-ahead',
     license='Apache License, Version 2.0',

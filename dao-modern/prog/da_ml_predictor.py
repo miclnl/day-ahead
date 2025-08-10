@@ -22,7 +22,15 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.pipeline import Pipeline
-import xgboost as xgb
+
+# XGBoost (optional import with fallback)
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+    logging.info("XGBoost available for advanced ML models")
+except ImportError:
+    XGBOOST_AVAILABLE = False
+    logging.warning("XGBoost not available, using sklearn models only")
 
 # TensorFlow Lite (optional imports with fallback)
 try:
@@ -163,7 +171,11 @@ class ConsumptionPredictor(MLModelBase):
             if self.algorithm == 'ensemble':
                 self.model = await self._train_ensemble(X_train_scaled, y_train)
             elif self.algorithm == 'xgboost':
-                self.model = await self._train_xgboost(X_train_scaled, y_train)
+                if XGBOOST_AVAILABLE:
+                    self.model = await self._train_xgboost(X_train_scaled, y_train)
+                else:
+                    logging.warning("XGBoost not available, using Gradient Boosting instead")
+                    self.model = await self._train_gradient_boosting(X_train_scaled, y_train)
             elif self.algorithm == 'neural_network' and TENSORFLOW_AVAILABLE:
                 self.model = await self._train_neural_network(X_train_scaled, y_train, X_test_scaled, y_test)
             else:
@@ -210,9 +222,30 @@ class ConsumptionPredictor(MLModelBase):
         
         return ensemble
     
-    async def _train_xgboost(self, X_train: np.ndarray, y_train: np.ndarray) -> xgb.XGBRegressor:
-        """Train XGBoost model with hyperparameter tuning"""
+    async def _train_gradient_boosting(self, X_train: np.ndarray, y_train: np.ndarray) -> GradientBoostingRegressor:
+        """Train Gradient Boosting model (sklearn alternative to XGBoost)"""
         
+        # Gradient Boosting with similar parameters to XGBoost
+        model = GradientBoostingRegressor(
+            n_estimators=200,
+            max_depth=6,
+            learning_rate=0.1,
+            subsample=0.8,
+            random_state=42
+        )
+        
+        # Train asynchronously
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            model = await loop.run_in_executor(executor, model.fit, X_train, y_train)
+        
+        return model
+    
+    async def _train_xgboost(self, X_train: np.ndarray, y_train: np.ndarray):
+        """Train XGBoost model (only if available)"""
+        if not XGBOOST_AVAILABLE:
+            raise RuntimeError("XGBoost not available")
+            
         # XGBoost with optimal parameters for time series
         model = xgb.XGBRegressor(
             n_estimators=200,
