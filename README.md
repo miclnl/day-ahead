@@ -1,9 +1,10 @@
 # Day Ahead Optimization Enhanced Repository
 
-![Supports aarch64 Architecture][aarch64-shield] ![Supports amd64 Architecture][amd64-shield]
+![Supports aarch64 Architecture][aarch64-shield] ![Supports amd64 Architecture][amd64-shield] ![Version][version-shield]
 
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
+[version-shield]: https://img.shields.io/badge/version-1.1.0-blue.svg
 
 This repository contains enhanced versions of the Day Ahead Optimizer (DAO) for Home Assistant with modern integration features, automatic service discovery, and advanced security.
 
@@ -35,8 +36,8 @@ This repository contains enhanced versions of the Day Ahead Optimizer (DAO) for 
 - 🤖 Optional AI optimization (OpenAI/Anthropic/Local)
 - 🔗 Real-time WebSocket updates and modern GUI
 
-**Requirements:** 8GB+ RAM recommended, modern Pi 4 or x86 system
-**Port:** 5001
+**Requirements:** 4GB+ RAM recommended, modern Pi 4 (aarch64) or x86_64 system
+**Port:** 8099 (ingress) or 5001 (direct)
 
 ### 🪶 DAO Light (Minimal & Stable)  
 **Lightweight version optimized for reliability**
@@ -48,8 +49,17 @@ This repository contains enhanced versions of the Day Ahead Optimizer (DAO) for 
 - ✅ Stable, proven libraries only
 - ✅ Fast startup and low memory usage
 
-**Requirements:** 2GB+ RAM, any Pi or x86 system
-**Port:** 5002
+**Requirements:** 1GB+ RAM, any Pi (aarch64) or x86_64 system  
+**Port:** 8099 (ingress) or 5002 (direct)
+
+## 🏗️ Architecture Support
+
+Both DAO versions support multiple architectures:
+
+- **aarch64** - ARM64 systems (Raspberry Pi 4, Apple Silicon, etc.)
+- **amd64** - x86_64 systems (Intel/AMD 64-bit processors)
+
+Home Assistant will automatically select the correct architecture for your system.
 
 ## 🔧 Installation
 
