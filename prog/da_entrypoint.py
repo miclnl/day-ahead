@@ -117,7 +117,7 @@ class DaoEntrypoint:
     
     def start_webserver(self):
         """Start the web server in background"""
-        logger.info("Starting web server")
+        logger.info("Starting web server on port 5001")
         
         try:
             os.chdir(self.app_dir / "webserver")
@@ -127,9 +127,13 @@ class DaoEntrypoint:
             if venv_python.exists():
                 # Start gunicorn within virtual environment
                 cmd = [str(venv_python), "-m", "gunicorn", "--config", "gunicorn_config.py", "app:app"]
+                logger.info("Using virtual environment gunicorn")
             else:
                 # Fallback to system gunicorn
                 cmd = ["gunicorn", "--config", "gunicorn_config.py", "app:app"]
+                logger.info("Using system gunicorn")
+            
+            logger.info(f"Starting command: {' '.join(cmd)}")
             
             process = subprocess.Popen(cmd, 
                                      stdout=subprocess.PIPE, 
@@ -138,12 +142,21 @@ class DaoEntrypoint:
             
             logger.info(f"Web server started with PID: {process.pid}")
             
-            # Check if process started successfully
-            time.sleep(1)
+            # Give it more time to start and capture initial output
+            time.sleep(3)
             if process.poll() is not None:
                 output = process.stdout.read()
                 logger.error(f"Web server failed to start: {output}")
                 return None
+            else:
+                logger.info("Web server is running successfully")
+                # Read any initial output
+                try:
+                    output = process.stdout.read(1024)  # Read first 1KB
+                    if output:
+                        logger.info(f"Web server initial output: {output.strip()}")
+                except:
+                    pass
             
             return process
             

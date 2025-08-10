@@ -207,7 +207,28 @@ def get_file_list(path: str, pattern: str) -> list:
 
 @app.route("/", methods=["POST", "GET"])
 def menu():
-    """Main dashboard with modern interface"""
+    """Main dashboard with modern interface - redirect to dashboard"""
+    from flask import redirect, url_for
+    return redirect(url_for('dashboard'))
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    """Modern DAO Dashboard - central hub for all functionality"""
+    import datetime
+    from datetime import timedelta
+    
+    return render_template(
+        "dashboard.html",
+        title="DAO Dashboard",
+        active_menu="dashboard",
+        datetime=datetime.datetime,
+        timedelta=timedelta,
+        version=__version__,
+    )
+
+@app.errorhandler(404)
+def page_not_found(e):
+    """Handle 404 errors by redirecting to dashboard"""
     from flask import redirect, url_for
     return redirect(url_for('dashboard'))
 
@@ -705,21 +726,6 @@ def calculate_hourly_accuracy(forecast, historical):
     accuracy = max(0.5, 1.0 - error_rate)  # Convert error to accuracy
     
     return min(0.99, accuracy)
-
-@app.route("/dashboard", methods=["GET"])
-def dashboard():
-    """Modern DAO Dashboard - central hub for all functionality"""
-    import datetime
-    from datetime import timedelta
-    
-    return render_template(
-        "dashboard.html",
-        title="DAO Dashboard",
-        active_menu="dashboard",
-        datetime=datetime.datetime,
-        timedelta=timedelta,
-        version=__version__,
-    )
 
 @app.route("/home", methods=["POST", "GET"])
 def home():
@@ -1421,6 +1427,23 @@ def restart_scheduler():
         logging.error(f"Scheduler restart error: {e}")
         return {"success": False, "error": str(e)}, 500
 
+
+@app.route("/debug/routes", methods=["GET"])
+def debug_routes():
+    """Show all available routes for debugging"""
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            'endpoint': rule.endpoint,
+            'methods': list(rule.methods),
+            'url': rule.rule
+        })
+    
+    return {
+        'routes': sorted(routes, key=lambda x: x['url']),
+        'total_routes': len(routes),
+        'version': __version__
+    }
 
 @app.route("/health")
 @app.route("/api/health-check")
