@@ -67,7 +67,7 @@ except ImportError:
         print("DEBUG: routes.py - Version imported via dao.prog.version")
     except ImportError:
         print("Warning: Could not import version")
-        __version__ = "1.3.12"
+        __version__ = "1.3.14"
 
 print("DEBUG: routes.py - Module imports completed")
 
@@ -343,8 +343,17 @@ def get_file_list(path: str, pattern: str) -> list:
 @app.route("/", methods=["POST", "GET"])
 def menu():
     """Main dashboard with modern interface - redirect to dashboard"""
-    from flask import redirect, url_for
-    return redirect(url_for('dashboard'))
+    from flask import redirect, request
+    
+    # Home Assistant ingress-aware redirect
+    # Check if we're behind Home Assistant ingress proxy
+    if request.headers.get('X-Ingress-Path') or request.headers.get('X-Forwarded-For'):
+        # Use relative redirect for ingress compatibility
+        return redirect('/dashboard')
+    else:
+        # Use Flask url_for for direct access
+        from flask import url_for
+        return redirect(url_for('dashboard'))
 
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
@@ -1622,8 +1631,12 @@ def not_found_error(error):
     # If it's an API call, return JSON
     if request.path.startswith('/api/'):
         return {"error": "Not found", "path": request.path}, 404
-    # Otherwise redirect to dashboard
-    return redirect(url_for('dashboard'))
+    # Otherwise redirect to dashboard with ingress awareness
+    if request.headers.get('X-Ingress-Path') or request.headers.get('X-Forwarded-For'):
+        return redirect('/dashboard')
+    else:
+        from flask import url_for
+        return redirect(url_for('dashboard'))
 
 @app.route("/api/system-status")
 def system_status():
