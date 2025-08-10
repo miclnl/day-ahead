@@ -13,14 +13,16 @@ from concurrent.futures import ThreadPoolExecutor
 # APScheduler imports with fallback
 try:
     import apscheduler
-    print(f"APScheduler version found: {apscheduler.__version__}")
+    # Get version safely
+    apscheduler_version = getattr(apscheduler, '__version__', 'unknown')
+    print(f"APScheduler version found: {apscheduler_version}")
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
     from apscheduler.triggers.date import DateTrigger
     from apscheduler.triggers.interval import IntervalTrigger
     from apscheduler.events import EVENT_JOB_EXECUTED, EVENT_JOB_ERROR
     APSCHEDULER_AVAILABLE = True
-    logging.info(f"APScheduler {apscheduler.__version__} loaded successfully")
+    logging.info(f"APScheduler {apscheduler_version} loaded successfully")
 except ImportError as e:
     APSCHEDULER_AVAILABLE = False
     logging.warning(f"APScheduler not available: {e}. Falling back to simple scheduler.")
