@@ -1,6 +1,6 @@
 ---
 name: 🪶 DAO Light (Minimal & Stable)
-version: 1.1.2
+version: 1.1.3
 slug: dao_light_minimal
 description: Lightweight and stable DAO with minimal dependencies for reliable operation on Pi
 url: https://github.com/miclnl/day-ahead
