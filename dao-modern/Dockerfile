@@ -4,8 +4,8 @@ FROM ${BUILD_FROM}
 ARG BUILD_ARCH
 ENV ENV_BUILD_ARCH=$BUILD_ARCH
 
-# Create non-root user for security
-RUN useradd --system --no-create-home --shell /sbin/nologin --home-dir /app daouser
+# Note: Using root user for Home Assistant compatibility
+# RUN useradd --system --no-create-home --shell /sbin/nologin --home-dir /app daouser
 
 # Add development tools needed for Python packages with C extensions
 RUN apt-get update && apt-get install -y \
@@ -26,12 +26,12 @@ RUN apt-get update && apt-get install -y \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
-# Copy software for add-on to non-root location
-RUN mkdir -p /app/dao && chown -R daouser:daouser /app
-COPY --chown=daouser:daouser __init__.py /app/dao/
-COPY --chown=daouser:daouser prog /app/dao/prog/
-COPY --chown=daouser:daouser webserver /app/dao/webserver/
-COPY --chown=daouser:daouser data /app/daodata/
+# Copy software for add-on (using root for HA compatibility)
+RUN mkdir -p /app/dao
+COPY __init__.py /app/dao/
+COPY prog /app/dao/prog/
+COPY webserver /app/dao/webserver/
+COPY data /app/daodata/
 
 #version
 ARG BUILD_VERSION
@@ -41,14 +41,13 @@ RUN printf  '__version__ ="%s"\n' "$DAO_VERSION" > /app/dao/prog/version.py
 #benodigde libraries voor mip (some may not exist in Alpine)
 RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/* || true
 
-COPY --chown=daouser:daouser miplib.tar.gz /tmp/
+COPY miplib.tar.gz /tmp/
 WORKDIR /app/dao/prog
 ENV BUILD_ARCH="$ENV_BUILD_ARCH"
 ENV PYTHONPATH="/app:/app/dao:/app/dao/prog"
 
 RUN if [ "${BUILD_ARCH}" = "aarch64" ]; then \
-      tar -xvf /tmp/miplib.tar.gz -C /app/dao/prog && \
-      chown -R daouser:daouser /app/dao/prog/miplib \
+      tar -xvf /tmp/miplib.tar.gz -C /app/dao/prog \
    ; fi
 
 # Set environment variables for runtime
@@ -60,16 +59,15 @@ ENV LD_LIBRARY_PATH="/app/dao/prog/miplib/lib/"
 RUN python3 -m pip install --break-system-packages --upgrade pip
 
 ENV VIRTUAL_ENV=/app/dao/venv/day_ahead
-RUN python3 -m venv $VIRTUAL_ENV && chown -R daouser:daouser $VIRTUAL_ENV
+RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/
 RUN pip3 install --break-system-packages uv
 RUN uv pip install --prerelease=allow -r /tmp/requirements.txt
-COPY --chown=daouser:daouser run /app/dao/prog/
+COPY run /app/dao/prog/
 
-# Switch to non-root user
-USER daouser
+# Using root user for Home Assistant compatibility
 EXPOSE 5001
 WORKDIR /app/dao/prog
 ENTRYPOINT ["python3", "da_entrypoint.py"]

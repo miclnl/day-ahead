@@ -1,6 +1,6 @@
 ---
 name: 🪶 DAO Light (Minimal & Stable)
-version: 1.1.0
+version: 1.1.1
 slug: dao_light_minimal
 description: Lightweight and stable DAO with minimal dependencies for reliable operation on Pi
 url: https://github.com/miclnl/day-ahead
@@ -25,15 +25,12 @@ ports:
 # Image wordt lokaal gebouwd via Dockerfile
 # image: "ghcr.io/miclnl/dao-light-{arch}"
 
-# Simplified configuration schema for Light version
+# Basic addon configuration - energy settings configured in webapp
 options:
   database_engine: sqlite
   log_level: info
-  optimization_interval: 60
+  homeassistant_token: ""
 schema:
   database_engine: list(sqlite|mysql)
   log_level: list(debug|info|warning|error)
-  optimization_interval: int(30,3600)
-  homeassistant_token: password?
-  energy_tax_rate: float(0.0,1.0)?
-  battery_capacity: float(0.0,100.0)?
+  homeassistant_token: password

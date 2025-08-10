@@ -1,6 +1,6 @@
 ---
 name: ⚡ DAO Modern (AI/ML Enhanced)
-version: 1.1.0
+version: 1.1.1
 slug: dao_modern_enhanced
 description: Modern high-performance DAO with AI/ML optimization and real-time responsiveness
 url: https://github.com/miclnl/day-ahead
@@ -25,23 +25,13 @@ ports:
 # Image wordt lokaal gebouwd via Dockerfile
 # image: "ghcr.io/miclnl/dao-modern-{arch}"
 
-# Configuration schema for better UX and validation
+# Basic addon configuration - energy settings configured in webapp
 options:
   database_engine: sqlite
   log_level: info
-  optimization_interval: 60
-  enable_ml_predictions: true
-  enable_realtime_optimization: true
+  homeassistant_token: ""
 schema:
   database_engine: list(sqlite|mysql|postgresql)
   log_level: list(debug|info|warning|error)
-  optimization_interval: int(30,3600)
-  enable_ml_predictions: bool
-  enable_realtime_optimization: bool
+  homeassistant_token: password
   homeassistant_url: str?
-  homeassistant_token: password?
-  entsoe_api_key: password?
-  nordpool_region: list(DK1|DK2|DE|FI|LT|LV|Oslo|Kr.sand|Bergen|Molde|Tr.heim|Tromsø|SE1|SE2|SE3|SE4)?
-  energy_tax_rate: float(0.0,1.0)?
-  battery_capacity: float(0.0,100.0)?
-  solar_panel_capacity: float(0.0,50.0)?

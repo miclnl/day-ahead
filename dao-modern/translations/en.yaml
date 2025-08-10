@@ -5,33 +5,9 @@ configuration:
   log_level:
     name: Log Level
     description: Set the logging verbosity level
-  optimization_interval:
-    name: Optimization Interval
-    description: How often to run optimization calculations (in minutes)
-  enable_ml_predictions:
-    name: Enable ML Predictions
-    description: Use machine learning for improved consumption predictions
-  enable_realtime_optimization:
-    name: Real-time Optimization
-    description: Enable real-time optimization based on current energy prices
   homeassistant_url:
     name: Home Assistant URL
     description: URL to your Home Assistant instance (optional, auto-detected if empty)
   homeassistant_token:
     name: Home Assistant Token
-    description: Long-lived access token for Home Assistant API
-  entsoe_api_key:
-    name: ENTSO-E API Key
-    description: API key for European energy price data (get from transparency.entsoe.eu)
-  nordpool_region:
-    name: Nord Pool Region
-    description: Your electricity price region for Nord Pool data
-  energy_tax_rate:
-    name: Energy Tax Rate
-    description: Local energy tax rate per kWh (e.g., 0.10 for 10 cents)
-  battery_capacity:
-    name: Battery Capacity (kWh)
-    description: Total capacity of your home battery system
-  solar_panel_capacity:
-    name: Solar Panel Capacity (kWp)
-    description: Peak power capacity of your solar panels
+    description: Long-lived access token for Home Assistant API (required for operation)
