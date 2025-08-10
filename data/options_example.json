@@ -94,11 +94,11 @@
   },
   "strategy": "minimize cost",
   "optimization": {
-    "engine": "hybrid",
-    "ai": {
+    "engine": "statistical",
+    "cloud_ai": {
       "enabled": false,
       "provider": "openai",
-      "fallback_to_local": true,
+      "fallback_to_statistical": true,
       "cost_threshold": 0.10,
       "openai": {
         "api_key": "!secret openai_key",
@@ -113,26 +113,27 @@
         "endpoint": "https://api.anthropic.com/v1",
         "max_tokens": 4000,
         "timeout": 60
-      },
-      "local": {
-        "endpoint": "http://localhost:11434",
-        "model": "llama3",
-        "timeout": 120
       }
     }
   },
-  "machine_learning": {
+  "statistical_intelligence": {
     "enabled": true,
     "consumption_predictor": {
-      "algorithm": "ensemble",
+      "method": "time_series_patterns",
       "lookback_hours": 168,
       "prediction_horizon": 48,
-      "model_path": "../data/models/"
+      "seasonal_adjustment": true
     },
-    "pattern_recognizer": {
-      "n_clusters": 5,
-      "pattern_length": 24,
-      "model_path": "../data/models/"
+    "weather_reactive": {
+      "enabled": true,
+      "monitoring_interval": 15,
+      "weather_events": ["sudden_clouds", "clear_skies", "temperature_change"]
+    },
+    "multiday_optimization": {
+      "enabled": true,
+      "planning_horizon": 7,
+      "holiday_detection": true,
+      "seasonal_optimization": true
     }
   },
   "notifications": {

@@ -31,9 +31,11 @@ options:
   log_level: info
   homeassistant_token: ""
   optimization_mode: "statistical"  # statistical intelligence only
+  cloud_ai_enabled: false  # optional cloud AI (OpenAI/Anthropic)
 schema:
   database_engine: list(sqlite|mysql|postgresql)
   log_level: list(debug|info|warning|error)
   homeassistant_token: password?
   homeassistant_url: str?
   optimization_mode: list(statistical)
+  cloud_ai_enabled: bool
