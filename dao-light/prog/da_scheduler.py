@@ -9,7 +9,7 @@ class DaScheduler(DaBase):
         super().__init__(file_name)
         self.scheduler_tasks = self.config.get(["scheduler"])
         self.active = True
-        if "active" in self.scheduler_tasks:
+        if self.scheduler_tasks and "active" in self.scheduler_tasks:
             self.active = not (self.scheduler_tasks["active"].lower() == "false")
 
     def scheduler(self):

@@ -70,7 +70,7 @@ class ModernDaScheduler(DaBase):
             'low': 4          # Reports, cleanup, maintenance
         }
         
-        if "active" in self.tasks_config:
+        if self.tasks_config and "active" in self.tasks_config:
             self.active = not (self.tasks_config["active"].lower() == "false")
             
         # Setup event listeners
@@ -126,31 +126,32 @@ class ModernDaScheduler(DaBase):
             
         logging.info("Scheduling configured tasks")
         
-        for time_key, task_name in self.tasks_config.items():
-            if time_key == "active":
-                continue
-                
-            # Parse time patterns
-            if self._is_cron_pattern(time_key):
-                trigger = self._parse_cron_pattern(time_key)
-            else:
-                trigger = self._parse_time_pattern(time_key)
-            
-            if trigger:
-                # Find matching task function
-                task_func = self._get_task_function(task_name)
-                if task_func:
-                    job_id = f"scheduled_{time_key}_{task_name}"
-                    self.scheduler.add_job(
-                        task_func,
-                        trigger=trigger,
-                        id=job_id,
-                        name=f"Scheduled: {task_name} at {time_key}",
-                        replace_existing=True
-                    )
-                    logging.info(f"Scheduled task '{task_name}' for pattern '{time_key}'")
+        if self.tasks_config:
+            for time_key, task_name in self.tasks_config.items():
+                if time_key == "active":
+                    continue
+                    
+                # Parse time patterns
+                if self._is_cron_pattern(time_key):
+                    trigger = self._parse_cron_pattern(time_key)
                 else:
-                    logging.warning(f"Unknown task function: {task_name}")
+                    trigger = self._parse_time_pattern(time_key)
+                
+                if trigger:
+                    # Find matching task function
+                    task_func = self._get_task_function(task_name)
+                    if task_func:
+                        job_id = f"scheduled_{time_key}_{task_name}"
+                        self.scheduler.add_job(
+                            task_func,
+                            trigger=trigger,
+                            id=job_id,
+                            name=f"Scheduled: {task_name} at {time_key}",
+                            replace_existing=True
+                        )
+                        logging.info(f"Scheduled task '{task_name}' for pattern '{time_key}'")
+                    else:
+                        logging.warning(f"Unknown task function: {task_name}")
     
     def _schedule_realtime_monitoring(self):
         """Schedule real-time monitoring tasks"""
@@ -619,7 +620,11 @@ async def main():
         logging.info("Scheduler stopped by user")
     except Exception as e:
         logging.error(f"Scheduler error: {e}")
-        sys.exit(1)
+        # Don't exit, let the container continue running web services
+        logging.warning("Scheduler failed but container will continue running web services")
+        # Wait indefinitely to keep container alive
+        while True:
+            await asyncio.sleep(60)
 
 
 if __name__ == "__main__":

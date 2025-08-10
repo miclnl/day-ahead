@@ -91,6 +91,17 @@ class DaoLightEntrypoint:
         try:
             # Change to prog directory for database check
             os.chdir(self.app_dir / "prog")
+            
+            # Set data symlink for options.json access
+            data_symlink = Path("../data")
+            if data_symlink.exists() and data_symlink.is_symlink():
+                data_symlink.unlink()
+            elif data_symlink.exists():
+                shutil.rmtree(data_symlink)
+            
+            # Create symlink to config directory
+            data_symlink.symlink_to(self.config_dir)
+            
             result = subprocess.run([sys.executable, "check_db.py"], 
                                   capture_output=True, text=True)
             
@@ -98,6 +109,8 @@ class DaoLightEntrypoint:
                 logger.info("Database check completed successfully")
             else:
                 logger.error(f"Database check failed: {result.stderr}")
+                if result.stdout:
+                    logger.error(f"Database check stdout: {result.stdout}")
                 
         except Exception as e:
             logger.error(f"Error during database check: {e}")

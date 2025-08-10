@@ -109,17 +109,27 @@ class DaBase(hass.Hass):
         self.hasstoken = self.config.get(
             ["homeassistant", "token"], default=os.environ.get("SUPERVISOR_TOKEN")
         )
-        super().__init__(hassurl=self.hassurl, token=self.hasstoken)
-        headers = {
-            "Authorization": "Bearer " + self.hasstoken,
-            "content-type": "application/json",
-        }
-        resp = get(self.hassurl + "api/config", headers=headers)
-        resp_dict = json.loads(resp.text)
-        # logging.debug(f"hass/api/config: {resp.text}")
-        self.config.set("latitude", resp_dict["latitude"])
-        self.config.set("longitude", resp_dict["longitude"])
-        self.config.set("time_zone", resp_dict["time_zone"])
+        try:
+            super().__init__(hassurl=self.hassurl, token=self.hasstoken)
+            headers = {
+                "Authorization": "Bearer " + self.hasstoken,
+                "content-type": "application/json",
+            }
+            resp = get(self.hassurl + "api/config", headers=headers)
+            resp_dict = json.loads(resp.text)
+            # logging.debug(f"hass/api/config: {resp.text}")
+            self.config.set("latitude", resp_dict["latitude"])
+            self.config.set("longitude", resp_dict["longitude"])
+            self.config.set("time_zone", resp_dict["time_zone"])
+            logging.info("Home Assistant connection established successfully")
+        except Exception as e:
+            logging.error(f"Home Assistant API is not running.")
+            logging.error(f"Fatal error: Home Assistant API is not running.")
+            # Set default values when HA is not available
+            self.config.set("latitude", 52.0)
+            self.config.set("longitude", 5.0) 
+            self.config.set("time_zone", "Europe/Amsterdam")
+            # Don't raise exception, let system continue with defaults
         self.db_da = self.config.get_db_da()
         self.db_ha = self.config.get_db_ha()
         self.meteo = Meteo(self.config, self.db_da)
