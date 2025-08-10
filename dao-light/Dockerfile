@@ -56,7 +56,7 @@ RUN python3 -m pip install --break-system-packages --upgrade pip
 # Light version: install directly to system Python for simplicity
 COPY requirements.txt /tmp/
 RUN pip3 install --break-system-packages -r /tmp/requirements.txt
-COPY run /app/dao/prog/
+COPY run/ /app/dao/run/
 
 # Using root user for Home Assistant compatibility
 EXPOSE 5002

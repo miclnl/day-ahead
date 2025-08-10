@@ -122,13 +122,22 @@ class DaoLightEntrypoint:
         try:
             os.chdir(self.app_dir / "webserver")
             
-            # Start gunicorn in background
-            cmd = ["gunicorn", "--config", "gunicorn_config.py", "app:app"]
+            # Light version uses system Python directly
+            cmd = [sys.executable, "-m", "gunicorn", "--config", "gunicorn_config.py", "app:app"]
             process = subprocess.Popen(cmd, 
                                      stdout=subprocess.PIPE, 
-                                     stderr=subprocess.PIPE)
+                                     stderr=subprocess.STDOUT,
+                                     universal_newlines=True)
             
             logger.info(f"Web server started with PID: {process.pid}")
+            
+            # Check if process started successfully
+            time.sleep(1)
+            if process.poll() is not None:
+                output = process.stdout.read()
+                logger.error(f"Web server failed to start: {output}")
+                return None
+            
             return process
             
         except Exception as e:
@@ -149,13 +158,26 @@ class DaoLightEntrypoint:
             
             logger.info(f"Using scheduler: {scheduler_file}")
             
-            # Import and run scheduler
-            if scheduler_file == "da_simple_scheduler.py":
-                from da_simple_scheduler import main
-                main()
-            else:
-                # Fallback to subprocess for old scheduler
-                subprocess.call([sys.executable, scheduler_file])
+            # Use subprocess for all schedulers to avoid import issues
+            logger.info(f"Starting scheduler: {scheduler_file}")
+            process = subprocess.Popen([sys.executable, scheduler_file],
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT,
+                                     universal_newlines=True)
+            
+            # Stream output
+            while self.running and process.poll() is None:
+                line = process.stdout.readline()
+                if line:
+                    print(line.strip(), flush=True)
+                time.sleep(0.1)
+            
+            if process.poll() is not None:
+                logger.error(f"Scheduler exited with code: {process.returncode}")
+                # Read remaining output
+                remaining_output = process.stdout.read()
+                if remaining_output:
+                    print(remaining_output.strip(), flush=True)
                 
         except KeyboardInterrupt:
             logger.info("Scheduler stopped by user")

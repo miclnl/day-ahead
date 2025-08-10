@@ -346,7 +346,7 @@ class ModernDaScheduler(DaBase):
         
         try:
             # Use the modular optimizer
-            from dao.prog.day_ahead import DaCalc
+            from day_ahead import DaCalc
             
             calc = DaCalc(self.file_name)
             if hasattr(calc, 'calc_optimum_modular'):
