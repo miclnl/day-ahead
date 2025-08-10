@@ -22,6 +22,9 @@ tzlocal>=5.2
 # Math/Optimization - lightweight (ALLEEN MIP)
 mip>=1.15.0,<1.17.0
 
+# Astronomical calculations for solar positioning
+ephem>=4.1.0
+
 # Async (stabiele versies)
 aiohttp>=3.8.6,<4.0.0
 
