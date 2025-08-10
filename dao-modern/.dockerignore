@@ -1,1 +1,39 @@
-tests/
+# Ignore files that shouldn't be in build context
+**/__pycache__
+**/*.pyc
+**/*.pyo  
+**/*.pyd
+**/.Python
+**/*.so
+**/.git
+**/.gitignore
+**/README.md
+**/Dockerfile*
+**/docker-compose*
+**/*.md
+**/tests
+**/test_*
+**/.pytest_cache
+**/.coverage
+**/.tox
+**/.cache
+**/.venv
+**/venv
+**/.env.local
+**/.env.*.local
+
+# Build artifacts
+**/build/
+**/dist/
+**/*.egg-info/
+
+# Logs and temporary files  
+**/data/log/*
+**/data/images/*
+**/.DS_Store
+**/Thumbs.db
+
+# Keep essential directories but ignore cache
+**/prog/__pycache__
+**/webserver/__pycache__
+**/webserver/app/__pycache__

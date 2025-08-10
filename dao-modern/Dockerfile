@@ -26,12 +26,16 @@ RUN apt-get update && apt-get install -y \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
-# Copy software for add-on (using root for HA compatibility)
+# Copy software for add-on (using root for HA compatibility)  
 RUN mkdir -p /app/dao
+
+# Copy static configuration first (rarely changes)
+COPY data /app/daodata/
 COPY __init__.py /app/dao/
+
+# Copy application code later (changes more often)
 COPY prog /app/dao/prog/
 COPY webserver /app/dao/webserver/
-COPY data /app/daodata/
 
 #version
 ARG BUILD_VERSION
@@ -64,8 +68,13 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/
 RUN $VIRTUAL_ENV/bin/pip install uv
-# Install PyTorch CPU-only first (no CUDA for Home Assistant)
+# Split requirements for better caching
+COPY requirements-base.txt /tmp/
+RUN $VIRTUAL_ENV/bin/uv pip install --prerelease=allow -r /tmp/requirements-base.txt
+
+# Install PyTorch CPU-only separately (large, cacheable layer)
 RUN $VIRTUAL_ENV/bin/uv pip install --index-url https://download.pytorch.org/whl/cpu torch>=2.0.0,\<2.3.0 torchvision>=0.15.0,\<0.18.0
+
 # Install remaining requirements
 RUN $VIRTUAL_ENV/bin/uv pip install --prerelease=allow -r /tmp/requirements.txt
 COPY run/ /app/dao/run/

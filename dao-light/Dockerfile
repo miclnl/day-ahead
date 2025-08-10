@@ -22,12 +22,16 @@ RUN apt-get update && apt-get install -y \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
-# Copy software for add-on (using root for HA compatibility)
+# Copy software for add-on (using root for HA compatibility)  
 RUN mkdir -p /app/dao
+
+# Copy static configuration first (rarely changes)
+COPY data /app/daodata/
 COPY __init__.py /app/dao/
+
+# Copy application code later (changes more often)
 COPY prog /app/dao/prog/
 COPY webserver /app/dao/webserver/
-COPY data /app/daodata/
 
 #version
 ARG BUILD_VERSION
@@ -53,7 +57,11 @@ ENV LD_LIBRARY_PATH="/app/dao/prog/miplib/lib/"
 # Python already added above, just ensure pip is upgraded
 RUN python3 -m pip install --break-system-packages --upgrade pip
 
-# Light version: install directly to system Python for simplicity
+# Light version: install with optimized layers for caching
+COPY requirements-base.txt /tmp/
+RUN pip3 install --break-system-packages -r /tmp/requirements-base.txt
+
+# Install remaining requirements in separate layer
 COPY requirements.txt /tmp/
 RUN pip3 install --break-system-packages -r /tmp/requirements.txt
 COPY run/ /app/dao/run/
