@@ -127,6 +127,12 @@ def _cache_clear():
     except Exception:
         pass
 
+# Health-check rate limiting (minimale interval)
+HEALTH_MIN_INTERVAL_S = int(os.getenv("DAO_HEALTH_CHECK_MIN_INTERVAL", "5"))
+_health_cache: Optional[Dict[str, Any]] = None
+_health_cache_time: float = 0.0
+_health_lock = threading.Lock()
+
 # Dependency injection for Config and Report instances
 async def get_config_instance():
     """Get singleton Config instance with thread safety"""
@@ -308,9 +314,12 @@ async def run_modern(request: Request):
     """Run modern page"""
     try:
         if templates:
+            import datetime as _dt
             return templates.TemplateResponse("run_modern.html", {
                 "request": request,
-                "version": __version__
+                "version": __version__,
+                "datetime": _dt,
+                "timedelta": _dt.timedelta,
             })
         else:
             return HTMLResponse(content="<h1>Run Modern</h1><p>Template system unavailable</p>")
@@ -755,6 +764,16 @@ async def api_health_check():
     Deze endpoint heeft GEEN harde dependency op Config, zodat het dashboard
     altijd kan laden en een correcte status toont, ook als config faalt.
     """
+    # Throttle: retourneer gecachte respons wanneer te snel achter elkaar aangeroepen
+    try:
+        now_ts = time.time()
+        with _health_lock:
+            if _health_cache is not None and (now_ts - _health_cache_time) < HEALTH_MIN_INTERVAL_S:
+                cached = dict(_health_cache)
+                cached["cached"] = True
+                return JSONResponse(cached)
+    except Exception:
+        pass
     details: Dict[str, Any] = {}
     healthy = True
     # Database check en HA API check
@@ -803,12 +822,20 @@ async def api_health_check():
     except Exception:
         details["homeassistant"] = "Error"
 
-    return JSONResponse({
+    response = {
         "healthy": healthy,
         "database_status": database_status,
         "details": details,
         "timestamp": datetime.datetime.now().isoformat(),
-    })
+    }
+    try:
+        with _health_lock:
+            global _health_cache, _health_cache_time
+            _health_cache = response
+            _health_cache_time = time.time()
+    except Exception:
+        pass
+    return JSONResponse(response)
 
 @app.get("/api/dashboard/energy-data")
 async def api_energy_data(config: Any = Depends(get_config_instance)):
