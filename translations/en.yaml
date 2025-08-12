@@ -2,6 +2,24 @@ configuration:
   database_engine:
     name: Database Engine
     description: Choose the database engine for storing optimization data
+  database_server:
+    name: Database Server
+    description: Hostname or service name (e.g., core-mariadb) of the database server (SQLite: not applicable)
+  database_port:
+    name: Database Port
+    description: Optional; leave empty for default port (MySQL 3306, PostgreSQL 5432). (SQLite: not applicable)
+  database_database:
+    name: Database Name
+    description: Name of the database (or filename for SQLite). For SQLite optional; defaults to 'day_ahead.db'
+  database_username:
+    name: Database Username
+    description: Username with access to the database (SQLite: not applicable)
+  database_password:
+    name: Database Password
+    description: Password for the database user (preferably via !secret). (SQLite: not applicable)
+  database_path:
+    name: Database Path (SQLite)
+    description: Path for SQLite database (optional; default /data)
   log_level:
     name: Log Level
     description: Set the logging verbosity level
@@ -11,3 +29,9 @@ configuration:
   homeassistant_token:
     name: Home Assistant Token
     description: Long-lived access token for Home Assistant API (optional - auto-detected in addon mode)
+  optimization_mode:
+    name: Optimization Mode
+    description: Choose the optimization core; 'statistical' (recommended) uses statistical intelligence
+  cloud_ai_enabled:
+    name: Enable Cloud AI
+    description: Enable optional Cloud AI integration (OpenAI/Anthropic); leave off if not needed

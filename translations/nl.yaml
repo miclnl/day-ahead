@@ -2,6 +2,24 @@ configuration:
   database_engine:
     name: Database Type
     description: Kies het database systeem voor het opslaan van optimalisatie gegevens
+  database_server:
+    name: Database Server
+    description: Hostnaam of service-naam (bijv. core-mariadb) van de database server (SQLite: niet van toepassing)
+  database_port:
+    name: Database Poort
+    description: Optioneel; laat leeg voor de standaardpoort (MySQL 3306, PostgreSQL 5432). (SQLite: niet van toepassing)
+  database_database:
+    name: Database Naam
+    description: Naam van de database (of bestandsnaam bij SQLite). Bij SQLite optioneel; standaard 'day_ahead.db'
+  database_username:
+    name: Database Gebruiker
+    description: Gebruikersnaam met toegang tot de database (SQLite: niet van toepassing)
+  database_password:
+    name: Database Wachtwoord
+    description: Wachtwoord behorend bij de database gebruiker (gebruik liefst !secret). (SQLite: niet van toepassing)
+  database_path:
+    name: Database Pad (SQLite)
+    description: Pad voor SQLite database (optioneel; standaard /data)
   log_level:
     name: Log Niveau
     description: Stel de uitgebreidheid van logging in
@@ -11,3 +29,9 @@ configuration:
   homeassistant_token:
     name: Home Assistant Token
     description: Langdurige toegangstoken voor Home Assistant API (optioneel - automatisch gedetecteerd in addon modus)
+  optimization_mode:
+    name: Optimalisatie Modus
+    description: Kies de optimalisatiekern; 'statistical' (aanbevolen) gebruikt statistische intelligentie
+  cloud_ai_enabled:
+    name: Cloud AI inschakelen
+    description: Schakel optionele Cloud AI integratie (OpenAI/Anthropic) in; laat uit als niet nodig

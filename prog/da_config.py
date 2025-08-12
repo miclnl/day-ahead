@@ -70,17 +70,27 @@ class Config:
             # Bepaal engine: respecteer nested config, val terug op top-level 'database_engine', default sqlite
             top_engine = self.get(["database_engine"], None, "sqlite")
             db_da_engine = self.get(["database da", "engine"], None, top_engine)
-            db_da_server = self.get(["database da", "server"], None, "core-mariadb")
-            db_da_port = int(self.get(["database da", "port"], None, 0))
+
+            # Fallbacks naar eenvoudige, platte add-on opties
+            db_da_server = self.get(["database da", "server"], None,
+                                     self.get(["database_server"], None, "core-mariadb"))
+            db_da_port = int(self.get(["database da", "port"], None,
+                                      int(self.get(["database_port"], None, 0))))
             if db_da_engine == "sqlite":
-                db_da_name = self.get(["database da", "database"], None, "day_ahead.db")
+                db_da_name = self.get(["database da", "database"], None,
+                                      self.get(["database_database"], None, "day_ahead.db"))
             else:
-                db_da_name = self.get(["database da", "database"], None, "day_ahead")
-            db_da_user = self.get(["database da", "username"], None, "day_ahead")
-            db_da_password = self.get(["database da", "password"])
+                db_da_name = self.get(["database da", "database"], None,
+                                      self.get(["database_database"], None, "day_ahead"))
+            db_da_user = self.get(["database da", "username"], None,
+                                   self.get(["database_username"], None, "day_ahead"))
+            db_da_password = self.get(["database da", "password"], None)
+            if db_da_password is None:
+                db_da_password = self.get(["database_password"], None)
             # Voor HA add-on omgeving: standaard /data als sqlite pad
             default_db_path = "/data" if db_da_engine == "sqlite" else "../data"
-            db_da_path = self.get(["database da", "db_path"], None, default_db_path)
+            db_da_path = self.get(["database da", "db_path"], None,
+                                  self.get(["database_path"], None, default_db_path))
             db_time_zone = self.get(["time_zone"])
             if check_create:
                 db_url = DBmanagerObj.db_url(

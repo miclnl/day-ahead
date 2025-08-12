@@ -1,4 +1,4 @@
-# DAO v1.3.20 - Minimal requirements for Raspberry Pi
+# DAO v0.5.0 - Minimal requirements for Raspberry Pi
 # Core libraries - Alpine/Pi compatible
 pandas>=2.1.0,<2.3.0
 numpy>=1.25.0,<1.27.0
