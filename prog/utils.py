@@ -311,8 +311,8 @@ def error_handling(ex):
 
 def prnt_xy(x: list, y: list):
     for i in range(len(x)):
-        print(f"{i} {x[i]}  {y[i]}")
-    print()
+        logging.debug(f"{i} {x[i]}  {y[i]}")
+    logging.debug("")
 
 
 def interpolate(
@@ -346,7 +346,7 @@ def interpolate(
         else:
             y = org_y[j] - (org_x[j] - x).seconds * a / 60 + b
         new_y.append(y)
-        print(x, y, a, b)
+        logging.debug(f"Interpolation values: x={x}, y={y}, a={a}, b={b}")
     return new_x, new_y
 
 
@@ -370,7 +370,7 @@ def interpolate_prognose_data():
     start_ts = datetime.datetime(year=2024, month=11, day=12).timestamp()
     end_ts = datetime.datetime(year=2024, month=11, day=14).timestamp()
     prognose_data = db_da.get_prognose_data(start=start_ts, end=end_ts)
-    print(prognose_data.to_string())
+    logging.debug(f"Prognose data: {prognose_data.to_string()}")
 
 
 #  tst_interpolate()

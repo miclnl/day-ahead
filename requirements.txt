@@ -1,5 +1,5 @@
-# DAO v1.3.14 - Pure Statistical Intelligence (ML-free)
-# Core libraries - Alpine/Pi compatible  
+# DAO v1.3.20 - Pure Statistical Intelligence (ML-free)
+# Core libraries - Alpine/Pi compatible
 pandas>=2.1.0,<2.3.0
 numpy>=1.25.0,<1.27.0
 requests>=2.32.3,<3.0.0
@@ -11,9 +11,12 @@ sqlalchemy-utils>=0.41.0
 psycopg2-binary>=2.9.7
 pymysql>=1.1.0
 
-# Web framework - recent versions
-flask>=2.3.0,<3.0.0
-gunicorn>=21.2.0,<24.0.0
+# Web framework - FastAPI with Uvicorn for maximum performance
+fastapi>=0.104.0,<0.105.0
+uvicorn[standard]>=0.24.0,<0.25.0
+jinja2>=3.1.0,<3.2.0
+httptools>=0.6.0  # Fast HTTP parser for Uvicorn
+python-multipart>=0.0.9,<0.1.0  # Required for FastAPI form/file uploads
 
 # Energy APIs - recent versions
 beautifulsoup4>=4.12.0
@@ -28,6 +31,9 @@ hassapi>=0.2.1
 
 # Optimization (ML-free)
 mip>=1.15.0,<1.17.0
+
+# Machine Learning (optional - may cause SIGILL on Raspberry Pi)
+scikit-learn>=1.3.0,<1.4.0  # ML features - test if it works on your system
 
 # Weather and Solar calculation
 ephem>=4.1.0

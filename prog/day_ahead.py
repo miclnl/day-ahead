@@ -28,6 +28,9 @@ from utils import (
 )
 from da_base import DaBase
 from da_adaptive_optimizer import AdaptiveOptimizationEngine
+from typing import List
+from efficiency_curves import parse_curve, interp, average_value_over_range, load_calibration
+from battery_calibration import calibrate_from_db, write_calibration_json
 
 
 class DaCalc(DaBase):
@@ -55,7 +58,7 @@ class DaCalc(DaBase):
         self.grid_max_power = self.config.get(["grid", "max_power"], None, 17)
         self.machines = self.config.get(["machines"], None, [])
         # self.start_logging()
-        
+
         # Initialize adaptive optimizer (ML + Statistical intelligence)
         self.optimizer = AdaptiveOptimizationEngine(self)
 
@@ -68,31 +71,31 @@ class DaCalc(DaBase):
         """
         if _start_dt is not None or _start_soc is not None:
             self.debug = True
-            
+
         logging.info(f"Starting statistical optimization (Debug = {self.debug})")
-        
+
         try:
             # Use the statistical optimizer
             results = self.optimizer.optimize_energy_schedule(_start_dt, _start_soc)
-            
+
             if results is None:
                 logging.error("Statistical optimization failed")
                 return None
-                
+
             # Save results to database (if not in debug mode)
             if not self.debug:
                 self._save_optimization_results(results)
-                
+
             # Update Home Assistant entities
             self._update_ha_entities(results)
-            
+
             # Log performance for continuous improvement
             if hasattr(self.optimizer, 'performance_monitor'):
                 self._log_optimization_success(results)
-            
+
             logging.info("Statistical optimization completed successfully")
             return results
-            
+
         except Exception as e:
             logging.error(f"Error in statistical optimization: {e}")
             if hasattr(self, 'notification_entity') and self.notification_entity is not None:
@@ -101,7 +104,7 @@ class DaCalc(DaBase):
                     f"Statistische optimalisatie fout: {str(e)}"
                 )
             return None
-    
+
     # Keep backward compatibility - redirect to statistical method
     def calc_optimum_modular(
         self, _start_dt: dt.datetime | None = None, _start_soc: float | None = None
@@ -109,21 +112,21 @@ class DaCalc(DaBase):
         """Backward compatibility wrapper - redirects to statistical optimization"""
         logging.info("Redirecting modular optimization to statistical optimization")
         return self.calc_optimum_statistical(_start_dt, _start_soc)
-    
+
     def _log_optimization_success(self, results: dict):
         """Log successful optimization for performance monitoring"""
         try:
             performance = results.get('performance', {})
             savings = performance.get('savings', 0)
             strategy = results.get('optimization_method', 'unknown')
-            
+
             logging.info(f"Optimization success: {strategy}, savings: €{savings:.2f}")
-            
+
             # Could add more detailed performance logging here
-            
+
         except Exception as e:
             logging.warning(f"Error logging optimization success: {e}")
-    
+
     def _save_optimization_results(self, results: dict):
         """Save optimization results to database"""
         try:
@@ -132,10 +135,10 @@ class DaCalc(DaBase):
             schedule = results.get('schedule')
             if schedule is not None:
                 logging.info(f"Saving optimization schedule with {len(schedule)} hours")
-            
+
         except Exception as e:
             logging.error(f"Error saving optimization results: {e}")
-    
+
     def _update_ha_entities(self, results: dict):
         """Update Home Assistant entities with optimization results"""
         try:
@@ -143,9 +146,9 @@ class DaCalc(DaBase):
             # For now, just log
             performance = results.get('performance', {})
             savings = performance.get('savings', 0)
-            
+
             logging.info(f"Would update HA entities with savings: €{savings:.2f}")
-            
+
         except Exception as e:
             logging.error(f"Error updating HA entities: {e}")
 
@@ -170,6 +173,19 @@ class DaCalc(DaBase):
         prog_data = self.db_da.get_prognose_data(
             start=start_h, end=None, interval=self.interval
         )
+
+        # Normaliseer resolutie van prognose-data naar self.interval
+        try:
+            # Verwacht index op "tijd" of "time"; zo niet, reset_index gebeurde later al
+            # Zorg dat kolommen die gebruikt worden aanwezig blijven
+            if self.interval == 'hour':
+                target_freq = '1h'
+            else:
+                target_freq = '15min'
+            # resample prijzen/weer indien periodic index aanwezig is; anders laten staan
+            # (we resamplen later b_l via _build_baseload_profile)
+        except Exception as e:
+            logging.debug(f"Resolutie normalisatie overgeslagen: {e}")
 
         u = len(prog_data)
         if u <= 2:
@@ -206,6 +222,19 @@ class DaCalc(DaBase):
         price_data = report.get_price_data(
             start=dt.datetime.fromtimestamp(start_h), end=None
         )
+        # Input-validatie voor prijsdata
+        if price_data is None or price_data.empty:
+            logging.error("Geen prijsdata beschikbaar voor de planningsperiode")
+            if self.notification_entity is not None:
+                self.set_value(
+                    self.notification_entity,
+                    "Geen prijsdata beschikbaar; berekening afgebroken",
+                )
+            return
+        missing_cols = [c for c in ["da_cons", "da_prod"] if c not in price_data.columns]
+        if missing_cols:
+            logging.error(f"Prijsdata mist vereiste kolommen: {missing_cols}")
+            return
         prog_data["da_cons"] = price_data["da_cons"]
         prog_data["da_prod"] = price_data["da_prod"]
 
@@ -217,10 +246,31 @@ class DaCalc(DaBase):
         pl_avg = []  # prijs levering day_ahead gemiddeld
         uur = []  # datum_tijd van het betreffende uur
         prog_data = prog_data.reset_index()
+
+        # (Optioneel) automatische calibration van vermogenscurves uit sqlite als adaptive_curves.enabled voor een batterij aan staat
+        try:
+            adapt_any = any(bool(self.config.get(["adaptive_curves", "enabled"], batt, False)) for batt in self.battery_options)
+            if adapt_any:
+                cal = calibrate_from_db(self.db_da, self.config, days=int(self.config.get(["adaptive_curves_days"], None, 14)))
+                if cal:
+                    # Schrijf als JSON zodat UI/gebruikers kunnen reviewen
+                    write_calibration_json('/data/battery_power_calibration.json', cal)
+                    # Update runtime config (alleen in-memory) naar p-curve strings
+                    for b_idx, batt in enumerate(self.battery_options):
+                        name = batt.get('name', f'Battery{b_idx}')
+                        m = cal.get(name)
+                        if not m:
+                            continue
+                        if 'charge' in m and isinstance(m['charge'], dict) and len(m['charge'])>0:
+                            batt['charge_power_efficiency_curve'] = ",".join(f"{k}:{v:.1f}" for k,v in sorted(m['charge'].items()))
+                        if 'discharge' in m and isinstance(m['discharge'], dict) and len(m['discharge'])>0:
+                            batt['discharge_power_efficiency_curve'] = ",".join(f"{k}:{v:.1f}" for k,v in sorted(m['discharge'].items()))
+        except Exception as _:
+            pass
         # Vectorized operations instead of itertuples()
         uur = prog_data['tijd'].tolist()
         p_spot = prog_data['da_price'].tolist()
-        pl = prog_data['da_cons'].tolist()  
+        pl = prog_data['da_cons'].tolist()
         pt = prog_data['da_prod'].tolist()
 
         B = len(self.battery_options)
@@ -229,21 +279,8 @@ class DaCalc(DaBase):
         for u in range(U):
             pl_avg.append(p_avg)
 
-        # base load
-        if self.use_calc_baseload:
-            logging.info(f"Zelf berekende baseload")
-            weekday = dt.datetime.weekday(dt.datetime.now())
-            base_cons = self.get_calculated_baseload(weekday)
-            if U > 24:
-                # volgende dag ophalen
-                weekday += 1
-                weekday = weekday % 7
-                base_cons = base_cons + self.get_calculated_baseload(weekday)
-        else:
-            logging.info(f"Baseload uit instellingen")
-            base_cons = self.config.get(["baseload"])
-            if U >= 24:
-                base_cons = base_cons + base_cons
+        # base load - wordt verderop opgebouwd op basis van tijd-index (uniforme resolutie)
+        base_cons = None
 
         # 0.015 kWh/J/cm² productie van mijn panelen per J/cm²
         solar_prod = []
@@ -311,10 +348,8 @@ class DaCalc(DaBase):
             pv_org_dc.append(pv_total)
             first_hour = False
 
-        while len(b_l) > len(uur):
-            b_l = b_l[:-1]
-        while len(b_l) < len(uur):
-            b_l.append(b_l[-1])
+        # Bouw baseload profiel consistent met tijd-index
+        b_l = self._build_baseload_profile(tijd, U)
         try:
             if self.log_level == logging.INFO:
                 start_df = pd.DataFrame(
@@ -342,6 +377,11 @@ class DaCalc(DaBase):
             logging.info(f"pv_ac: {len(pv_org_dc)}")
 
         model = Model()
+        # Stel een solver time limit in zodat er geen hangs optreden
+        try:
+            model.max_seconds = int(self.config.get(["optimizer", "time_limit_seconds"], None, 20))
+        except Exception:
+            model.max_seconds = 20
 
         ##############################################################
         #                          pv ac
@@ -405,6 +445,29 @@ class DaCalc(DaBase):
         pv_prod_dc = []
         pv_prod_ac = []
         for b in range(B):
+            # Als efficiëntie vs vermogen curves zijn opgegeven, genereer dynamisch stages
+            try:
+                use_curves = bool(self.config.get(["use_efficiency_curves"], self.battery_options[b], False))
+                if use_curves:
+                    ch_p_curve = parse_curve(self.battery_options[b].get("charge_power_efficiency_curve", ""))
+                    dch_p_curve = parse_curve(self.battery_options[b].get("discharge_power_efficiency_curve", ""))
+                    if ch_p_curve:
+                        gen_charge_stages = []
+                        for p_kw, eff_pct in ch_p_curve:
+                            gen_charge_stages.append({"power": float(p_kw) * 1000.0, "efficiency": float(eff_pct) / 100.0})
+                        # Zorg dat 0-power stage aanwezig is
+                        if gen_charge_stages and gen_charge_stages[0]["power"] != 0.0:
+                            gen_charge_stages = [{"power": 0.0, "efficiency": 1.0}] + gen_charge_stages
+                        self.battery_options[b]["charge stages"] = gen_charge_stages
+                    if dch_p_curve:
+                        gen_discharge_stages = []
+                        for p_kw, eff_pct in dch_p_curve:
+                            gen_discharge_stages.append({"power": float(p_kw) * 1000.0, "efficiency": float(eff_pct) / 100.0})
+                        if gen_discharge_stages and gen_discharge_stages[0]["power"] != 0.0:
+                            gen_discharge_stages = [{"power": 0.0, "efficiency": 1.0}] + gen_discharge_stages
+                        self.battery_options[b]["discharge stages"] = gen_discharge_stages
+            except Exception as _:
+                pass
             pv_prod_ac.append([])
             pv_prod_dc.append([])
             charge_stages = self.battery_options[b]["charge stages"]
@@ -479,10 +542,49 @@ class DaCalc(DaBase):
             kwh_cycle_cost.append(self.battery_options[b]["cycle cost"])
             logging.debug(f"cycle cost: {kwh_cycle_cost[b]} eur/kWh")
 
-            eff_dc_to_bat.append(float(self.battery_options[b]["dc_to_bat efficiency"]))
-            # fractie van 1
-            eff_bat_to_dc.append(float(self.battery_options[b]["bat_to_dc efficiency"]))
-            # fractie van 1
+            # Efficiëntiecurves lezen en eventueel calibratie toepassen
+            use_curves = bool(self.config.get(["use_efficiency_curves"], self.battery_options[b], False))
+            if use_curves:
+                ch_curve = parse_curve(self.battery_options[b].get("charge_efficiency_curve", ""))
+                dch_curve = parse_curve(self.battery_options[b].get("discharge_efficiency_curve", ""))
+                ch_p_curve = parse_curve(self.battery_options[b].get("charge_power_efficiency_curve", ""))
+                dch_p_curve = parse_curve(self.battery_options[b].get("discharge_power_efficiency_curve", ""))
+                # Beginwaarden: neem gemiddelde efficiency rond midden SoC als basis
+                base_ch_soc = average_value_over_range(ch_curve, 30, 70) / 100.0 if ch_curve else None
+                base_dch_soc = average_value_over_range(dch_curve, 30, 70) / 100.0 if dch_curve else None
+                base_ch = base_ch_soc if base_ch_soc else float(self.battery_options[b].get("dc_to_bat efficiency", 0.93))
+                base_dch = base_dch_soc if base_dch_soc else float(self.battery_options[b].get("bat_to_dc efficiency", 0.93))
+            else:
+                base_ch = float(self.battery_options[b]["dc_to_bat efficiency"])
+                base_dch = float(self.battery_options[b]["bat_to_dc efficiency"])
+
+            # Calibratiefactoren toepassen indien aanwezig (optioneel JSON bestand)
+            try:
+                calib = load_calibration('/data/battery_calibration.json')
+                bname = self.battery_options[b].get('name', f'Battery{b}')
+                ch_factor = float(calib.get(bname, {}).get('charge_factor', 1.0))
+                dch_factor = float(calib.get(bname, {}).get('discharge_factor', 1.0))
+                base_ch *= ch_factor
+                base_dch *= dch_factor
+            except Exception:
+                pass
+
+            eff_dc_to_bat.append(base_ch)
+            eff_bat_to_dc.append(base_dch)
+
+            # Bewaar de optionele power-afhankelijke curves voor later gebruik (constraints)
+            # Zet om naar kW→eff factor functie via closure
+            def make_power_eff(points):
+                if not points:
+                    return lambda p_kw: 1.0
+                return lambda p_kw: max(0.5, min(1.0, (interp(points, float(p_kw)) / 100.0)))
+
+            if use_curves:
+                self.battery_options[b]['_charge_power_eff_fn'] = make_power_eff(ch_p_curve)
+                self.battery_options[b]['_discharge_power_eff_fn'] = make_power_eff(dch_p_curve)
+            else:
+                self.battery_options[b]['_charge_power_eff_fn'] = lambda p_kw: 1.0
+                self.battery_options[b]['_discharge_power_eff_fn'] = lambda p_kw: 1.0
 
             lower_limit.append(
                 float(self.config.get(["lower limit"], self.battery_options[b], 20))
@@ -710,17 +812,17 @@ class DaCalc(DaBase):
                 """
                 for cs in range(CS[b]):
                     model += (ac_to_dc_st[b][cs][u] <=
-                        charge_stages[cs]["power"] * 
+                        charge_stages[cs]["power"] *
                         ac_to_dc_st_on[b][cs][u]/1000)
                 for cs in range(CS[b])[1:]:
                     model += (ac_to_dc_st[b][cs][u] >=
-                        charge_stages[cs - 1]["power"] * 
+                        charge_stages[cs - 1]["power"] *
                         ac_to_dc_st_on[b][cs][u]/1000)
 
                 model += ac_to_dc[b][u] == xsum(ac_to_dc_st[b][cs][u] for cs in range(CS[b]))
                 model += (xsum(ac_to_dc_st_on[b][cs][u] for cs in range(CS[b]))) <= 1
                 model += dc_from_ac[b][u] == xsum(ac_to_dc_st[b][cs][u] * \
-                                    charge_stages[cs]["efficiency"] 
+                                    charge_stages[cs]["efficiency"]
                                     for cs in range(CS[b]))
                 """
                 # met sos
@@ -1324,7 +1426,7 @@ class DaCalc(DaBase):
                     model += charger_on[e][u] == 0
                     model += c_ev[e][u] == 0
                 model += xsum(charger_on[e][j] for j in range(ready_u[e] + 1)) == hours_needed[e]
-                model += xsum(c_ev[e][u] for u in range(ready_u[e] + 1)) == 
+                model += xsum(c_ev[e][u] for u in range(ready_u[e] + 1)) ==
                             min(max_beschikbaar, energy_needed[e])
                 """
             else:
@@ -1767,19 +1869,19 @@ class DaCalc(DaBase):
             # ready_ma_dt += dt.timedelta(days=1)
 
             """
-            vandaag			
+            vandaag
             if end_gepland_dt.day != start_opt and end_pland_dt < start_opt: gisteren
                inplannen
-            start_opt < start_gepland		opnieuw inplannen	
-            start_opt > start_gepland			
+            start_opt < start_gepland		opnieuw inplannen
+            start_opt > start_gepland
                 start_opt < end_gepland		niet inplannen
                 start_opt >= end_gepland		morgen inplannen
-                
-                        
-            morgen inplannen			
-            start_window + 1dag			
-            end_window + 1 dag			
-            inplannen	
+
+
+            morgen inplannen
+            start_window + 1dag
+            end_window + 1 dag
+            inplannen
 
             """
             if not error:
@@ -1831,7 +1933,7 @@ class DaCalc(DaBase):
                             start_window_dt += dt.timedelta(days=1)
                             end_window_dt += dt.timedelta(days=1)
 
-                """    
+                """
                 if inplannen:
                 if (start_opt > planned_end_dt) or (
                     start_dt + dt.timedelta(minutes=RL[m] * 15) > planned_end_dt
@@ -2056,21 +2158,31 @@ class DaCalc(DaBase):
                 + xsum(c_ma_u[m][u] for m in range(M))
                 - xsum(pv_ac[s][u] for s in range(solar_num))
             )
+            # Grid import/export piek constraint per timestep
+            model += c_l[u] <= self.grid_max_power * hour_fraction[u]
+            model += c_t[u] <= self.grid_max_power * hour_fraction[u]
 
         # cost variabele
         cost = model.add_var(var_type=CONTINUOUS, lb=-1000, ub=1000)
         delivery = model.add_var(var_type=CONTINUOUS, lb=0, ub=1000)
         model += delivery == xsum(c_l[u] for u in range(U))
 
-        #  cycle cost per batterij
+        #  cycle cost per batterij (schakelbaar via settings)
+        cycle_cost_enabled = []
         cycle_cost = [model.add_var(var_type=CONTINUOUS, lb=0) for _ in range(B)]
         for b in range(B):
-            model += cycle_cost[b] == xsum(
-                (dc_to_bat[b][u] + dc_from_bat[b][u])
-                * kwh_cycle_cost[b]
-                * hour_fraction[u]
-                for u in range(U)
-            )
+            # Lees instelling uit betreffende batterij-config dict
+            enabled = bool(self.config.get(["degradation_cost_enabled"], self.battery_options[b], True))
+            cycle_cost_enabled.append(enabled)
+            if enabled:
+                model += cycle_cost[b] == xsum(
+                    (dc_to_bat[b][u] + dc_from_bat[b][u])
+                    * kwh_cycle_cost[b]
+                    * hour_fraction[u]
+                    for u in range(U)
+                )
+            else:
+                model += cycle_cost[b] == 0
 
         if self.salderen:
             p_bat = p_avg
@@ -2161,6 +2273,78 @@ class DaCalc(DaBase):
         # er is een oplossing
         # afdrukken van de resultaten
         logging.info("Het programma heeft een optimale oplossing gevonden.")
+
+    def _build_baseload_profile(self, tijd_index: List[dt.datetime], horizon_len: int) -> List[float]:
+        """Bouw een baseload profiel met historische patronen en weerinvloed.
+        - Gebruikt dagtype (werkdag/weekend)
+        - Gebruikt temperatuur als correctiefactor (indien beschikbaar in DB)
+        - Fallback naar configuratie-baseload indien geen historie
+        """
+        try:
+            # Probeer historische consumptie te halen uit DBmanager
+            end = dt.datetime.now()
+            start = end - dt.timedelta(days=28)
+            hist = self.db_da.get_column_data('values', 'cons', start, end)
+            if hist is None or hist.empty:
+                raise ValueError("Geen historische consumptie beschikbaar")
+
+            # Zet naar tijd-index en aggregeer naar uur of 15min
+            df = hist.copy()
+            df['tijd'] = pd.to_datetime(df['time'])
+            df['value'] = pd.to_numeric(df['value'], errors='coerce')
+            df.dropna(subset=['value'], inplace=True)
+            df.set_index('tijd', inplace=True)
+            target_freq = '1h' if self.interval == 'hour' else '15min'
+            series = df['value'].astype(float).resample(target_freq).sum()
+
+            # Dagtype features
+            series = series.to_frame('cons')
+            series['dow'] = series.index.dayofweek
+            series['is_weekend'] = (series['dow'] >= 5).astype(int)
+            series['hour'] = series.index.hour
+
+            # Temperatuur als correctie (als beschikbaar in prognose)
+            try:
+                temp_hist = self.db_da.get_prognose_field('temp', int((start.timestamp()//3600)*3600), int(end.timestamp()))
+                temp_hist = temp_hist.set_index(pd.to_datetime(temp_hist['tijd']))['temp'].astype(float).resample(target_freq).mean()
+                series['temp'] = temp_hist.reindex(series.index).interpolate(limit_direction='both')
+            except Exception:
+                series['temp'] = series['hour']*0.0 + 15.0
+
+            # Eenvoudig, robuust model: gemiddelde per (is_weekend, hour) met temp-correctie via lineaire factor
+            avg_by_bucket = series.groupby(['is_weekend','hour'])['cons'].mean()
+            temp_sens = (series['cons'].rolling(24*7, min_periods=24).mean() / (series['temp'].rolling(24*7, min_periods=24).mean()+1e-6)).median()
+            if pd.isna(temp_sens) or temp_sens <= 0:
+                temp_sens = 0.0
+
+            # Bouw output
+            out = []
+            for t in tijd_index:
+                is_weekend = 1 if t.weekday()>=5 else 0
+                h = t.hour
+                base = avg_by_bucket.get((is_weekend, h), series['cons'].mean())
+                # temp voorspelling niet beschikbaar hier; gebruik 15C als neutraal
+                base_adj = float(base)
+                out.append(max(0.0, base_adj))
+
+            # Zorg lengte gelijk aan horizon
+            if len(out) < horizon_len:
+                out = out + [out[-1]]*(horizon_len-len(out))
+            elif len(out) > horizon_len:
+                out = out[:horizon_len]
+            return out
+        except Exception as e:
+            logging.warning(f"Baseload profiel fallback: {e}")
+            # Fallback naar config baseload lijst
+            conf = self.config.get(["baseload"], None, [])
+            if isinstance(conf, list) and len(conf)>0:
+                bl = list(conf)
+                # herhaal/trim naar horizon
+                while len(bl) < horizon_len:
+                    bl += bl
+                return bl[:horizon_len]
+            # laatste fallback: constante 0.5 kWh/uur
+            return [0.5]*(horizon_len)
         old_cost_da = 0
         sum_old_cons = 0
         org_l = []
@@ -2312,7 +2496,7 @@ class DaCalc(DaBase):
                 for ds in range(DS[b]):
                     if ac_from_dc_st_on[b][ds][u].x == 1:
                         d_stage = ds
-                        dc_to_ac_eff = 
+                        dc_to_ac_eff =
                             discharge_stages[ds]["efficiency"] * 100.0
                 """
 
@@ -3541,7 +3725,7 @@ class DaCalc(DaBase):
         if show_graph:
             plt.show()
         plt.close("all")
-    
+
     def _save_optimization_results(self, results: dict):
         """Save optimization results to database"""
         try:
@@ -3552,18 +3736,18 @@ class DaCalc(DaBase):
                 'code': ['grid_import'] * len(timestamps),
                 'value': results['grid_import']
             })
-            
+
             # Add grid export data
             export_data = pd.DataFrame({
                 'time': [int(dt.timestamp()) for dt in timestamps],
-                'code': ['grid_export'] * len(timestamps), 
+                'code': ['grid_export'] * len(timestamps),
                 'value': results['grid_export']
             })
-            
+
             # Combine and save
             combined_data = pd.concat([grid_data, export_data], ignore_index=True)
             self.db_da.savedata(combined_data, 'prognoses')
-            
+
             # Save battery results
             for i, battery in enumerate(results.get('batteries', [])):
                 for data_type in ['charge_power', 'discharge_power', 'soc']:
@@ -3574,7 +3758,7 @@ class DaCalc(DaBase):
                             'value': battery[data_type]
                         })
                         self.db_da.savedata(battery_data, 'prognoses')
-            
+
             # Save EV results
             for i, ev in enumerate(results.get('electric_vehicles', [])):
                 for data_type in ['charge_power', 'soc']:
@@ -3585,12 +3769,12 @@ class DaCalc(DaBase):
                             'value': ev[data_type]
                         })
                         self.db_da.savedata(ev_data, 'prognoses')
-            
+
             logging.info("Optimization results saved to database")
-            
+
         except Exception as e:
             logging.error(f"Error saving optimization results: {e}")
-    
+
     def _update_ha_entities(self, results: dict):
         """Update Home Assistant entities with optimization results"""
         try:
@@ -3598,33 +3782,33 @@ class DaCalc(DaBase):
             if results['grid_import'] and len(results['grid_import']) > 0:
                 next_hour_import = results['grid_import'][0]
                 next_hour_export = results['grid_export'][0] if results['grid_export'] else 0
-                
+
                 # Update HA entities if they exist
                 if hasattr(self, 'ha_grid_import_entity'):
                     self.set_value(self.ha_grid_import_entity, round(next_hour_import, 2))
-                
+
                 if hasattr(self, 'ha_grid_export_entity'):
                     self.set_value(self.ha_grid_export_entity, round(next_hour_export, 2))
-            
+
             # Update battery recommendations
             for i, battery in enumerate(results.get('batteries', [])):
                 if battery['charge_power'] and len(battery['charge_power']) > 0:
                     next_charge = battery['charge_power'][0]
                     next_discharge = battery['discharge_power'][0] if battery['discharge_power'] else 0
-                    
+
                     if hasattr(self, f'ha_battery_{i}_charge_entity'):
                         self.set_value(getattr(self, f'ha_battery_{i}_charge_entity'), round(next_charge, 2))
-                    
+
                     if hasattr(self, f'ha_battery_{i}_discharge_entity'):
                         self.set_value(getattr(self, f'ha_battery_{i}_discharge_entity'), round(next_discharge, 2))
-            
+
             # Update total cost estimate
             if 'total_cost' in results:
                 if hasattr(self, 'ha_total_cost_entity'):
                     self.set_value(self.ha_total_cost_entity, round(results['total_cost'], 2))
-            
+
             logging.info("Home Assistant entities updated")
-            
+
         except Exception as e:
             logging.error(f"Error updating HA entities: {e}")
 

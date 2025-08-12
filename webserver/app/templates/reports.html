@@ -1,0 +1,18 @@
+{% extends "base.html" %} {% block selectie %}{% endblock %} {% block content %}
+<div class="container" style="max-width: 1200px; margin: 0 auto; padding: 20px">
+  <h1>📊 Rapportages</h1>
+  <p>Versie: {{ version }}</p>
+  <div
+    class="card"
+    style="
+      background: #fff;
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+    "
+  >
+    <p><em>Geen rapportage-data beschikbaar.</em></p>
+    <p>Voer eerst een optimalisatie-run uit of importeer data.</p>
+  </div>
+</div>
+{% endblock %}

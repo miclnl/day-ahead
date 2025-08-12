@@ -19,10 +19,14 @@ RUN apt-get update && apt-get install -y \
     libffi-dev libssl-dev \
     # Network tools
     pkg-config \
+    # System monitoring tools
+    procps htop \
+    # Debugging tools
+    vim nano curl wget \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
-# Copy software for add-on (using root for HA compatibility)  
+# Copy software for add-on (using root for HA compatibility)
 RUN mkdir -p /app/dao
 
 # Copy static configuration first (rarely changes)
@@ -44,7 +48,12 @@ RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/* || 
 COPY miplib.tar.gz /tmp/
 WORKDIR /app/dao/prog
 ENV BUILD_ARCH="$ENV_BUILD_ARCH"
-ENV PYTHONPATH="/app:/app/dao:/app/dao/prog"
+ENV PYTHONPATH="/app/dao:/app/dao/prog"
+# Limit BLAS threads for Raspberry Pi stability
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
 
 RUN if [ "${BUILD_ARCH}" = "aarch64" ]; then \
       tar -xvf /tmp/miplib.tar.gz -C /app/dao/prog \
@@ -70,8 +79,9 @@ RUN $VIRTUAL_ENV/bin/uv pip install --prerelease=allow -r /tmp/requirements-base
 
 # ML dependencies removed - using statistical intelligence only
 
-# Install remaining requirements
+# Install remaining requirements including FastAPI
 RUN $VIRTUAL_ENV/bin/uv pip install --prerelease=allow -r /tmp/requirements.txt
+
 COPY run/ /app/dao/run/
 
 # Using root user for Home Assistant compatibility

@@ -1,59 +1,50 @@
-# Core dependencies - piwheels compatible voor Raspberry Pi
-pandas>=2.0.3,<2.4.0
-numpy>=1.24.0,<2.0.0
-requests>=2.31.0,<3.0.0
-python-dateutil>=2.8.2
+# DAO v1.3.20 - Minimal requirements for Raspberry Pi
+# Core libraries - Alpine/Pi compatible
+pandas>=2.1.0,<2.3.0
+numpy>=1.25.0,<1.27.0
+requests>=2.32.3,<3.0.0
+python-dateutil>=2.9.0.post0
 
-# Database (stabiele versies)
-sqlalchemy>=2.0.21,<2.1.0
-psycopg2-binary>=2.9.7
+# Database support - recent versions
+sqlalchemy>=2.0.20,<2.1.0
+sqlalchemy-utils>=0.41.0
 pymysql>=1.1.0
 
-# Web (geen APScheduler - veroorzaakt SIGILL)
-flask>=2.3.3,<3.0.0
-gunicorn>=21.2.0
-websockets>=12.0
+# Web framework - FastAPI with Uvicorn for maximum performance
+fastapi>=0.104.0,<0.105.0
+uvicorn[standard]>=0.24.0,<0.25.0
+jinja2>=3.1.0,<3.2.0
+httptools>=0.6.0  # Fast HTTP parser for Uvicorn
 
-# Energy APIs
-beautifulsoup4>=4.12.2
+# Energy APIs - recent versions
+beautifulsoup4>=4.12.0
 pytz>=2023.3
 tzlocal>=5.2
+nordpool>=0.4.2
+entsoe-py>=0.6.9
 
-# Math/Optimization - lightweight (ALLEEN MIP)
-mip>=1.15.0,<1.17.0
-
-# Astronomical calculations for solar positioning
-ephem>=4.1.0
-
-# Async (stabiele versies)
-aiohttp>=3.8.6,<4.0.0
-
-# Security
-cryptography>=41.0.7,<46.0.0
-
-# ML - UITGESCHAKELD wegens SIGILL op Pi
-# scikit-learn==1.3.2  # Veroorzaakt SIGILL 
-# joblib==1.3.2        # Niet nodig zonder scikit-learn
-# xgboost              # Veroorzaakt SIGILL
-# torch                # Veroorzaakt SIGILL
-# lightgbm             # Veroorzaakt SIGILL
-
-# Home Assistant - essentieel voor DAO
+# Scheduling and Automation
+APScheduler>=3.10.4,<4.0.0
 hassapi>=0.2.1
 
-# Ephem voor sun calculations  
+# Optimization (ML-free)
+mip>=1.15.0,<1.17.0
+
+# Machine Learning (disabled for Pi - may cause SIGILL)
+# scikit-learn>=1.3.0,<1.4.0  # ML features - test if it works on your system
+
+# Weather and Solar calculation
 ephem>=4.1.0
 
-# Nord Pool API
-nordpool>=0.5.0
+# Essential - recent versions
+cryptography>=3.4.8,<46.0.0
+aiohttp>=3.11.11
+websockets>=14.1
 
-# ENTSO-E API
-entsoe-py>=0.7.1
+# Graphing support (optional - webserver works without)
+# matplotlib>=3.5.0
 
-# Database connectors (minimale set)
-mysql>=0.0.3
-mysql-connector-python>=9.4.0
-mariadb>=1.1.13
-
-# SQLAlchemy Utils
-SQLAlchemy-Utils>=0.41.2
+# Cloud AI Support (optional - only if API keys configured)
+# No local ML dependencies - cloud services only
+# openai>=1.58.1
+# anthropic>=0.40.0

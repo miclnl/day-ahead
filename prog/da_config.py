@@ -3,7 +3,11 @@ import logging
 import os
 
 # from logging import raiseExceptions
-from dao.prog.db_manager import DBmanagerObj
+# Support both execution contexts (module run from /app/dao/prog and from webserver cwd)
+try:
+    from dao.prog.db_manager import DBmanagerObj  # type: ignore
+except Exception:  # pragma: no cover - fallback for webserver context
+    from db_manager import DBmanagerObj  # type: ignore
 import sqlalchemy_utils
 
 
@@ -23,8 +27,21 @@ class Config:
     def __init__(self, file_name: str):
         self.options = self.parse(file_name)
         datapath = os.path.dirname(file_name)
-        file_secrets = datapath + "/secrets.json"
-        self.secrets = self.parse(file_secrets)
+        file_secrets = os.path.join(datapath, "secrets.json")
+        # Secrets zijn optioneel; als het bestand ontbreekt val terug op leeg dict
+        if os.path.exists(file_secrets):
+            try:
+                self.secrets = self.parse(file_secrets)
+            except Exception:
+                logging.warning(
+                    f"Kon secrets.json niet parsen ({file_secrets}), gebruik lege secrets"
+                )
+                self.secrets = {}
+        else:
+            logging.info(
+                f"secrets.json niet gevonden op {file_secrets} – ga verder met lege secrets"
+            )
+            self.secrets = {}
 
     def get(
         self, keys: list, options: dict = None, default=None
@@ -50,7 +67,9 @@ class Config:
 
     def get_db_da(self, check_create: bool = False):
         if Config.db_da is None:
-            db_da_engine = self.get(["database da", "engine"], None, "mysql")
+            # Bepaal engine: respecteer nested config, val terug op top-level 'database_engine', default sqlite
+            top_engine = self.get(["database_engine"], None, "sqlite")
+            db_da_engine = self.get(["database da", "engine"], None, top_engine)
             db_da_server = self.get(["database da", "server"], None, "core-mariadb")
             db_da_port = int(self.get(["database da", "port"], None, 0))
             if db_da_engine == "sqlite":
@@ -59,7 +78,9 @@ class Config:
                 db_da_name = self.get(["database da", "database"], None, "day_ahead")
             db_da_user = self.get(["database da", "username"], None, "day_ahead")
             db_da_password = self.get(["database da", "password"])
-            db_da_path = self.get(["database da", "db_path"], None, "../data")
+            # Voor HA add-on omgeving: standaard /data als sqlite pad
+            default_db_path = "/data" if db_da_engine == "sqlite" else "../data"
+            db_da_path = self.get(["database da", "db_path"], None, default_db_path)
             db_time_zone = self.get(["time_zone"])
             if check_create:
                 db_url = DBmanagerObj.db_url(

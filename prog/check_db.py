@@ -1,5 +1,7 @@
 import datetime
 import tzlocal
+import logging
+import os
 
 from sqlalchemy import (
     Table,
@@ -33,49 +35,20 @@ class CheckDB:
         self.config = Config(self.file_name)
         self.version = __version__
         self.last_version = None
+
+        # Maak database directory aan als deze niet bestaat
+        if self.config.get(["database da", "engine"], None, "mysql") == "sqlite":
+            db_path = self.config.get(["database da", "db_path"], None, "../data")
+            if db_path and not os.path.exists(db_path):
+                os.makedirs(db_path, exist_ok=True)
+                logging.info(f"Database directory aangemaakt: {db_path}")
+
         self.db_da = self.config.get_db_da(check_create=True)
-        self.engine = self.db_da.engine
-        """
-        db_da_engine = self.config.get(["database da", "engine"], None, "mysql")
-        if db_da_engine == "sqlite":
-            db_da_name = self.config.get(
-                ["database da", "database"], None, "day_ahead.db"
-            )
-        else:
-            db_da_name = self.config.get(["database da", "database"], None, "day_ahead")
-        db_da_server = self.config.get(["database da", "server"], None, "core-mariadb")
-        db_da_port = int(self.config.get(["database da", "port"], None, 0))
-        db_da_user = self.config.get(["database da", "username"], None, "day_ahead")
-        db_da_path = self.config.get(["database da", "db_path"], None, "../data")
-        db_da_password = self.config.get(["database da", "password"])
-        db_da_time_zone = self.config.get(["time_zone"])
-        self.db_url = DBmanagerObj.db_url(
-            db_dialect=db_da_engine,
-            db_name=db_da_name,
-            db_server=db_da_server,
-            db_user=db_da_user,
-            db_password=db_da_password,
-            db_port=db_da_port,
-            db_path=db_da_path,
-        )
-        if not sqlalchemy_utils.database_exists(self.db_url):
-            sqlalchemy_utils.create_database(self.db_url)
-        try:
-            self.db_da = DBmanagerObj(
-                db_dialect=db_da_engine,
-                db_name=db_da_name,
-                db_server=db_da_server,
-                db_user=db_da_user,
-                db_password=db_da_password,
-                db_port=db_da_port,
-                db_path=db_da_path,
-                db_time_zone=db_da_time_zone,
-            )
+        if self.db_da:
             self.engine = self.db_da.engine
-        except Exception as ex:
-            error_handling(ex)
-            print("Check your credentials")
-        """
+        else:
+            self.engine = None
+            logging.error("Kon database niet initialiseren")
 
     def upsert_variabel(self, variabel_table, record):
         select_variabel = select(variabel_table.c.id).where(
@@ -162,7 +135,7 @@ class CheckDB:
                 record = records[i]
                 self.upsert_variabel(variabel_tabel, record)
 
-            print('Table "variabel" met inhoud gecreeerd.')
+            logging.info('Table "variabel" met inhoud gecreeerd.')
 
             # table "values" maken
             values_tabel = Table(
@@ -182,7 +155,7 @@ class CheckDB:
             )
             values_tabel.create(self.engine)
 
-            print('Table "values" gecreeerd.')
+            logging.info('Table "values" gecreeerd.')
             prognoses_tabel = Table(
                 "prognoses",
                 metadata,
@@ -199,12 +172,12 @@ class CheckDB:
                 sqlite_autoincrement=True,  # Ensure SQLite uses AUTOINCREMENT
             )
             prognoses_tabel.create(self.engine)
-            print('Table "prognoses" gecreeerd.')
+            logging.info('Table "prognoses" gecreeerd.')
 
         if l_version < 20240307:
             record = [18, "mach", "Apparatuur", "kWh"]
             self.upsert_variabel(variabel_tabel, record)
-            print('Table "variabel" geupdated.')
+            logging.info('Table "variabel" geupdated.')
 
         if l_version < 20240805:
             records_2024_8_5 = [
@@ -217,7 +190,7 @@ class CheckDB:
             for i in range(len(records_2024_8_5)):
                 record = records_2024_8_5[i]
                 self.upsert_variabel(variabel_tabel, record)
-            print('Table "variabel" geupdated.')
+            logging.info('Table "variabel" geupdated.')
 
         """
         if l_version < 20250700:
@@ -282,8 +255,8 @@ class CheckDB:
                 row = result.first()
                 tz_db = row[0]
                 if tz_db != timezone:
-                    print(f'De timezone van de database "day_ahead" is "{tz_db}" en wijkt af van local timezone: {timezone}')
-                    print("Update de timezone (zie DOCS.md)")
+                    logging.warning(f'De timezone van de database "day_ahead" is "{tz_db}" en wijkt af van local timezone: {timezone}')
+                    logging.warning("Update de timezone (zie DOCS.md)")
 
         if l_version < n_version:
             # update version number database

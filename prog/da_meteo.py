@@ -84,7 +84,7 @@ class Meteo:
 
         alfa_zon = lamda_zon_deg - 2.468 * math.sin(2 * lamda_zon_rad) + 0.053 * math.sin(
             4 * lamda_zon_rad) - 0.0014 * math.sin(6 * lamda_zon_rad)  # in graden
-        delta_zon = 22.8008 * math.sin(lamda_zon_rad) + 0.5999 * pow(math.sin(lamda_zon_rad), 3) 
+        delta_zon = 22.8008 * math.sin(lamda_zon_rad) + 0.5999 * pow(math.sin(lamda_zon_rad), 3)
                     + 0.0493 * pow(math.sin(lamda_zon_rad), 5)
         delta_zon_rad = math.radians(delta_zon)
         noorder_breedte = self.latitude
@@ -101,11 +101,11 @@ class Meteo:
 
         # hoogte boven horizon
         h_rad = math.asin(math.sin(noorder_breedte_rad) * math.sin(delta_zon_rad)
-                          + math.cos(noorder_breedte_rad) * math.cos(delta_zon_rad) * 
+                          + math.cos(noorder_breedte_rad) * math.cos(delta_zon_rad) *
                           math.cos(h_rad))
         a_rad = math.atan2(math.sin(h_rad),
-                           math.cos(h_rad) * math.sin(noorder_breedte_rad) - 
-                           math.tan(delta_zon_rad) * math.cos(noorder_breedte_rad))  
+                           math.cos(h_rad) * math.sin(noorder_breedte_rad) -
+                           math.tan(delta_zon_rad) * math.cos(noorder_breedte_rad))
                            # links of rechts van zuid
         result = {'h': h_rad, 'A': a_rad}
 
@@ -113,40 +113,40 @@ class Meteo:
         """
         # vanaf hier nieuwe methode
         """
-   
+
         Declinatie en uurhoek
-        De in de afbeelding over deklinatie en uurhoek getekende hoeken zoals u en d leggen 
-        de stralingsrichting vast. 
-        Op iedere datum geldt: d = constant. Deze constante kan op de n- de dag van het jaar 
-        met grote nauwkeurigheid 
+        De in de afbeelding over deklinatie en uurhoek getekende hoeken zoals u en d leggen
+        de stralingsrichting vast.
+        Op iedere datum geldt: d = constant. Deze constante kan op de n- de dag van het jaar
+        met grote nauwkeurigheid
         worden berekend met behulp van formule 1:
         d = 23,44° sin {360°(284 + n)/365} (1)
         Eveneens op iedere datum geldt, dat:
         u = t x 15° (2)
-        met t gelijk aan de tijd in uren volgens Z.T. Met gehulp van (1) en (2) kan nu de 
-        stralingsrichting worden 
+        met t gelijk aan de tijd in uren volgens Z.T. Met gehulp van (1) en (2) kan nu de
+        stralingsrichting worden
         gevonden op ieder gewenst tijdstip op iedere gewenste datum.
 
         Azimut en zonshoogte
-        De stralingsrichting is ook vast te leggen met behulp van de hoeken a en h. Zie de figuur 
-        over Azimut en  
-        zonshoogte. In appendix A is afgeleid, hoe deze hoeken kunnen worden geschreven als functie 
-        van de zojuist 
-        genoemde hoeken u en d. Het blijkt handiger om h te schrijven als functie van u en d en 
-        om a te schrijven als 
+        De stralingsrichting is ook vast te leggen met behulp van de hoeken a en h. Zie de figuur
+        over Azimut en
+        zonshoogte. In appendix A is afgeleid, hoe deze hoeken kunnen worden geschreven als functie
+        van de zojuist
+        genoemde hoeken u en d. Het blijkt handiger om h te schrijven als functie van u en d en
+        om a te schrijven als
         functie van u, d en h. Gevonden wordt:
         h = arcsin (sin ф sin d – cos ф cos d cos u) (3)
         a = arcsin { (cos d sin u) / cos h } (4)
-        De hoek ф is gelijk aan de breedtegraad van de plaats op aarde, waar a en h moeten 
-        worden bepaald. 
-        De waarden, die a en h aannemen, zijn nu dus plaatsafhankelijk. 
+        De hoek ф is gelijk aan de breedtegraad van de plaats op aarde, waar a en h moeten
+        worden bepaald.
+        De waarden, die a en h aannemen, zijn nu dus plaatsafhankelijk.
         """
         """
         dt = datetime.datetime.fromtimestamp(utc_time)
         dt_start = datetime.datetime(dt.year,1,1)
         dif = dt - dt_start
         n = dif.days
-        d = math.radians(23.44 *  math.sin(math.radians(360*(284 + n) / 365))) # declinatie 
+        d = math.radians(23.44 *  math.sin(math.radians(360*(284 + n) / 365))) # declinatie
         in radialen
         dtz = datetime.datetime.fromtimestamp(utc_time, tz=pytz.utc)
         t = dtz.hour
@@ -252,13 +252,13 @@ class Meteo:
         acol = math.radians(orientation)
         # Vectorized solar radiation calculation instead of itertuples()
         global_rad = global_rad.reset_index()
-        
+
         # Calculate solar radiation in vectorized way
         def calc_solar_rad_vectorized(row):
             utc_time = row['tijd']
             radiation = float(row['gr'])
             return self.solar_rad(int(utc_time) - 3600, radiation, hcol, acol)
-        
+
         global_rad['solar_rad'] = global_rad.apply(calc_solar_rad_vectorized, axis=1)
         return global_rad
 
@@ -307,58 +307,58 @@ class Meteo:
             df_db = pd.DataFrame(columns=["time", "code", "value"])
         else:
             df1 = df1.reset_index()  # make sure indexes pair with number of rows
-            
+
             # Vectorized approach: create all records at once
             time_str = df1['tijd'].astype(int).astype(str)
-            
+
             # Create separate DataFrames for each measurement type
             gr_data = pd.DataFrame({
                 'time': time_str,
-                'code': 'gr', 
+                'code': 'gr',
                 'value': df1['gr'].astype(float)
             })
-            
+
             temp_data = pd.DataFrame({
                 'time': time_str,
                 'code': 'temp',
                 'value': df1['temp'].astype(float)
             })
-            
+
             solar_data = pd.DataFrame({
                 'time': time_str,
                 'code': 'solar_rad',
                 'value': df1['solar_rad'].astype(float)
             })
-            
+
             # Concatenate all data at once instead of row-by-row appending
             df_db = pd.concat([gr_data, temp_data, solar_data], ignore_index=True)
 
         if count < 96:
             df1_gfs = self.get_from_meteoserver("gfs")
             df1_subset = df1_gfs[count:] if count > 0 else df1_gfs
-            
+
             if not df1_subset.empty:
                 # Vectorized approach for GFS data as well
                 time_str_gfs = df1_subset['tijd'].astype(int).astype(str)
-                
+
                 gr_data_gfs = pd.DataFrame({
                     'time': time_str_gfs,
                     'code': 'gr',
                     'value': df1_subset['gr'].astype(float)
                 })
-                
+
                 temp_data_gfs = pd.DataFrame({
-                    'time': time_str_gfs, 
+                    'time': time_str_gfs,
                     'code': 'temp',
                     'value': df1_subset['temp'].astype(float)
                 })
-                
+
                 solar_data_gfs = pd.DataFrame({
                     'time': time_str_gfs,
-                    'code': 'solar_rad', 
+                    'code': 'solar_rad',
                     'value': df1_subset['solar_rad'].astype(float)
                 })
-                
+
                 # Append GFS data
                 gfs_db = pd.concat([gr_data_gfs, temp_data_gfs, solar_data_gfs], ignore_index=True)
                 df_db = pd.concat([df_db, gfs_db], ignore_index=True)
@@ -385,7 +385,7 @@ class Meteo:
         url = "https://api.forecast.solar/estimate/watthours/"+str(self.latitude)+"/"
                 +str(self.longitude)+"/45/5/5.5"
         resp = get(url)
-        
+
         print (resp.text)
         json_object = json.loads(resp.text)
         data = json_object["result"]
@@ -403,49 +403,49 @@ class Meteo:
             if (day != last_day): # or (last_hour < hour-1):
                 if last_day == -1:
                     for h in range(last_hour+1, hour):
-                        time_h = dt.datetime(datetime_obj.year, datetime_obj.month, 
+                        time_h = dt.datetime(datetime_obj.year, datetime_obj.month,
                         datetime_obj.day, h,0,0 )
                         time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
+                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)),
                         time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
                 else:
                     for h in range(last_hour + 1, 24):
                         time_h = dt.datetime(last_datetime_obj.year,last_datetime_obj.month,
                         last_datetime_obj.day,h,0,0)
                         time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
+                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)),
                         time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
                     for h in range(0, hour):
-                        time_h = dt.datetime(datetime_obj.year, datetime_obj.month, 
+                        time_h = dt.datetime(datetime_obj.year, datetime_obj.month,
                         datetime_obj.day, h, 0, 0)
                         time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
+                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)),
                         time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
                     last_value = 0
             time_h = dt.datetime(datetime_obj.year, datetime_obj.month, d
             atetime_obj.day, hour, 0, 0)
             time_utc = dt.datetime.timestamp(time_h) -3600
-            df_db.loc[df_db.shape[0]] = [str(int(time_utc)), time_h.strftime("%Y-%m-%d %H:%M"), 
+            df_db.loc[df_db.shape[0]] = [str(int(time_utc)), time_h.strftime("%Y-%m-%d %H:%M"),
             'pv', pv_w - last_value]
             last_hour = hour
             last_value = pv_w
             last_day = day
             last_datetime_obj = datetime_obj
         for h in range(last_hour + 1, 24):
-            time_h = dt.datetime(last_datetime_obj.year, last_datetime_obj.month, 
+            time_h = dt.datetime(last_datetime_obj.year, last_datetime_obj.month,
             last_datetime_obj.day, h, 0, 0)
             time_utc = dt.datetime.timestamp(time_h) - 3600
-            df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
+            df_db.loc[df_db.shape[0]] = [str(int(time_utc)),
             time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
 
-        print(df_db)
+        logging.debug(f"Database data before graph: {df_db}")
 
-        graphs.make_graph_meteo(df_db, file = "../data/images/meteo" + 
-                                              datetime.datetime.now().strftime("%H%M") + 
+        graphs.make_graph_meteo(df_db, file = "../data/images/meteo" +
+                                              datetime.datetime.now().strftime("%H%M") +
                                              ".png", show=show_graph)
-                               
+
         del df_db["time_str"]
-        print(df_db)
+        logging.debug(f"Database data after processing: {df_db}")
         self.db_da.savedata(df_db)
         """
 
@@ -501,8 +501,8 @@ class Meteo:
             "SELECT AVG(t1.`value`) avg_temp FROM "
             "(SELECT `time`, `value`,  from_unixtime(`time`) 'begin' "
             "FROM `values` , `variabel` "
-            "WHERE `variabel`.`code` = 'temp' 
-                AND `values`.`variabel` = `variabel`.`id` 
+            "WHERE `variabel`.`code` = 'temp'
+                AND `values`.`variabel` = `variabel`.`id`
                 AND time >= " + str(date_utc) + " "
             "ORDER BY `time` ASC LIMIT 24) t1 "
         )

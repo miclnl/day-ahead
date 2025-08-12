@@ -77,7 +77,15 @@ class DBmanagerObj(object):
             # abs_db_path = os.path.abspath(self.db_path) # ../data
             # self.dbname = "home-assistant_v2.db"
             # self.engine = create_engine(f'sqlite:////{abs_db_path}/{self.db_name}')
-            self.engine = create_engine(f"sqlite:///{self.db_path}/{self.db_name}")
+            self.engine = create_engine(
+                f"sqlite:///{self.db_path}/{self.db_name}",
+                connect_args={
+                    "timeout": 30,
+                    # Veilig bij threaded gebruik in één proces; elk proces krijgt eigen engine
+                    "check_same_thread": False,
+                },
+                pool_pre_ping=True,
+            )
         if self.db_dialect == "sqlite":
             logging.debug(
                 f"Dialect: {self.db_dialect}, database: {self.db_name}, db_path: {self.db_path}"
@@ -95,8 +103,34 @@ class DBmanagerObj(object):
             db_port=self.port,
             db_path=self.db_path,
         )
-        if not sqlalchemy_utils.database_exists(db_url):
-            raise ConnectionAbortedError
+
+        # Voor SQLite, controleer of het bestand bestaat, anders maak het aan
+        if self.db_dialect == "sqlite":
+            db_file_path = os.path.join(self.db_path, self.db_name)
+            if not os.path.exists(db_file_path):
+                # Maak een lege SQLite database aan
+                import sqlite3
+                try:
+                    conn = sqlite3.connect(db_file_path)
+                    conn.close()
+                    logging.info(f"SQLite database aangemaakt: {db_file_path}")
+                except Exception as e:
+                    logging.error(f"Kon SQLite database niet aanmaken: {e}")
+                    raise ConnectionAbortedError
+            # Zet pragmas voor betere concurrency op SQLite
+            try:
+                with self.engine.connect() as connection:
+                    connection.execute(text("PRAGMA journal_mode=WAL"))
+                    connection.execute(text("PRAGMA busy_timeout=30000"))
+                    connection.execute(text("PRAGMA synchronous=NORMAL"))
+                    logging.debug("SQLite PRAGMAs gezet: WAL, busy_timeout=30000, synchronous=NORMAL")
+            except Exception as e:
+                logging.warning(f"Kon SQLite PRAGMAs niet zetten: {e}")
+        else:
+            # Voor andere database types, controleer of de database bestaat
+            if not sqlalchemy_utils.database_exists(db_url):
+                raise ConnectionAbortedError
+
         self.metadata = MetaData()
 
     @staticmethod
@@ -240,12 +274,12 @@ class DBmanagerObj(object):
         """
         Save data in dataframe using bulk operations for optimal performance.
         If record exists then update else insert.
-        
+
         Args:
             df: Dataframe that we wish to save in table tablename
                columns:
                code	string
-               calculated datetime, 0 if realised  
+               calculated datetime, 0 if realised
                time	timestamp in sec
                value	float
             tablename: values or prognoses
@@ -262,15 +296,15 @@ class DBmanagerObj(object):
                 # Reflect existing tables from the database
                 values_table = Table(tablename, self.metadata, autoload_with=self.engine)
                 variabel_table = Table("variabel", self.metadata, autoload_with=self.engine)
-                
+
                 # Clean and prepare DataFrame
                 df_clean = df.copy().reset_index(drop=True)
-                
+
                 # Filter out invalid values in vectorized way
                 df_clean = df_clean[
                     df_clean['value'].apply(lambda x: isinstance(x, (int, float)) and x != float('inf'))
                 ]
-                
+
                 if df_clean.empty:
                     logging.debug("No valid data to save after filtering")
                     return
@@ -282,16 +316,16 @@ class DBmanagerObj(object):
                 )
                 variabel_result = connection.execute(variabel_query).fetchall()
                 code_to_id = {row[0]: row[1] for row in variabel_result}
-                
+
                 # Filter out unknown codes
                 df_clean = df_clean[df_clean['code'].isin(code_to_id.keys())]
                 if df_clean.empty:
                     logging.error("No valid codes found for data saving")
                     return
-                
+
                 # Add variabel_id column
                 df_clean['variabel_id'] = df_clean['code'].map(code_to_id)
-                
+
                 # Check existing records in bulk using upsert pattern
                 records_to_process = []
                 for _, row in df_clean.iterrows():
@@ -300,7 +334,7 @@ class DBmanagerObj(object):
                         'variabel': int(row['variabel_id']),
                         'value': float(row['value'])
                     })
-                
+
                 if records_to_process:
                     # Use database-specific upsert if available, otherwise fallback to insert/update
                     if self.engine.dialect.name == 'postgresql':
@@ -317,7 +351,7 @@ class DBmanagerObj(object):
                         from sqlalchemy import text
                         for record in records_to_process:
                             stmt = text(f"""
-                                REPLACE INTO {tablename} (time, variabel, value) 
+                                REPLACE INTO {tablename} (time, variabel, value)
                                 VALUES (:time, :variabel, :value)
                             """)
                             connection.execute(stmt, record)
@@ -330,13 +364,13 @@ class DBmanagerObj(object):
                                 VALUES (:time, :variabel, :value)
                             """)
                             connection.execute(stmt, record)
-                    
+
                     logging.info(f"Bulk saved {len(records_to_process)} records using optimized upsert")
-                
+
             except Exception as e:
                 logging.error(f"Error in bulk savedata: {e}")
                 raise
-        
+
         self.log_pool_status()
 
     def get_prognose_field(self, field: str, start, end=None, interval="hour"):

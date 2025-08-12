@@ -1,0 +1,170 @@
+{% extends "base.html" %} {% block content %}
+<div class="container">
+  <h1>DAO Configuratie</h1>
+
+  {% if error_message %}
+  <div class="error-message">
+    <h3>Fout opgetreden:</h3>
+    <p>{{ error_message }}</p>
+  </div>
+  {% endif %}
+
+  <div class="config-section">
+    <h2>Add-on Configuratie</h2>
+    <table class="config-table">
+      <tr>
+        <th>Instelling</th>
+        <th>Waarde</th>
+      </tr>
+      <tr>
+        <td>Log Level</td>
+        <td>{{ config.log_level }}</td>
+      </tr>
+      <tr>
+        <td>Database Engine</td>
+        <td>{{ config.database_engine }}</td>
+      </tr>
+      <tr>
+        <td>Home Assistant Token</td>
+        <td>{{ config.homeassistant_token }}</td>
+      </tr>
+      <tr>
+        <td>Home Assistant URL</td>
+        <td>{{ config.homeassistant_url or 'Niet ingesteld' }}</td>
+      </tr>
+      <tr>
+        <td>Optimalisatie Modus</td>
+        <td>{{ config.optimization_mode }}</td>
+      </tr>
+      <tr>
+        <td>Cloud AI Ingeschakeld</td>
+        <td>{{ 'Ja' if config.cloud_ai_enabled else 'Nee' }}</td>
+      </tr>
+      <tr>
+        <td>Configuratie Bestand</td>
+        <td>{{ config.config_file }}</td>
+      </tr>
+      <tr>
+        <td>Configuratie Geladen</td>
+        <td>{{ 'Ja' if config.config_loaded else 'Nee' }}</td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="config-section">
+    <h2>API Endpoints</h2>
+    <ul>
+      <li>
+        <a href="api/config">JSON Configuratie</a> - Machine-leesbare
+        configuratie
+      </li>
+      <li>
+        <a href="api/reload-config" onclick="reloadConfig()"
+          >Configuratie Herladen</a
+        >
+        - Herlaad configuratie zonder restart
+      </li>
+      <li><a href="api/health-check">Health Check</a> - Systeem status</li>
+    </ul>
+  </div>
+
+  <div class="config-section">
+    <h2>Acties</h2>
+    <button onclick="reloadConfig()" class="btn btn-primary">
+      Configuratie Herladen
+    </button>
+    <button onclick="window.location.reload()" class="btn btn-secondary">
+      Pagina Vernieuwen
+    </button>
+  </div>
+</div>
+
+<script>
+  function reloadConfig() {
+    fetch("api/reload-config", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+    })
+      .then((response) => response.json())
+      .then((data) => {
+        if (data.success) {
+          alert("Configuratie succesvol herladen!");
+          window.location.reload();
+        } else {
+          alert("Fout bij herladen configuratie: " + data.error);
+        }
+      })
+      .catch((error) => {
+        alert("Fout bij herladen configuratie: " + error);
+      });
+  }
+</script>
+
+<style>
+  .container {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+
+  .config-section {
+    margin-bottom: 30px;
+    padding: 20px;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    background-color: #f9f9f9;
+  }
+
+  .config-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 15px;
+  }
+
+  .config-table th,
+  .config-table td {
+    padding: 10px;
+    text-align: left;
+    border-bottom: 1px solid #ddd;
+  }
+
+  .config-table th {
+    background-color: #e9e9e9;
+    font-weight: bold;
+  }
+
+  .error-message {
+    background-color: #ffebee;
+    border: 1px solid #f44336;
+    color: #c62828;
+    padding: 15px;
+    border-radius: 5px;
+    margin-bottom: 20px;
+  }
+
+  .btn {
+    padding: 10px 20px;
+    margin: 5px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+
+  .btn-primary {
+    background-color: #2196f3;
+    color: white;
+  }
+
+  .btn-secondary {
+    background-color: #757575;
+    color: white;
+  }
+
+  .btn:hover {
+    opacity: 0.8;
+  }
+</style>
+{% endblock %}
