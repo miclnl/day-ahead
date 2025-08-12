@@ -22,6 +22,7 @@ import os
 from subprocess import PIPE, run
 from sqlalchemy import text
 from logging.handlers import TimedRotatingFileHandler
+from datetime import datetime, timedelta
 
 # Import ha_client with fallback
 try:
@@ -93,7 +94,7 @@ try:
     logging.debug("routes.py - Version imported via version")
 except ImportError:
     logging.warning("Could not import version")
-    __version__ = "0.5.0"
+    __version__ = "0.5.1"
 
 logging.debug("routes.py - Module imports completed")
 
@@ -538,6 +539,105 @@ async def settings_import(config_file: UploadFile = File(...)):
         return JSONResponse({"success": True})
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+def _sync_ha_energy_internal(config: Any) -> Dict[str, Any]:
+    """Core sync functie die door endpoint én periodieke taak gebruikt wordt."""
+    try:
+        # 1) Probeer Energy Dashboard preferences
+        try:
+            from ha_client import get_energy_preferences, get_statistics_period
+            prefs = get_energy_preferences(config)
+        except Exception:
+            prefs = None
+
+        consumption_stat = None
+        production_stat = None
+
+        if prefs and isinstance(prefs, dict):
+            try:
+                sources = prefs.get('energy_sources', [])
+                for src in sources:
+                    # Grid from (consumption)
+                    for flow in src.get('flow_from', []) or []:
+                        sid = flow.get('stat_energy_from')
+                        if isinstance(sid, str) and not consumption_stat:
+                            consumption_stat = sid
+                    # Grid to (return)
+                    for flow in src.get('flow_to', []) or []:
+                        sid = flow.get('stat_energy_to')
+                        if isinstance(sid, str) and not production_stat:
+                            production_stat = sid
+            except Exception:
+                pass
+
+        # 2) Val terug op handmatige entities in config
+        if not consumption_stat:
+            consumption_stat = config.get(['energy', 'consumption_entity'])
+        if not production_stat:
+            production_stat = config.get(['energy', 'production_entity'])
+
+        if not consumption_stat and not production_stat:
+            return {"success": False, "error": "Geen HA statistics of entities gevonden"}
+
+        # 3) Haal laatste 24 uur (uurwaarden)
+        start = datetime.now() - timedelta(hours=24)
+        cons_series = None
+        prod_series = None
+        try:
+            if consumption_stat:
+                cons_series = get_statistics_period(config, consumption_stat, start=start, period='hour')
+            if production_stat:
+                prod_series = get_statistics_period(config, production_stat, start=start, period='hour')
+        except Exception:
+            pass
+
+        # 4) Schrijf naar DAO database (codes: cons/prod)
+        db = config.get_db_da()
+        if db is None:
+            return {"success": False, "error": "Database niet beschikbaar"}
+
+        import pandas as pd
+        rows = []
+        def push_series(series, code):
+            if not series:
+                return
+            # Expect list of lists/dicts per HA API; loop defensively
+            try:
+                items = series[0] if isinstance(series[0], list) else series
+            except Exception:
+                items = []
+            for item in items:
+                try:
+                    # HA statistics samples hebben 'start' en 'sum'/'change'
+                    ts_str = item.get('start') or item.get('start_time')
+                    val = item.get('sum') or item.get('change')
+                    if ts_str and isinstance(val, (int, float)):
+                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp()
+                        rows.append({'code': code, 'time': int(ts), 'value': float(val)})
+                except Exception:
+                    continue
+
+        push_series(cons_series, 'cons')
+        push_series(prod_series, 'prod')
+
+        if rows:
+            df = pd.DataFrame(rows)
+            try:
+                db.savedata(df, tablename='values')
+            except Exception as e:
+                return {"success": False, "error": f"Opslaan mislukt: {e}"}
+        return {"success": True, "inserted": len(rows), "cons_stat": consumption_stat, "prod_stat": production_stat}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/settings/sync-ha-energy")
+async def settings_sync_ha_energy(config: Any = Depends(get_config_instance)):
+    """Sync consumptie/productie uit Home Assistant Energy dashboard/statistics naar DAO DB."""
+    result = _sync_ha_energy_internal(config)
+    status = 200 if result.get("success") else 500
+    return JSONResponse(result, status_code=status)
 
 @app.get("/statistics", response_class=HTMLResponse)
 async def statistics(request: Request, report: Any = Depends(get_report_instance)):

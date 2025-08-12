@@ -50,6 +50,16 @@ def get_core_config(config) -> Optional[Dict[str, Any]]:
         return None
 
 
+def get_energy_preferences(config) -> Optional[Dict[str, Any]]:
+    base, token = get_base_and_token(config)
+    if not base:
+        return None
+    try:
+        return _http_get_json(f"{base}/api/energy/preferences", token, timeout=10)
+    except Exception:
+        return None
+
+
 def get_states(config) -> List[Dict[str, Any]]:
     base, token = get_base_and_token(config)
     if not base:
@@ -114,6 +124,23 @@ def get_statistics_max_daily(config, entity_id: str, days: int = 365) -> Optiona
                 return max(vals)
     except Exception:
         pass
+    return None
+
+
+def get_statistics_period(config, statistic_id: str, start: dt.datetime, period: str = "hour") -> Optional[list]:
+    base, token = get_base_and_token(config)
+    if not base:
+        return None
+    try:
+        url = (
+            f"{base}/api/statistics/period?start_time={_iso(start)}&period={period}"
+            f"&statistic_id={statistic_id}"
+        )
+        data = _http_get_json(url, token, timeout=15)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        return None
     return None
 
 
