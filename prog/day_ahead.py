@@ -478,10 +478,14 @@ class DaCalc(DaBase):
                 discharge_stages = [{"power": 0.0, "efficiency": 1}] + discharge_stages
 
             # noinspection PyTypeChecker
-            max_charge_power.append(int(charge_stages[-1]["power"]) / 1000)
+            inferred_max_charge = int(charge_stages[-1]["power"]) / 1000
+            explicit_max_charge = float(self.battery_options[b].get("max_charge_power", inferred_max_charge))
+            max_charge_power.append(min(inferred_max_charge, explicit_max_charge))
             # CS is aantal charge stages
             CS.append(len(charge_stages))
-            max_discharge_power.append(discharge_stages[-1]["power"] / 1000)
+            inferred_max_discharge = discharge_stages[-1]["power"] / 1000
+            explicit_max_discharge = float(self.battery_options[b].get("max_discharge_power", inferred_max_discharge))
+            max_discharge_power.append(min(inferred_max_discharge, explicit_max_discharge))
 
             # reduced power
             red_hours = self.config.get(["reduced hours"], self.battery_options[b], {})
@@ -526,7 +530,7 @@ class DaCalc(DaBase):
                 self.config.get(
                     ["dc_to_bat max power"],
                     self.battery_options[b],
-                    2000 * max_discharge_power[b],
+                    2000 * max_charge_power[b],
                 )
                 / 1000
             )

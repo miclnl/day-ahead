@@ -95,7 +95,7 @@ try:
     logging.debug("routes.py - Version imported via version")
 except ImportError:
     logging.warning("Could not import version")
-    __version__ = "0.5.2"
+    __version__ = "0.5.3"
 
 logging.debug("routes.py - Module imports completed")
 
@@ -383,6 +383,27 @@ async def api_run_operation(operation_id: str):
             log("Weerdata ophalen/analyseren niet geactiveerd in deze build.")
         elif op_name == "get_tibber":
             log("Tibber-gegevens ophalen niet geactiveerd in deze build.")
+        elif op_name == "dry_run":
+            # Veiligheidsmodus: geen acties richting HA; alleen data inladen en plannen berekenen
+            import os
+            os.environ["DAO_SAFE_MODE"] = "1"
+            log("Dry-run modus geactiveerd (DAO_SAFE_MODE=1): geen HA-acties worden uitgevoerd")
+            run_dt = datetime.datetime.now()
+            results = calc.calc_optimum_statistical(_start_dt=run_dt, _start_soc=None)
+            if results is None:
+                log("Geen resultaten ontvangen (None)")
+                raise RuntimeError("Dry-run gaf geen resultaten")
+            method = results.get('optimization_method') or results.get('strategy_used') or 'unknown'
+            log(f"Methode: {method}")
+            schedule = results.get('schedule')
+            if schedule is not None:
+                try:
+                    import pandas as _pd  # type: ignore
+                    head = schedule.head(6).copy()
+                    log("Voorbeeld planning (eerste 6 regels):")
+                    log(head.to_string())
+                except Exception:
+                    pass
         else:
             log(f"Onbekende operatie: {op_name}")
 
@@ -662,10 +683,29 @@ def _sync_ha_energy_internal(config: Any) -> Dict[str, Any]:
 
 @app.post("/settings/sync-ha-energy")
 async def settings_sync_ha_energy(config: Any = Depends(get_config_instance)):
-    """Sync consumptie/productie uit Home Assistant Energy dashboard/statistics naar DAO DB."""
+    """Sync/Fetch energiegegevens uit HA. In 'external' modus wordt er niets opgeslagen.
+    Als 'external' actief is, heeft sync geen nut; we retourneren een duidelijke melding.
+    """
+    # Lees modus
+    try:
+        mode = str(config.get(['energy', 'storage_mode'], None, 'external')).lower()
+    except Exception:
+        mode = 'external'
+
+    if mode == 'external':
+        # Alleen test of we data kunnen ophalen, sla niets op.
+        try:
+            res = _sync_ha_energy_internal(config)
+            res['note'] = 'external mode: geen opslag uitgevoerd'
+            _last_energy_sync.update(res)
+            _last_energy_sync["time"] = datetime.now().isoformat(timespec='seconds')
+            return JSONResponse(res, status_code=200 if res.get('success') else 500)
+        except Exception as e:
+            return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    # internal modus: bestaand gedrag
     result = _sync_ha_energy_internal(config)
     try:
-        # Update last energy sync status
         _last_energy_sync.update(result)
         _last_energy_sync["time"] = datetime.now().isoformat(timespec='seconds')
     except Exception:
@@ -717,7 +757,7 @@ async def api_health_check():
     """
     details: Dict[str, Any] = {}
     healthy = True
-    # Database check
+    # Database check en HA API check
     try:
         # Probeer via Config; als dat faalt, val terug op SQLite pad check
         db = None
@@ -753,7 +793,15 @@ async def api_health_check():
     details["scheduler"] = "Running"
     details["memory_usage"] = "Normal"
     details["disk_space"] = "OK"
-    details["homeassistant"] = "OK"
+    # Check HA API bereikbaarheid
+    try:
+        if HA_CLIENT_AVAILABLE:
+            core = get_core_config(cfg) if 'cfg' in locals() else None
+            details["homeassistant"] = "OK" if core else "Unavailable"
+        else:
+            details["homeassistant"] = "Unavailable"
+    except Exception:
+        details["homeassistant"] = "Error"
 
     return JSONResponse({
         "healthy": healthy,

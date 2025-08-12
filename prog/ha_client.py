@@ -158,6 +158,13 @@ def _http_post_json(url: str, token: Optional[str], body: Dict[str, Any], timeou
 
 
 def call_service(config, domain: str, service: str, service_data: Dict[str, Any]) -> bool:
+    # Safe mode: niet uitvoeren, alleen melden
+    if os.getenv("DAO_SAFE_MODE", "0") == "1":
+        try:
+            print(f"[SAFE_MODE] Skip service call {domain}.{service} {service_data}")
+        except Exception:
+            pass
+        return True
     base, token = get_base_and_token(config)
     if not base:
         return False
@@ -170,6 +177,12 @@ def call_service(config, domain: str, service: str, service_data: Dict[str, Any]
 
 
 def turn_switch(config, entity_id: str, on: bool) -> bool:
+    if os.getenv("DAO_SAFE_MODE", "0") == "1":
+        try:
+            print(f"[SAFE_MODE] Skip switch {'on' if on else 'off'} for {entity_id}")
+        except Exception:
+            pass
+        return True
     domain = 'switch'
     service = 'turn_on' if on else 'turn_off'
     return call_service(config, domain, service, {"entity_id": entity_id})
