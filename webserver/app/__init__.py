@@ -198,7 +198,7 @@ try:
 
         templates.env.globals.update({
             'now': datetime.datetime.now,  # Function to get current time
-            'datetime': datetime.datetime,  # datetime class for other operations
+            'datetime': datetime,          # expose full module so templates can use datetime.datetime
             'timedelta': datetime.timedelta,
             'math': math,
             'random': random,

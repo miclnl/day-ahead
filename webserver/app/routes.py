@@ -63,6 +63,7 @@ _report_lock = threading.Lock()
 
 # In-memory run status registry for UI (not persisted)
 _last_runs: Dict[str, Dict[str, Any]] = {}
+_last_energy_sync: Dict[str, Any] = {"success": False, "inserted": 0}
 
 def get_config_class():
     """Lazy import Config class to avoid SQLAlchemy circular imports"""
@@ -94,7 +95,7 @@ try:
     logging.debug("routes.py - Version imported via version")
 except ImportError:
     logging.warning("Could not import version")
-    __version__ = "0.5.1"
+    __version__ = "0.5.2"
 
 logging.debug("routes.py - Module imports completed")
 
@@ -544,6 +545,16 @@ async def settings_import(config_file: UploadFile = File(...)):
 def _sync_ha_energy_internal(config: Any) -> Dict[str, Any]:
     """Core sync functie die door endpoint én periodieke taak gebruikt wordt."""
     try:
+        # Bepaal opslagmodus: external (default) of internal
+        try:
+            mode = (
+                (config.get(['energy', 'storage_mode'], None, 'external') or 'external')
+                if hasattr(config, 'get') else 'external'
+            )
+        except Exception:
+            mode = 'external'
+        mode = str(mode).lower()
+
         # 1) Probeer Energy Dashboard preferences
         try:
             from ha_client import get_energy_preferences, get_statistics_period
@@ -592,7 +603,24 @@ def _sync_ha_energy_internal(config: Any) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # 4) Schrijf naar DAO database (codes: cons/prod)
+        # 4) Afhankelijk van opslagmodus: wel/niet naar DAO database schrijven
+        if mode == 'external':
+            # In external-modus slaan we brondata NIET op in de DAO database.
+            # Rapporteer alleen wat er is opgehaald.
+            cnt = 0
+            try:
+                items = cons_series[0] if (isinstance(cons_series, list) and cons_series and isinstance(cons_series[0], list)) else (cons_series or [])
+                cnt += len(items) if isinstance(items, list) else 0
+            except Exception:
+                pass
+            try:
+                items = prod_series[0] if (isinstance(prod_series, list) and prod_series and isinstance(prod_series[0], list)) else (prod_series or [])
+                cnt += len(items) if isinstance(items, list) else 0
+            except Exception:
+                pass
+            return {"success": True, "inserted": 0, "read": cnt, "mode": mode, "cons_stat": consumption_stat, "prod_stat": production_stat}
+
+        # INTERNAL modus: schrijven naar DAO DB (bestaand gedrag)
         db = config.get_db_da()
         if db is None:
             return {"success": False, "error": "Database niet beschikbaar"}
@@ -636,8 +664,18 @@ def _sync_ha_energy_internal(config: Any) -> Dict[str, Any]:
 async def settings_sync_ha_energy(config: Any = Depends(get_config_instance)):
     """Sync consumptie/productie uit Home Assistant Energy dashboard/statistics naar DAO DB."""
     result = _sync_ha_energy_internal(config)
+    try:
+        # Update last energy sync status
+        _last_energy_sync.update(result)
+        _last_energy_sync["time"] = datetime.now().isoformat(timespec='seconds')
+    except Exception:
+        pass
     status = 200 if result.get("success") else 500
     return JSONResponse(result, status_code=status)
+
+@app.get("/api/energy/sync-status")
+async def api_energy_sync_status():
+    return JSONResponse(_last_energy_sync)
 
 @app.get("/statistics", response_class=HTMLResponse)
 async def statistics(request: Request, report: Any = Depends(get_report_instance)):

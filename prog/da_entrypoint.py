@@ -679,7 +679,19 @@ class DaoEntrypoint:
 
             # Start periodic HA energy sync (every 15 minutes)
             try:
-                t = threading.Thread(target=self._periodic_sync_ha_energy_loop, daemon=True)
+                def _periodic_sync_loop():
+                    while self.running:
+                        try:
+                            import urllib.request
+                            req = urllib.request.Request(
+                                "http://127.0.0.1:5001/settings/sync-ha-energy", method='POST'
+                            )
+                            urllib.request.urlopen(req, data=b"", timeout=15).read()
+                        except Exception:
+                            pass
+                        time.sleep(900)
+
+                t = threading.Thread(target=_periodic_sync_loop, daemon=True)
                 t.start()
                 logger.info("⏱️ Periodieke HA energie sync gestart (15 min)")
             except Exception as e:
@@ -764,35 +776,3 @@ class DaoEntrypoint:
 if __name__ == "__main__":
     entrypoint = DaoEntrypoint()
     entrypoint.run()
-
-
-
-
-def _periodic_sync_ha_energy_call():
-    try:
-        import urllib.request
-        req = urllib.request.Request("http://127.0.0.1:5001/settings/sync-ha-energy", method='POST')
-        urllib.request.urlopen(req, data=b"", timeout=15).read()
-    except Exception:
-        pass
-
-
-def _periodic_sync_ha_energy_loop_wrapper(self_ref):
-    while self_ref.running:
-        _periodic_sync_ha_energy_call()
-        time.sleep(900)
-
-
-# Add as method on DaoEntrypoint dynamically to avoid refactor
-def _periodic_sync_ha_energy_loop(self):
-    while self.running:
-        try:
-            import urllib.request
-            req = urllib.request.Request("http://127.0.0.1:5001/settings/sync-ha-energy", method='POST')
-            urllib.request.urlopen(req, data=b"", timeout=15).read()
-        except Exception:
-            pass
-        time.sleep(900)
-
-# Bind method
-setattr(DaoEntrypoint, "_periodic_sync_ha_energy_loop", _periodic_sync_ha_energy_loop)

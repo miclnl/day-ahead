@@ -53,6 +53,11 @@
    "last invoice": "2022-09-01",
     "tax refund": "True"
   },
+  "energy": {
+    "storage_mode": "external",
+    "consumption_entity": "",
+    "production_entity": ""
+  },
   "logging level" : "info",
   "use_calc_baseload": "False",
   "baseload calc periode": 56,

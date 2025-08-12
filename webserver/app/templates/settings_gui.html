@@ -121,7 +121,7 @@
             </div>
         </div>
 
-        <div class="form-section">
+        <div class="form-section" style="background:#fff;border-radius:8px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.06)">
             <h3>🏠 Home Assistant Energiemetingen</h3>
             <div class="form-group">
                 <label for="consumption_entity">Verbruik Entity (kWh):</label>
@@ -139,8 +139,9 @@
                 <small>HA sensor met PV‑productie (kWh), liefst met statistics (total/total_increasing)</small>
             </div>
 
-            <div class="form-group">
+            <div class="form-group" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
                 <button type="button" class="btn" onclick="syncHaEnergy()">🔄 Sync HA energie nu</button>
+                <span id="energy-sync-status" style="font-size:0.9em;color:#666">Status: onbekend</span>
                 <small>Haalt laatste 24 uur op en schrijft naar DAO database (codes: cons/prod)</small>
             </div>
         </div>
@@ -1019,6 +1020,36 @@
 </style>
 
 <script>
+// Energy sync status updater
+function updateEnergySyncStatus() {
+    fetch('/api/energy/sync-status')
+      .then(r => r.json())
+      .then(s => {
+        const el = document.getElementById('energy-sync-status');
+        if (!el) return;
+        const when = s.time ? s.time : 'onbekend';
+        const ins = (typeof s.inserted !== 'undefined') ? s.inserted : '-';
+        const ok = s.success === true ? '✅' : '⚠️';
+        el.textContent = `Status: ${ok} laatst: ${when}, records: ${ins}`;
+      })
+      .catch(() => {});
+}
+
+// Sync HA energy
+function syncHaEnergy() {
+    const el = document.getElementById('energy-sync-status');
+    if (el) el.textContent = 'Status: bezig...';
+    fetch('settings/sync-ha-energy', { method: 'POST' })
+        .then(r => r.json())
+        .then(() => updateEnergySyncStatus())
+        .catch(() => updateEnergySyncStatus());
+}
+
+// Initialize status on load and refresh every minute
+document.addEventListener('DOMContentLoaded', () => {
+    updateEnergySyncStatus();
+    setInterval(updateEnergySyncStatus, 60000);
+});
 // Tab switching
 document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
