@@ -1,4 +1,4 @@
-# DAY AHEAD OPTIMIZER
+# DAO+
 
 ![Supports aarch64 Architecture][aarch64-shield] ![Supports amd64 Architecture][amd64-shield]
 
@@ -6,12 +6,50 @@
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
 
 ## Inleiding
-Het programma Day Ahead Optimizer (DAO) voert de volgende acties, 
+Het programma DAO+ voert de volgende acties, 
 berekeningen en bewerkingen uit: 
 
 * ophalen dynamische energie tarieven bij Entsoe en/of NordPool
 * ophalen van meteogegevens bij Meteoserver
 * berekenen van de optimale inzet van een aanwezige batterij, wp-boiler en elektrische auto.<br>
+## PV-prognose: PR-kalibratie en temperatuurcorrecties
+
+DAO+ bevat optimalisaties voor de PV-prognose die de nauwkeurigheid verbeteren:
+
+- PR-kalibratie (Performance Ratio)
+  - Globale PR-factor: schaalt de totale PV-uitkomst zodat de som van de voorspelde productie beter aansluit bij recente werkelijkheid.
+  - Per-uur PR-profiel: corrigeert systematische ochtend-/middagafwijkingen door 24 uurlijkse factoren toe te passen.
+  - Configuratie: je kunt een vaste PR-factor en/of 24-uurs PR-lijst opgeven om de automatische kalibratie te overrulen.
+
+- Temperatuurcorrecties
+  - Ondersteunt een expliciete power temperatuurcoëfficiënt in %/°C (negatief), of afleiding uit voltage en current temp coeffs.
+  - Paneeltemperatuur: indien een entiteit voor paneel- of invertertemperatuur beschikbaar is, wordt die gebruikt; anders wordt een offset t.o.v. buitentemperatuur toegepast.
+  - Correctie is begrensd om onrealistische waarden te vermijden.
+
+### Relevante configuratievelden
+- Bij elke PV-array of string (JSON-editor):
+  - `tilt` (graden, 0–90)
+  - `azimuth` (graden, 0–360; 180 = zuid)
+  - `yield` (kWh per J/cm²; zie DOCS voor bepaling uit jaaropbrengst)
+  - Optioneel: `power temp coeff %/C` (bijv. -0.35)
+  - Optioneel: `voltage temp coeff %/C` en `current temp coeff %/C` (als power-coeff niet bekend is)
+  - Optioneel: `NOCT (°C)`
+
+- Globaal (of per array):
+  - `pv.pr_factor`: vaste PR-override (bv. 1.0)
+  - `pv.pr_hourly_cal`: lijst van 24 getallen (per-uur PR-override)
+  - `pv.temp_coeff_pct_per_C`: globale default voor power temp coeff (factor/°C, bv. -0.004)
+  - `pv.temp_ref_C`: referentietemperatuur (meestal 25.0)
+  - `pv.panel_temp_offset_C`: benadering van paneeltemperatuur boven omgeving (bv. 20.0)
+  - `pv.entity panel temp` of `pv.entity inverter temp`: entiteiten om paneeltemperatuur te bepalen
+
+Wanneer zowel globale als per-array/string velden bestaan, gaan specifieke (string/array) instellingen voor.
+
+## Baseload-opties
+- `use_calc_baseload`: "True"/"False" — bepaal of automatisch berekende baseloadprofielen worden gebruikt.
+- `baseload calc periode`: aantal dagen aan historie voor baseloadberekening (typisch 56).
+- `baseload`: 24-uurs lijst (handmatig profiel) als je niet automatisch laat berekenen.
+
 
 Het programma draait alleen als addon op HA installaties met een arm64 processor (bijv Raspberry Pi4) of 
 een intel 64 bit processor (amd64)
