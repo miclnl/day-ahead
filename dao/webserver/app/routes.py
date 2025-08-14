@@ -79,6 +79,9 @@ def _release_task_lock(task_key: str) -> None:
     except Exception:
         pass
 
+# Track running processes to support stop action
+_RUN_PROCS = {}
+
 views = {
     "tabel": {"name": "Tabel", "icon": "tabel.png"},
     "grafiek": {"name": "Grafiek", "icon": "grafiek.png"},
@@ -407,6 +410,7 @@ def run_process():
             def _worker(_cmd, _fname):
                 try:
                     proc = subprocess.Popen(_cmd, stdout=PIPE, stderr=PIPE, text=True)
+                    _RUN_PROCS[task_key] = proc
                     out, err = proc.communicate()
                     content = (out or "") + (err or "")
                 except Exception as ex:
@@ -417,6 +421,7 @@ def run_process():
                 except Exception:
                     pass
                 finally:
+                    _RUN_PROCS.pop(task_key, None)
                     _release_task_lock(task_key)
 
             # Start background thread, return immediately to avoid worker timeout
@@ -438,6 +443,16 @@ def run_process():
                                 ][0]
                                 parameters[param_str] = param_value
                     break
+            # Stop taak request
+            if dct.get("action", [""])[0] == "stop_task" and dct.get("current_bewerking"):
+                tkey = dct["current_bewerking"][0]
+                proc = _RUN_PROCS.get(tkey)
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                _release_task_lock(tkey)
 
     return render_template(
         "run.html",

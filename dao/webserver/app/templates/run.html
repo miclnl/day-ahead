@@ -43,6 +43,11 @@
 {% if current_bewerking != "" %}
   <h2> Logging van bewerking "{{ bewerkingen[current_bewerking]["name"] }}":</h2>
   <pre class="log_content" id="log_content">{{ log_content }}</pre>
+  <form method="post" style="margin:8px 0;">
+    <input type="hidden" name="current_menu" value="run" />
+    <input type="hidden" name="current_bewerking" value="{{ current_bewerking }}" />
+    <button class="btn" name="action" value="stop_task">Stop taak</button>
+  </form>
   <script>
     (function(){
       // Probeer logbestandspad uit de tekst te halen
