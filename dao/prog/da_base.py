@@ -362,36 +362,111 @@ class DaBase(hass.Hass):
 
     def calc_prod_solar(self, solar_opt: dict, act_time: int, act_gr: float, hour_fraction: float):
         """
-        berekent de productie van een string
-        :param solar_opt: dict met alle instellingen van de string
-        :param act_time: timestamp in utc seconden van het moment
-        :param act_gr: de globale straling
-        :param hour_fraction: de uurfractie
-        :return: de productie in kWh
+        Berekent de productie van een zonnepanelen string/array met PR- en temperatuurcorrecties.
+        - Ondersteunt per-string/array velden: "power temp coeff %/C", "voltage temp coeff %/C",
+          "current temp coeff %/C", "NOCT (°C)" (NOCT informatief, niet gebruikt in deze formule).
+        - Globale defaults uit pv.*: pr_factor, pr_hourly_cal, temp_coeff_pct_per_C, temp_ref_C, panel_temp_offset_C.
+        - Oriëntatie: gebruikt "orientation" (oost=-90, zuid=0, west=+90). Indien alleen "azimuth" (0–360) aanwezig,
+          wordt omgezet naar orientation via: ((azimuth - 180 + 540) % 360) - 180.
         """
-        if "strings" in solar_opt:
-            prod = 0
-            str_num = len(solar_opt["strings"])
-            for str_s in range(str_num):
-                prod_str = (
-                    self.meteo.calc_solar_rad(
-                        solar_opt["strings"][str_s],
-                        act_time,
-                        act_gr,
-                    )
-                    * solar_opt["strings"][str_s]["yield"]
-                    * hour_fraction
-                )
-                prod += prod_str
+        # Bepaal uur en datum
+        try:
+            moment = datetime.datetime.fromtimestamp(int(act_time))
+            hour_idx = moment.hour
+            day_date = datetime.datetime(moment.year, moment.month, moment.day)
+        except Exception:
+            moment = datetime.datetime.now()
+            hour_idx = moment.hour
+            day_date = datetime.datetime(moment.year, moment.month, moment.day)
+
+        # PR-factoren (globaal)
+        pr_factor = float(self.config.get(["pv", "pr_factor"], None, 1.0) or 1.0)
+        pr_hourly = self.config.get(["pv", "pr_hourly_cal"], None, None)
+        if isinstance(pr_hourly, list) and len(pr_hourly) == 24:
+            try:
+                pr_hour = float(pr_hourly[hour_idx])
+            except Exception:
+                pr_hour = 1.0
         else:
-            prod = (
-                self.meteo.calc_solar_rad(solar_opt, act_time, act_gr)
-                * solar_opt["yield"]
-                * hour_fraction
-            )
+            pr_hour = 1.0
+
+        # Temperatuurparameters (globaal)
+        # Globale power temp coeff in factor/°C; default -0.004
+        global_temp_coeff = float(self.config.get(["pv", "temp_coeff_pct_per_C"], None, -0.004) or -0.004)
+        temp_ref = float(self.config.get(["pv", "temp_ref_C"], None, 25.0) or 25.0)
+        panel_offset = float(self.config.get(["pv", "panel_temp_offset_C"], None, 20.0) or 20.0)
+
+        # Voorspelde omgevingstemperatuur (uurwaarde) en paneeltemperatuur benadering
+        try:
+            amb_temp = float(self.meteo.get_hour_temperature(moment))
+        except Exception:
+            try:
+                amb_temp = float(self.meteo.get_avg_temperature(day_date))
+            except Exception:
+                amb_temp = 15.0
+        panel_temp = amb_temp + panel_offset
+
+        def calc_temp_coeff(local: dict) -> float:
+            # Voorkeur: expliciete power temp coeff (in %/°C)
+            pct = local.get("power temp coeff %/C")
+            if pct is not None:
+                try:
+                    return float(pct) / 100.0
+                except Exception:
+                    pass
+            # Anders: som van voltage + current temp coeffs (in %/°C)
+            v_pct = local.get("voltage temp coeff %/C")
+            i_pct = local.get("current temp coeff %/C")
+            try:
+                if v_pct is not None or i_pct is not None:
+                    v = float(v_pct) if v_pct is not None else 0.0
+                    i = float(i_pct) if i_pct is not None else 0.0
+                    return (v + i) / 100.0
+            except Exception:
+                pass
+            # Fallback: globale coeff
+            return global_temp_coeff
+
+        def ensure_orientation(local: dict) -> dict:
+            if "orientation" not in local and "azimuth" in local:
+                try:
+                    az = float(local["azimuth"])  # 0..360 (180=zuid)
+                    # convert to orientation: oost=-90, zuid=0, west=+90
+                    ori = ((az - 180.0 + 540.0) % 360.0) - 180.0
+                    local = dict(local)
+                    local["orientation"] = ori
+                except Exception:
+                    pass
+            return local
+
+        # Basisproductie zonder correcties
+        if "strings" in solar_opt:
+            prod = 0.0
+            for s_def in solar_opt["strings"]:
+                s_def = ensure_orientation(s_def)
+                base = self.meteo.calc_solar_rad(s_def, act_time, act_gr) * float(s_def.get("yield", 0.0)) * hour_fraction
+                coeff = calc_temp_coeff(s_def)
+                temp_factor = 1.0 + coeff * (panel_temp - temp_ref)
+                temp_factor = max(0.7, min(1.05, temp_factor))
+                prod += base * temp_factor
+        else:
+            local = ensure_orientation(solar_opt)
+            base = self.meteo.calc_solar_rad(local, act_time, act_gr) * float(local.get("yield", 0.0)) * hour_fraction
+            coeff = calc_temp_coeff(local)
+            temp_factor = 1.0 + coeff * (panel_temp - temp_ref)
+            temp_factor = max(0.7, min(1.05, temp_factor))
+            prod = base * temp_factor
+
+        # PR-correcties
+        prod *= pr_factor * pr_hour
+
+        # Begrenzen op max vermogen (indien opgegeven)
         max_power = self.config.get(["max power"], solar_opt, None)
-        if not max_power is None:
-            prod = min(prod, max_power)
+        if max_power is not None:
+            try:
+                prod = min(prod, float(max_power))
+            except Exception:
+                pass
         return prod
 
     def calc_da_avg(self) -> float:

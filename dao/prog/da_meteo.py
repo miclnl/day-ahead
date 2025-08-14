@@ -492,6 +492,46 @@ class Meteo:
         """
         return avg_temp
 
+    def get_hour_temperature(self, moment: datetime.datetime) -> float:
+        """
+        Geef de (voorspelde of gemeten) buitentemperatuur voor het begin van dit uur.
+        Voorkeur uit tabel 'prognoses' met code 'temp'; anders 'values'; anders daggemiddelde.
+        """
+        try:
+            hour_dt = datetime.datetime(moment.year, moment.month, moment.day, moment.hour)
+            ts = int(hour_dt.timestamp())
+        except Exception:
+            return self.get_avg_temperature()
+
+        values_table = Table("values", self.db_da.metadata, autoload_with=self.db_da.engine)
+        variabel_table = Table("variabel", self.db_da.metadata, autoload_with=self.db_da.engine)
+        prognoses_table = Table("prognoses", self.db_da.metadata, autoload_with=self.db_da.engine)
+        v1 = variabel_table.alias("v1")
+        # Eerst prognoses
+        try:
+            with self.db_da.engine.connect() as connection:
+                q = select(prognoses_table.c.value).where(
+                    and_(v1.c.code == "temp", prognoses_table.c.variabel == v1.c.id, prognoses_table.c.time == ts)
+                )
+                row = connection.execute(q).first()
+                if row and row[0] is not None:
+                    return float(row[0])
+        except Exception:
+            pass
+        # Dan values
+        try:
+            with self.db_da.engine.connect() as connection:
+                q = select(values_table.c.value).where(
+                    and_(v1.c.code == "temp", values_table.c.variabel == v1.c.id, values_table.c.time == ts)
+                )
+                row = connection.execute(q).first()
+                if row and row[0] is not None:
+                    return float(row[0])
+        except Exception:
+            pass
+        # Fallback
+        return self.get_avg_temperature(hour_dt)
+
     def calc_graaddagen(
         self,
         date: datetime.datetime = None,
