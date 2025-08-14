@@ -444,21 +444,63 @@ class DaBase(hass.Hass):
             prod = 0.0
             for s_def in solar_opt["strings"]:
                 s_def = ensure_orientation(s_def)
-                base = self.meteo.calc_solar_rad(s_def, act_time, act_gr) * float(s_def.get("yield", 0.0)) * hour_fraction
+                poa_j_cm2 = self.meteo.calc_solar_rad(s_def, act_time, act_gr)
+                base = poa_j_cm2 * float(s_def.get("yield", 0.0)) * hour_fraction
                 coeff = calc_temp_coeff(s_def)
-                temp_factor = 1.0 + coeff * (panel_temp - temp_ref)
+                # NOCT-gereguleerde paneeltemperatuur indien beschikbaar
+                noct = s_def.get("NOCT (°C)")
+                if noct is not None:
+                    try:
+                        noct_val = float(noct)
+                        # omzetting naar W/m²: J/cm² per uur -> W/m²
+                        poa_w_m2 = (poa_j_cm2 / 3600.0) * 10000.0
+                        panel_temp_loc = amb_temp + ((noct_val - 20.0) / 800.0) * poa_w_m2
+                    except Exception:
+                        panel_temp_loc = panel_temp
+                else:
+                    panel_temp_loc = panel_temp
+                temp_factor = 1.0 + coeff * (panel_temp_loc - temp_ref)
                 temp_factor = max(0.7, min(1.05, temp_factor))
                 prod += base * temp_factor
         else:
             local = ensure_orientation(solar_opt)
-            base = self.meteo.calc_solar_rad(local, act_time, act_gr) * float(local.get("yield", 0.0)) * hour_fraction
+            poa_j_cm2 = self.meteo.calc_solar_rad(local, act_time, act_gr)
+            base = poa_j_cm2 * float(local.get("yield", 0.0)) * hour_fraction
             coeff = calc_temp_coeff(local)
-            temp_factor = 1.0 + coeff * (panel_temp - temp_ref)
+            noct = local.get("NOCT (°C)")
+            if noct is not None:
+                try:
+                    noct_val = float(noct)
+                    poa_w_m2 = (poa_j_cm2 / 3600.0) * 10000.0
+                    panel_temp_loc = amb_temp + ((noct_val - 20.0) / 800.0) * poa_w_m2
+                except Exception:
+                    panel_temp_loc = panel_temp
+            else:
+                panel_temp_loc = panel_temp
+            temp_factor = 1.0 + coeff * (panel_temp_loc - temp_ref)
             temp_factor = max(0.7, min(1.05, temp_factor))
             prod = base * temp_factor
 
-        # PR-correcties
-        prod *= pr_factor * pr_hour
+        # PR-correcties (ondersteun maand-specifieke overrides)
+        month_idx = moment.month
+        pr_factor_by_month = self.config.get(["pv", "pr_factor_by_month"], None, None) or {}
+        try:
+            pr_factor_m = float(pr_factor_by_month.get(str(month_idx))) if isinstance(pr_factor_by_month, dict) else None
+        except Exception:
+            pr_factor_m = None
+        pr_factor_eff = pr_factor_m if pr_factor_m is not None else pr_factor
+
+        pr_hour_m = pr_hour
+        pr_hourly_by_month = self.config.get(["pv", "pr_hourly_cal_by_month"], None, None)
+        if isinstance(pr_hourly_by_month, dict):
+            arr = pr_hourly_by_month.get(str(month_idx))
+            if isinstance(arr, list) and len(arr) == 24:
+                try:
+                    pr_hour_m = float(arr[hour_idx])
+                except Exception:
+                    pr_hour_m = pr_hour
+
+        prod *= pr_factor_eff * pr_hour_m
 
         # Begrenzen op max vermogen (indien opgegeven)
         max_power = self.config.get(["max power"], solar_opt, None)
