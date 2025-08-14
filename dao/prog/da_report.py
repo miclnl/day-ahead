@@ -2712,9 +2712,17 @@ class Report(DaBase):
             battery_production, result, "battery_production", "baseload"
         )
 
-        logging.debug(f"Baseload berekening per uur:\n {result.to_string()}\n")
+        logging.debug(f"Baseload berekening per uur (raw):\n {result.to_string()}\n")
+        # Winsorize om outliers te dempen (1e en 99e percentiel over alle rijen)
+        try:
+            q1 = result["baseload"].quantile(0.01)
+            q99 = result["baseload"].quantile(0.99)
+            result["baseload"] = result["baseload"].clip(lower=q1, upper=q99)
+        except Exception:
+            pass
+        # Gebruik mediaan per uur i.p.v. gemiddelde voor robuustheid
         result = result.groupby("uur", as_index=False).agg(
-            {"tijd": "min", "weekdag": "mean", "baseload": "mean"}
+            {"tijd": "min", "weekdag": "mean", "baseload": "median"}
         )
         logging.debug(f"Geagregeerde baseload uur:\n {result.to_string()}\n")
         result.baseload = result.baseload.round(3)
