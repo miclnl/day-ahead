@@ -14,6 +14,7 @@ from logging.handlers import TimedRotatingFileHandler
 from dao.prog.da_config import Config
 from dao.prog.da_report import Report
 from dao.prog.version import __version__
+import errno
 
 web_datapath = "static/data/"
 app_datapath = "app/static/data/"
@@ -39,6 +40,34 @@ logging.basicConfig(
     format=f"%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s",
 )
 browse = {}
+
+# ---- Simple cross-process lock using lockfiles in /data/run ----
+_RUN_DIR = os.path.abspath(os.path.join(os.getcwd(), "../data", "run"))
+os.makedirs(_RUN_DIR, exist_ok=True)
+
+def _lock_path(task_key: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-","_") else "_" for ch in task_key)
+    return os.path.join(_RUN_DIR, f"{safe}.lock")
+
+def _acquire_task_lock(task_key: str) -> bool:
+    path = _lock_path(task_key)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(datetime.datetime.now()))
+        return True
+    except OSError as ex:
+        if ex.errno == errno.EEXIST:
+            return False
+        raise
+
+def _release_task_lock(task_key: str) -> None:
+    path = _lock_path(task_key)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 views = {
     "tabel": {"name": "Tabel", "icon": "tabel.png"},
@@ -348,6 +377,23 @@ def run_process():
                 + datetime.datetime.now().strftime("%Y-%m-%d__%H:%M:%S")
                 + ".log"
             )
+            # Voorkom parallelle uitvoering van dezelfde bewerking
+            task_key = current_bewerking
+            if not _acquire_task_lock(task_key):
+                log_content = (
+                    f"Taak '{task_key}' is al actief. Wacht tot deze is afgerond.\n"
+                )
+                return render_template(
+                    "run.html",
+                    title="Run",
+                    active_menu="run",
+                    bewerkingen=bewerkingen,
+                    bewerking=bewerking,
+                    current_bewerking=current_bewerking,
+                    parameters=parameters,
+                    log_content=log_content,
+                    version=__version__,
+                )
             def _worker(_cmd, _fname):
                 try:
                     proc = subprocess.Popen(_cmd, stdout=PIPE, stderr=PIPE, text=True)
@@ -360,6 +406,8 @@ def run_process():
                         f.write(content)
                 except Exception:
                     pass
+                finally:
+                    _release_task_lock(task_key)
 
             # Start background thread, return immediately to avoid worker timeout
             threading.Thread(target=_worker, args=(cmd, filename), daemon=True).start()
