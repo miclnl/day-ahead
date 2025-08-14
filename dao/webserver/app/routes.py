@@ -7,6 +7,8 @@ from flask import render_template, request
 import fnmatch
 import os
 from subprocess import PIPE, run
+import subprocess
+import threading
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from dao.prog.da_config import Config
@@ -339,10 +341,6 @@ def run_process():
                             extra_parameters.append(param_value)
             cmd = run_bewerking["cmd"] + extra_parameters
             bewerking = ""
-            proc = run(cmd, stdout=PIPE, stderr=PIPE)
-            data = proc.stdout.decode()
-            err = proc.stderr.decode()
-            log_content = data + err
             filename = (
                 "../data/log/"
                 + run_bewerking["file_name"]
@@ -350,8 +348,24 @@ def run_process():
                 + datetime.datetime.now().strftime("%Y-%m-%d__%H:%M:%S")
                 + ".log"
             )
-            with open(filename, "w") as f:
-                f.write(log_content)
+            def _worker(_cmd, _fname):
+                try:
+                    proc = subprocess.Popen(_cmd, stdout=PIPE, stderr=PIPE, text=True)
+                    out, err = proc.communicate()
+                    content = (out or "") + (err or "")
+                except Exception as ex:
+                    content = f"Fout bij starten taak: {ex}\n"
+                try:
+                    with open(_fname, "w") as f:
+                        f.write(content)
+                except Exception:
+                    pass
+
+            # Start background thread, return immediately to avoid worker timeout
+            threading.Thread(target=_worker, args=(cmd, filename), daemon=True).start()
+            log_content = (
+                "Taak gestart: " + " ".join(cmd) + "\nLogbestand: " + filename + "\n"
+            )
         else:
             for i in range(len(dct.keys())):
                 bew = list(dct.keys())[i]
