@@ -44,6 +44,16 @@ browse = {}
 # ---- Simple cross-process lock using lockfiles in /data/run ----
 _RUN_DIR = os.path.abspath(os.path.join(os.getcwd(), "../data", "run"))
 os.makedirs(_RUN_DIR, exist_ok=True)
+# Reset achtergebleven locks bij opstart
+try:
+    for f in os.listdir(_RUN_DIR):
+        if f.endswith('.lock'):
+            try:
+                os.remove(os.path.join(_RUN_DIR, f))
+            except Exception:
+                pass
+except Exception:
+    pass
 
 def _lock_path(task_key: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in ("-","_") else "_" for ch in task_key)
