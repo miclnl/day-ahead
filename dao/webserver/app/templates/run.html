@@ -42,7 +42,31 @@
 
 {% if current_bewerking != "" %}
   <h2> Logging van bewerking "{{ bewerkingen[current_bewerking]["name"] }}":</h2>
-    <pre class="log_content">{{ log_content }}</pre>
+  <pre class="log_content" id="log_content">{{ log_content }}</pre>
+  <script>
+    (function(){
+      // Probeer logbestandspad uit de tekst te halen
+      var pre = document.getElementById('log_content');
+      if(!pre) return;
+      var m = pre.textContent.match(/Logbestand:\s*(.+\.log)/);
+      if(!m) return;
+      var logPath = m[1];
+      // Poll iedere 2s om tail-achtige update te tonen zonder de request vast te houden
+      function poll(){
+        fetch(logPath, {cache: 'no-store'}).then(function(r){
+          if(!r.ok) return;
+          return r.text();
+        }).then(function(txt){
+          if(typeof txt === 'string') {
+            pre.textContent = txt;
+            pre.scrollTop = pre.scrollHeight;
+          }
+          setTimeout(poll, 2000);
+        }).catch(function(){ setTimeout(poll, 3000); });
+      }
+      setTimeout(poll, 2000);
+    })();
+  </script>
 {% endif %}
 
 </div>
