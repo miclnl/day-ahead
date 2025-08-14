@@ -345,6 +345,15 @@
       "entity pv switch": "input_boolean.pv_garage_aan_uit"
     }
   ],
+  "pv": {
+    "pr_factor": 1.0,
+    "pr_hourly_cal": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    "temp_coeff_pct_per_C": -0.004,
+    "temp_ref_C": 25.0,
+    "panel_temp_offset_C": 20.0,
+    "entity panel temp": "sensor.panel_temperature",
+    "entity inverter temp": "sensor.inverter_temperature"
+  },
   "electric vehicle": [
     {
       "name": "Golf GTE",
