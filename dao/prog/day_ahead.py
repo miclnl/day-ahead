@@ -3522,6 +3522,9 @@ def main():
             if arg.lower() == "calc_baseloads":
                 da_calc.run_task_function("calc_baseloads")
                 continue
+            if arg.lower() == "calc_pr":
+                da_calc.run_task_function("calc_pr")
+                continue
     da_calc.db_da.log_pool_status()
 
 

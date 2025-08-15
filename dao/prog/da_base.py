@@ -258,6 +258,12 @@ class DaBase(hass.Hass):
                 "function": "calc_baseloads",
                 "file_name": "baseloads",
             },
+            "calc_pr": {
+                "name": "Kalibreer PV PR-correcties",
+                "cmd": ["python3", "../prog/day_ahead.py", "calc_pr"],
+                "function": "calc_pr",
+                "file_name": "calc_pr",
+            },
             "clean": {
                 "name": "Bestanden opschonen",
                 "cmd": ["python3", "../prog/day_ahead.py", "clean_data"],
@@ -361,7 +367,14 @@ class DaBase(hass.Hass):
             result = json.load(f)
         return result
 
-    def calc_prod_solar(self, solar_opt: dict, act_time: int, act_gr: float, hour_fraction: float):
+    def calc_prod_solar(
+        self,
+        solar_opt: dict,
+        act_time: int,
+        act_gr: float,
+        hour_fraction: float,
+        apply_pr: bool = True,
+    ):
         """
         Berekent de productie van een zonnepanelen string/array met PR- en temperatuurcorrecties.
         - Ondersteunt per-string/array velden: "power temp coeff %/C", "voltage temp coeff %/C",
@@ -380,15 +393,19 @@ class DaBase(hass.Hass):
             hour_idx = moment.hour
             day_date = datetime.datetime(moment.year, moment.month, moment.day)
 
-        # PR-factoren (globaal)
-        pr_factor = float(self.config.get(["pv", "pr_factor"], None, 1.0) or 1.0)
-        pr_hourly = self.config.get(["pv", "pr_hourly_cal"], None, None)
-        if isinstance(pr_hourly, list) and len(pr_hourly) == 24:
-            try:
-                pr_hour = float(pr_hourly[hour_idx])
-            except Exception:
+        # PR-factoren (globaal) — optioneel toe te passen
+        if apply_pr:
+            pr_factor = float(self.config.get(["pv", "pr_factor"], None, 1.0) or 1.0)
+            pr_hourly = self.config.get(["pv", "pr_hourly_cal"], None, None)
+            if isinstance(pr_hourly, list) and len(pr_hourly) == 24:
+                try:
+                    pr_hour = float(pr_hourly[hour_idx])
+                except Exception:
+                    pr_hour = 1.0
+            else:
                 pr_hour = 1.0
         else:
+            pr_factor = 1.0
             pr_hour = 1.0
 
         # Temperatuurparameters (globaal)
@@ -483,25 +500,26 @@ class DaBase(hass.Hass):
             prod = base * temp_factor
 
         # PR-correcties (ondersteun maand-specifieke overrides)
-        month_idx = moment.month
-        pr_factor_by_month = self.config.get(["pv", "pr_factor_by_month"], None, None) or {}
-        try:
-            pr_factor_m = float(pr_factor_by_month.get(str(month_idx))) if isinstance(pr_factor_by_month, dict) else None
-        except Exception:
-            pr_factor_m = None
-        pr_factor_eff = pr_factor_m if pr_factor_m is not None else pr_factor
+        if apply_pr:
+            month_idx = moment.month
+            pr_factor_by_month = self.config.get(["pv", "pr_factor_by_month"], None, None) or {}
+            try:
+                pr_factor_m = float(pr_factor_by_month.get(str(month_idx))) if isinstance(pr_factor_by_month, dict) else None
+            except Exception:
+                pr_factor_m = None
+            pr_factor_eff = pr_factor_m if pr_factor_m is not None else pr_factor
 
-        pr_hour_m = pr_hour
-        pr_hourly_by_month = self.config.get(["pv", "pr_hourly_cal_by_month"], None, None)
-        if isinstance(pr_hourly_by_month, dict):
-            arr = pr_hourly_by_month.get(str(month_idx))
-            if isinstance(arr, list) and len(arr) == 24:
-                try:
-                    pr_hour_m = float(arr[hour_idx])
-                except Exception:
-                    pr_hour_m = pr_hour
+            pr_hour_m = pr_hour
+            pr_hourly_by_month = self.config.get(["pv", "pr_hourly_cal_by_month"], None, None)
+            if isinstance(pr_hourly_by_month, dict):
+                arr = pr_hourly_by_month.get(str(month_idx))
+                if isinstance(arr, list) and len(arr) == 24:
+                    try:
+                        pr_hour_m = float(arr[hour_idx])
+                    except Exception:
+                        pr_hour_m = pr_hour
 
-        prod *= pr_factor_eff * pr_hour_m
+            prod *= pr_factor_eff * pr_hour_m
 
         # Begrenzen op max vermogen (indien opgegeven)
         max_power = self.config.get(["max power"], solar_opt, None)
@@ -634,6 +652,114 @@ class DaBase(hass.Hass):
 
         report = Report()
         report.calc_save_baseloads()
+
+    def calc_pr(self):
+        """Calibreer PR-correcties (globaal, per uur, per maand) op basis van historische data.
+        Schrijft resultaten terug in options.json (pv.pr_factor, pv.pr_hourly_cal, pv.pr_factor_by_month).
+        """
+        import numpy as np
+        import pandas as pd
+
+        if self.config is None:
+            logging.error("Geen config geladen; PR-calibratie afgebroken")
+            return
+        # Vereiste sensoren voor actuele PV (AC)
+        report_opts = self.config.get(["report"])
+        sensors_ac = self.config.get(["entities solar production ac"], report_opts, []) or []
+        if not isinstance(sensors_ac, list) or len(sensors_ac) == 0:
+            logging.error("Geen 'report.entities solar production ac' sensoren gedefinieerd")
+            return
+
+        # Bereik bepalen
+        days = int(self.config.get(["pv", "pr_calibration_days"], None, 60))
+        now = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
+        start = now - datetime.timedelta(days=days)
+        end = now
+
+        # Historische globale straling (gr) uit DA-db
+        df_gr = self.db_da.get_column_data("values", "gr", start, end)
+        if df_gr is None or df_gr.empty:
+            logging.error("Geen globale stralingsdata (gr) gevonden in 'values'")
+            return
+        df_gr = df_gr.rename(columns={"value": "gr"})
+        df_gr["time"] = pd.to_datetime(df_gr["time"])
+        df_gr.set_index("time", inplace=True)
+
+        # Actuele PV uit HA-db (som van AC-productie sensoren), per uur
+        from dao.prog.da_report import Report
+        report = Report(self.file_name)
+        df_actual = None
+        for sensor in sensors_ac:
+            try:
+                df_s = report.get_sensor_data(sensor, start, end, col_name="pv", agg="uur")
+                df_s = df_s.rename(columns={"tijd": "time", "pv": "value"})
+                df_s["time"] = pd.to_datetime(df_s["time"])  # ensure datetime
+                df_s = df_s[["time", "value"]]
+                df_s.set_index("time", inplace=True)
+                df_actual = df_s if df_actual is None else df_actual.add(df_s, fill_value=0.0)
+            except Exception as ex:
+                logging.warning(f"Sensor {sensor} niet opgehaald: {ex}")
+        if df_actual is None or df_actual.empty:
+            logging.error("Geen PV-actuals gevonden uit HA-db")
+            return
+
+        # Verwachte PV met fysisch model zonder PR (apply_pr=False)
+        # Gebruik 'solar' definitie voor arrays
+        if not isinstance(self.solar, list) or len(self.solar) == 0:
+            logging.error("Geen 'solar' configuratie aanwezig")
+            return
+        # Combineer gr met expected
+        df = pd.DataFrame(index=df_gr.index)
+        df["gr"] = df_gr["gr"]
+        def _expect_at(ts: pd.Timestamp, gr_val: float) -> float:
+            try:
+                if pd.isna(gr_val):
+                    return 0.0
+                tot = 0.0
+                for s in range(len(self.solar)):
+                    tot += self.calc_prod_solar(self.solar[s], int(ts.timestamp()), float(gr_val), 1.0, apply_pr=False)
+                return float(tot)
+            except Exception:
+                return 0.0
+        df["exp"] = [
+            _expect_at(ts, df.loc[ts, "gr"]) for ts in df.index
+        ]
+        # Align met actuals (inner join op uren)
+        df = df.join(df_actual.rename(columns={"value": "act"}), how="inner")
+        df = df[(df["exp"] > 1e-6) & (df["act"] >= 0.0)]
+        if df.empty:
+            logging.error("Onvoldoende overlappende data voor PR-calibratie")
+            return
+
+        # Globale factor
+        pr_global = float(df["act"].sum() / max(df["exp"].sum(), 1e-6))
+
+        # Uurprofiel
+        df["hour"] = df.index.hour
+        hourly = df.groupby("hour").apply(lambda g: float((g["act"].sum()) / max(g["exp"].sum(), 1e-6)))
+        pr_hourly = [float(hourly.get(h, pr_global)) for h in range(24)]
+
+        # Maandfactoren
+        df["month"] = df.index.month
+        by_month = df.groupby("month").apply(lambda g: float((g["act"].sum()) / max(g["exp"].sum(), 1e-6)))
+        pr_by_month = {str(int(m)): float(by_month[m]) for m in sorted(by_month.index)}
+
+        # Schrijf naar options.json (pv.*)
+        try:
+            with open(self.file_name, "r") as f:
+                opts = json.load(f)
+            pv = opts.get("pv", {})
+            pv["pr_factor"] = round(pr_global, 4)
+            pv["pr_hourly_cal"] = [round(x, 4) for x in pr_hourly]
+            pv["pr_factor_by_month"] = {k: round(v, 4) for k, v in pr_by_month.items()}
+            opts["pv"] = pv
+            with open(self.file_name, "w") as f:
+                json.dump(opts, f, indent=2)
+            logging.info(
+                f"PR-calibratie opgeslagen: pr_factor={pv['pr_factor']}, pr_factor_by_month={pv['pr_factor_by_month']}"
+            )
+        except Exception as ex:
+            logging.error(f"Fout bij opslaan van PR-calibratie in options.json: {ex}")
 
     def run_task_function(self, task, logfile: bool = True):
         # klass = globals()["class_name"]
