@@ -3525,6 +3525,9 @@ def main():
             if arg.lower() == "calc_pr":
                 da_calc.run_task_function("calc_pr")
                 continue
+            if arg.lower() == "backfill_pr_data":
+                da_calc.run_task_function("backfill_pr_data")
+                continue
     da_calc.db_da.log_pool_status()
 
 

@@ -264,6 +264,12 @@ class DaBase(hass.Hass):
                 "function": "calc_pr",
                 "file_name": "calc_pr",
             },
+            "backfill_pr_data": {
+                "name": "Backfill meteo (gr/temp) voor PR-calibratie",
+                "cmd": ["python3", "../prog/day_ahead.py", "backfill_pr_data"],
+                "function": "backfill_pr_data",
+                "file_name": "backfill_pr",
+            },
             "clean": {
                 "name": "Bestanden opschonen",
                 "cmd": ["python3", "../prog/day_ahead.py", "clean_data"],
@@ -797,6 +803,66 @@ class DaBase(hass.Hass):
             )
         except Exception as ex:
             logging.error(f"Fout bij opslaan van PR-calibratie in options.json: {ex}")
+
+    def backfill_pr_data(self):
+        """Vul historische meteo-gegevens (gr,temp,solar_rad) voor PR-calibratie in de DA-database.
+        Gebruikt dezelfde bronnen als de reguliere meteo-task, maar loopt terug in de tijd.
+        """
+        try:
+            days = int(self.config.get(["pv", "pr_calibration_days"], None, 60))
+        except Exception:
+            days = 60
+        end_dt = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
+        start_dt = end_dt - datetime.timedelta(days=days)
+
+        # Haal per dag de GFS-uurverwachting op (fallback) en schrijf in 'values'
+        # We gebruiken de bestaande Meteo class utilities om solar_rad te berekenen.
+        try:
+            from dao.prog.da_meteo import Meteo
+        except Exception:
+            logging.error("Meteo-module niet beschikbaar; backfill afgebroken")
+            return
+
+        meteo = Meteo(self.config, self.db_da)
+        tz = self.config.get(["time_zone"], None, None)
+        cur = start_dt
+        total_rows = 0
+        while cur < end_dt:
+            # voor elke dag: 24 punten
+            day_start = cur
+            day_end = min(day_start + datetime.timedelta(days=1), end_dt)
+            # Bouw df met uren van deze dag
+            hours = pd.date_range(day_start, day_end, freq="H", inclusive="left")
+            df = pd.DataFrame({"time": hours.astype(int) // 10**9})
+            # Vraag meteo-server per uur op via GFS API wrapper (we hergebruiken logica uit get_from_meteoserver)
+            try:
+                df_day = meteo.get_from_meteoserver("gfs")
+            except Exception as ex:
+                logging.warning(f"GFS-download mislukt voor {day_start.date()}: {ex}")
+                df_day = pd.DataFrame(columns=["tijd", "gr", "temp", "solar_rad"])  # leeg
+            if not df_day.empty:
+                df_day = df_day.rename(columns={"tijd": "time"})
+                df_day["time"] = pd.to_datetime(df_day["time"], unit="s")
+            # Join op time
+            df["time"] = pd.to_datetime(df["time"], unit="s")
+            merged = df.merge(df_day, on="time", how="left")
+            # Naar unix tijd
+            merged["ts"] = merged["time"].astype(int) // 10**9
+            # Schrijf records die we hebben
+            df_db = pd.DataFrame(columns=["time", "code", "value"])
+            for row in merged.itertuples():
+                ts = int(row.ts)
+                if not pd.isna(row.gr):
+                    df_db.loc[df_db.shape[0]] = [str(ts), "gr", float(row.gr)]
+                if not pd.isna(row.temp):
+                    df_db.loc[df_db.shape[0]] = [str(ts), "temp", float(row.temp)]
+                if not pd.isna(row.solar_rad):
+                    df_db.loc[df_db.shape[0]] = [str(ts), "solar_rad", float(row.solar_rad)]
+            if df_db.shape[0] > 0:
+                self.db_da.savedata(df_db)
+                total_rows += df_db.shape[0]
+            cur = day_end
+        logging.info(f"Backfill klaar: {total_rows} records toegevoegd voor periode {start_dt} t/m {end_dt}")
 
     def run_task_function(self, task, logfile: bool = True):
         # klass = globals()["class_name"]
