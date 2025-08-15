@@ -105,6 +105,12 @@
   "history": {
     "save days": 7
   },
+  "solver": {
+    "threads": 1,
+    "max_seconds": 60,
+    "max_gap": 0.03,
+    "max_nodes": 1500
+  },
   "dashboard": {
     "port": 5000
   },

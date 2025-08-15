@@ -8,6 +8,7 @@ import datetime
 import datetime as dt
 import sys
 import math
+import os
 import pandas as pd
 from mip import Model, xsum, minimize, BINARY, CONTINUOUS
 from pandas.core.dtypes.inference import is_number
@@ -2003,11 +2004,54 @@ class DaCalc(DaBase):
         #        strategy optimization
         #####################################################
         # settings
-        model.max_gap = 0.1
-        model.max_nodes = 1500
+        solver_threads = int(
+            self.config.get(
+                ["solver", "threads"], None, max(1, (os.cpu_count() or 2) - 1)
+            )
+        )
+        solver_time_limit = float(
+            self.config.get(["solver", "max_seconds"], None, 60)
+        )
+        solver_max_gap = float(self.config.get(["solver", "max_gap"], None, 0.03))
+        model.threads = solver_threads
+        model.max_seconds = solver_time_limit
+        model.max_gap = solver_max_gap
+        model.max_nodes = int(self.config.get(["solver", "max_nodes"], None, 1500))
         if self.log_level > logging.DEBUG:
             model.verbose = 0
         model.check_optimization_results()
+
+        # Warm start: provide an initial feasible-leaning guess (non-binding)
+        try:
+            for b in range(B):
+                # Prefer the zero-power knot for SOS2 weights if present
+                zero_index = 0
+                for cs in range(CS[b]):
+                    if ac_to_dc_samples[b][cs] <= 1e-9:
+                        zero_index = cs
+                        break
+                for u in range(U):
+                    # Binary mode variables default to off
+                    ac_to_dc_on[b][u].start = 0
+                    ac_from_dc_on[b][u].start = 0
+                    # SOS2 weights mass on zero-power knot
+                    for cs in range(CS[b]):
+                        ac_to_dc_w[b][u][cs].start = 1.0 if cs == zero_index else 0.0
+                    # Flow variables default to zero
+                    ac_to_dc[b][u].start = 0.0
+                    dc_from_ac[b][u].start = 0.0
+                    ac_from_dc[b][u].start = 0.0
+                    dc_to_ac[b][u].start = 0.0
+                    dc_to_bat[b][u].start = 0.0
+                    dc_from_bat[b][u].start = 0.0
+                # SoC trajectories start flat at initial SoC
+                soc[b][0].start = start_soc[b]
+                for u in range(1, U + 1):
+                    soc[b][u].start = start_soc[b]
+                    soc_low[b][u].start = min(start_soc[b], opt_low_level[b])
+                    soc_mid[b][u].start = max(0.0, soc[b][u].start - soc_low[b][u].start)
+        except Exception as e:
+            logging.debug(f"Warm start initialisation skipped (non-fatal): {e}")
 
         # kosten optimalisering
         if self.strategy == "minimize cost":
