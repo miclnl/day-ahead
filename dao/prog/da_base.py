@@ -200,7 +200,10 @@ class DaBase(hass.Hass):
         )
         self.set_last_activity()
         self.graphics_options = self.config.get(["graphics"])
-        self.db_da.log_pool_status()
+        if self.db_da is not None:
+            self.db_da.log_pool_status()
+        else:
+            logging.error("Day Ahead database niet beschikbaar; sommige taken kunnen falen.")
 
     def set_value(self, entity_id: str, value: Union[int, float, str]) -> StateList:
         try:
@@ -970,10 +973,12 @@ class DaBase(hass.Hass):
                 f"{datetime.datetime.now().strftime('%d-%m-%Y %H:%M:%S')} "
                 f"taak: {run_task['function']}"
             )
-            self.db_da.log_pool_status()
+            if self.db_da is not None:
+                self.db_da.log_pool_status()
             getattr(self, run_task["function"])()
             self.set_last_activity()
-            self.db_da.log_pool_status()
+            if self.db_da is not None:
+                self.db_da.log_pool_status()
         except Exception:
             logging.exception("Er is een fout opgetreden, zie de fout-tracering")
             raise
