@@ -731,6 +731,43 @@ class DaBase(hass.Hass):
             logging.error("Onvoldoende overlappende data voor PR-calibratie")
             return
 
+        # Datacoverage-waarschuwingen
+        try:
+            # Dagen en maanden met data
+            unique_days = pd.to_datetime(df.index.normalize()).unique()
+            num_days = int(len(unique_days))
+            months_present = sorted(set(int(m) for m in df.index.month.unique()))
+            num_months = len(months_present)
+            # Gevraagde lookback-dagen
+            requested_days = days
+            # Per-uur dekking
+            per_hour_counts = df.groupby(df.index.hour).size()
+            missing_hours = [h for h in range(24) if h not in per_hour_counts.index]
+
+            if num_days < requested_days:
+                logging.warning(
+                    f"PR-calibratie: minder overlappende dagen dan gevraagd: {num_days}/{requested_days}. "
+                    f"Resultaten kunnen onstabiel zijn; overweeg 'pv.pr_calibration_days' te verhogen."
+                )
+            if num_days < 30:
+                logging.warning(
+                    f"PR-calibratie: zeer beperkte dataset (slechts {num_days} dagen). Uitkomsten zijn mogelijk ruisgevoelig."
+                )
+            if num_months < 2:
+                logging.warning(
+                    "PR-calibratie: minder dan 2 maanden aan data; maandfactoren zijn mogelijk niet representatief."
+                )
+            elif num_months < 4:
+                logging.warning(
+                    f"PR-calibratie: beperkte maanddekking ({num_months} maanden: {months_present}); interpretatie met zorg."
+                )
+            if len(missing_hours) > 0:
+                logging.warning(
+                    f"PR-calibratie: geen data voor uren {missing_hours}; uurprofiel kan vertekend zijn."
+                )
+        except Exception as _:
+            pass
+
         # Globale factor
         pr_global = float(df["act"].sum() / max(df["exp"].sum(), 1e-6))
 
