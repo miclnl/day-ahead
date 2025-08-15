@@ -369,12 +369,63 @@ class DaBase(hass.Hass):
         """
         Haalt de berekende baseload op voor de weekdag.
         :param weekday: : 0 = maandag, 6 zondag
-        :return: een lijst van eerder berekende baseload van 24uurvoor de betreffende dag
+        :return: 24-uur baseload lijst. Val terug op berekenen uit DB of options als bestand ontbreekt.
         """
-        in_file = "../data/baseload/baseload_" + str(weekday) + ".json"
-        with open(in_file, "r") as f:
-            result = json.load(f)
-        return result
+        import os
+        import json as _json
+        import logging as _logging
+
+        folder = "../data/baseload"
+        in_file = f"{folder}/baseload_{weekday}.json"
+        # 1) Probeer bestand te lezen
+        try:
+            with open(in_file, "r") as f:
+                result = _json.load(f)
+            if not isinstance(result, list) or len(result) != 24:
+                raise ValueError("baseload-bestand heeft geen 24 waarden")
+            return [float(x) for x in result]
+        except Exception as ex:
+            _logging.warning(
+                f"Baseloadbestand niet beschikbaar of ongeldig ({in_file}); probeer te berekenen: {ex}"
+            )
+
+        # 2) Probeer te berekenen uit historische data
+        try:
+            from da_report import Report
+
+            report = Report()
+            calc = report.calc_weekday_baseload(weekday)
+            if isinstance(calc, list) and len(calc) == 24:
+                try:
+                    os.makedirs(folder, exist_ok=True)
+                    with open(in_file, "w") as f:
+                        print(_json.dumps(calc, indent=2), file=f)
+                except Exception:
+                    pass
+                return [float(x) for x in calc]
+        except Exception as ex:
+            _logging.warning(f"Baseload berekenen uit DB mislukt: {ex}")
+
+        # 3) Val terug op options.json -> 'baseload'
+        try:
+            from dao.prog.da_config import Config as _Cfg
+        except Exception:
+            try:
+                from da_config import Config as _Cfg
+            except Exception:
+                _Cfg = None
+        try:
+            if _Cfg is not None:
+                cfg = _Cfg("../data/options.json")
+                base = cfg.get(["baseload"], None, None)
+                if isinstance(base, list) and len(base) == 24:
+                    _logging.warning("Val terug op 'baseload' uit options.json")
+                    return [float(x) for x in base]
+        except Exception:
+            pass
+
+        _logging.error("Geen baseload beschikbaar; gebruik 24 nullen als noodoplossing")
+        return [0.0] * 24
 
     def calc_prod_solar(
         self,
