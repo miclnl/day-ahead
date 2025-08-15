@@ -1,6 +1,7 @@
 import datetime
 import sys
 import os
+import errno
 import fnmatch
 import time
 from requests import get
@@ -679,8 +680,62 @@ class DaBase(hass.Hass):
             )
             notification_handler.setFormatter(formatter)
             logger.addHandler(notification_handler)
+        # ---- Simple cross-process lock using lockfiles in /data/run ----
+        def _run_dir() -> str:
+            path = os.path.abspath(os.path.join(os.getcwd(), "../data", "run"))
+            os.makedirs(path, exist_ok=True)
+            return path
+
+        def _lock_path(task_key: str) -> str:
+            safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in task_key)
+            return os.path.join(_run_dir(), f"{safe}.lock")
+
+        def _acquire_task_lock(task_key: str) -> bool:
+            path = _lock_path(task_key)
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w") as f:
+                    f.write(str(datetime.datetime.now()))
+                return True
+            except OSError as ex:
+                if ex.errno == errno.EEXIST:
+                    return False
+                raise
+
+        def _release_task_lock(task_key: str) -> None:
+            path = _lock_path(task_key)
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+        def _wait_for_locks(task_keys: list[str], timeout_seconds: int) -> bool:
+            """Wait until none of the given locks exist. Returns True if all cleared within timeout, else False."""
+            import time as _time
+            end = _time.time() + timeout_seconds if timeout_seconds > 0 else None
+            while True:
+                busy = [k for k in task_keys if os.path.exists(_lock_path(k))]
+                if not busy:
+                    return True
+                if end is not None and _time.time() > end:
+                    logging.warning(f"Wachttijd verstreken; ga verder ondanks actieve locks: {busy}")
+                    return False
+                logging.info(f"Wachten op afronden van taken: {', '.join(busy)}")
+                _time.sleep(2.0)
+
         self.start_logging()
         try:
+            # Voor calc-optimum: wacht op lopende meteo/prices/baseloads
+            if run_task["function"] in ("calc_optimum", "calc_optimum_met_debug"):
+                wait_seconds = int(self.config.get(["scheduler", "wait_seconds_for_calc"], None, 600))
+                _wait_for_locks(["meteo", "prices", "calc_baseloads"], wait_seconds)
+
+            # Acquire lock for this task (cross-process de-dup)
+            acquired = _acquire_task_lock(task)
+            if not acquired:
+                logging.info(f"Taak '{task}' draait al; overslaan.")
+                return
             logging.info(
                 f"Day Ahead Optimalisatie gestart: "
                 f"{datetime.datetime.now().strftime('%d-%m-%Y %H:%M:%S')} "
@@ -693,11 +748,19 @@ class DaBase(hass.Hass):
         except Exception:
             logging.exception("Er is een fout opgetreden, zie de fout-tracering")
             raise
-
-        if logfile:
-            file_handler.flush()
-            file_handler.close()
-            stream_handler.close()
+        finally:
+            # release lock and handlers
+            try:
+                _release_task_lock(task)
+            except Exception:
+                pass
+            if logfile:
+                try:
+                    file_handler.flush()
+                    file_handler.close()
+                    stream_handler.close()
+                except Exception:
+                    pass
 
     def run_task_cmd(self, task):
         if task not in self.tasks:

@@ -201,6 +201,7 @@
   },
   "scheduler": {
     "active": "false",
+    "wait_seconds_for_calc": 600,
     "0430": "get_meteo_data",
     "1030": "get_meteo_data",
     "1630": "get_meteo_data",
