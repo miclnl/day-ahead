@@ -835,7 +835,7 @@ class DaBase(hass.Hass):
             day_start = cur
             day_end = min(day_start + datetime.timedelta(days=1), end_dt)
             # Bouw df met uren van deze dag
-            hours = pd.date_range(day_start, day_end, freq="H", inclusive="left")
+            hours = pd.date_range(day_start, day_end, freq="h", inclusive="left")
             df = pd.DataFrame({"time": hours.astype(int) // 10**9})
             # Vraag meteo-server per uur op via GFS API wrapper (we hergebruiken logica uit get_from_meteoserver)
             try:
@@ -845,9 +845,10 @@ class DaBase(hass.Hass):
                 df_day = pd.DataFrame(columns=["tijd", "gr", "temp", "solar_rad"])  # leeg
             if not df_day.empty:
                 df_day = df_day.rename(columns={"tijd": "time"})
-                df_day["time"] = pd.to_datetime(df_day["time"], unit="s")
+                # Cast naar int voor to_datetime om toekomstig gedrag te fixeren
+                df_day["time"] = pd.to_datetime(pd.to_numeric(df_day["time"], errors="coerce"), unit="s")
             # Join op time
-            df["time"] = pd.to_datetime(df["time"], unit="s")
+            df["time"] = pd.to_datetime(pd.to_numeric(df["time"], errors="coerce"), unit="s")
             merged = df.merge(df_day, on="time", how="left")
             # Naar unix tijd
             merged["ts"] = merged["time"].astype(int) // 10**9

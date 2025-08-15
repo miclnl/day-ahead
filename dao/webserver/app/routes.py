@@ -227,6 +227,12 @@ bewerkingen = {
         "task": "calc_baseloads",
         "file_name": "baseloads",
     },
+    "backfill_pr_data": {
+        "name": "Backfill meteo (gr/temp) voor PR-calibratie",
+        "cmd": ["python3", "../prog/day_ahead.py", "backfill_pr_data"],
+        "task": "backfill_pr_data",
+        "file_name": "backfill_pr",
+    },
 }
 
 
