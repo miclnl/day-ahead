@@ -9,6 +9,7 @@ dao/data/*.db
 dao/data/tst_options
 dao/prog/tst_py
 dao/tests
+options_local.json
 to_do
 whl
 .idea/
