@@ -1,6 +1,8 @@
 import datetime
 import sys
 import time
+import threading
+import queue
 from da_base import DaBase
 
 
@@ -11,6 +13,35 @@ class DaScheduler(DaBase):
         self.active = True
         if "active" in self.scheduler_tasks:
             self.active = not (self.scheduler_tasks["active"].lower() == "false")
+        # Minimal refactor: background worker to run tasks so the tick loop never blocks
+        self._task_queue: "queue.Queue[str]" = queue.Queue()
+        self._running_tasks = set()  # keys of self.tasks currently running
+        self._running_lock = threading.Lock()
+        self._worker_thread = threading.Thread(target=self._worker, name="scheduler-worker", daemon=True)
+        self._worker_thread.start()
+
+    def _enqueue(self, key_task: str) -> None:
+        with self._running_lock:
+            if key_task in self._running_tasks:
+                return
+            # mark enqueued to prevent rapid duplicates within same minute
+            self._running_tasks.add(key_task)
+        self._task_queue.put(key_task)
+
+    def _worker(self) -> None:
+        while True:
+            key_task = self._task_queue.get()
+            try:
+                try:
+                    self.run_task_function(key_task, True)
+                except KeyboardInterrupt:
+                    sys.exit()
+                except Exception as e:
+                    print(e)
+            finally:
+                with self._running_lock:
+                    self._running_tasks.discard(key_task)
+                self._task_queue.task_done()
 
     def scheduler(self):
         # if not (self.notification_entity is None) and self.notification_opstarten:
@@ -43,15 +74,8 @@ class DaScheduler(DaBase):
             if task is not None:
                 for key_task in self.tasks:
                     if self.tasks[key_task]["function"] == task:
-                        try:
-                            # self.run_task_cmd(key_task)
-                            self.run_task_function(key_task, True)
-                        except KeyboardInterrupt:
-                            sys.exit()
-                            pass
-                        except Exception as e:
-                            print(e)
-                            continue
+                        # Enqueue task to background worker if not already running
+                        self._enqueue(key_task)
                         break
 
 
