@@ -225,10 +225,12 @@ class SolarPredictor(DaBase):
         constraints = {}
 
         for hour in range(24):
-            # uren zijn in utc
-            # noon = noon_utc - longitude/15
-            # Solar hour angle (longitude = solar noon, ±15° per hour)
-            hour_angle = 15.0 * (hour - 12 - self.longitude / 15)
+            # Uren zijn in UTC. Ten oosten van Greenwich valt de zonnemiddag
+            # *vroeger* dan 12:00 UTC, dus solar_noon_utc = 12 - lon/15 en de
+            # uurhoek wordt (hour - solar_noon_utc) * 15. Voor Nederland
+            # (~5,3 gr. oost) zat dit er 42 minuten naast, en de verkeerde kant op.
+            solar_noon_utc = 12.0 - self.longitude / 15.0
+            hour_angle = 15.0 * (hour - solar_noon_utc)
 
             # Calculate solar elevation angle
             lat_rad = math.radians(self.latitude)
@@ -910,8 +912,9 @@ class SolarPredictor(DaBase):
 
         start = dt.datetime(start.year, start.month, start.day, start.hour)
         # get weather-dataframe from database
-        weather_data = pd.DataFrame(columns=["utc", "gr", "temp", "winds"])
-        for weather_item in weather_data.columns[1:]:
+        fields = ("gr", "temp", "winds")
+        weather_data = pd.DataFrame(columns=["utc", *fields])
+        for weather_item in fields:
             if prognose:
                 table_name = "prognoses"
             else:
@@ -927,9 +930,24 @@ class SolarPredictor(DaBase):
             df_item = self.db_da.get_column_data(
                 table_name, weather_item, start=start, end=end
             )
+            # Join on the timestamp, never on row position. The three series
+            # are fetched independently and do not have to be equally long:
+            # winds was added later than gr and temp and is backfilled by a
+            # separate path, so one missing hour used to shift an entire
+            # column against the others without any visible error.
+            part = df_item[["utc", "value"]].rename(columns={"value": weather_item})
+            part = part.dropna(subset=["utc"]).drop_duplicates(subset=["utc"])
             if len(weather_data) == 0:
-                weather_data["utc"] = df_item["utc"]
-            weather_data[weather_item] = df_item["value"]
+                weather_data = part
+            else:
+                weather_data = weather_data.merge(part, on="utc", how="outer")
+        weather_data = weather_data.sort_values("utc").reset_index(drop=True)
+        missing = int(weather_data[list(fields)].isna().any(axis=1).sum())
+        if missing:
+            logging.warning(
+                f"Weerdata: {missing} van {len(weather_data)} uren missen een of "
+                f"meer velden en worden overgeslagen"
+            )
         weather_data["utc"] = pd.to_datetime(weather_data["utc"], unit="s", utc=True)
         weather_data = weather_data.set_index(weather_data["utc"])
         weather_data = weather_data.rename(
