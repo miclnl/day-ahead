@@ -1437,6 +1437,9 @@ Totaal  -7.06     --  -7.50   0.00  -7.50     --  -7.65     --
 - Addon display name changed from "刀 Day Ahead Optimizer (TESTING)" to
   "DAO+ (TESTING)".
 - Slug changed from `day_ahead_opt-testing` to `dao_plus-testing`.
+- The shorter, distinctive name makes the testing channel visually
+  easy to spot and select in the Home Assistant Add-on Store, where
+  the old long name blended in with other energy-related addons.
 - Documentation and Pydantic model `x-docs-url` references now point at
   the fork at `github.com/miclnl/day-ahead`. The image, container paths,
   data directory, and sensor identifiers are unchanged, so existing
