@@ -5,7 +5,7 @@ Tests for configuration loader.
 import json
 import pytest
 from pathlib import Path
-from dao.prog.config.loader import ConfigurationLoader
+from dao.prog.config.loader import CURRENT_VERSION, ConfigurationLoader
 
 
 @pytest.fixture
@@ -73,17 +73,19 @@ class TestConfigurationLoader:
         
         assert secrets == {}
     
-    def test_migrate_unversioned_to_v0(self, temp_config_dir, sample_unversioned_config):
-        """Test migration from unversioned to v0."""
+    def test_migrate_unversioned_to_current(
+        self, temp_config_dir, sample_unversioned_config
+    ):
+        """An unversioned config is migrated all the way to the current version."""
         config_path = temp_config_dir / "options.json"
         config_path.write_text(json.dumps(sample_unversioned_config))
-        
+
         loader = ConfigurationLoader(config_path)
         loader.load_and_validate()
-        
+
         # Config file should have been updated with a version field
         migrated = json.loads(config_path.read_text())
-        assert migrated["config_version"] == 0
+        assert migrated["config_version"] == CURRENT_VERSION
     
     def test_backup_creation(self, temp_config_dir, sample_unversioned_config):
         """Test backup creation before migration."""

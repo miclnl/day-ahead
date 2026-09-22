@@ -94,7 +94,9 @@ class BoilerEnabled(BaseModel):
         },
     )
     cop: FlexFloat = Field(
-        default=3.0,
+        # Pydantic does not validate defaults, so a bare float would reach the
+        # FlexValue serializer unwrapped and break model_dump().
+        default=FlexFloat(value=3.0),
         description="Coefficient of Performance",
         json_schema_extra={
             "x-help": "Coefficient of Performance if using heat pump water heater. For resistive heating element, use 1.0. For heat pump water heater, typically 2.5-4.0.",

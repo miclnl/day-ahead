@@ -320,26 +320,32 @@ class DAOConfigBaseModel(BaseModel):
         # Iterate through all fields in the model
         for field_name, field_info in cls.model_fields.items():
             # Check if this field is annotated as FlexEnum
-            if field_info.annotation == FlexEnum and field_name in data:
-                value = data[field_name]
+            if field_info.annotation != FlexEnum:
+                continue
 
-                # Try to get enum_values from field metadata first (legacy)
-                enum_values = None
-                if field_info.json_schema_extra:
-                    enum_values = field_info.json_schema_extra.get("x-enum-values")
+            # Input may use the python name or the alias, e.g. "storage value mode".
+            key = field_name if field_name in data else field_info.alias
+            if key is None or key not in data:
+                continue
+            value = data[key]
 
-                # If not in metadata, try to extract from field default
-                if not enum_values and hasattr(field_info, "default"):
-                    default = field_info.default
-                    if isinstance(default, FlexEnum) and default.enum_values:
-                        enum_values = default.enum_values
+            # Try to get enum_values from field metadata first (legacy)
+            enum_values = None
+            if isinstance(field_info.json_schema_extra, dict):
+                enum_values = field_info.json_schema_extra.get("x-enum-values")
 
-                if enum_values:
-                    # Inject enum_values into the data
-                    if isinstance(value, str):
-                        data[field_name] = {"value": value, "enum_values": enum_values}
-                    elif isinstance(value, dict) and "enum_values" not in value:
-                        value["enum_values"] = enum_values
+            # If not in metadata, try to extract from field default
+            if not enum_values and hasattr(field_info, "default"):
+                default = field_info.default
+                if isinstance(default, FlexEnum) and default.enum_values:
+                    enum_values = default.enum_values
+
+            if enum_values:
+                # Inject enum_values into the data
+                if isinstance(value, str):
+                    data[key] = {"value": value, "enum_values": enum_values}
+                elif isinstance(value, dict) and "enum_values" not in value:
+                    value["enum_values"] = enum_values
 
         return data
 
