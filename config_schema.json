@@ -1,5 +1,112 @@
 {
   "$defs": {
+    "BaseloadOptionsConfig": {
+      "additionalProperties": true,
+      "description": "How the daily baseload profile is estimated from history.",
+      "properties": {
+        "aggregate": {
+          "default": "median",
+          "description": "Statistic used to combine the observations of one hour",
+          "enum": [
+            "median",
+            "mean",
+            "trimmed"
+          ],
+          "title": "Aggregate",
+          "type": "string",
+          "x-help": "The profile rests on roughly eight observations per weekday and hour, so the choice matters.\n\n**median** - robust, a single odd day cannot move it. Recommended.\n\n**trimmed** - drops the extremes and averages the rest, a middle ground.\n\n**mean** - the old behaviour. One party or one recorder gap shifts the hour by an eighth of the excursion, for two months.",
+          "x-order": 110,
+          "x-ui-section": "Baseload"
+        },
+        "trim fraction": {
+          "default": 0.2,
+          "description": "Fraction dropped from each tail when aggregate is 'trimmed'",
+          "exclusiveMaximum": 0.5,
+          "minimum": 0.0,
+          "title": "Trim Fraction",
+          "type": "number",
+          "x-help": "Only used with the 'trimmed' aggregate. 0.2 drops the highest and the lowest fifth of the observations before averaging.",
+          "x-order": 111,
+          "x-ui-section": "Baseload"
+        },
+        "remove outliers": {
+          "default": true,
+          "description": "Reject implausible observations before aggregating",
+          "title": "Remove Outliers",
+          "type": "boolean",
+          "x-help": "Rejects observations far outside the interquartile range of their own hour. Catches parties, guests and recorder gaps. Switched off automatically for hours with fewer than five observations.",
+          "x-order": 112,
+          "x-ui-section": "Baseload"
+        },
+        "outlier factor": {
+          "default": 2.0,
+          "description": "Interquartile range multiplier for outlier rejection",
+          "exclusiveMinimum": 0.0,
+          "title": "Outlier Factor",
+          "type": "number",
+          "x-help": "Higher is more permissive. The textbook value is 1.5; the default of 2.0 is deliberately wider because household consumption is genuinely skewed and the aim is to remove the exceptional day, not the merely busy one.",
+          "x-order": 113,
+          "x-ui-section": "Baseload"
+        },
+        "half life days": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 28.0,
+          "description": "Half-life in days of the recency weighting, empty to disable",
+          "title": "Half Life Days",
+          "x-help": "Observations of four weeks ago count half as heavily as those of today. Without this a new freezer or a departed housemate takes the whole calculation period to work through. Leave empty to weight every observation equally.",
+          "x-order": 114,
+          "x-ui-section": "Baseload",
+          "x-unit": "days"
+        },
+        "holidays": {
+          "default": "sunday",
+          "description": "Which profile public holidays are folded into",
+          "enum": [
+            "sunday",
+            "saturday",
+            "ignore"
+          ],
+          "title": "Holidays",
+          "type": "string",
+          "x-help": "A public holiday has the consumption pattern of a weekend day, not of the weekday it happens to fall on. Folding it into the Sunday profile keeps Christmas from contaminating every Thursday for two months. Covers New Year, King's Day, Easter Monday, Ascension, Whit Monday and both Christmas days.",
+          "x-order": 115,
+          "x-ui-section": "Baseload"
+        },
+        "clip negative": {
+          "default": true,
+          "description": "Never let an estimated hour go below zero",
+          "title": "Clip Negative",
+          "type": "boolean",
+          "x-help": "A negative baseload is physically impossible. It occurs when the grid meter has a recorder gap while the solar meter does not, and it lets the optimizer plan with energy that never existed.",
+          "x-order": 116,
+          "x-ui-section": "Baseload"
+        },
+        "min samples": {
+          "default": 3,
+          "description": "Observations needed before an hour is trusted on its own",
+          "minimum": 1,
+          "title": "Min Samples",
+          "type": "integer",
+          "x-help": "Hours with fewer observations left after filtering borrow the estimate for the same hour pooled over all weekdays, rather than resting on one or two measurements.",
+          "x-order": 117,
+          "x-ui-section": "Baseload"
+        }
+      },
+      "title": "BaseloadOptionsConfig",
+      "type": "object",
+      "x-help": "# Baseload estimation\n\nThe baseload is the entire consumption forecast the optimizer works with:\ntwenty-four values per weekday, in kilowatt hours, with everything the\noptimizer schedules itself already subtracted.\n\nIt is estimated from the last `baseload calc periode` days, which at the\ndefault of 56 days means about eight observations per weekday and hour. That is\nvery few, so how those eight are combined matters more than it looks.\n\n## What the defaults do\n\n- Public holidays are counted as Sundays instead of contaminating a weekday.\n- Observations far outside the spread of their own hour are rejected.\n- Recent weeks weigh more heavily, with a half-life of four weeks.\n- The median is used rather than the average, so a single odd day cannot move\n  an hour.\n- Hours left with too few observations borrow from the same hour on other days.\n- Nothing is ever negative.\n\n## When to change something\n\n- **Very regular household, want maximum responsiveness**: `aggregate: mean`\n  and a shorter `half life days`.\n- **Irregular household, a lot of variation**: keep the median and raise\n  `baseload calc periode` to 84 days.\n- **You want the old behaviour back**: `aggregate: mean`,\n  `remove outliers: false`, `half life days` empty, `holidays: ignore`.\n\n## Checking whether it helps\n\nRun the forecast accuracy report, `<url>/api/run/forecast_accuracy`, and look\nat the bias per hour. A consistently negative bias in the evening means the\noptimizer reserves too little energy for the peak, which no amount of realtime\ncorrection can repair afterwards.\n",
+      "x-icon": "chart-bell-curve",
+      "x-order": 19,
+      "x-ui-group": "DAO"
+    },
     "BatteryConfig": {
       "additionalProperties": true,
       "description": "Battery configuration for optimization.",
@@ -2266,6 +2373,17 @@
           "x-ui-section": "History",
           "x-unit": "days",
           "x-validation-hint": "Must be >= 1, typical 7-30 days"
+        },
+        "forecast days": {
+          "default": 60,
+          "description": "Number of days of forecast history kept for accuracy reporting",
+          "minimum": 7,
+          "title": "Forecast Days",
+          "type": "integer",
+          "x-help": "The forecast archive records what was predicted and how far ahead, so the forecast error can be measured afterwards. It holds one row per variable, moment and lead time bucket, which keeps it bounded no matter how often the optimizer runs: roughly 10 MB at the default of 60 days. Reduce it on a machine with limited storage, such as a Home Assistant Yellow on eMMC.",
+          "x-ui-section": "History",
+          "x-unit": "days",
+          "x-validation-hint": "Must be >= 7, typical 30-90 days"
         }
       },
       "title": "HistoryConfig",
@@ -2985,7 +3103,8 @@
             "calc_optimum_met_debug",
             "clean_data",
             "calc_baseloads",
-            "train_ml_predictions"
+            "train_ml_predictions",
+            "forecast_accuracy"
           ],
           "title": "Action",
           "type": "string",
@@ -3026,7 +3145,7 @@
       "title": "SchedulerConfig",
       "type": "object",
       "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Scheduler",
-      "x-help": "# Scheduler Configuration\n\nDefine when automatic tasks run using time patterns.\n\n## Time Pattern Format\n\n- **Specific time**: \"0435\" (4:35 AM), \"1255\" (12:55 PM)\n- **Hourly wildcard**: \"xx00\" (every hour at :00), \"xx15\" (every hour at :15)\n- **Format**: HHMM (24-hour, no colons)\n\n## Available Actions\n\n### Data Collection\n- **get_meteo_data**: Fetch weather forecasts (solar irradiation, temperature)\n- **get_tibber_data**: Fetch Tibber prices (if using Tibber)\n- **get_day_ahead_prices**: Fetch day-ahead market prices\n\n### Optimization\n- **calc_optimum**: Run main optimization algorithm\n- **calc_baseloads**: Calculate baseline consumption from history\n\n### Maintenance\n- **clean_data**: Clean up old data (runs save_days retention)\n\n## Example Configuration\n\n```json\n{\n  \"active\": true,\n  \"schedule\": [\n    {\"time\": \"0435\", \"action\": \"get_day_ahead_prices\"},\n    {\"time\": \"0445\", \"action\": \"get_meteo_data\"},\n    {\"time\": \"0500\", \"action\": \"calc_optimum\"},\n    {\"time\": \"xx00\", \"action\": \"calc_baseloads\"},\n    {\"time\": \"0300\", \"action\": \"clean_data\"}\n  ]\n}\n```\n\n## Typical Schedule\n\n1. **04:00-05:00**: Fetch prices and weather (after day-ahead auction)\n2. **05:00**: Run optimization with fresh data\n3. **Hourly**: Update baseload calculations\n4. **03:00**: Clean old data (low activity time)\n\n## Tips\n\n- Day-ahead prices available after ~13:00 (CET) for next day\n- Run optimization after all data fetched\n- Hourly baseload updates improve accuracy\n- Clean data during low activity (night)\n- Avoid overlapping long-running tasks\n",
+      "x-help": "# Scheduler Configuration\n\nDefine when automatic tasks run using time patterns.\n\n## Time Pattern Format\n\n- **Specific time**: \"0435\" (4:35 AM), \"1255\" (12:55 PM)\n- **Hourly wildcard**: \"xx00\" (every hour at :00), \"xx15\" (every hour at :15)\n- **Format**: HHMM (24-hour, no colons)\n\n## Available Actions\n\n### Data Collection\n- **get_meteo_data**: Fetch weather forecasts (solar irradiation, temperature)\n- **get_tibber_data**: Fetch Tibber prices (if using Tibber)\n- **get_day_ahead_prices**: Fetch day-ahead market prices\n\n### Optimization\n- **calc_optimum**: Run main optimization algorithm\n- **calc_baseloads**: Calculate baseline consumption from history\n\n### Analysis\n- **forecast_accuracy**: Report how far the forecasts were off and prune the\n  forecast archive\n\n### Maintenance\n- **clean_data**: Clean up old data (runs save_days retention)\n\n## Example Configuration\n\n```json\n{\n  \"active\": true,\n  \"schedule\": [\n    {\"time\": \"0435\", \"action\": \"get_day_ahead_prices\"},\n    {\"time\": \"0445\", \"action\": \"get_meteo_data\"},\n    {\"time\": \"0500\", \"action\": \"calc_optimum\"},\n    {\"time\": \"xx00\", \"action\": \"calc_baseloads\"},\n    {\"time\": \"0300\", \"action\": \"clean_data\"}\n  ]\n}\n```\n\n## Typical Schedule\n\n1. **04:00-05:00**: Fetch prices and weather (after day-ahead auction)\n2. **05:00**: Run optimization with fresh data\n3. **Hourly**: Update baseload calculations\n4. **03:00**: Clean old data (low activity time)\n\n## Tips\n\n- Day-ahead prices available after ~13:00 (CET) for next day\n- Run optimization after all data fetched\n- Hourly baseload updates improve accuracy\n- Clean data during low activity (night)\n- Avoid overlapping long-running tasks\n",
       "x-icon": "clock-outline",
       "x-order": 18,
       "x-ui-group": "DAO"
@@ -3568,6 +3687,12 @@
         "effect": "SHOW"
       },
       "x-ui-section": "Baseload"
+    },
+    "baseload options": {
+      "$ref": "#/$defs/BaseloadOptionsConfig",
+      "description": "How the baseload profile is estimated from history",
+      "x-ui-section": "Baseload",
+      "title": "Baseload Options"
     },
     "baseload": {
       "anyOf": [

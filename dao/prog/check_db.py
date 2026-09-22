@@ -56,7 +56,33 @@ class CheckDB:
         self.db_da = make_db_da(self.config, self.secrets, check_create=True)
         self.engine = self.db_da.engine
 
+    @staticmethod
+    def default_aggregate(dim: str) -> str:
+        """Same rule the 'aggregate' column was originally filled with."""
+        return "sum" if dim in ("kWh", "euro", "mm") else "avg"
+
+    def has_aggregate_column(self) -> bool:
+        """Whether the live 'variabel' table already has the aggregate column.
+
+        Checked against the database rather than against the declared Table,
+        because on an existing installation the column is only added by the
+        ALTER further down in update_db_da.
+        """
+        try:
+            columns = inspect(self.engine).get_columns("variabel")
+        except Exception:
+            return False
+        return any(item["name"] == "aggregate" for item in columns)
+
     def upsert_variabel(self, variabel_table, record):
+        values = {"code": record[1], "name": record[2], "dim": record[3]}
+        # Rows inserted after the "aggregate" column was introduced would
+        # otherwise silently fall back to the 'avg' default, which is wrong for
+        # every kWh variable.
+        if self.has_aggregate_column():
+            values["aggregate"] = (
+                record[4] if len(record) > 4 else self.default_aggregate(record[3])
+            )
         select_variabel = select(variabel_table.c.id).where(
             variabel_table.c.id == record[0]
         )
@@ -66,12 +92,10 @@ class CheckDB:
             query = (
                 update(variabel_table)
                 .where(variabel_table.c.id == record[0])
-                .values(code=record[1], name=record[2], dim=record[3])
+                .values(**values)
             )
         else:
-            query = insert(variabel_table).values(
-                id=record[0], code=record[1], name=record[2], dim=record[3]
-            )
+            query = insert(variabel_table).values(id=record[0], **values)
         with self.engine.connect() as connection:
             connection.execute(query)
             connection.commit()
@@ -360,8 +384,18 @@ class CheckDB:
 
             print('Kolom "aggregate" toegevoegd aan tabel "variabel"    ')
 
+        # Variabelen voor het meten van de prognosefout. Idempotent, en bewust
+        # na het toevoegen van de kolom "aggregate" zodat die goed wordt gezet.
+        for record in (
+            [25, "m_house", "Gemeten huisvraag", "kWh"],
+            [26, "m_pv", "Gemeten pv productie", "kWh"],
+            [27, "hload", "Geplande huisvraag", "kWh"],
+        ):
+            self.upsert_variabel(variabel_tabel, record)
+
         # Voeg indexen toe op kolom `time` in de values en prognoses tabel, indien niet bestaand
         self.ensure_time_indexes()
+        self.ensure_forecast_table()
 
         # timezone in postgresql could be wrong, check and report
         if self.db_da.db_dialect == "postgresql":
@@ -389,6 +423,46 @@ class CheckDB:
                 connection.execute(insert_query)
                 connection.commit()
 
+
+    def ensure_forecast_table(self) -> None:
+        """Create the forecast archive if it is not there yet.
+
+        Unlike "values" and "prognoses" this table keeps the lead time at which
+        a forecast was made, so forecast quality can be measured afterwards.
+        The unique key caps it at one row per (variable, target, lead bucket),
+        which bounds its size regardless of how often the optimizer runs.
+        """
+        inspector = inspect(self.engine)
+        if "forecasts" in inspector.get_table_names():
+            return
+        metadata = self.db_da.metadata
+        # The foreign key can only be resolved when "variabel" is known in the
+        # same metadata. Do not rely on an earlier call having defined it.
+        if "variabel" not in metadata.tables:
+            Table("variabel", metadata, autoload_with=self.engine)
+        forecasts = Table(
+            "forecasts",
+            metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column(
+                "variabel",
+                Integer,
+                ForeignKey("variabel.id", ondelete="CASCADE"),
+                nullable=False,
+            ),
+            Column("target_time", BigInteger, nullable=False),
+            Column("lead_bucket", Integer, nullable=False),
+            Column("issued_time", BigInteger, nullable=False),
+            Column("value", Float),
+            UniqueConstraint("variabel", "target_time", "lead_bucket"),
+            sqlite_autoincrement=True,
+            extend_existing=True,
+        )
+        forecasts.create(self.engine, checkfirst=True)
+        Index("ix_forecasts_target", forecasts.c.target_time).create(
+            bind=self.engine, checkfirst=True
+        )
+        print('Table "forecasts" gecreeerd.')
 
     def ensure_time_indexes(self) -> None:
         indexes = (

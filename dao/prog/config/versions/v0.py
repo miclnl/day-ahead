@@ -14,6 +14,7 @@ from ..models.database import HADatabaseConfig, DatabaseConfig
 from ..models.pricing import PricingConfig
 from ..models.graphics import GraphicsConfig
 from ..models.notifications import NotificationsConfig
+from ..models.baseload import BaseloadOptionsConfig
 from ..models.grid import GridConfig
 from ..models.fastcontrol import FastControlConfig
 from ..models.history import HistoryConfig
@@ -144,6 +145,12 @@ class ConfigurationV0(DAOConfigBaseModel):
                 },
             },
         },
+    )
+    baseload_options: BaseloadOptionsConfig = Field(
+        default_factory=BaseloadOptionsConfig,
+        alias="baseload options",
+        description="How the baseload profile is estimated from history",
+        json_schema_extra={"x-ui-group": "DAO", "x-ui-section": "Baseload"},
     )
     baseload: Optional[list[float]] = Field(
         default=None,

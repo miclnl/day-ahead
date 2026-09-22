@@ -40,6 +40,7 @@
   - [📉 ReportConfig](#reportconfig)
 - [DAO](#dao)
   - [🕐 SchedulerConfig](#schedulerconfig)
+  - [BaseloadOptionsConfig](#baseloadoptionsconfig)
 - [HASS](#hass)
   - [🏠 HomeAssistantConfig](#homeassistantconfig)
 - [Other](#other)
@@ -1699,6 +1700,7 @@ Control how long optimization history is retained in the database.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `save days` | integer | No | `7` | Number of days to retain historical data (Unit: `days`) _Must be >= 1, typical 7-30 days_ |
+| `forecast days` | integer | No | `60` | Number of days of forecast history kept for accuracy reporting (Unit: `days`) _Must be >= 7, typical 30-90 days_ |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
@@ -1706,6 +1708,10 @@ Control how long optimization history is retained in the database.
 **`save days`**
 
 Number of days to retain optimization history in database. Older data is automatically cleaned up. Longer retention enables better trend analysis but increases database size. Minimum 1 day.
+
+**`forecast days`**
+
+The forecast archive records what was predicted and how far ahead, so the forecast error can be measured afterwards. It holds one row per variable, moment and lead time bucket, which keeps it bounded no matter how often the optimizer runs: roughly 10 MB at the default of 60 days. Reduce it on a machine with limited storage, such as a Home Assistant Yellow on eMMC.
 
 </details>
 
@@ -1865,6 +1871,10 @@ Define when automatic tasks run using time patterns.
 - **calc_optimum**: Run main optimization algorithm
 - **calc_baseloads**: Calculate baseline consumption from history
 
+### Analysis
+- **forecast_accuracy**: Report how far the forecasts were off and prune the
+  forecast archive
+
 ### Maintenance
 - **clean_data**: Clean up old data (runs save_days retention)
 
@@ -1916,6 +1926,102 @@ When enabled, scheduled tasks will run automatically at configured times. Disabl
 **`schedule`**
 
 Define when tasks should run. Add entries with time patterns (e.g., '0435', 'xx00') and actions.
+
+</details>
+
+
+### BaseloadOptionsConfig
+
+_How the daily baseload profile is estimated from history._
+
+# Baseload estimation
+
+The baseload is the entire consumption forecast the optimizer works with:
+twenty-four values per weekday, in kilowatt hours, with everything the
+optimizer schedules itself already subtracted.
+
+It is estimated from the last `baseload calc periode` days, which at the
+default of 56 days means about eight observations per weekday and hour. That is
+very few, so how those eight are combined matters more than it looks.
+
+## What the defaults do
+
+- Public holidays are counted as Sundays instead of contaminating a weekday.
+- Observations far outside the spread of their own hour are rejected.
+- Recent weeks weigh more heavily, with a half-life of four weeks.
+- The median is used rather than the average, so a single odd day cannot move
+  an hour.
+- Hours left with too few observations borrow from the same hour on other days.
+- Nothing is ever negative.
+
+## When to change something
+
+- **Very regular household, want maximum responsiveness**: `aggregate: mean`
+  and a shorter `half life days`.
+- **Irregular household, a lot of variation**: keep the median and raise
+  `baseload calc periode` to 84 days.
+- **You want the old behaviour back**: `aggregate: mean`,
+  `remove outliers: false`, `half life days` empty, `holidays: ignore`.
+
+## Checking whether it helps
+
+Run the forecast accuracy report, `<url>/api/run/forecast_accuracy`, and look
+at the bias per hour. A consistently negative bias in the evening means the
+optimizer reserves too little energy for the peak, which no amount of realtime
+correction can repair afterwards.
+
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `aggregate` | string | No | `"median"` | Statistic used to combine the observations of one hour. Options: `median`, `mean`, `trimmed` |
+| `trim fraction` | number | No | `0.2` | Fraction dropped from each tail when aggregate is 'trimmed' |
+| `remove outliers` | boolean | No | `true` | Reject implausible observations before aggregating |
+| `outlier factor` | number | No | `2.0` | Interquartile range multiplier for outlier rejection |
+| `half life days` | number (optional) | No | `28.0` | Half-life in days of the recency weighting, empty to disable (Unit: `days`) |
+| `holidays` | string | No | `"sunday"` | Which profile public holidays are folded into. Options: `sunday`, `saturday`, `ignore` |
+| `clip negative` | boolean | No | `true` | Never let an estimated hour go below zero |
+| `min samples` | integer | No | `3` | Observations needed before an hour is trusted on its own |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`aggregate`**
+
+The profile rests on roughly eight observations per weekday and hour, so the choice matters.
+
+**median** - robust, a single odd day cannot move it. Recommended.
+
+**trimmed** - drops the extremes and averages the rest, a middle ground.
+
+**mean** - the old behaviour. One party or one recorder gap shifts the hour by an eighth of the excursion, for two months.
+
+**`trim fraction`**
+
+Only used with the 'trimmed' aggregate. 0.2 drops the highest and the lowest fifth of the observations before averaging.
+
+**`remove outliers`**
+
+Rejects observations far outside the interquartile range of their own hour. Catches parties, guests and recorder gaps. Switched off automatically for hours with fewer than five observations.
+
+**`outlier factor`**
+
+Higher is more permissive. The textbook value is 1.5; the default of 2.0 is deliberately wider because household consumption is genuinely skewed and the aim is to remove the exceptional day, not the merely busy one.
+
+**`half life days`**
+
+Observations of four weeks ago count half as heavily as those of today. Without this a new freezer or a departed housemate takes the whole calculation period to work through. Leave empty to weight every observation equally.
+
+**`holidays`**
+
+A public holiday has the consumption pattern of a weekend day, not of the weekday it happens to fall on. Folding it into the Sunday profile keeps Christmas from contaminating every Thursday for two months. Covers New Year, King's Day, Easter Monday, Ascension, Whit Monday and both Christmas days.
+
+**`clip negative`**
+
+A negative baseload is physically impossible. It occurs when the grid meter has a recorder gap while the solar meter does not, and it lets the optimizer plan with energy that never existed.
+
+**`min samples`**
+
+Hours with fewer observations left after filtering borrow the estimate for the same hour pooled over all weekdays, rather than resting on one or two measurements.
 
 </details>
 
@@ -2303,7 +2409,7 @@ _A single scheduled task entry._
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `time` | string | Yes | — | Time pattern in HHMM format _Format: HHMM (24-hour, e.g., '0435', 'xx15')_ |
-| `action` | string | Yes | — | Action to execute at this time. Options: `get_meteo_data`, `get_tibber_data`, `get_day_ahead_prices`, `calc_optimum`, `calc_optimum_met_debug`, `clean_data`, `calc_baseloads`, `train_ml_predictions` |
+| `action` | string | Yes | — | Action to execute at this time. Options: `get_meteo_data`, `get_tibber_data`, `get_day_ahead_prices`, `calc_optimum`, `calc_optimum_met_debug`, `clean_data`, `calc_baseloads`, `train_ml_predictions`, `forecast_accuracy` |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>

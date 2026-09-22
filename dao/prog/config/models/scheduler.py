@@ -16,6 +16,7 @@ SchedulerAction = Literal[
     "clean_data",
     "calc_baseloads",
     "train_ml_predictions",
+    "forecast_accuracy",
 ]
 
 
@@ -99,6 +100,10 @@ Define when automatic tasks run using time patterns.
 ### Optimization
 - **calc_optimum**: Run main optimization algorithm
 - **calc_baseloads**: Calculate baseline consumption from history
+
+### Analysis
+- **forecast_accuracy**: Report how far the forecasts were off and prune the
+  forecast archive
 
 ### Maintenance
 - **clean_data**: Clean up old data (runs save_days retention)

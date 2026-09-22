@@ -2,6 +2,7 @@ import datetime
 import sys
 import os
 import fnmatch
+import math
 import time
 import threading
 import pytz
@@ -313,6 +314,12 @@ class DaBase(hass.Hass):
                 "function": "consolidate_data",
                 "file_name": "consolidate",
             },
+            "forecast_accuracy": {
+                "name": "Prognosefout rapporteren",
+                "cmd": ["python3", "../prog/day_ahead.py", "accuracy"],
+                "function": "forecast_accuracy",
+                "file_name": "accuracy",
+            },
             "fast_control_simulate": {
                 "name": "Snelle regellaag: terugrekenen op historie",
                 "cmd": ["python3", "../prog/da_fast.py", "simulate"],
@@ -379,12 +386,16 @@ class DaBase(hass.Hass):
         )
         self.prices.get_prices(source)
 
-    def save_df(self, tablename: str, tijd: list, df: pd.DataFrame):
+    def save_df(
+        self, tablename: str, tijd: list, df: pd.DataFrame, vintage: bool = False
+    ):
         """
         Slaat de data in het dataframe op in de tabel "table"
         :param tablename: de naam van de tabel waarin de data worden opgeslagen
         :param tijd: de datum tijd van de rijen in het dataframe
         :param df: het dataframe met de code van de variabelen in de kolomheader
+        :param vintage: ook archiveren met de vooruitblik waarmee ze zijn gemaakt,
+            zodat de prognosefout achteraf te meten is
         :return: None
         """
         df_db = pd.DataFrame(columns=["time", "code", "value"])
@@ -400,18 +411,49 @@ class DaBase(hass.Hass):
                 df_db.loc[df_db.shape[0]] = db_row
         logging.debug("Save calculated data:\n{}".format(df_db.to_string()))
         self.db_da.savedata(df_db, tablename=tablename)
+        if vintage:
+            # "prognoses" is upserted, so it only ever holds the most recent
+            # forecast for a moment. The archive additionally keeps what was
+            # predicted at longer lead times, which is what the plan was
+            # actually built on.
+            try:
+                self.db_da.save_forecasts(
+                    (
+                        (int(row.time), row.code, row.value)
+                        for row in df_db.itertuples()
+                    ),
+                    issued_ts=int(time.time()),
+                )
+            except Exception as ex:
+                error_handling(ex)
+                logging.warning(f"Prognose-archief niet bijgewerkt: {ex}")
         return
 
     @staticmethod
     def get_calculated_baseload(weekday: int) -> list:
         """
         Haalt de berekende baseload op voor de weekdag.
+
+        Leest zowel het oude formaat (een kale lijst van 24 getallen) als het
+        nieuwe (een dict met daarin het profiel en het aantal metingen per
+        uur). Waarschuwt als het profiel oud is: een verouderd profiel is
+        lastig te herkennen aan de uitkomst, maar kost wel geld.
+
         :param weekday: : 0 = maandag, 6 zondag
-        :return: een lijst van eerder berekende baseload van 24uurvoor de betreffende dag
+        :return: een lijst van 24 waarden voor de betreffende dag
         """
+        from dao.prog.baseload import profile_age_days, profile_from_file
+
         in_file = "../data/baseload/baseload_" + str(weekday) + ".json"
         with open(in_file, "r") as f:
-            result = json.load(f)
+            payload = json.load(f)
+        result = profile_from_file(payload)
+        age = profile_age_days(payload)
+        if age is not None and age > 14:
+            logging.warning(
+                f"Het baseload-profiel is {age:.0f} dagen oud. Plan de taak "
+                f"'calc_baseloads' in zodat het profiel je huidige verbruik volgt."
+            )
         return result
 
     def calc_prod_solar(
@@ -591,6 +633,122 @@ class DaBase(hass.Hass):
 
         report = Report()
         report.calc_save_baseloads()
+
+    #: Which forecast is compared against which realised series.
+    #: (forecast code, realised table, realised code, unit, label)
+    ACCURACY_PAIRS = (
+        ("hload", "values", "m_house", "kWh", "Huisvraag"),
+        ("pv_ac", "values", "m_pv", "kWh", "PV productie"),
+        ("gr", "values", "gr", "J/cm2", "Globale straling"),
+        ("temp", "values", "temp", "°C", "Temperatuur"),
+    )
+
+    def forecast_accuracy(self, days: int = 30):
+        """Report how far the forecasts were off, and prune the archive.
+
+        This is the loop that was missing: DAO wrote forecasts and it wrote
+        measurements, but never subtracted the two. Without it there is no way
+        to tell whether the consumption forecast is 5 percent or 40 percent
+        off, and therefore no way to tell whether any change to it helped.
+
+        All aggregation happens in the database, so only a handful of summary
+        rows ever reach Python. That keeps the nightly job light enough for a
+        Home Assistant Yellow.
+        """
+        now = datetime.datetime.now()
+        end_ts = int(now.timestamp())
+        start_ts = int((now - datetime.timedelta(days=days)).timestamp())
+        logging.info(
+            f"Prognosefout over de laatste {days} dagen "
+            f"({datetime.datetime.fromtimestamp(start_ts).strftime('%Y-%m-%d')} "
+            f"t/m {now.strftime('%Y-%m-%d')})"
+        )
+
+        any_data = False
+        for code, table, realised, unit, label in self.ACCURACY_PAIRS:
+            try:
+                rows = self.db_da.forecast_accuracy(
+                    code, table, realised, start_ts, end_ts
+                )
+            except Exception as ex:
+                logging.debug(f"Prognosefout {code} niet te bepalen: {ex}")
+                continue
+            if not rows:
+                logging.info(
+                    f"  {label:<18} geen gepaarde waarnemingen; "
+                    f"het archief moet zich nog vullen"
+                )
+                continue
+            any_data = True
+            logging.info(f"  {label} ({unit})")
+            logging.info(
+                f"    {'vooruitblik':<14}{'n':>6}{'bias':>10}{'MAE':>10}"
+                f"{'RMSE':>10}{'rel. MAE':>10}"
+            )
+            for row in rows:
+                scale = row.get("scale") or 0.0
+                rel = (row["mae"] / scale * 100) if scale else float("nan")
+                logging.info(
+                    f"    {self._lead_label(row['lead_bucket']):<14}"
+                    f"{row['n']:>6.0f}{row['bias']:>10.3f}{row['mae']:>10.3f}"
+                    f"{math.sqrt(max(0.0, row['mse'])):>10.3f}{rel:>9.0f}%"
+                )
+
+        self._log_hour_bias(start_ts, end_ts)
+
+        if not any_data:
+            logging.info(
+                "Nog geen gepaarde prognoses en metingen. Het archief vult zich bij "
+                "elke optimalisatie; zet de snelle regellaag minimaal in 'shadow' "
+                "zodat de gemeten huisvraag wordt vastgelegd."
+            )
+
+        keep_days = max(days, self.history_options.forecast_days)
+        try:
+            removed = self.db_da.prune_forecasts(
+                int((now - datetime.timedelta(days=keep_days)).timestamp())
+            )
+            if removed:
+                logging.info(f"Prognose-archief opgeschoond: {removed} rijen verwijderd")
+        except Exception as ex:
+            logging.debug(f"Prognose-archief niet opgeschoond: {ex}")
+
+    @staticmethod
+    def _lead_label(bucket: int) -> str:
+        labels = {0: "< 1 uur", 1: "1-4 uur", 4: "4-12 uur", 12: "12-24 uur"}
+        return labels.get(bucket, f">= {bucket} uur")
+
+    def _log_hour_bias(self, start_ts: int, end_ts: int) -> None:
+        """The actionable table: is the forecast structurally off at some hour?"""
+        try:
+            rows = self.db_da.forecast_bias_by_hour(
+                "hload", "values", "m_house", start_ts, end_ts
+            )
+        except Exception as ex:
+            logging.debug(f"Bias per uur niet te bepalen: {ex}")
+            return
+        if not rows:
+            return
+        logging.info("  Huisvraag: afwijking per uur van de dag (prognose - gemeten)")
+        logging.info(
+            f"    {'uur':<8}{'n':>5}{'gemeten':>10}{'bias':>10}{'MAE':>10}  verloop"
+        )
+        worst = max(rows, key=lambda r: abs(r["bias"] or 0.0))
+        for row in rows:
+            bias = row["bias"] or 0.0
+            bar = ("+" if bias > 0 else "-") * min(20, int(abs(bias) * 20))
+            logging.info(
+                f"    {row['uur']:<8}{row['n']:>5.0f}{row['realised']:>10.3f}"
+                f"{bias:>10.3f}{row['mae']:>10.3f}  {bar}"
+            )
+        if abs(worst["bias"] or 0.0) > 0.1:
+            direction = "te hoog" if worst["bias"] > 0 else "te laag"
+            logging.warning(
+                f"De huisvraag wordt rond {worst['uur']} structureel {direction} "
+                f"ingeschat ({worst['bias']:+.3f} kWh per interval). Daardoor "
+                f"reserveert de optimalisatie de verkeerde hoeveelheid energie; "
+                f"de snelle regellaag kan dat achteraf niet repareren."
+            )
 
     def fast_control_simulate(self):
         """Backtest the fast control layer on the recorded history.

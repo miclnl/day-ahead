@@ -181,3 +181,100 @@ class TestRootIntegration:
         )
         assert config.interval == "15min"
         assert config.fast_control is not None
+
+
+class TestBaseloadOptions:
+    """Configuration of the baseload estimator."""
+
+    def test_the_defaults_are_the_robust_ones(self):
+        from dao.prog.config.models.baseload import BaseloadOptionsConfig
+
+        config = BaseloadOptionsConfig()
+        assert config.aggregate == "median"
+        assert config.remove_outliers is True
+        assert config.half_life_days == 28.0
+        assert config.holidays == "sunday"
+        assert config.clip_negative is True
+        assert config.min_samples >= 1
+
+    def test_spaced_aliases_are_accepted(self):
+        from dao.prog.config.models.baseload import BaseloadOptionsConfig
+
+        config = BaseloadOptionsConfig.model_validate(
+            {
+                "aggregate": "trimmed",
+                "trim fraction": 0.1,
+                "remove outliers": False,
+                "outlier factor": 3.0,
+                "half life days": 14.0,
+                "holidays": "ignore",
+                "clip negative": False,
+                "min samples": 5,
+            }
+        )
+        assert config.trim_fraction == 0.1
+        assert config.outlier_factor == 3.0
+        assert config.min_samples == 5
+
+    def test_the_old_behaviour_can_be_restored(self):
+        from dao.prog.config.models.baseload import BaseloadOptionsConfig
+
+        config = BaseloadOptionsConfig.model_validate(
+            {
+                "aggregate": "mean",
+                "remove outliers": False,
+                "half life days": None,
+                "holidays": "ignore",
+            }
+        )
+        assert config.aggregate == "mean"
+        assert config.half_life_days is None
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("aggregate", "geometric"),
+            ("trim fraction", 0.5),
+            ("trim fraction", -0.1),
+            ("outlier factor", 0.0),
+            ("half life days", 0.0),
+            ("holidays", "monday"),
+            ("min samples", 0),
+        ],
+    )
+    def test_invalid_values_are_rejected(self, field, value):
+        from dao.prog.config.models.baseload import BaseloadOptionsConfig
+
+        with pytest.raises(ValidationError):
+            BaseloadOptionsConfig.model_validate({field: value})
+
+    def test_it_is_reachable_from_the_root_config(self):
+        config = ConfigurationV0.model_validate(
+            {
+                "meteoserver-key": "x",
+                "baseload options": {"aggregate": "mean"},
+            }
+        )
+        assert config.baseload_options.aggregate == "mean"
+
+    def test_the_root_default_needs_no_configuration(self):
+        config = ConfigurationV0.model_validate({"meteoserver-key": "x"})
+        assert config.baseload_options.aggregate == "median"
+
+
+class TestForecastRetention:
+    def test_the_default_keeps_two_months(self):
+        config = ConfigurationV0.model_validate({"meteoserver-key": "x"})
+        assert config.history.forecast_days == 60
+
+    def test_it_can_be_shortened_for_small_storage(self):
+        config = ConfigurationV0.model_validate(
+            {"meteoserver-key": "x", "history": {"forecast days": 14}}
+        )
+        assert config.history.forecast_days == 14
+
+    def test_an_absurdly_short_retention_is_rejected(self):
+        with pytest.raises(ValidationError):
+            ConfigurationV0.model_validate(
+                {"meteoserver-key": "x", "history": {"forecast days": 1}}
+            )

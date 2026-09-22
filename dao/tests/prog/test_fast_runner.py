@@ -515,3 +515,102 @@ class TestFlashWear:
         restored = load_state(workspace["state_path"])
         assert restored.saved_today_eur == 1.2345
         assert restored.battery(0).daily_deviation_kwh == 2.5
+
+
+class TestMeasurement:
+    """The loop already reconstructs the true house demand; record it.
+
+    Without a measured counterpart on the same time grid and with the same
+    definition, the forecast error of 'hload' cannot be computed at all.
+    """
+
+    class RecordingDb:
+        def __init__(self):
+            self.saved = []
+
+        def savedata(self, df, tablename="values"):
+            self.saved.append((tablename, df.values.tolist()))
+
+    def make(self, workspace, interval_battery_w=0.0):
+        make_plan(workspace["plan_path"], battery_w=interval_battery_w)
+        hass = FakeHass(
+            {
+                "sensor.p1_power": "1000",
+                "sensor.battery_power": "0",
+                "sensor.soc": "60",
+            }
+        )
+        hass.db_da = self.RecordingDb()
+        runner = FastControlRunner(
+            hass, make_config(mode="shadow", **{"max sensor age": 999999}), **workspace
+        )
+        return runner, hass
+
+    def test_the_realised_house_demand_is_written_at_the_interval_boundary(
+        self, workspace
+    ):
+        runner, hass = self.make(workspace)
+        # A whole 900 s interval at a steady 1000 W is 0.25 kWh.
+        for offset in range(0, 900, 30):
+            runner.tick(T0 + offset)
+        assert hass.db_da.saved == []  # nothing until the interval closes
+        runner.tick(T0 + 905)
+        assert hass.db_da.saved
+        table, rows = hass.db_da.saved[0]
+        assert table == "values"
+        codes = {row[1]: row[2] for row in rows}
+        assert codes["m_house"] == pytest.approx(0.25, abs=0.02)
+
+    def test_a_partly_covered_interval_is_not_written(self, workspace):
+        runner, hass = self.make(workspace)
+        # Only the last two minutes of the interval are observed.
+        runner.tick(T0 + 780)
+        runner.tick(T0 + 810)
+        runner.tick(T0 + 905)
+        assert hass.db_da.saved == []
+
+    def test_pv_is_recorded_when_a_sensor_is_configured(self, workspace):
+        make_plan(workspace["plan_path"])
+        hass = FakeHass(
+            {
+                "sensor.p1_power": "1000",
+                "sensor.battery_power": "0",
+                "sensor.soc": "60",
+                "sensor.pv": "2000",
+            }
+        )
+        hass.db_da = self.RecordingDb()
+        config = make_config(
+            mode="shadow",
+            **{"pv power": {"entity": "sensor.pv"}, "max sensor age": 999999},
+        )
+        runner = FastControlRunner(hass, config, **workspace)
+        for offset in range(0, 900, 30):
+            runner.tick(T0 + offset)
+        runner.tick(T0 + 905)
+        codes = {row[1]: row[2] for row in hass.db_da.saved[0][1]}
+        assert codes["m_pv"] == pytest.approx(0.5, abs=0.02)
+
+    def test_a_long_gap_does_not_invent_energy(self, workspace):
+        runner, hass = self.make(workspace)
+        runner.tick(T0 + 0)
+        # The add-on was down for ten minutes; integrating across that gap
+        # would book energy that was never measured.
+        runner.tick(T0 + 600)
+        runner.tick(T0 + 905)
+        assert hass.db_da.saved == []
+
+    def test_a_missing_database_is_survivable(self, workspace):
+        make_plan(workspace["plan_path"])
+        hass = FakeHass(
+            {
+                "sensor.p1_power": "1000",
+                "sensor.battery_power": "0",
+                "sensor.soc": "60",
+            }
+        )
+        runner = FastControlRunner(
+            hass, make_config(mode="shadow", **{"max sensor age": 999999}), **workspace
+        )
+        for offset in range(0, 950, 30):
+            runner.tick(T0 + offset)  # must not raise

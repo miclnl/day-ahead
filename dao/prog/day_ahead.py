@@ -3683,6 +3683,7 @@ class DaCalc(DaBase):
         cols = cols + [
             "cons",
             "prod",
+            "hload",
             "base",
             "boil",
             "wp",
@@ -3700,6 +3701,10 @@ class DaCalc(DaBase):
             row = row + [
                 c_l[u].x,
                 c_t[u].x,
+                # Netto huisvraag: alles achter de meter behalve de accu. Dit
+                # is de grootheid die de snelle regellaag meet, dus de enige
+                # die achteraf tegen een meting te leggen is.
+                (c_l[u].x - c_t[u].x) - (accu_in_sum[u] - accu_out_sum[u]),
                 b_l[u],
                 c_b[u].x,
                 c_hp[u].x,
@@ -3718,7 +3723,9 @@ class DaCalc(DaBase):
             if interval_fraction_first_interval < 0.99:  # drop first row
                 d_f_save = d_f_save.iloc[1:]
                 save_tijd = save_tijd[1:]
-            self.save_df(tablename="prognoses", tijd=save_tijd, df=d_f_save)
+            self.save_df(
+                tablename="prognoses", tijd=save_tijd, df=d_f_save, vintage=True
+            )
         else:
             logging.info("Berekende prognoses zijn niet opgeslagen.")
 
@@ -5281,6 +5288,9 @@ def main():
                 continue
             if arg.lower() == "train":
                 da_calc.run_task_function("train_ml_predictions")
+                continue
+            if arg.lower() == "accuracy":
+                da_calc.run_task_function("forecast_accuracy")
                 continue
     da_calc.db_da.log_pool_status()
     import platform

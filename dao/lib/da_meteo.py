@@ -502,6 +502,19 @@ class Meteo:
         )
         logging.debug(f"Meteo data records \n{df_tostring.to_string(index=False)}")
         self.db_da.savedata(df_db, tablename="prognoses")
+        # Archiveer met de vooruitblik erbij. "prognoses" wordt overschreven,
+        # dus zonder dit is achteraf niet meer te zien hoe goed de verwachting
+        # van gisteren voor vanavond eigenlijk was.
+        try:
+            self.db_da.save_forecasts(
+                (
+                    (int(row.time), row.code, row.value)
+                    for row in df_db.itertuples()
+                ),
+                issued_ts=int(datetime.datetime.now().timestamp()),
+            )
+        except Exception as ex:
+            logging.warning(f"Prognose-archief niet bijgewerkt: {ex}")
         """
         if len(df1) > 0:
             if len(df2) > len(df1):

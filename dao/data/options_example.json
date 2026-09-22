@@ -59,6 +59,12 @@
   "logging level": "info",
   "use_calc_baseload": "True",
   "baseload calc periode": 56,
+  "baseload options": {
+    "aggregate": "median",
+    "remove outliers": true,
+    "half life days": 28.0,
+    "holidays": "sunday"
+  },
   "baseload": [
     0.14,
     0.38,
@@ -139,7 +145,8 @@
     }
   },
   "history": {
-    "save days": 7
+    "save days": 7,
+    "forecast days": 60
   },
   "dashboard": {
     "port": 5000
@@ -614,6 +621,10 @@
       {
         "time": "0935",
         "action": "calc_baseloads"
+      },
+      {
+        "time": "0940",
+        "action": "forecast_accuracy"
       },
       {
         "time": "2350",

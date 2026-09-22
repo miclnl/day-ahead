@@ -17,10 +17,40 @@ import sqlalchemy_utils
 import os
 import logging
 
+from sqlalchemy import bindparam, delete
+
 from dao.prog.utils import interpolate
 
 
 # import utils as utils
+
+#: Lead time buckets in hours used by the forecast archive.
+#:
+#: Storing every forecast of every run would grow without bound and is not what
+#: you want to analyse anyway. Keeping exactly one row per (variable, target,
+#: bucket) caps the table at ``codes x targets x 5`` rows no matter how often
+#: the optimizer runs, which keeps it small enough for the eMMC of a Home
+#: Assistant Yellow while still answering "how good is my forecast a day out?".
+LEAD_BUCKETS = (0, 1, 4, 12, 24)
+
+#: Which forecasts are worth archiving.
+#:
+#: Deliberately short. These are the series whose error actually moves the
+#: plan: the net house demand, the PV production, and the two weather inputs
+#: they are derived from. Archiving every optimizer output would multiply the
+#: table for no analytical gain.
+ARCHIVED_FORECAST_CODES = frozenset({"hload", "pv_ac", "gr", "temp"})
+
+
+def lead_bucket(lead_hours: float) -> int:
+    """Largest bucket that is still below or equal to *lead_hours*."""
+    chosen = LEAD_BUCKETS[0]
+    for bucket in LEAD_BUCKETS:
+        if lead_hours >= bucket:
+            chosen = bucket
+        else:
+            break
+    return chosen
 
 
 class DBmanagerObj(object):
@@ -606,3 +636,210 @@ class DBmanagerObj(object):
 
         result = {"consumption": consumption, "production": production}
         return result
+
+    # ------------------------------------------------------------------
+    # forecast archive
+    #
+    # "values" holds what happened, "prognoses" holds the latest forecast for
+    # each moment. Neither remembers what was predicted *when*, because
+    # savedata() upserts on (variabel, time). Without that the question "how
+    # far off was the forecast that actually drove this morning's plan?" cannot
+    # be answered afterwards, so forecast quality cannot be improved in a
+    # measured way. This table keeps one row per lead time bucket, which is
+    # enough to answer it and small enough to keep.
+    # ------------------------------------------------------------------
+
+    def variabel_ids(self, codes) -> dict:
+        """Map variable codes to ids in one query, cached for the session."""
+        if not hasattr(self, "_variabel_cache"):
+            self._variabel_cache = {}
+        missing = [c for c in set(codes) if c not in self._variabel_cache]
+        if missing:
+            variabel_table = Table(
+                "variabel", self.metadata, autoload_with=self.engine
+            )
+            query = select(variabel_table.c.code, variabel_table.c.id).where(
+                variabel_table.c.code.in_(missing)
+            )
+            with self.engine.connect() as connection:
+                for code, ident in connection.execute(query):
+                    self._variabel_cache[code] = ident
+        return {c: self._variabel_cache[c] for c in codes if c in self._variabel_cache}
+
+    def save_forecasts(
+        self,
+        rows,
+        issued_ts: int,
+        tablename: str = "forecasts",
+        codes_filter=ARCHIVED_FORECAST_CODES,
+    ):
+        """Archive forecast values with the lead time at which they were made.
+
+        ``rows`` is an iterable of ``(target_time, code, value)``. Rows whose
+        target already lies in the past are dropped: a "forecast" for a moment
+        that has been and gone carries no information about forecast skill.
+        Codes outside ``codes_filter`` are ignored, which is what keeps the
+        table small; pass ``None`` to archive everything.
+
+        Written as two executemany statements inside one transaction, rather
+        than the row-at-a-time select-then-update that :meth:`savedata` uses,
+        because this runs on every optimizer pass.
+        """
+        prepared = []
+        codes = set()
+        for target_time, code, value in rows:
+            if codes_filter is not None and code not in codes_filter:
+                continue
+            try:
+                target_time = int(target_time)
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if value != value:  # NaN
+                continue
+            lead_h = (target_time - issued_ts) / 3600.0
+            if lead_h < 0:
+                continue
+            prepared.append((target_time, code, value, lead_bucket(lead_h)))
+            codes.add(code)
+        if not prepared:
+            return 0
+
+        ids = self.variabel_ids(codes)
+        unknown = codes - set(ids)
+        if unknown:
+            logging.debug(f"Prognose-archief: onbekende codes overgeslagen: {unknown}")
+
+        records = [
+            {
+                "variabel": ids[code],
+                "target_time": target_time,
+                "lead_bucket": bucket,
+                "issued_time": int(issued_ts),
+                "value": value,
+            }
+            for target_time, code, value, bucket in prepared
+            if code in ids
+        ]
+        if not records:
+            return 0
+
+        table = Table(tablename, self.metadata, autoload_with=self.engine)
+        remove = delete(table).where(
+            and_(
+                table.c.variabel == bindparam("b_variabel"),
+                table.c.target_time == bindparam("b_target_time"),
+                table.c.lead_bucket == bindparam("b_lead_bucket"),
+            )
+        )
+        keys = [
+            {
+                "b_variabel": r["variabel"],
+                "b_target_time": r["target_time"],
+                "b_lead_bucket": r["lead_bucket"],
+            }
+            for r in records
+        ]
+        with self.engine.begin() as connection:
+            connection.execute(remove, keys)
+            connection.execute(insert(table), records)
+        logging.debug(f"Prognose-archief: {len(records)} rijen weggeschreven")
+        return len(records)
+
+    def prune_forecasts(self, before_ts: int, tablename: str = "forecasts") -> int:
+        """Drop archived forecasts whose target lies before *before_ts*."""
+        table = Table(tablename, self.metadata, autoload_with=self.engine)
+        statement = delete(table).where(table.c.target_time < int(before_ts))
+        with self.engine.begin() as connection:
+            result = connection.execute(statement)
+        return result.rowcount or 0
+
+    def _accuracy_query(
+        self, code: str, realised_table: str, realised_code: str, start_ts, end_ts
+    ):
+        """Join the archive to the realised series. Shared by the two reports."""
+        forecasts = Table("forecasts", self.metadata, autoload_with=self.engine)
+        realised = Table(realised_table, self.metadata, autoload_with=self.engine)
+        var_f = Table("variabel", self.metadata, autoload_with=self.engine).alias("vf")
+        var_r = Table("variabel", self.metadata, autoload_with=self.engine).alias("vr")
+        joined = (
+            forecasts.join(var_f, var_f.c.id == forecasts.c.variabel)
+            .join(realised, realised.c.time == forecasts.c.target_time)
+            .join(var_r, var_r.c.id == realised.c.variabel)
+        )
+        condition = and_(
+            var_f.c.code == code,
+            var_r.c.code == realised_code,
+            forecasts.c.target_time >= int(start_ts),
+            forecasts.c.target_time < int(end_ts),
+        )
+        error = forecasts.c.value - realised.c.value
+        return joined, condition, error, forecasts, realised
+
+    def forecast_accuracy(
+        self, code: str, realised_table: str, realised_code: str, start_ts, end_ts
+    ) -> list:
+        """Error statistics per lead time bucket, aggregated by the database.
+
+        Returns at most five rows, so nothing large ever reaches Python. That
+        matters on low powered hardware where the alternative -- pulling the
+        whole join into pandas -- would be the heaviest thing DAO does all day.
+        """
+        joined, condition, error, forecasts, realised = self._accuracy_query(
+            code, realised_table, realised_code, start_ts, end_ts
+        )
+        query = (
+            select(
+                forecasts.c.lead_bucket.label("lead_bucket"),
+                func.count().label("n"),
+                func.avg(func.abs(error)).label("mae"),
+                func.avg(error).label("bias"),
+                func.avg(error * error).label("mse"),
+                func.avg(func.abs(realised.c.value)).label("scale"),
+            )
+            .select_from(joined)
+            .where(condition)
+            .group_by(forecasts.c.lead_bucket)
+            .order_by(forecasts.c.lead_bucket)
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(query).mappings().all()
+        return [dict(row) for row in rows]
+
+    def forecast_bias_by_hour(
+        self,
+        code: str,
+        realised_table: str,
+        realised_code: str,
+        start_ts,
+        end_ts,
+        bucket: int | None = None,
+    ) -> list:
+        """Mean error per hour of the local day. This is the actionable one.
+
+        A forecast that is consistently too low between 17:00 and 20:00 makes
+        the optimizer reserve too little energy for the evening peak, and no
+        amount of realtime correction can repair that afterwards.
+        """
+        joined, condition, error, forecasts, realised = self._accuracy_query(
+            code, realised_table, realised_code, start_ts, end_ts
+        )
+        if bucket is not None:
+            condition = and_(condition, forecasts.c.lead_bucket == bucket)
+        hour = self.hour(forecasts.c.target_time)
+        query = (
+            select(
+                hour.label("uur"),
+                func.count().label("n"),
+                func.avg(error).label("bias"),
+                func.avg(func.abs(error)).label("mae"),
+                func.avg(realised.c.value).label("realised"),
+            )
+            .select_from(joined)
+            .where(condition)
+            .group_by(hour)
+            .order_by(hour)
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(query).mappings().all()
+        return [dict(row) for row in rows]

@@ -24,16 +24,64 @@ het geplande SoC-verloop. Zie [DOCS.md](DOCS.md#snelle-regellaag-fast-control).
 - een cyclus kost een enkele api-aanroep dankzij een gebundelde template-render, met
   automatische terugval op losse state-verzoeken
 
+## Prognosefout meten
+Tot nu toe schreef DAO prognoses weg in `prognoses` en metingen in `values`, en trok
+die nergens van elkaar af. Er was dus geen manier om te weten of de verbruiksvoorspelling
+er 5% of 40% naast zat. Bovendien wordt `prognoses` per tijdstip overschreven, zodat de
+verwachting waar het plan op gebouwd is achteraf verdwenen was.
+
+- nieuwe tabel `forecasts` die vastlegt met welke vooruitblik een waarde is voorspeld.
+  Eén rij per (variabele, tijdstip, vooruitblik-bucket), zodat de tabel niet meegroeit
+  met hoe vaak de optimalisatie draait: ~10 MB bij 60 dagen op een kwartierraster
+- nieuwe variabelen `hload` (geplande netto huisvraag), `m_house` en `m_pv` (gemeten)
+- de snelle regellaag legt de gemeten huisvraag en pv-productie per planinterval vast;
+  in `shadow` meet hij wel en stuurt hij niet
+- nieuwe taak `forecast_accuracy`: fout per vooruitblik én per uur van de dag, met een
+  expliciete waarschuwing bij een structurele afwijking. Aggregeert volledig in de
+  database. Ook via `<url>/api/run/forecast_accuracy`
+- bewaartermijn instelbaar met `history` -> `forecast days`
+
+## Betere baseload-schatting
+De baseload is de volledige verbruiksvoorspelling en rustte op het rekenkundig gemiddelde
+van zo'n acht waarnemingen per weekdag en uur, zonder enige bescherming.
+
+- feestdagen tellen mee als zondag in plaats van de weekdag te vervuilen
+- uitschieters per uur worden verworpen
+- recente weken wegen zwaarder, halveringstijd standaard vier weken
+- mediaan in plaats van gemiddelde
+- uren met te weinig waarnemingen lenen van hetzelfde uur over alle weekdagen
+- een negatieve baseload wordt afgekapt; die ontstond bij een gat in de netmeter terwijl
+  de pv-meter doorliep, en liet de optimalisatie rekenen met energie die nooit bestond
+- alles instelbaar onder `baseload options`, inclusief het oude gedrag
+- het profielbestand bevat nu ook de datum en het aantal waarnemingen per uur; het oude
+  formaat wordt nog gelezen
+- `calc_baseloads` waarschuwt als een apparaat wel wordt ingepland maar niet wordt
+  gemeten (dubbeltelling) of andersom (structureel te lage prognose)
+
+## Beperkte hardware (Home Assistant Yellow, Green, Raspberry Pi)
+- de snelle regellaag schrijft zijn toestand nog hooguit eens per vijf minuten weg in
+  plaats van elke cyclus, plus direct bij override-wissel, nieuw plan en nieuwe dag.
+  Dat scheelt duizenden kleine flash-schrijfacties per dag
+- de terugrekening leest recorder-historie in blokken van twee dagen en brengt elk blok
+  meteen terug tot het simulatieraster; een P1-meter met een update per seconde leverde
+  anders ruim een miljoen rijen in één DataFrame
+- `calc_baseloads` haalt de historie nog één keer op in plaats van zeven keer
+- het accuraatheidsrapport aggregeert in de database
+
 ## Correcties
-- `boiler.cop` had een kale float als default op een `FlexFloat`-veld, waardoor
-  `model_dump()` van een ingeschakelde boiler een serialisatiefout gaf
-- `FlexEnum`-velden met een alias (spaties in de sleutel) kregen hun toegestane waarden
-  niet geïnjecteerd en werden daardoor niet gevalideerd
 - `SolarPredictor.get_weatherdata` plakte `temp` en `winds` op **rijpositie** aan de
   stralingsreeks in plaats van op tijdstempel. Eén ontbrekend uur verschoof daardoor een
   hele kolom ten opzichte van de andere, zonder zichtbare fout
 - tekenfout in de zonnestand van de outlierfilter: de zonnemiddag lag 42 minuten
   verkeerd om voor Nederland
+- `boiler.cop` had een kale float als default op een `FlexFloat`-veld, waardoor
+  `model_dump()` van een ingeschakelde boiler een serialisatiefout gaf
+- `FlexEnum`-velden met een alias (spaties in de sleutel) kregen hun toegestane waarden
+  niet geïnjecteerd en werden daardoor niet gevalideerd
+- variabelen die na de introductie van de kolom `aggregate` werden toegevoegd kregen
+  stilzwijgend `avg`, ook als het om kWh ging
+- `get_sensor_period_sum` telt sensoren nu altijd op tijdstempel bij elkaar op; de oude
+  snelkoppeling op gelijke lengte leverde NaN zodra één sensor een gat had
 
 # 2026.9.1
 - removed us of pipe, let the child inherit the scheduler's stdout/stderr: (#812)

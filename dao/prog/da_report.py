@@ -11,11 +11,19 @@ from pandas.core.dtypes.inference import is_number
 
 from dao.lib.da_graph import GraphBuilder
 from dao.prog.da_base import DaBase
+from dao.prog.baseload import (
+    BaseloadOptions,
+    BaseloadProfile,
+    build_profile,
+    iter_samples,
+    profile_to_dict,
+)
 from dao.prog.utils import get_value_from_dict
 import math
 import json
 import itertools
 import logging
+import os
 from sqlalchemy import (
     Table,
     select,
@@ -2714,15 +2722,15 @@ class Report(DaBase):
     def get_sensor_week_data(
             self,
             sensor: str,
-            weekday: int,
+            weekday: int | None,
             vanaf: datetime.datetime,
             tot: datetime.datetime,
             col_name: str,
     ) -> pd.DataFrame:
         """
-        Berekent de waarde van een HA-sensor over 24 uur voor een bepaalde weekdag
+        Berekent de waarde van een HA-sensor per uur
         :param sensor:
-        :param weekday:
+        :param weekday: 0..6, of None voor alle dagen in de periode
         :param vanaf:
         :param tot:
         :param col_name:
@@ -2818,16 +2826,26 @@ class Report(DaBase):
         df_raw.index = pd.to_datetime(df_raw["tijd"])
         # when NaN in result replace with zero (0.0)
         df_raw.fillna(0.0, inplace=True)
+        if weekday is None:
+            return df_raw
         df_wd = df_raw.loc[df_raw["weekdag"] == weekday]
         return df_wd
 
-    def get_sensor_week_sum(
-            self, sensor_list: list, weekday: int, vanaf: datetime.datetime, col_name: str
+    def get_sensor_period_sum(
+            self,
+            sensor_list: list,
+            vanaf: datetime.datetime,
+            tot: datetime.datetime,
+            col_name: str,
     ) -> pd.DataFrame:
-        # counter = 0
-        result = None
-        now = datetime.datetime.now()
-        tot = datetime.datetime(now.year, now.month, now.day)
+        """Hourly sum of a group of sensors over the whole period.
+
+        Deliberately without a weekday filter. The previous implementation
+        fetched the identical series once per weekday, so the whole history
+        was pulled from the Home Assistant database seven times over. On a
+        Home Assistant Yellow that is the difference between a few seconds and
+        most of a minute.
+        """
         result = self.generate_df(vanaf, tot, "uur", None, col_name)
         result["weekdag"] = result.apply(
             lambda x: self.tijd_at_interval("weekdag", x["tijd"]), axis=1
@@ -2835,147 +2853,204 @@ class Report(DaBase):
         result["uur"] = result.apply(
             lambda x: self.tijd_at_interval("heel_uur", x["tijd"]), axis=1
         )
-        result = result.loc[result["weekdag"] == weekday]
         for sensor in sensor_list:
-            df = self.get_sensor_week_data(sensor, weekday, vanaf, tot, col_name)
+            df = self.get_sensor_week_data(sensor, None, vanaf, tot, col_name)
             df.dropna(subset=[col_name], inplace=True)
-            if len(df) == len(result):
-                result[col_name] = result[col_name] + df[col_name]
-            else:
-                result = Report.add_col_df(df, result, col_name)
-
-        if result is None:
-            logging.debug(f"Geen data voor baseload van {col_name}")
-        else:
-            logging.debug(f"Baseload berekening {col_name}:\n {result.to_string()}\n")
+            # Always match on the timestamp. The old code took a shortcut and
+            # added column to column whenever the two frames happened to have
+            # the same length, which silently produced NaN as soon as one
+            # sensor had a recorder gap that the other did not.
+            result = Report.add_col_df(df, result, col_name)
+        logging.debug(f"Baseload berekening {col_name}:\n {result.to_string()}\n")
         return result
 
-    def calc_weekday_baseload(self, wd: int) -> list:
+    def check_baseload_sensors(self) -> list:
+        """Warn when a modelled device has no meter to subtract it with.
+
+        The baseload is the measured total minus everything the optimizer
+        schedules itself. A device that is modelled but not metered therefore
+        stays inside the baseload *and* is added again by the optimizer, which
+        silently double counts it, every hour of every day. The reverse, a
+        meter without a modelled device, subtracts consumption that is never
+        added back and quietly underforecasts.
+
+        Both are easy to end up with and impossible to see in the output, so
+        they are reported explicitly.
         """
-        :param wd : weekdag 0= maandag, 6 = zondag
-        :return: de berekende basislast voor die dag
+        checks = [
+            (
+                "boiler",
+                bool(getattr(self.config.boiler, "boiler_present", False)),
+                self.boiler_consumption_sensors,
+                "entities boiler consumption",
+            ),
+            (
+                "warmtepomp",
+                bool(getattr(self.config.heating, "heater_present", False)),
+                self.wp_consumption_sensors,
+                "entities wp consumption",
+            ),
+            (
+                "elektrische auto",
+                bool(self.config.electric_vehicle),
+                self.ev_consumption_sensors,
+                "entities ev consumption",
+            ),
+            (
+                "apparatuur",
+                bool(self.config.machines),
+                self.machine_consumption_sensors,
+                "entities machine consumption",
+            ),
+            (
+                "batterij",
+                bool(self.config.battery),
+                self.battery_consumption_sensors,
+                "entities battery consumption",
+            ),
+            (
+                "zonnepanelen",
+                bool(self.config.solar),
+                self.solar_production_ac_sensors,
+                "entities solar production ac",
+            ),
+        ]
+        problems = []
+        for name, modelled, sensors, setting in checks:
+            if modelled and not sensors:
+                message = (
+                    f"{name} wordt wel meegerekend door de optimalisatie maar er is "
+                    f"geen '{setting}' ingesteld; het verbruik zit daardoor zowel in "
+                    f"de baseload als in de planning en wordt dubbel geteld"
+                )
+                problems.append(message)
+                logging.warning(f"Baseload: {message}")
+            elif sensors and not modelled:
+                message = (
+                    f"er is een '{setting}' ingesteld maar {name} wordt niet door de "
+                    f"optimalisatie ingepland; dat verbruik wordt van de baseload "
+                    f"afgetrokken en nergens weer opgeteld"
+                )
+                problems.append(message)
+                logging.warning(f"Baseload: {message}")
+        if not problems:
+            logging.info("Baseload: de meetpunten voor de apparaten zijn consistent")
+        return problems
+
+    def calc_baseload_frame(self) -> pd.DataFrame:
+        """Measured baseload per hour over the whole calculation period.
+
+        baseload = grid in - grid out + pv ac - ev - heat pump - boiler
+                   - machines - battery in + battery out
+
+        One pass over the history, so the result can be sliced per weekday
+        afterwards instead of re-querying the database seven times.
         """
         calc_periode = self.config.baseload_calc_periode
-        calc_start = datetime.datetime.combine(
-            (datetime.datetime.now() - datetime.timedelta(days=calc_periode)).date(),
-            datetime.time(),
+        now = datetime.datetime.now()
+        tot = datetime.datetime(now.year, now.month, now.day)
+        vanaf = datetime.datetime.combine(
+            (now - datetime.timedelta(days=calc_periode)).date(), datetime.time()
         )
 
-        grid_consumption = self.get_sensor_week_sum(
-            self.grid_consumption_sensors,
-            wd,
-            calc_start,
-            "grid_consumption",
-        )
-        grid_production = self.get_sensor_week_sum(
-            self.grid_production_sensors,
-            wd,
-            calc_start,
-            "grid_production",
-        )
-        solar_production = self.get_sensor_week_sum(
-            self.solar_production_ac_sensors,
-            wd,
-            calc_start,
-            "solar_production",
-        )
-        ev_consumption = self.get_sensor_week_sum(
-            self.ev_consumption_sensors,
-            wd,
-            calc_start,
-            "ev_consumption",
-        )
-        wp_consumption = self.get_sensor_week_sum(
-            self.wp_consumption_sensors,
-            wd,
-            calc_start,
-            "wp_consumption",
-        )
-        boiler_consumption = self.get_sensor_week_sum(
-            self.boiler_consumption_sensors,
-            wd,
-            calc_start,
-            "boiler_consumption",
-        )
-        machine_consumption = self.get_sensor_week_sum(
-            self.machine_consumption_sensors,
-            wd,
-            calc_start,
-            "machine_consumption",
-        )
-        battery_consumption = self.get_sensor_week_sum(
-            self.battery_consumption_sensors,
-            wd,
-            calc_start,
-            "battery_consumption",
-        )
-        battery_production = self.get_sensor_week_sum(
-            self.battery_production_sensors,
-            wd,
-            calc_start,
-            "battery_production",
-        )
+        groups = [
+            (self.grid_consumption_sensors, "grid_consumption", False),
+            (self.grid_production_sensors, "grid_production", True),
+            (self.solar_production_ac_sensors, "solar_production", False),
+            (self.ev_consumption_sensors, "ev_consumption", True),
+            (self.wp_consumption_sensors, "wp_consumption", True),
+            (self.boiler_consumption_sensors, "boiler_consumption", True),
+            (self.machine_consumption_sensors, "machine_consumption", True),
+            (self.battery_consumption_sensors, "battery_consumption", True),
+            (self.battery_production_sensors, "battery_production", False),
+        ]
 
-        # baseload = grid_consumption - grid_production + solar_production - ev_consumption
-        # - wp_consumption - battery_consumption + battery_production
-        grid_consumption = grid_consumption.rename(
-            columns={"grid_consumption": "baseload"}
-        )
-        # grid_consumption.drop(columns=["state_t1", "state_t2"])
-        # baseload - grid_production
-        result = Report.add_col_df(
-            grid_production, grid_consumption, "grid_production", "baseload", True
-        )
-        # baseload + solar_production
-        result = Report.add_col_df(
-            solar_production, result, "solar_production", "baseload"
-        )
-        # baseload - ev_consumption
-        result = Report.add_col_df(
-            ev_consumption, result, "ev_consumption", "baseload", True
-        )
-        # baseload - wp_consumption
-        result = Report.add_col_df(
-            wp_consumption, result, "wp_consumption", "baseload", True
-        )
-        # baseload - boiler_consumption
-        result = Report.add_col_df(
-            boiler_consumption, result, "boiler_consumption", "baseload", True
-        )
-        # baseload - machine_consumption
-        result = Report.add_col_df(
-            machine_consumption, result, "machine_consumption", "baseload", True
-        )
+        result = None
+        for sensors, col_name, subtract in groups:
+            frame = self.get_sensor_period_sum(sensors, vanaf, tot, col_name)
+            if result is None:
+                result = frame.rename(columns={col_name: "baseload"})
+                if subtract:
+                    result["baseload"] = -result["baseload"]
+                continue
+            result = Report.add_col_df(frame, result, col_name, "baseload", subtract)
 
-        # baseload - battery_consumption
-        result = Report.add_col_df(
-            battery_consumption, result, "battery_consumption", "baseload", True
-        )
-        # baseload - battery_production
-        result = Report.add_col_df(
-            battery_production, result, "battery_production", "baseload"
-        )
-
+        if result is None:
+            return pd.DataFrame(columns=["tijd", "weekdag", "uur", "baseload"])
         logging.debug(f"Baseload berekening per uur:\n {result.to_string()}\n")
-        result = result.groupby("uur", as_index=False).agg(
-            {"tijd": "min", "weekdag": "mean", "baseload": "mean"}
-        )
-        logging.debug(f"Geagregeerde baseload uur:\n {result.to_string()}\n")
-        result.baseload = result.baseload.round(3)
-        result = result["baseload"].values.tolist()
         return result
 
+    def baseload_options(self) -> BaseloadOptions:
+        """Translate the configuration into the pure estimator's options."""
+        options = self.config.baseload_options
+        return BaseloadOptions(
+            aggregate=options.aggregate,
+            trim_fraction=options.trim_fraction,
+            remove_outliers=options.remove_outliers,
+            outlier_factor=options.outlier_factor,
+            half_life_days=options.half_life_days,
+            holidays=options.holidays,
+            clip_negative=options.clip_negative,
+            min_samples=options.min_samples,
+        )
+
+    def calc_weekday_baseload(self, wd: int, frame: pd.DataFrame = None) -> list:
+        """
+        :param wd : weekdag 0= maandag, 6 = zondag
+        :param frame: het resultaat van calc_baseload_frame, wordt anders opgehaald
+        :return: de berekende basislast voor die dag
+        """
+        return self.calc_weekday_profile(wd, frame).values
+
+    def calc_weekday_profile(
+        self, wd: int, frame: pd.DataFrame = None
+    ) -> BaseloadProfile:
+        """Robust 24 hour profile for one weekday, with its sample counts."""
+        if frame is None:
+            frame = self.calc_baseload_frame()
+        options = self.baseload_options()
+        reference = datetime.datetime.now()
+        if frame is None or len(frame) == 0:
+            return BaseloadProfile()
+
+        rows = list(zip(frame["tijd"], frame["baseload"]))
+        grouped = iter_samples(rows, reference, options.holidays)
+        pooled: dict = {}
+        for cells in grouped.values():
+            for hour, samples in cells.items():
+                pooled.setdefault(hour, []).extend(samples)
+        return build_profile(grouped.get(wd, {}), pooled, options)
+
     def calc_save_baseloads(self):
+        """Recompute and store the seven weekday profiles."""
+        self.check_baseload_sensors()
+        frame = self.calc_baseload_frame()
+        if frame is None or len(frame) == 0:
+            logging.error(
+                "Baseload: geen meetdata gevonden; de profielen zijn niet bijgewerkt"
+            )
+            return
+        options = self.baseload_options()
+        period = self.config.baseload_calc_periode
+        os.makedirs("../data/baseload", exist_ok=True)
         for weekday in range(7):
-            baseload = self.calc_weekday_baseload(weekday)
-            logging.info(f"baseload voor weekdag {weekday} :")
-            bl_str = ""
-            for x in baseload:
-                bl_str += str(x) + " "
-            logging.info(bl_str)
+            profile = self.calc_weekday_profile(weekday, frame)
+            thin = [h for h in range(24) if profile.pooled[h]]
+            logging.info(
+                f"baseload weekdag {weekday}: totaal {profile.total:.2f} kWh, "
+                f"mediaan aantal metingen per uur "
+                f"{sorted(profile.samples)[12]}"
+                + (f", {len(thin)} uur uit de gepoolde schatting" if thin else "")
+            )
+            logging.info(" ".join(str(x) for x in profile.values))
             out_file = "../data/baseload/baseload_" + str(weekday) + ".json"
             with open(out_file, "w") as f:
-                print(json.dumps(baseload, indent=2), file=f)
+                print(
+                    json.dumps(
+                        profile_to_dict(profile, weekday, period, options), indent=2
+                    ),
+                    file=f,
+                )
         return
 
     # ------------------------------------------------

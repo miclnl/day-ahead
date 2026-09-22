@@ -8,6 +8,8 @@
 [Dashboard](#dashboard) <br>
 [Configuratie](#configuratie) <br>
 [Snelle regellaag](#snelle-regellaag-fast-control) <br>
+[Prognosefout meten](#prognosefout-meten) <br>
+[Beperkte hardware](#draaien-op-beperkte-hardware) <br>
 [CO2 emissie](#co2-emissie) <br>
 [Api](#api) <br>
 [Terminal](#terminal)
@@ -1886,6 +1888,208 @@ python3 da_fast.py demo                  # terugrekenen op een synthetische dag
 De terugrekening is ook bereikbaar via de api:
 `<url>/api/run/fast_control_simulate`. Het resultaat komt in
 `data/log/fast_simulate_<datum>.log`.
+
+
+---
+
+## Prognosefout meten
+
+### Waarom dit er nog niet was
+
+DAO schreef prognoses weg in de tabel `prognoses` en metingen in `values`, en trok ze
+nergens van elkaar af. Je kon dus niet weten of je verbruiksvoorspelling er 5% of 40%
+naast zat, en dus ook niet of een wijziging eraan iets hielp.
+
+Erger nog: `prognoses` wordt *overschreven* per tijdstip. De verwachting die gisteren om
+13:00 werd gemaakt voor vanavond 19:00 is weg zodra er om 18:45 een nieuwe berekening
+overheen gaat. Juist die eerste is degene waar het plan op is gebouwd.
+
+### Wat er nu gebeurt
+
+Er is een derde tabel bijgekomen, `forecasts`, die per waarde vastlegt *met welke
+vooruitblik* hij is gemaakt:
+
+| vooruitblik | betekenis |
+|---|---|
+| `< 1 uur` | de verwachting van vlak daarvoor |
+| `1-4 uur` | |
+| `4-12 uur` | |
+| `12-24 uur` | |
+| `>= 24 uur` | de verwachting van gisteren |
+
+Per (variabele, tijdstip, vooruitblik) wordt precies één rij bewaard. Daardoor groeit de
+tabel niet mee met hoe vaak je optimalisatie draait: bij een kwartierraster en 60 dagen
+bewaartermijn zijn het er ongeveer 115.000, zo'n 10 MB. Met `history` -> `forecast days`
+kort je dat in.
+
+Gearchiveerd worden alleen de reeksen waarvan de fout het plan echt verschuift:
+
+| code | wat | vergeleken met |
+|---|---|---|
+| `hload` | geplande netto huisvraag (alles achter de meter behalve de accu) | `m_house` |
+| `pv_ac` | geplande pv-productie | `m_pv` |
+| `gr` | verwachte globale straling | gemeten KNMI-straling |
+| `temp` | verwachte temperatuur | gemeten KNMI-temperatuur |
+
+`m_house` en `m_pv` zijn nieuw en worden geschreven door de **snelle regellaag**. Die
+reconstrueert elke paar seconden toch al `huis = net - accu`, precies de grootheid die de
+optimalisatie als `hload` voorspelt. Zet de snelle laag dus minstens op `shadow`, ook als
+je hem niet wilt laten sturen: in die stand meet hij wel en stuurt hij niet.
+
+### Het rapport draaien
+
+```
+cd /root/dao/prog
+python3 day_ahead.py accuracy
+```
+
+of via de api: `<url>/api/run/forecast_accuracy`. Plan hem dagelijks in:
+
+```json
+{"time": "0940", "action": "forecast_accuracy"}
+```
+
+Uitvoer, twee delen. Eerst per vooruitblik:
+
+```
+Huisvraag (kWh)
+  vooruitblik        n      bias       MAE      RMSE  rel. MAE
+  < 1 uur         1412    -0.021     0.094     0.141       18%
+  1-4 uur         1388    -0.038     0.121     0.183       23%
+  4-12 uur        1301    -0.052     0.167     0.244       32%
+  12-24 uur       1180    -0.061     0.198     0.287       38%
+```
+
+Zo hoort het eruit te zien: de fout loopt op met de vooruitblik. Doet hij dat niet, dan
+haalt je model geen informatie uit de recente meting.
+
+Dan het deel waar je echt iets mee kunt, de afwijking per uur van de dag:
+
+```
+Huisvraag: afwijking per uur van de dag (prognose - gemeten)
+  uur         n   gemeten      bias       MAE  verloop
+  17:00      58     0.412    -0.180     0.201  ---
+  18:00      58     0.685    -0.342     0.351  ------
+  19:00      58     0.590    -0.258     0.266  -----
+```
+
+En, als het structureel is, een waarschuwing:
+
+```
+waarschuwing: De huisvraag wordt rond 18:00 structureel te laag ingeschat
+(-0.342 kWh per interval). Daardoor reserveert de optimalisatie de verkeerde
+hoeveelheid energie; de snelle regellaag kan dat achteraf niet repareren.
+```
+
+### Hoe je het leest
+
+**Bias is belangrijker dan MAE.** Een MAE van 0,15 kWh met bias nul betekent ruis, en die
+vangt de snelle regellaag grotendeels op. Een bias van -0,15 kWh betekent dat je
+structureel te laag zit, en dat is niet te repareren: de optimalisatie reserveert dan te
+weinig accu voor de avondpiek en om 19:00 is de accu gewoon leeg.
+
+**Kijk naar de uren, niet naar het gemiddelde.** Een dagtotaal dat klopt kan bestaan uit
+een ochtend die 20% te hoog is en een avond die 20% te laag is. Dat is de slechtst
+denkbare vorm, want hij verschuift precies de energie die je in de dure uren nodig hebt.
+
+**Wat te doen bij een structurele afwijking in de avond:**
+
+1. Controleer eerst de de-embedding. `calc_baseloads` waarschuwt nu expliciet als een
+   apparaat wel wordt ingepland maar niet wordt gemeten; dat telt dubbel.
+2. Verhoog `baseload calc periode` naar 84 dagen als je weinig metingen per cel hebt.
+3. Verkort `half life days` naar 14 als je verbruik recent is veranderd.
+4. Blijft het staan, dan is het echte structuur (bijvoorbeeld temperatuurafhankelijk
+   verbruik) en niet iets wat betere statistiek oplost.
+
+### Baseload-schatting
+
+De baseload is de hele verbruiksvoorspelling: 24 waarden per weekdag, in kWh, met alles
+wat DAO zelf inplant er al af getrokken. Hij rust op ongeveer acht waarnemingen per
+(weekdag, uur) uit de laatste `baseload calc periode` dagen. Dat is weinig, en daarom is
+wat je met die acht doet belangrijker dan het lijkt.
+
+Wat er standaard gebeurt, in deze volgorde:
+
+1. **Feestdagen tellen als zondag.** Tweede Kerstdag heeft het patroon van een weekenddag,
+   niet van de donderdag waar hij toevallig op valt. Zonder dit vervuilt hij twee maanden
+   lang elke donderdag.
+2. **Uitschieters eruit.** Waarnemingen ver buiten de spreiding van hun eigen uur worden
+   verworpen: feestjes, logees, gaten in de recorder. Uitgeschakeld bij minder dan vijf
+   waarnemingen, want dan is de spreiding betekenisloos.
+3. **Recente weken wegen zwaarder**, met een halveringstijd van vier weken. Zonder dit
+   doet een nieuwe vriezer of een vertrokken huisgenoot acht weken over om door te werken.
+4. **Mediaan in plaats van gemiddelde.** Eén feestje schuift het gemiddelde van acht
+   waarnemingen met een achtste van de uitschieter, en houdt dat twee maanden vol.
+5. **Uren met te weinig waarnemingen lenen** van hetzelfde uur over alle weekdagen, in
+   plaats van op één meting te leunen.
+6. **Nooit negatief.** Een negatieve baseload ontstaat als de netmeter een gat heeft
+   terwijl de pv-meter doorloopt, en laat de optimalisatie rekenen met energie die nooit
+   heeft bestaan.
+
+Alles instelbaar onder `baseload options`. Het oude gedrag terug:
+
+```json
+"baseload options": {
+  "aggregate": "mean",
+  "remove outliers": false,
+  "half life days": null,
+  "holidays": "ignore"
+}
+```
+
+Het profielbestand `data/baseload/baseload_<weekdag>.json` heeft nu een kop met de
+datum, de gebruikte periode en het aantal waarnemingen per uur. Het oude formaat, een
+kale lijst van 24 getallen, wordt nog gewoon gelezen.
+
+---
+
+## Draaien op beperkte hardware
+
+DAO draait op een Home Assistant Yellow of Green, en op een Raspberry Pi. Dat zijn machines
+met 2 tot 8 GB geheugen, vier trage kernen en opslag op eMMC of een SD-kaart. Drie dingen
+verdienen daar aandacht.
+
+### Schrijfacties naar flash
+
+De snelle regellaag draait elke 10 tot 20 seconden. Zijn toestandsbestand wordt daarom
+**niet** elke cyclus weggeschreven, maar hooguit eens per vijf minuten, plus direct bij de
+gebeurtenissen die je niet kwijt wilt: het begin of einde van een override, een nieuw plan
+en een nieuwe dag. Dat scheelt duizenden kleine schrijfacties per dag. Op een eMMC is dat
+netjes, op een SD-kaart scheelt het levensduur.
+
+Het prognose-archief schrijft per optimalisatie één transactie, niet één query per rij.
+
+### Geheugen tijdens de terugrekening
+
+`da_fast.py simulate` leest je recorder-historie **in blokken van twee dagen** en brengt elk
+blok meteen terug tot het simulatieraster. Een P1-meter die elke seconde ververst levert
+ruwweg een miljoen rijen per twee weken; in één keer inlezen is zinloos, want het raster
+waar ze op eindigen heeft een paar duizend punten, en het is genoeg om het geheugen van
+een Yellow vol te zetten. De piek blijft nu bij één blok van één entiteit.
+
+Het accuraatheidsrapport aggregeert volledig in de database en haalt alleen de
+samenvattingsregels op. Er komt nooit een grote tabel in pandas terecht.
+
+### Rekentijd
+
+`calc_baseloads` haalde de volledige historie zeven keer op, één keer per weekdag. Dat is
+nu één keer, en daarna wordt er per weekdag uit hetzelfde resultaat gesneden. Op een Yellow
+scheelt dat het verschil tussen een paar seconden en het grootste deel van een minuut.
+
+De zwaarste taak blijft `train_ml_predictions`: die haalt drie jaar weerdata op en draait
+een rasterzoektocht van 162 fits per zonnepaneel-device. Plan hem 's nachts in, en zet
+`xgboost` -> `tune_hyperparameters` op `false` als het te lang duurt; dan gebruikt hij de
+vaste parameters en is hij tientallen keren sneller.
+
+### Instellingen om te temperen
+
+| Instelling | Standaard | Op krappe hardware |
+|---|---|---|
+| `fast control` -> `interval` | 15 s | 20-30 s |
+| `history` -> `forecast days` | 60 | 21-30 |
+| `baseload calc periode` | 56 | 56, laat staan |
+| `xgboost` -> `tune_hyperparameters` | true | false |
+| `max gap` | 0.005 | 0.02 (solver stopt eerder) |
 
 
 ---

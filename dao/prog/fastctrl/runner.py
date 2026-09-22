@@ -51,6 +51,11 @@ FAST_STATE_FILE = "../data/fast_state.json"
 #: day -- force an immediate write regardless of this interval.
 STATE_SAVE_INTERVAL = 300.0
 
+#: Fraction of a plan interval that must have been measured before the
+#: realised energy is stored. A partly covered interval would understate the
+#: total and pollute the forecast error statistics.
+MEASUREMENT_MIN_COVERAGE = 0.8
+
 #: States that mean "no usable value".
 INVALID_STATES = frozenset({"unknown", "unavailable", "none", "", "null"})
 
@@ -271,6 +276,12 @@ class FastControlRunner:
         self._warned_stale_plan = False
         self._last_state_save = 0.0
         self._state_signature: Optional[tuple] = None
+        self._measure_start: Optional[int] = None
+        self._measure_house_kwh = 0.0
+        self._measure_pv_kwh = 0.0
+        self._measure_seconds = 0.0
+        self._measure_pv_seen = False
+        self._measure_last_ts: Optional[float] = None
 
     # -- helpers ---------------------------------------------------------
 
@@ -502,6 +513,12 @@ class FastControlRunner:
         )
         decision = policy.decide(plan, measurement, self.state, enabled)
 
+        # decision.house_w is the reconstructed site demand excluding the
+        # battery, which is exactly the quantity the optimizer forecasts as
+        # "hload". Recording it turns the control loop into the measurement
+        # the forecast side has been missing.
+        self._measure(now, plan, decision.house_w, pv_w, measurement.grid_valid)
+
         elapsed_h = (
             min(now - self.state.last_tick_ts, 600.0) / 3600.0
             if self.state.last_tick_ts
@@ -513,6 +530,89 @@ class FastControlRunner:
         self._publish(decision, mode, measurement)
         self._persist_state(now)
         return decision
+
+    # -- measurement for the forecast side -------------------------------
+
+    def _measure(
+        self,
+        now: float,
+        plan: FastPlan,
+        house_w: float,
+        pv_w: Optional[float],
+        usable: bool,
+    ) -> None:
+        """Integrate the realised house demand and PV over each plan interval.
+
+        The optimizer writes what it expected; this writes what happened, on
+        the same time grid and with the same definition. Without it there is
+        nothing to compare a forecast against, because Home Assistant's own
+        statistics do not know where the battery boundary is.
+        """
+        interval = plan.interval_at(now)
+        if interval is None:
+            return
+        if self._measure_start is not None and interval.start_ts != self._measure_start:
+            self._flush_measurement(plan)
+        if self._measure_start != interval.start_ts:
+            self._measure_start = interval.start_ts
+            self._measure_house_kwh = 0.0
+            self._measure_pv_kwh = 0.0
+            self._measure_seconds = 0.0
+            self._measure_pv_seen = False
+            self._measure_last_ts = now
+            return
+
+        previous = self._measure_last_ts
+        self._measure_last_ts = now
+        if previous is None or now <= previous or not usable:
+            return
+        # Guard against a long gap, for example after the add-on was stopped:
+        # integrating across it would invent energy that was never measured.
+        elapsed = now - previous
+        if elapsed > 10 * max(5, int(self.config.interval)):
+            return
+        hours = elapsed / 3600.0
+        self._measure_house_kwh += house_w * hours / 1000.0
+        self._measure_seconds += elapsed
+        if pv_w is not None:
+            self._measure_pv_kwh += pv_w * hours / 1000.0
+            self._measure_pv_seen = True
+
+    def _flush_measurement(self, plan: FastPlan) -> None:
+        """Write the finished interval to the values table."""
+        start = self._measure_start
+        self._measure_start = None
+        if start is None or self._measure_seconds <= 0:
+            return
+        interval = next(
+            (i for i in plan.intervals if i.start_ts == start), None
+        )
+        duration = interval.duration_s if interval else plan.interval_s
+        coverage = self._measure_seconds / max(1, duration)
+        if coverage < MEASUREMENT_MIN_COVERAGE:
+            logging.debug(
+                f"Fast control: interval {start} maar {coverage:.0%} gemeten, "
+                f"niet opgeslagen"
+            )
+            return
+
+        rows = [[str(int(start)), "m_house", round(self._measure_house_kwh, 4)]]
+        if self._measure_pv_seen:
+            rows.append([str(int(start)), "m_pv", round(self._measure_pv_kwh, 4)])
+        database = getattr(self.hass, "db_da", None)
+        if database is None:
+            return
+        try:
+            import pandas as pd
+
+            database.savedata(
+                pd.DataFrame(rows, columns=["time", "code", "value"]),
+                tablename="values",
+            )
+        except Exception as exception:  # noqa: BLE001 - never break the loop
+            logging.warning(
+                f"Fast control: meting kon niet worden opgeslagen: {exception}"
+            )
 
     def _persist_state(self, now: float, force: bool = False) -> None:
         """Write the controller state, but not on every single tick.

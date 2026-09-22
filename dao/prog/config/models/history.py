@@ -21,6 +21,24 @@ class HistoryConfig(BaseModel):
         },
     )
 
+    forecast_days: int = Field(
+        alias="forecast days",
+        default=60,
+        ge=7,
+        description="Number of days of forecast history kept for accuracy reporting",
+        json_schema_extra={
+            "x-help": "The forecast archive records what was predicted and how far ahead, "
+            "so the forecast error can be measured afterwards. It holds one row "
+            "per variable, moment and lead time bucket, which keeps it bounded "
+            "no matter how often the optimizer runs: roughly 10 MB at the "
+            "default of 60 days. Reduce it on a machine with limited storage, "
+            "such as a Home Assistant Yellow on eMMC.",
+            "x-unit": "days",
+            "x-ui-section": "History",
+            "x-validation-hint": "Must be >= 7, typical 30-90 days",
+        },
+    )
+
     model_config = ConfigDict(
         extra="allow",
         populate_by_name=True,
