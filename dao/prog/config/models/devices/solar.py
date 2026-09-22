@@ -231,7 +231,7 @@ For panels facing different directions, use the 'strings' configuration:
 - Include all inverter and cable losses in yield factor
 - Account for shading in yield factor
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Solar-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Solar-Configuration",
         },
     )
 

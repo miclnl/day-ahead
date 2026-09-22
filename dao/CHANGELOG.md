@@ -1,6 +1,14 @@
-# Changelog 刀 DAO
+# Changelog DAO+
 # Day Ahead Optimizer
 # Unreleased
+
+## Rename to DAO+
+The addon is renamed from "Day Ahead Optimizer" to "DAO+" so it is easier
+to find in the Home Assistant Add-on Store. The slug changes from
+`day_ahead_opt` to `dao_plus`. The image, container paths, data
+directory, and sensor identifiers are unchanged, so existing installs
+keep working. To pick up the new name in HA, remove the old addon and
+install "DAO+" from the store.
 
 ## Snelle regellaag (fast control)
 Nieuwe, standaard uitgeschakelde regellaag die bovenop de dag-vooruit planning draait.

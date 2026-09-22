@@ -598,7 +598,7 @@ produces the opposite behaviour, without any special casing.
 - Battery empty before the evening peak: lower `energy budget`, or switch
   `storage value mode` to `fixed` with a high value.
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Fast-Control",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Fast-Control",
         },
     )
 

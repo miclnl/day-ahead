@@ -292,6 +292,6 @@ Use `charge_scheduler` for time-based optimization:
 - Three-phase charging (11/22kW) much faster than single-phase (3.7/7.4kW)
 - Consider time-of-use tariffs when setting charge deadlines
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/EV-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/EV-Configuration",
         },
     )

@@ -19,11 +19,11 @@ een intel 64 bit processor (amd64). Maar het kan ook separate Docker-container w
 ---
 ## Documentatie 
 In de loop van 2025 is begonnen met het verhuizen en actualiseren van de documentie vanaf DOCS.md
-naar de wiki-pagina's op github: https://github.com/corneel27/day-ahead/wiki
+naar de wiki-pagina's op github: https://github.com/miclnl/day-ahead/wiki
 ---
 
 ## Installatie
-Deze is uitgebreid beschreven in de wiki: https://github.com/corneel27/day-ahead/wiki/2.-Installatie-en-basis-configuratie
+Deze is uitgebreid beschreven in de wiki: https://github.com/miclnl/day-ahead/wiki/2.-Installatie-en-basis-configuratie
 
 
 
@@ -88,9 +88,9 @@ Of in tabelvorm:
 ````
 Heb je wensen, opmerkingen, suggesties, commentaar of kritiek: alles is welkom op de github pagina 
 van deze addon. Bij het onderdeel issues:<br>
-https://github.com/corneel27/day-ahead/issues <br>
+https://github.com/miclnl/day-ahead/issues <br>
 of bij de discussions:<br>
-https://github.com/corneel27/day-ahead/discussions <br>
+https://github.com/miclnl/day-ahead/discussions <br>
 Voordat je een issue invult of een discusie begint: doorzoek de geschiedenis, misschien is het probleem al 
 eerder aangekaart.<br>
 Of nog beter: Plaats een pull request met een oplossing of een nieuwe feature!

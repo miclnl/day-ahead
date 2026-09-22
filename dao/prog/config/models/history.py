@@ -79,6 +79,6 @@ Control how long optimization history is retained in the database.
 - Old data cleaned up automatically
 - Increase for detailed cost analysis
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/History-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/History-Configuration",
         },
     )

@@ -16,7 +16,7 @@
 
 **Opmerking**: De verwijzingen in bovenstaand menu en ook verwijzingen naar plaatjes werken niet in de documentatie pagina van de 
 add-on. Wil je de documentatie goed lezen open dan een extra tab in je browser met deze verwijzing:
-https://github.com/corneel27/day-ahead/blob/main/dao/DOCS.md
+https://github.com/miclnl/day-ahead/blob/main/dao/DOCS.md
 
 
 *****************************************
@@ -29,7 +29,7 @@ daarna voor de optie "Add-ons".
 Je kiest met de knop rechtsonder voor "Add-on shop".
 In het "drie puntjes menu" rechtsboven kies je voor "Repositories".
 Dan krijg je een pop-up waarin je o.a Github repositories kunt toevoegen.
-Vul daar  `https://github.com/corneel27/day-ahead/` in en klik op "Toevoegen" (Add).
+Vul daar  `https://github.com/miclnl/day-ahead/` in en klik op "Toevoegen" (Add).
 Na ca 10 seconden staat de add-on in de lijst en kun je de "Beheer de add-onrepositories" dialoog sluiten.
 Als je nu je pagina ververst (met F5) staat de nieuw add-on in het overzicht (onder de officiele add-ons).
 Klik op de nieuwe add-on en je krijgt het informatie-scherm te zien.

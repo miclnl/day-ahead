@@ -1,6 +1,6 @@
 {% extends "v2/base.html" %}
 
-{% block title %}{{title}} - DAO{% endblock %}
+{% block title %}{{title}} - DAO+{% endblock %}
 
 {% macro option(label, value, currentValue=None) %}
 <option value="{{value}}" {% if currentValue==value %}selected{% endif %}>{{label}}</option>

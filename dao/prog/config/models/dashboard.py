@@ -60,6 +60,6 @@ Access dashboard at:
 - Use reverse proxy for external access
 - Dashboard updates after each optimization
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Dashboard",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Dashboard",
         },
     )

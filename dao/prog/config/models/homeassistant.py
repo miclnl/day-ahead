@@ -108,6 +108,6 @@ Only needed if:
 - Test connection from dashboard
 - Check HA logs if issues persist
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Home-Assistant-Integration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Home-Assistant-Integration",
         },
     )

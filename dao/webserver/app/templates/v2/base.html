@@ -9,7 +9,7 @@
 <html lang="nl">
 <head>
     <meta charset="utf-8">
-    <title>{% block title %}DAO{% endblock %}</title>
+    <title>{% block title %}DAO+{% endblock %}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <meta name="color-scheme" content="light dark">
     <style>
@@ -85,7 +85,7 @@
 <body class="d-flex flex-column min-vh-100">
 <nav class="navbar navbar-expand-lg bg-body-tertiary">
     <div class="container">
-        <a class="navbar-brand text-center" href="{{ url_for('v2.chart') }}">DAO</a>
+        <a class="navbar-brand text-center" href="{{ url_for('v2.chart') }}">DAO+</a>
         <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarSupportedContent"
                 aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
@@ -163,7 +163,7 @@
             <div class="col"><small>Version: {{version}}</small></div>
             <div class="col"><a aria-current="page" href="{{ url_for('home') }}">legacy UI</a></div>
             <div class="col"><a aria-current="page" href="https://github.com/corneel27/">Github</a></div>
-            <div class="col"><a aria-current="page" href="https://github.com/corneel27/day-ahead/wiki">Wiki</a></div>
+            <div class="col"><a aria-current="page" href="https://github.com/miclnl/day-ahead/wiki">Wiki</a></div>
         </div>
     </div>
 </footer>

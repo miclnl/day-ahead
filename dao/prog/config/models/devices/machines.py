@@ -159,6 +159,6 @@ Examples:
 - Use instant start for urgent loads
 - Multiple machines can be optimized together
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Machine-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Machine-Configuration",
         },
     )

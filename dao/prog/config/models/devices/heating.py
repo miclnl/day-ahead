@@ -257,7 +257,7 @@ Define power levels and corresponding COP values:
 - Higher COP = cheaper heating, maximize runtime during high-COP conditions
 - Consider solar production when scheduling heating loads
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Heating-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Heating-Configuration",
         },
     )
 

@@ -115,7 +115,7 @@ Configure your home battery storage system for optimal energy management and cos
 - Monitor battery degradation with cycle_cost setting
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Battery-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Battery-Configuration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -310,7 +310,7 @@ For panels facing different directions, use the 'strings' configuration:
 - Account for shading in yield factor
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Solar-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Solar-Configuration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -406,7 +406,7 @@ Optimizer ensures combined consumption never exceeds this limit:
 - Consider upgrade if frequently hitting limits
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Grid-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Grid-Configuration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -486,7 +486,7 @@ produces the opposite behaviour, without any special casing.
   `storage value mode` to `fixed` with a high value.
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Fast-Control)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Fast-Control)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -661,7 +661,7 @@ Use `charge_scheduler` for time-based optimization:
 - Consider time-of-use tariffs when setting charge deadlines
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/EV-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/EV-Configuration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -793,7 +793,7 @@ Examples:
 - Multiple machines can be optimized together
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Machine-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Machine-Configuration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -884,7 +884,7 @@ Define power levels and corresponding COP values:
 - Consider solar production when scheduling heating loads
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Heating-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Heating-Configuration)
 
 > **Conditional configuration** — the `heater present` field acts as a discriminator that selects which variant is active:
 >
@@ -1011,7 +1011,7 @@ The system models boiler as a thermal battery:
 - Instant start available for emergency hot water needs
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Boiler-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Boiler-Configuration)
 
 > **Conditional configuration** — the `boiler present` field acts as a discriminator that selects which variant is active:
 >
@@ -1160,7 +1160,7 @@ Then in options.json:
 - Check database size periodically (can grow with history)
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Database-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Database-Configuration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1249,7 +1249,7 @@ Configure Home Assistant notifications for optimization events.
 - Consider automations based on last_activity_entity
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Notifications)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Notifications)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1318,7 +1318,7 @@ Access dashboard at:
 - Dashboard updates after each optimization
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Dashboard)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Dashboard)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1385,7 +1385,7 @@ Tibber is an electricity supplier offering:
 - Combine with Tibber HA integration for full experience
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Tibber-Integration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Tibber-Integration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1509,7 +1509,7 @@ System uses tariff active on optimization date.
 - Check your electricity bill for exact tariff components
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Pricing-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Pricing-Configuration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1616,7 +1616,7 @@ Graphs can show:
 - Graphs regenerated each optimization run
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Graphics)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Graphics)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1695,7 +1695,7 @@ Control how long optimization history is retained in the database.
 - Increase for detailed cost analysis
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/History-Configuration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/History-Configuration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1769,7 +1769,7 @@ All entity fields accept lists of HA sensors:
 - Update when adding new monitoring devices
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Reports)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Reports)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1909,7 +1909,7 @@ Define when automatic tasks run using time patterns.
 - Avoid overlapping long-running tasks
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Scheduler)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Scheduler)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -2088,7 +2088,7 @@ Only needed if:
 - Check HA logs if issues persist
 
 
-📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Home-Assistant-Integration)
+📚 [**View detailed documentation →**](https://github.com/miclnl/day-ahead/wiki/Home-Assistant-Integration)
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|

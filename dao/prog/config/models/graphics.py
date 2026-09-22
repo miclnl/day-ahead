@@ -94,6 +94,6 @@ Graphs can show:
 - Toggle individual elements to simplify graphs
 - Graphs regenerated each optimization run
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Graphics",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Graphics",
         },
     )

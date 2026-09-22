@@ -32,7 +32,7 @@ Before you begin, ensure you have the following installed:
 First, clone the repository and navigate to the project directory:
 
 ```bash
-git clone https://github.com/corneel27/day-ahead.git
+git clone https://github.com/miclnl/day-ahead.git
 cd day-ahead
 ```
 Alternatively, you can use a fork to your own account.
@@ -470,7 +470,7 @@ logger.exception("Exception with traceback")
 
 If you need assistance:
 
-- Check existing [Issues](https://github.com/corneel27/day-ahead/issues) on GitHub
+- Check existing [Issues](https://github.com/miclnl/day-ahead/issues) on GitHub
 - Review the [DOCS.md](dao/DOCS.md) for user documentation
 - Create a new issue with:
   - Clear description of the problem

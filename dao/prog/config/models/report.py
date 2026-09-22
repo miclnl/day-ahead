@@ -195,6 +195,6 @@ All entity fields accept lists of HA sensors:
 - CO2 tracking optional but insightful
 - Update when adding new monitoring devices
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Reports",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Reports",
         },
     )

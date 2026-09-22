@@ -331,7 +331,7 @@ Then in options.json:
 - Ensure database is backed up (contains optimization history)
 - Check database size periodically (can grow with history)
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Database-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Database-Configuration",
         },
     )
 

@@ -5,7 +5,7 @@ setup(
     version='2024.8.4',
     packages=['dao', 'dao.lib', 'dao.prog', 'dao.prog.fastctrl',
               'dao.webserver', 'dao.webserver.app'],
-    url='https://github.com/corneel27/day-ahead',
+    url='https://github.com/miclnl/day-ahead',
     license='Apache License, Version 2.0',
     author='Cees van Beek',
     author_email='cees.van.beek@xs4all.nl',

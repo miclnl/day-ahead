@@ -248,7 +248,7 @@ The system models boiler as a thermal battery:
 - Schedule heating during solar production or cheap grid periods
 - Instant start available for emergency hot water needs
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Boiler-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Boiler-Configuration",
         },
     )
 

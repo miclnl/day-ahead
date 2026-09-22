@@ -202,6 +202,6 @@ System uses tariff active on optimization date.
 - Keep last_invoice updated for accurate cost tracking
 - Check your electricity bill for exact tariff components
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Pricing-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Pricing-Configuration",
         },
     )

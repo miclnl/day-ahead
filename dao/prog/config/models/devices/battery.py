@@ -441,7 +441,7 @@ Configure your home battery storage system for optimal energy management and cos
 - Configure charge/discharge stages for accurate optimization
 - Monitor battery degradation with cycle_cost setting
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Battery-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Battery-Configuration",
         },
     )
 

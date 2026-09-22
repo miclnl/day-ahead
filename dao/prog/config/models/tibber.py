@@ -83,6 +83,6 @@ Tibber is an electricity supplier offering:
 - Tibber provides next-day prices after ~13:00 CET
 - Combine with Tibber HA integration for full experience
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Tibber-Integration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Tibber-Integration",
         },
     )

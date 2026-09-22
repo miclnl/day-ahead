@@ -87,6 +87,6 @@ Configure Home Assistant notifications for optimization events.
 - Disable during testing to avoid notification spam
 - Consider automations based on last_activity_entity
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Notifications",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Notifications",
         },
     )

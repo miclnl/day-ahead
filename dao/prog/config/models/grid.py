@@ -75,6 +75,6 @@ Optimizer ensures combined consumption never exceeds this limit:
 - System will prioritize loads within this constraint
 - Consider upgrade if frequently hitting limits
 """,
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Grid-Configuration",
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Grid-Configuration",
         },
     )

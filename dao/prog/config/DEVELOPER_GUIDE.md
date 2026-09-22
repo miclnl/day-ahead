@@ -125,7 +125,7 @@ class BatteryConfig(BaseModel):
             "x-ui-widget": "number-input",
             
             # External documentation
-            "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Battery-Capacity"
+            "x-docs-url": "https://github.com/miclnl/day-ahead/wiki/Battery-Capacity"
         }
     )
 ```
@@ -180,7 +180,7 @@ The optimizer decides when to charge/discharge based on:
 - Use optimal_lower_level for cost optimization''',
             
             # External documentation
-            'x-docs-url': 'https://github.com/corneel27/day-ahead/wiki/Battery-Configuration'
+            'x-docs-url': 'https://github.com/miclnl/day-ahead/wiki/Battery-Configuration'
         }
     )
 ```

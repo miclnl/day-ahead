@@ -1,4 +1,4 @@
-# Changelog 刀 DAO
+# Changelog DAO+
 # Day Ahead Optimizer
 # 2026.9.1.rc1
 - removed us of pipe, let the child inherit the scheduler's stdout/stderr: (#812)
@@ -1434,6 +1434,14 @@ Deze tabel is nu aangepast (de berekeningen zijn hetzelfde):
 Totaal  -7.06     --  -7.50   0.00  -7.50     --  -7.65     --       
 ```
 ## [Unreleased]
+- Addon display name changed from "刀 Day Ahead Optimizer (TESTING)" to
+  "DAO+ (TESTING)".
+- Slug changed from `day_ahead_opt-testing` to `dao_plus-testing`.
+- Documentation and Pydantic model `x-docs-url` references now point at
+  the fork at `github.com/miclnl/day-ahead`. The image, container paths,
+  data directory, and sensor identifiers are unchanged, so existing
+  installs keep working.
+
 De volgende zaken staan nog op de todo lijst:
 - Alle uitvoer omzetten naar logger 
 - dashboard afmaken
