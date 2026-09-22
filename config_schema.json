@@ -1203,6 +1203,418 @@
       "type": "string",
       "x-help": "Home Assistant entity ID in the format \"domain.object_id\" (e.g. \"sensor.battery_soc\")."
     },
+    "FastBatteryLink": {
+      "additionalProperties": true,
+      "description": "Links a battery from the `battery` section to its realtime measurements.",
+      "properties": {
+        "name": {
+          "description": "Battery name, must match a name in the battery section",
+          "title": "Name",
+          "type": "string",
+          "x-help": "Exact name of the battery as configured under 'battery'. The fast control layer reuses that battery's stages, capacity, efficiency and setpoint entity."
+        },
+        "enabled": {
+          "default": true,
+          "description": "Allow the fast control layer to steer this battery",
+          "title": "Enabled",
+          "type": "boolean",
+          "x-help": "Disable to keep this battery strictly on the day-ahead plan while other batteries are steered in realtime."
+        },
+        "priority": {
+          "default": 0,
+          "description": "Dispatch order, lowest number is corrected first",
+          "title": "Priority",
+          "type": "integer",
+          "x-help": "With multiple batteries the correction is handed to the battery with the lowest priority number first; the remainder spills over to the next one."
+        },
+        "actual power": {
+          "$ref": "#/$defs/PowerSensor",
+          "description": "Measured AC power of this battery, positive is charging",
+          "x-help": "Strongly recommended. Without it the controller assumes the inverter follows its last command exactly, which makes it blind to derating, standby losses and manual overrides.",
+          "x-ui-section": "Measurements",
+          "title": "Actual Power"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "FastBatteryLink",
+      "type": "object"
+    },
+    "FastControlConfig": {
+      "additionalProperties": true,
+      "description": "Realtime feedback layer on top of the day-ahead plan.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/FlexEnum",
+          "default": "off",
+          "description": "Operating mode of the fast control layer",
+          "x-enum-values": [
+            "off",
+            "shadow",
+            "active"
+          ],
+          "x-help": "**off** - the layer does not run at all.\n\n**shadow** - the layer runs, logs every decision and writes its diagnostics, but never touches the inverter. Always start here and compare the logged setpoints against reality for a few days.\n\n**active** - the layer writes the corrected setpoint to the battery.\n\nMay also be a Home Assistant entity (input_select) so you can switch modes without restarting the add-on.",
+          "x-order": 1,
+          "x-ui-section": "Main",
+          "x-ui-widget-filter": "input_select,select,sensor",
+          "x-validation-hint": "'off', 'shadow' or 'active', or an HA entity id",
+          "title": "Mode"
+        },
+        "interval": {
+          "default": 15,
+          "description": "Control loop period in seconds",
+          "maximum": 300,
+          "minimum": 5,
+          "title": "Interval",
+          "type": "integer",
+          "x-help": "How often the P1 meter is sampled and the setpoint recomputed. 10-20 seconds is a good balance: fast enough to catch an oven or a kettle, slow enough to stay well inside Home Assistant's API budget. Every cycle costs one templated API call.",
+          "x-order": 2,
+          "x-ui-section": "Main",
+          "x-unit": "s"
+        },
+        "grid power": {
+          "$ref": "#/$defs/PowerSensor",
+          "description": "Realtime P1 power measurement, positive is import",
+          "x-help": "The single most important input. Point this at your P1 reader's instantaneous power sensor. Without it the fast control layer cannot run.",
+          "x-order": 10,
+          "x-ui-section": "Measurements",
+          "title": "Grid Power"
+        },
+        "pv power": {
+          "$ref": "#/$defs/PowerSensor",
+          "description": "Optional realtime PV power, used for diagnostics only",
+          "x-help": "Optional. The control law does not need it because PV is already contained in the P1 measurement, but logging it makes the decision trace far easier to interpret.",
+          "x-order": 11,
+          "x-ui-section": "Measurements",
+          "title": "Pv Power"
+        },
+        "max sensor age": {
+          "default": 120,
+          "description": "Maximum age of a measurement in seconds before it is considered stale",
+          "minimum": 10,
+          "title": "Max Sensor Age",
+          "type": "integer",
+          "x-help": "When the grid or battery measurement has not updated within this window the controller falls back to the day-ahead plan. Protects against a frozen P1 integration silently driving the battery.",
+          "x-order": 20,
+          "x-ui-section": "Safety",
+          "x-unit": "s"
+        },
+        "max plan age": {
+          "default": 5400,
+          "description": "Maximum age of the day-ahead plan in seconds before overriding stops",
+          "minimum": 300,
+          "title": "Max Plan Age",
+          "type": "integer",
+          "x-help": "If the optimizer has not produced a fresh plan within this window the fast layer stops overriding. Keep it slightly above your longest gap between calc_optimum runs (default allows one missed hourly run).",
+          "x-order": 21,
+          "x-ui-section": "Safety",
+          "x-unit": "s"
+        },
+        "batteries": {
+          "description": "Per battery realtime measurement links",
+          "items": {
+            "$ref": "#/$defs/FastBatteryLink"
+          },
+          "title": "Batteries",
+          "type": "array",
+          "x-help": "Leave empty to steer every configured battery with default settings. Add entries to attach a measured power sensor or to exclude a battery.",
+          "x-order": 30,
+          "x-ui-section": "Batteries"
+        },
+        "storage value mode": {
+          "$ref": "#/$defs/FlexEnum",
+          "default": "plan",
+          "description": "How the marginal value of stored energy is determined",
+          "x-enum-values": [
+            "plan",
+            "average",
+            "fixed"
+          ],
+          "x-help": "The controller compares the current grid price against the marginal value of a kWh sitting in the battery.\n\n**plan** - derived from the remaining day-ahead plan: the cheaper of (best future use of the energy) and (cheapest future refill). This is the recommended setting.\n\n**average** - the average consumption price over the remaining horizon, the same valuation the day-ahead optimizer itself uses.\n\n**fixed** - use the 'storage value' field, optionally backed by an HA entity so you can tune it live.",
+          "x-order": 40,
+          "x-ui-section": "Economics",
+          "x-ui-widget-filter": "input_select,select,sensor",
+          "title": "Storage Value Mode"
+        },
+        "storage value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FlexFloat"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Marginal value of stored energy in euro/kWh when mode is 'fixed'",
+          "x-help": "Only used when 'storage value mode' is 'fixed'. Discharging happens when the import price exceeds this value, charging from surplus when this value exceeds the export price. A sensible starting point is your typical evening import price times the round trip efficiency.",
+          "x-order": 41,
+          "x-ui-section": "Economics",
+          "x-unit": "euro/kWh",
+          "title": "Storage Value"
+        },
+        "round trip efficiency": {
+          "default": 0.9,
+          "description": "AC to AC round trip efficiency used to value stored energy",
+          "exclusiveMinimum": 0.1,
+          "maximum": 1.0,
+          "title": "Round Trip Efficiency",
+          "type": "number",
+          "x-help": "Used to discount the value of stored energy. Should match the real AC-to-AC efficiency of your inverter plus battery, typically 0.85-0.92.",
+          "x-order": 42,
+          "x-ui-section": "Economics",
+          "x-unit": "ratio"
+        },
+        "min benefit": {
+          "default": 0.02,
+          "description": "Minimum estimated benefit in euro/hour before the plan is overridden",
+          "minimum": 0.0,
+          "title": "Min Benefit",
+          "type": "number",
+          "x-help": "An override is only issued when the estimated saving rate exceeds this threshold. Raise it to make the layer more conservative and to ignore small, short deviations. 0.02 euro/hour corresponds to roughly a 100 W correction at a 0.20 euro/kWh spread.",
+          "x-order": 43,
+          "x-ui-section": "Economics",
+          "x-unit": "euro/h"
+        },
+        "deadband": {
+          "default": 150,
+          "description": "Minimum setpoint change in W before a new command is sent",
+          "minimum": 0,
+          "title": "Deadband",
+          "type": "integer",
+          "x-help": "Suppresses command chatter caused by measurement noise. Set it above the noise level of your P1 sensor, typically 100-250 W.",
+          "x-order": 50,
+          "x-ui-section": "Stability",
+          "x-unit": "W"
+        },
+        "min command interval": {
+          "default": 60,
+          "description": "Minimum time in seconds between two setpoint writes",
+          "minimum": 0,
+          "title": "Min Command Interval",
+          "type": "integer",
+          "x-help": "Protects the inverter and its Modbus/cloud link against excessive write rates, and keeps the battery from hunting. Check your inverter's documented minimum setpoint interval.",
+          "x-order": 51,
+          "x-ui-section": "Stability",
+          "x-unit": "s"
+        },
+        "urgent deviation": {
+          "default": 1500,
+          "description": "Deviation in W that is allowed to bypass the minimum command interval",
+          "minimum": 0,
+          "title": "Urgent Deviation",
+          "type": "integer",
+          "x-help": "A large step, such as an oven or an EV charger starting, may be acted on immediately instead of waiting out the minimum command interval. Set to 0 to always respect the interval.",
+          "x-order": 52,
+          "x-ui-section": "Stability",
+          "x-unit": "W"
+        },
+        "max ramp": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Maximum setpoint change in W per command, empty means unlimited",
+          "title": "Max Ramp",
+          "x-help": "Optional slew rate limit. Most hybrid inverters ramp internally and do not need this. Set it if your inverter trips on large setpoint steps.",
+          "x-order": 53,
+          "x-ui-section": "Stability",
+          "x-unit": "W"
+        },
+        "release deviation": {
+          "default": 100,
+          "description": "Deviation in W below which the controller returns to the plan",
+          "minimum": 0,
+          "title": "Release Deviation",
+          "type": "integer",
+          "x-help": "Together with 'release time' this forms the hysteresis that ends an override. Keep it below the deadband to avoid immediate re-engagement.",
+          "x-order": 54,
+          "x-ui-section": "Stability",
+          "x-unit": "W"
+        },
+        "release time": {
+          "default": 120,
+          "description": "Time in seconds the deviation must stay small before returning to the plan",
+          "minimum": 0,
+          "title": "Release Time",
+          "type": "integer",
+          "x-help": "Prevents the controller from dropping an override during a short dip, for example between two heating elements of an oven cycling.",
+          "x-order": 55,
+          "x-ui-section": "Stability",
+          "x-unit": "s"
+        },
+        "energy budget": {
+          "default": 0.5,
+          "description": "Allowed energy deviation from the planned SoC trajectory, in kWh",
+          "minimum": 0.0,
+          "title": "Energy Budget",
+          "type": "number",
+          "x-help": "The trust region around the day-ahead plan. The fast layer may move at most this much energy more or less than the plan intended within a single plan interval; after that it snaps back. This is what keeps a wrong storage value from emptying the battery before the evening peak. 0.3-1.0 kWh works well for a 10-30 kWh battery.",
+          "x-order": 60,
+          "x-ui-section": "Budgets",
+          "x-unit": "kWh"
+        },
+        "daily extra throughput": {
+          "default": 4.0,
+          "description": "Maximum extra battery throughput per day caused by the fast layer, in kWh",
+          "minimum": 0.0,
+          "title": "Daily Extra Throughput",
+          "type": "number",
+          "x-help": "Hard cap on the additional wear the fast layer is allowed to cause. Counted as the integral of the absolute difference between the actual and the planned battery power. Once exhausted the layer follows the plan for the rest of the day. Set to 0 to disable the cap.",
+          "x-order": 61,
+          "x-ui-section": "Budgets",
+          "x-unit": "kWh/day"
+        },
+        "soc margin": {
+          "default": 2.0,
+          "description": "Extra SoC margin in percent kept away from the configured battery limits",
+          "maximum": 50.0,
+          "minimum": 0.0,
+          "title": "Soc Margin",
+          "type": "number",
+          "x-help": "The fast layer stays this far inside the battery's 'lower limit' and 'upper limit'. The day-ahead plan may use the full range; the realtime corrections may not, so a failed plan refresh can never leave the battery stranded at a limit.",
+          "x-order": 62,
+          "x-ui-section": "Budgets",
+          "x-unit": "%"
+        },
+        "max grid import": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional peak shaving limit on grid import in W",
+          "title": "Max Grid Import",
+          "x-help": "When set, the fast layer also acts as a peak shaver: it discharges whatever is needed to keep grid import below this value, regardless of price, as long as the battery has energy and the SoC margin allows it. Useful for capacity tariffs or a marginal main fuse. Leave empty to disable.",
+          "x-order": 63,
+          "x-ui-section": "Budgets",
+          "x-unit": "W"
+        },
+        "allow grid charge": {
+          "$ref": "#/$defs/FlexBool",
+          "default": false,
+          "description": "Allow the fast layer to increase charging beyond the plan from the grid",
+          "x-help": "When disabled (default) the fast layer will charge more than planned only from a genuine surplus, so it never turns a planned export into a grid purchase. Enabling it lets the layer also buy during very cheap or negative price intervals, which is profitable but increases cycling.",
+          "x-order": 64,
+          "x-ui-section": "Budgets",
+          "x-ui-widget-filter": "input_boolean,switch",
+          "title": "Allow Grid Charge"
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/FastControlDiagnostics",
+          "description": "Entities written with the controller state",
+          "x-order": 70,
+          "x-ui-section": "Diagnostics",
+          "title": "Diagnostics"
+        }
+      },
+      "title": "FastControlConfig",
+      "type": "object",
+      "x-docs-url": "https://github.com/corneel27/day-ahead/wiki/Fast-Control",
+      "x-help": "# Fast Control\n\nA realtime feedback layer that sits on top of the day-ahead plan.\n\n## The problem it solves\n\nThe optimizer plans on a 15-minute or hourly grid using a *forecast* of the house\nload and the PV production. Between two runs the battery setpoint is frozen.\nEvery watt of forecast error therefore flows straight through the meter:\n\n- An oven starting at 18:03 is imported at the full consumption price, even\n  though the battery is standing by with cheap energy.\n- A cloud passing over the array turns a planned self-consumption into a grid\n  purchase.\n- A load that finishes early turns a planned discharge into an export at the\n  much lower feed-in price.\n\nEach of those costs you the spread between the import and the export price.\n\n## How it works\n\nEvery few seconds the layer reads the P1 meter, reconstructs the true house load\nby subtracting the measured battery power, and compares it with the plan. It\nthen solves a one-dimensional cost minimisation over the grid setpoint, using\nthe current import price, the current export price and the marginal value of a\nkWh in the battery. The result is clamped by the inverter limits, an energy\ntrust region around the planned state of charge, and a daily wear budget.\n\nIn the normal price regime the solution is simply \"cover the deviation from the\nbattery\". During negative prices or a price spike the same formula automatically\nproduces the opposite behaviour, without any special casing.\n\n## Getting started\n\n1. Configure `grid power` with your P1 instantaneous power sensor.\n2. Configure `actual power` for each battery if you have a sensor for it.\n3. Leave `mode` on **shadow** for a few days and inspect\n   `sensor.dao_fast_control` and the log.\n4. Run the backtest to quantify the expected saving:\n   `python3 da_fast.py simulate --days 14`\n5. Switch `mode` to **active**.\n\n## Tuning\n\n- Too much switching: raise `deadband`, `min command interval` and `min benefit`.\n- Too little effect: lower `min benefit`, raise `energy budget`.\n- Battery empty before the evening peak: lower `energy budget`, or switch\n  `storage value mode` to `fixed` with a high value.\n",
+      "x-icon": "speedometer",
+      "x-order": 13,
+      "x-ui-group": "Energy"
+    },
+    "FastControlDiagnostics": {
+      "additionalProperties": true,
+      "description": "Entities the fast control layer writes its own state to.",
+      "properties": {
+        "entity status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "sensor.dao_fast_control",
+          "description": "Entity written with the controller status and attributes",
+          "title": "Entity Status",
+          "x-help": "Written through the Home Assistant states API, so the entity does not have to exist up front. Its attributes carry the full decision trace: deviation, storage value, benefit, budget use and the reason for the current decision. Leave empty to disable.",
+          "x-ui-section": "Diagnostics"
+        },
+        "entity active": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional input_boolean set to on while an override is active",
+          "x-help": "Optional helper (input_boolean) that mirrors whether the fast layer is currently deviating from the day-ahead plan.",
+          "x-ui-section": "Diagnostics",
+          "x-ui-widget-filter": "input_boolean",
+          "title": "Entity Active"
+        },
+        "entity setpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional input_number receiving the corrected battery setpoint in W",
+          "x-help": "Optional helper (input_number) that records the setpoint the fast layer computed, in watts. Useful in shadow mode to compare the fast layer against the plan without touching the inverter.",
+          "x-ui-section": "Diagnostics",
+          "x-ui-widget-filter": "input_number",
+          "title": "Entity Setpoint"
+        },
+        "entity benefit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional input_number receiving the estimated benefit in euro/hour",
+          "x-help": "Optional helper (input_number) with the instantaneous estimated saving rate of the current correction, in euro per hour.",
+          "x-ui-section": "Diagnostics",
+          "x-ui-widget-filter": "input_number",
+          "title": "Entity Benefit"
+        },
+        "entity saved today": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional input_number with the cumulative saving of today in euro",
+          "x-help": "Optional helper (input_number) accumulating the estimated saving since midnight, in euro. Resets at midnight.",
+          "x-ui-section": "Diagnostics",
+          "x-ui-widget-filter": "input_number",
+          "title": "Entity Saved Today"
+        }
+      },
+      "title": "FastControlDiagnostics",
+      "type": "object"
+    },
     "FlexBool": {
       "anyOf": [
         {
@@ -2120,6 +2532,78 @@
       "x-icon": "bell",
       "x-order": 14,
       "x-ui-group": "Integration"
+    },
+    "PowerSensor": {
+      "additionalProperties": true,
+      "description": "A power measurement read from Home Assistant.\n\nSupports the two shapes commonly produced by P1 / inverter integrations: a\nsingle signed sensor, or a separate positive-only pair.",
+      "properties": {
+        "entity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "HA entity with the signed power value",
+          "x-help": "Home Assistant entity holding the power as a single signed number. For the grid meter the convention is positive = import from grid. For a battery the convention is positive = charging. Use 'invert' when your integration uses the opposite sign.",
+          "x-ui-widget-filter": "sensor,input_number,number",
+          "title": "Entity"
+        },
+        "entity positive": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "HA entity with the positive-only part of the power value",
+          "x-help": "Alternative to 'entity': the sensor that only reports the positive direction (grid import, or battery charging). Combine with 'entity negative'.",
+          "x-ui-widget-filter": "sensor,input_number,number",
+          "title": "Entity Positive"
+        },
+        "entity negative": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "HA entity with the negative-only part of the power value",
+          "x-help": "Alternative to 'entity': the sensor that only reports the negative direction (grid export, or battery discharging), as a positive number. Combine with 'entity positive'.",
+          "x-ui-widget-filter": "sensor,input_number,number",
+          "title": "Entity Negative"
+        },
+        "unit": {
+          "default": "W",
+          "description": "Unit of the sensor value",
+          "enum": [
+            "W",
+            "kW"
+          ],
+          "title": "Unit",
+          "type": "string",
+          "x-help": "Unit reported by the sensor. kW values are converted to W internally.",
+          "x-unit": "W or kW"
+        },
+        "invert": {
+          "default": false,
+          "description": "Flip the sign of the measured value",
+          "title": "Invert",
+          "type": "boolean",
+          "x-help": "Enable when your integration reports the opposite sign, for example a grid sensor that is positive while exporting."
+        }
+      },
+      "title": "PowerSensor",
+      "type": "object"
     },
     "PricingConfig": {
       "additionalProperties": true,
@@ -3184,6 +3668,12 @@
       "description": "Grid connection settings",
       "x-ui-section": "Grid",
       "title": "Grid"
+    },
+    "fast control": {
+      "$ref": "#/$defs/FastControlConfig",
+      "description": "Realtime feedback layer that corrects the plan between optimizer runs",
+      "x-ui-section": "Fast control",
+      "title": "Fast Control"
     },
     "history": {
       "$ref": "#/$defs/HistoryConfig",

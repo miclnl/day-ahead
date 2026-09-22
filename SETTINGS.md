@@ -19,6 +19,7 @@
   - [🔋 BatteryConfig](#batteryconfig)
   - [☀️ SolarConfig](#solarconfig)
   - [⚡ GridConfig](#gridconfig)
+  - [FastControlConfig](#fastcontrolconfig)
 - [Devices](#devices)
   - [🚗 EVConfig](#evconfig)
   - [🧺 MachineConfig](#machineconfig)
@@ -46,12 +47,15 @@
   - [EVChargeScheduler](#evchargescheduler)
   - [EVChargeStage](#evchargestage)
   - [EntityId](#entityid)
+  - [FastBatteryLink](#fastbatterylink)
+  - [FastControlDiagnostics](#fastcontroldiagnostics)
   - [FlexBool](#flexbool)
   - [FlexEnum](#flexenum)
   - [FlexFloat](#flexfloat)
   - [FlexInt](#flexint)
   - [HeatingStage](#heatingstage)
   - [MachineProgram](#machineprogram)
+  - [PowerSensor](#powersensor)
   - [ScheduleEntry](#scheduleentry)
   - [SecretStr](#secretstr)
   - [SocPowerLimit](#socpowerlimit)
@@ -423,6 +427,194 @@ Optional: Home Assistant entity to enable/disable grid balancing mode. Used for 
 **`entity grid setpoint`**
 
 Optional: Home Assistant entity to save the average calculated power on the grid-point. Can be used for XOM-regulation.
+
+</details>
+
+
+### FastControlConfig
+
+_Realtime feedback layer on top of the day-ahead plan._
+
+# Fast Control
+
+A realtime feedback layer that sits on top of the day-ahead plan.
+
+## The problem it solves
+
+The optimizer plans on a 15-minute or hourly grid using a *forecast* of the house
+load and the PV production. Between two runs the battery setpoint is frozen.
+Every watt of forecast error therefore flows straight through the meter:
+
+- An oven starting at 18:03 is imported at the full consumption price, even
+  though the battery is standing by with cheap energy.
+- A cloud passing over the array turns a planned self-consumption into a grid
+  purchase.
+- A load that finishes early turns a planned discharge into an export at the
+  much lower feed-in price.
+
+Each of those costs you the spread between the import and the export price.
+
+## How it works
+
+Every few seconds the layer reads the P1 meter, reconstructs the true house load
+by subtracting the measured battery power, and compares it with the plan. It
+then solves a one-dimensional cost minimisation over the grid setpoint, using
+the current import price, the current export price and the marginal value of a
+kWh in the battery. The result is clamped by the inverter limits, an energy
+trust region around the planned state of charge, and a daily wear budget.
+
+In the normal price regime the solution is simply "cover the deviation from the
+battery". During negative prices or a price spike the same formula automatically
+produces the opposite behaviour, without any special casing.
+
+## Getting started
+
+1. Configure `grid power` with your P1 instantaneous power sensor.
+2. Configure `actual power` for each battery if you have a sensor for it.
+3. Leave `mode` on **shadow** for a few days and inspect
+   `sensor.dao_fast_control` and the log.
+4. Run the backtest to quantify the expected saving:
+   `python3 da_fast.py simulate --days 14`
+5. Switch `mode` to **active**.
+
+## Tuning
+
+- Too much switching: raise `deadband`, `min command interval` and `min benefit`.
+- Too little effect: lower `min benefit`, raise `energy budget`.
+- Battery empty before the evening peak: lower `energy budget`, or switch
+  `storage value mode` to `fixed` with a high value.
+
+
+📚 [**View detailed documentation →**](https://github.com/corneel27/day-ahead/wiki/Fast-Control)
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `mode` | [FlexEnum](#flexenum) | No | `"off"` | Operating mode of the fast control layer _'off', 'shadow' or 'active', or an HA entity id_ |
+| `interval` | integer | No | `15` | Control loop period in seconds (Unit: `s`) |
+| `grid power` | [PowerSensor](#powersensor) | No | _See nested fields_ | Realtime P1 power measurement, positive is import |
+| `pv power` | [PowerSensor](#powersensor) | No | _See nested fields_ | Optional realtime PV power, used for diagnostics only |
+| `max sensor age` | integer | No | `120` | Maximum age of a measurement in seconds before it is considered stale (Unit: `s`) |
+| `max plan age` | integer | No | `5400` | Maximum age of the day-ahead plan in seconds before overriding stops (Unit: `s`) |
+| `batteries` | list[[FastBatteryLink](#fastbatterylink)] | No | `null` | Per battery realtime measurement links |
+| `storage value mode` | [FlexEnum](#flexenum) | No | `"plan"` | How the marginal value of stored energy is determined |
+| `storage value` | [FlexFloat](#flexfloat) (optional) | No | `null` | Marginal value of stored energy in euro/kWh when mode is 'fixed' (Unit: `euro/kWh`) |
+| `round trip efficiency` | number | No | `0.9` | AC to AC round trip efficiency used to value stored energy (Unit: `ratio`) |
+| `min benefit` | number | No | `0.02` | Minimum estimated benefit in euro/hour before the plan is overridden (Unit: `euro/h`) |
+| `deadband` | integer | No | `150` | Minimum setpoint change in W before a new command is sent (Unit: `W`) |
+| `min command interval` | integer | No | `60` | Minimum time in seconds between two setpoint writes (Unit: `s`) |
+| `urgent deviation` | integer | No | `1500` | Deviation in W that is allowed to bypass the minimum command interval (Unit: `W`) |
+| `max ramp` | integer (optional) | No | `null` | Maximum setpoint change in W per command, empty means unlimited (Unit: `W`) |
+| `release deviation` | integer | No | `100` | Deviation in W below which the controller returns to the plan (Unit: `W`) |
+| `release time` | integer | No | `120` | Time in seconds the deviation must stay small before returning to the plan (Unit: `s`) |
+| `energy budget` | number | No | `0.5` | Allowed energy deviation from the planned SoC trajectory, in kWh (Unit: `kWh`) |
+| `daily extra throughput` | number | No | `4.0` | Maximum extra battery throughput per day caused by the fast layer, in kWh (Unit: `kWh/day`) |
+| `soc margin` | number | No | `2.0` | Extra SoC margin in percent kept away from the configured battery limits (Unit: `%`) |
+| `max grid import` | integer (optional) | No | `null` | Optional peak shaving limit on grid import in W (Unit: `W`) |
+| `allow grid charge` | [FlexBool](#flexbool) | No | `false` | Allow the fast layer to increase charging beyond the plan from the grid |
+| `diagnostics` | [FastControlDiagnostics](#fastcontroldiagnostics) | No | _See nested fields_ | Entities written with the controller state |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`mode`**
+
+**off** - the layer does not run at all.
+
+**shadow** - the layer runs, logs every decision and writes its diagnostics, but never touches the inverter. Always start here and compare the logged setpoints against reality for a few days.
+
+**active** - the layer writes the corrected setpoint to the battery.
+
+May also be a Home Assistant entity (input_select) so you can switch modes without restarting the add-on.
+
+**`interval`**
+
+How often the P1 meter is sampled and the setpoint recomputed. 10-20 seconds is a good balance: fast enough to catch an oven or a kettle, slow enough to stay well inside Home Assistant's API budget. Every cycle costs one templated API call.
+
+**`grid power`**
+
+The single most important input. Point this at your P1 reader's instantaneous power sensor. Without it the fast control layer cannot run.
+
+**`pv power`**
+
+Optional. The control law does not need it because PV is already contained in the P1 measurement, but logging it makes the decision trace far easier to interpret.
+
+**`max sensor age`**
+
+When the grid or battery measurement has not updated within this window the controller falls back to the day-ahead plan. Protects against a frozen P1 integration silently driving the battery.
+
+**`max plan age`**
+
+If the optimizer has not produced a fresh plan within this window the fast layer stops overriding. Keep it slightly above your longest gap between calc_optimum runs (default allows one missed hourly run).
+
+**`batteries`**
+
+Leave empty to steer every configured battery with default settings. Add entries to attach a measured power sensor or to exclude a battery.
+
+**`storage value mode`**
+
+The controller compares the current grid price against the marginal value of a kWh sitting in the battery.
+
+**plan** - derived from the remaining day-ahead plan: the cheaper of (best future use of the energy) and (cheapest future refill). This is the recommended setting.
+
+**average** - the average consumption price over the remaining horizon, the same valuation the day-ahead optimizer itself uses.
+
+**fixed** - use the 'storage value' field, optionally backed by an HA entity so you can tune it live.
+
+**`storage value`**
+
+Only used when 'storage value mode' is 'fixed'. Discharging happens when the import price exceeds this value, charging from surplus when this value exceeds the export price. A sensible starting point is your typical evening import price times the round trip efficiency.
+
+**`round trip efficiency`**
+
+Used to discount the value of stored energy. Should match the real AC-to-AC efficiency of your inverter plus battery, typically 0.85-0.92.
+
+**`min benefit`**
+
+An override is only issued when the estimated saving rate exceeds this threshold. Raise it to make the layer more conservative and to ignore small, short deviations. 0.02 euro/hour corresponds to roughly a 100 W correction at a 0.20 euro/kWh spread.
+
+**`deadband`**
+
+Suppresses command chatter caused by measurement noise. Set it above the noise level of your P1 sensor, typically 100-250 W.
+
+**`min command interval`**
+
+Protects the inverter and its Modbus/cloud link against excessive write rates, and keeps the battery from hunting. Check your inverter's documented minimum setpoint interval.
+
+**`urgent deviation`**
+
+A large step, such as an oven or an EV charger starting, may be acted on immediately instead of waiting out the minimum command interval. Set to 0 to always respect the interval.
+
+**`max ramp`**
+
+Optional slew rate limit. Most hybrid inverters ramp internally and do not need this. Set it if your inverter trips on large setpoint steps.
+
+**`release deviation`**
+
+Together with 'release time' this forms the hysteresis that ends an override. Keep it below the deadband to avoid immediate re-engagement.
+
+**`release time`**
+
+Prevents the controller from dropping an override during a short dip, for example between two heating elements of an oven cycling.
+
+**`energy budget`**
+
+The trust region around the day-ahead plan. The fast layer may move at most this much energy more or less than the plan intended within a single plan interval; after that it snaps back. This is what keeps a wrong storage value from emptying the battery before the evening peak. 0.3-1.0 kWh works well for a 10-30 kWh battery.
+
+**`daily extra throughput`**
+
+Hard cap on the additional wear the fast layer is allowed to cause. Counted as the integral of the absolute difference between the actual and the planned battery power. Once exhausted the layer follows the plan for the rest of the day. Set to 0 to disable the cap.
+
+**`soc margin`**
+
+The fast layer stays this far inside the battery's 'lower limit' and 'upper limit'. The day-ahead plan may use the full range; the realtime corrections may not, so a failed plan refresh can never leave the battery stranded at a limit.
+
+**`max grid import`**
+
+When set, the fast layer also acts as a peak shaver: it discharges whatever is needed to keep grid import below this value, regardless of price, as long as the battery has energy and the SoC margin allows it. Useful for capacity tariffs or a marginal main fuse. Leave empty to disable.
+
+**`allow grid charge`**
+
+When disabled (default) the fast layer will charge more than planned only from a genuine surplus, so it never turns a planned export into a grid purchase. Enabling it lets the layer also buy during very cheap or negative price intervals, which is profitable but increases cycling.
 
 </details>
 
@@ -1914,6 +2106,77 @@ Home Assistant entity ID in the format "domain.object_id" (e.g. "sensor.battery_
 *No configuration fields.*
 
 
+### FastBatteryLink
+
+_Links a battery from the `battery` section to its realtime measurements._
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | string | Yes | — | Battery name, must match a name in the battery section |
+| `enabled` | boolean | No | `true` | Allow the fast control layer to steer this battery |
+| `priority` | integer | No | `0` | Dispatch order, lowest number is corrected first |
+| `actual power` | [PowerSensor](#powersensor) | No | _See nested fields_ | Measured AC power of this battery, positive is charging |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`name`**
+
+Exact name of the battery as configured under 'battery'. The fast control layer reuses that battery's stages, capacity, efficiency and setpoint entity.
+
+**`enabled`**
+
+Disable to keep this battery strictly on the day-ahead plan while other batteries are steered in realtime.
+
+**`priority`**
+
+With multiple batteries the correction is handed to the battery with the lowest priority number first; the remainder spills over to the next one.
+
+**`actual power`**
+
+Strongly recommended. Without it the controller assumes the inverter follows its last command exactly, which makes it blind to derating, standby losses and manual overrides.
+
+</details>
+
+
+### FastControlDiagnostics
+
+_Entities the fast control layer writes its own state to._
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `entity status` | string (optional) | No | `"sensor.dao_fast_control"` | Entity written with the controller status and attributes |
+| `entity active` | [EntityId](#entityid) (optional) | No | `null` | Optional input_boolean set to on while an override is active |
+| `entity setpoint` | [EntityId](#entityid) (optional) | No | `null` | Optional input_number receiving the corrected battery setpoint in W |
+| `entity benefit` | [EntityId](#entityid) (optional) | No | `null` | Optional input_number receiving the estimated benefit in euro/hour |
+| `entity saved today` | [EntityId](#entityid) (optional) | No | `null` | Optional input_number with the cumulative saving of today in euro |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`entity status`**
+
+Written through the Home Assistant states API, so the entity does not have to exist up front. Its attributes carry the full decision trace: deviation, storage value, benefit, budget use and the reason for the current decision. Leave empty to disable.
+
+**`entity active`**
+
+Optional helper (input_boolean) that mirrors whether the fast layer is currently deviating from the day-ahead plan.
+
+**`entity setpoint`**
+
+Optional helper (input_number) that records the setpoint the fast layer computed, in watts. Useful in shadow mode to compare the fast layer against the plan without touching the inverter.
+
+**`entity benefit`**
+
+Optional helper (input_number) with the instantaneous estimated saving rate of the current correction, in euro per hour.
+
+**`entity saved today`**
+
+Optional helper (input_number) accumulating the estimated saving since midnight, in euro. Resets at midnight.
+
+</details>
+
+
 ### Unknown
 
 FlexValue enables dynamic configuration using Home Assistant entities. Instead of hardcoding values, reference HA entities that can change at runtime. System automatically detects and resolves entity IDs.
@@ -1988,6 +2251,47 @@ Descriptive name for this program. Examples: 'eco', 'quick wash', 'intensive', '
 **`power`**
 
 Power profile as list of watts per time interval. Length defines program duration. Example: [2000, 2000, 500, 500, 100] for 5-hour wash cycle.
+
+</details>
+
+
+### PowerSensor
+
+_A power measurement read from Home Assistant.
+
+Supports the two shapes commonly produced by P1 / inverter integrations: a
+single signed sensor, or a separate positive-only pair._
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `entity` | [EntityId](#entityid) (optional) | No | `null` | HA entity with the signed power value |
+| `entity positive` | [EntityId](#entityid) (optional) | No | `null` | HA entity with the positive-only part of the power value |
+| `entity negative` | [EntityId](#entityid) (optional) | No | `null` | HA entity with the negative-only part of the power value |
+| `unit` | string | No | `"W"` | Unit of the sensor value (Unit: `W or kW`). Options: `W`, `kW` |
+| `invert` | boolean | No | `false` | Flip the sign of the measured value |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`entity`**
+
+Home Assistant entity holding the power as a single signed number. For the grid meter the convention is positive = import from grid. For a battery the convention is positive = charging. Use 'invert' when your integration uses the opposite sign.
+
+**`entity positive`**
+
+Alternative to 'entity': the sensor that only reports the positive direction (grid import, or battery charging). Combine with 'entity negative'.
+
+**`entity negative`**
+
+Alternative to 'entity': the sensor that only reports the negative direction (grid export, or battery discharging), as a positive number. Combine with 'entity positive'.
+
+**`unit`**
+
+Unit reported by the sensor. kW values are converted to W internally.
+
+**`invert`**
+
+Enable when your integration reports the opposite sign, for example a grid sensor that is positive while exporting.
 
 </details>
 

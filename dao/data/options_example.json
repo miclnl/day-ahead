@@ -107,6 +107,37 @@
     "max_power": 17,
     "entity balance switch": "input_boolean.balanceer_grid"
   },
+  "fast control": {
+    "mode": "shadow",
+    "interval": 15,
+    "grid power": {
+      "entity": "sensor.p1_meter_actief_vermogen",
+      "unit": "W"
+    },
+    "pv power": {
+      "entity": "sensor.pv_vermogen_totaal"
+    },
+    "batteries": [
+      {
+        "name": "Accu1",
+        "actual power": {
+          "entity": "sensor.ess_battery_power"
+        }
+      }
+    ],
+    "storage value mode": "plan",
+    "round trip efficiency": 0.9,
+    "min benefit": 0.02,
+    "deadband": 150,
+    "min command interval": 60,
+    "urgent deviation": 1500,
+    "energy budget": 0.5,
+    "daily extra throughput": 4.0,
+    "soc margin": 2.0,
+    "diagnostics": {
+      "entity status": "sensor.dao_fast_control"
+    }
+  },
   "history": {
     "save days": 7
   },

@@ -1,8 +1,10 @@
 import datetime
+import logging
 import sys
 import time
 from da_base import DaBase
-from subprocess import Popen, PIPE, STDOUT
+from dao.prog.fastctrl.runner import start_if_enabled
+from subprocess import Popen
 
 
 class DaScheduler(DaBase):
@@ -12,6 +14,7 @@ class DaScheduler(DaBase):
         self.scheduler_tasks = {
             entry.time: entry.action for entry in self.config.scheduler.schedule
         }
+        self.fast_control = None
 
     def run_task_process(self, key_task):
         run_task = self.tasks[key_task]
@@ -22,10 +25,30 @@ class DaScheduler(DaBase):
             return False
         return True
 
+    def start_fast_control(self):
+        """Start the realtime feedback layer next to the cron loop.
+
+        It lives in this process on purpose. The watchdog restarts the
+        scheduler whenever options.json changes, so the fast layer picks up
+        configuration changes for free, and a task subprocess blocking the
+        minute tick cannot stall it.
+        """
+        try:
+            self.fast_control = start_if_enabled(self)
+        except Exception as exception:  # noqa: BLE001 - never block the scheduler
+            logging.exception(f"Fast control kon niet worden gestart: {exception}")
+            self.fast_control = None
+
+    def stop_fast_control(self):
+        if self.fast_control is not None:
+            self.fast_control.stop()
+            self.fast_control = None
+
     def scheduler(self):
         # if not (self.notification_entity is None) and self.notification_opstarten:
         #     self.set_value(self.notification_entity, "DAO scheduler gestart " +
         #                    datetime.datetime.now().strftime('%d-%m-%Y %H:%M:%S'))
+        self.start_fast_control()
 
         while True:
             t = datetime.datetime.now()
@@ -57,8 +80,8 @@ class DaScheduler(DaBase):
                         try:
                             self.run_task_process(key_task)
                         except KeyboardInterrupt:
+                            self.stop_fast_control()
                             sys.exit()
-                            pass
                         except Exception as e:
                             print(e)
                             continue
@@ -67,7 +90,10 @@ class DaScheduler(DaBase):
 
 def main():
     da_sched = DaScheduler("../data/options.json")
-    da_sched.scheduler()
+    try:
+        da_sched.scheduler()
+    finally:
+        da_sched.stop_fast_control()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,40 @@
 # Changelog 刀 DAO
 # Day Ahead Optimizer
+# Unreleased
+
+## Snelle regellaag (fast control)
+Nieuwe, standaard uitgeschakelde regellaag die bovenop de dag-vooruit planning draait.
+De optimalisering plant op een uur- of kwartierraster met een *prognose* van je verbruik;
+tussen twee berekeningen staat het accusetpoint vast en loopt elke prognosefout recht door
+de meter. De nieuwe laag leest elke 10 tot 20 seconden je P1-meter en corrigeert het
+setpoint, maar alleen als dat economisch zinvol is en alleen binnen een energiebudget rond
+het geplande SoC-verloop. Zie [DOCS.md](DOCS.md#snelle-regellaag-fast-control).
+
+- nieuwe configuratiesectie `fast control`, standaard `mode: off`
+- modus `shadow` rekent alles door en logt het, zonder de omvormer aan te raken
+- de optimalisering schrijft na elke geslaagde berekening `data/fast_plan.json`, het
+  overdrachtsbestand tussen de twee lagen
+- beslissingen worden gepubliceerd op `sensor.dao_fast_control` met het volledige
+  beslisspoor in de attributen, geen helpers nodig
+- ingebouwde terugrekening op je eigen historie: `python3 da_fast.py simulate --days 14`,
+  of via `<url>/api/run/fast_control_simulate`
+- slijtage begrensd met een energiebudget per interval, een dagbudget op extra doorzet,
+  een minimaal rendement per ingreep, een deadband en een minimale schakeltijd
+- optioneel piekscheren met `max grid import`
+- een cyclus kost een enkele api-aanroep dankzij een gebundelde template-render, met
+  automatische terugval op losse state-verzoeken
+
+## Correcties
+- `boiler.cop` had een kale float als default op een `FlexFloat`-veld, waardoor
+  `model_dump()` van een ingeschakelde boiler een serialisatiefout gaf
+- `FlexEnum`-velden met een alias (spaties in de sleutel) kregen hun toegestane waarden
+  niet geïnjecteerd en werden daardoor niet gevalideerd
+- `SolarPredictor.get_weatherdata` plakte `temp` en `winds` op **rijpositie** aan de
+  stralingsreeks in plaats van op tijdstempel. Eén ontbrekend uur verschoof daardoor een
+  hele kolom ten opzichte van de andere, zonder zichtbare fout
+- tekenfout in de zonnestand van de outlierfilter: de zonnemiddag lag 42 minuten
+  verkeerd om voor Nederland
+
 # 2026.9.1
 - removed us of pipe, let the child inherit the scheduler's stdout/stderr: (#812)
 - added git and nano to the installed packages

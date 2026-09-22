@@ -7,6 +7,7 @@
 [Instellingen](#instellingen)<br>
 [Dashboard](#dashboard) <br>
 [Configuratie](#configuratie) <br>
+[Snelle regellaag](#snelle-regellaag-fast-control) <br>
 [CO2 emissie](#co2-emissie) <br>
 [Api](#api) <br>
 [Terminal](#terminal)
@@ -1612,6 +1613,280 @@ Bijvoorbeeld : <br/>
 `"0955": "get_meteo_data"`: de meteodata worden opgehaald om 9 uur 55<br/>
 `"1255": "get_day_ahead_prices"`: haal de actuele prijzen op om 12 uur 55<br>
 `"xx00": "calc_optimum"`: ieder uur exact om "00" wordt de optimaliseringsberekening uitgevoerd.
+
+---
+
+## Snelle regellaag (fast control)
+
+### Waarom
+
+De optimaliseringsberekening plant op een raster van een uur of een kwartier, op basis van een
+**prognose** van je huisverbruik en je pv-opbrengst. Tussen twee berekeningen staat het
+setpoint van de accu vast. Elke watt prognosefout loopt daardoor recht door de meter:
+
+* De oven die om 18:03 aangaat wordt volledig van het net betrokken tegen het volle
+  leveringstarief, terwijl de accu er met goedkope stroom naast staat.
+* Een wolk boven de panelen maakt van geplande zelfconsumptie ineens netinkoop.
+* Een wasmachine die eerder klaar is maakt van een geplande ontlading een teruglevering
+  tegen het veel lagere terugleveringstarief.
+
+Elk van die drie kost je het verschil tussen het leverings- en het terugleveringstarief.
+Bij een spread van 0,20 euro/kWh en 3 tot 6 kWh prognosefout per dag praat je over
+0,30 tot 0,60 euro per dag.
+
+De snelle regellaag leest daarom elke 10 tot 20 seconden je P1-meter en corrigeert het
+accusetpoint, maar alleen als corrigeren economisch zinvol is en alleen binnen een
+energiebudget rond het geplande SoC-verloop.
+
+### Hoe het werkt
+
+Elke cyclus reconstrueert de laag eerst je echte huisverbruik uit de meting:
+
+```
+huis = netvermogen - accuvermogen
+```
+
+Daarna minimaliseert hij de kosten per uur over het accusetpoint `p`:
+
+```
+net(p) = huis + p
+kosten(p) =  leveringstarief        * max(net, 0) / 1000
+           - terugleveringstarief   * max(-net, 0) / 1000
+           - opslagwaarde * rendement * max(p, 0) / 1000
+           - opslagwaarde             * min(p, 0) / 1000
+           + cycluskosten * abs(p) / 1000
+```
+
+Die functie is convex en stuksgewijs lineair, dus het minimum ligt altijd op een van vier
+punten en is exact te berekenen. De uitkomst wordt begrensd door de omvormerlimieten, het
+SoC-werkgebied, het energiebudget rond het plan en een dagelijks slijtagebudget.
+
+In het normale prijsregime (`teruglevering < opslagwaarde < levering`) komt daar gewoon
+"dek de afwijking uit de accu" uit, oftewel zelfconsumptie. Bij negatieve prijzen of een
+prijspiek draait dezelfde formule het gedrag vanzelf om, zonder uitzonderingen in de code.
+
+### De opslagwaarde
+
+`opslagwaarde` is de marginale waarde van een kWh in de accu. Dat getal koppelt het
+eenperiodeprobleem van de snelle laag aan het meerperiodeprobleem van de optimalisering.
+Met de instelling `storage value mode: plan` wordt hij afgeleid uit het resterende plan:
+
+* **beste toepassing** = rendement x de hoogste resterende leveringsprijs tot aan het
+  laagste punt in het geplande SoC-verloop;
+* **goedkoopste aanvulling** = de laagste leveringsprijs in datzelfde venster, gedeeld door
+  het rendement;
+* de opslagwaarde is de **laagste** van die twee, want het plan kiest vanzelf de goedkoopste
+  van de twee routes.
+
+Daar komt een tweede vraag bij: *heeft het plan die energie eigenlijk wel nodig?* Blijft het
+laagste punt in het geplande SoC-verloop ruim boven je `lower limit`, dan draagt je accu
+energie mee waar het plan geen bestemming voor heeft. Die kun je nu uitgeven zonder ook maar
+een enkele geplande ontlading in te korten; je eindigt alleen lager. Zulke overtollige energie
+krijgt de waarde die de optimalisering er zelf aan hangt: het gemiddelde tarief over de
+horizon maal het rendement. Tussen "krap" en "overtollig" wordt geleidelijk overgegaan over
+10% van de accucapaciteit.
+
+Zonder die tweede stap zou de laag weigeren om een avondpiek te dekken terwijl hij op een
+volle accu zit waar het plan niets mee van plan is, en dat is juist het waardevolste wat hij
+kan doen.
+
+Gevolg van dit alles: de snelle laag gaat nooit zelf inkopen om te handelen op de
+prijsverschillen tussen de uren. Dat is en blijft het werk van de optimalisering, die als
+enige alle randvoorwaarden ziet. De snelle laag doet alleen wat de optimalisering per
+definitie niet kan doen: reageren op wat er nu echt gebeurt.
+
+### Wat je nodig hebt
+
+| Nodig | Waarvoor |
+|---|---|
+| Een P1-sensor met het **actuele** vermogen in W | zonder dit doet de laag niets |
+| Een accu met een setpoint-entity (`entity set power feedin`) | die had je al voor DAO |
+| Een sensor met het **gemeten** accuvermogen | sterk aanbevolen, zie hieronder |
+| Een SoC-sensor (`entity actual level`) | die had je al voor DAO |
+
+Zonder gemeten accuvermogen gaat de laag ervan uit dat de omvormer zijn laatste commando
+exact volgt. Hij is dan blind voor derating, standbyverbruik en handmatige overrides.
+
+### Instellen
+
+```json
+"fast control": {
+  "mode": "shadow",
+  "interval": 15,
+  "grid power": {
+    "entity": "sensor.p1_meter_actief_vermogen",
+    "unit": "W"
+  },
+  "pv power": {
+    "entity": "sensor.pv_vermogen_totaal"
+  },
+  "batteries": [
+    {
+      "name": "Accu1",
+      "actual power": { "entity": "sensor.ess_battery_power" }
+    }
+  ],
+  "storage value mode": "plan",
+  "round trip efficiency": 0.9,
+  "min benefit": 0.02,
+  "deadband": 150,
+  "min command interval": 60,
+  "urgent deviation": 1500,
+  "energy budget": 0.5,
+  "daily extra throughput": 4.0,
+  "soc margin": 2.0,
+  "diagnostics": { "entity status": "sensor.dao_fast_control" }
+}
+```
+
+De `name` onder `batteries` moet exact overeenkomen met de `name` in de `battery`-sectie.
+
+Heeft jouw integratie geen enkele sensor met een teken, maar twee losse sensoren voor
+inkoop en teruglevering? Gebruik dan:
+
+```json
+"grid power": {
+  "entity positive": "sensor.p1_vermogen_inkoop",
+  "entity negative": "sensor.p1_vermogen_teruglevering"
+}
+```
+
+Rapporteert je sensor positief bij teruglevering, zet dan `"invert": true`. Levert hij kW in
+plaats van W, zet dan `"unit": "kW"`.
+
+Alle instellingen staan met uitleg en eenheid in [SETTINGS.md](../SETTINGS.md).
+
+### In gebruik nemen
+
+Doe dit in deze volgorde. Stap 1 tot en met 3 raken je accu niet aan.
+
+1. **Zet `mode` op `shadow`.** De laag rekent alles door, logt elke beslissing en schrijft
+   `sensor.dao_fast_control`, maar stuurt niets naar de omvormer.
+2. **Controleer de bedrading.** Draai een enkele cyclus en kijk of de getallen kloppen:
+   ```
+   cd /root/dao/prog
+   python3 da_fast.py once
+   ```
+   Let vooral op `house_w`: dat hoort je echte huisverbruik te zijn, zonder accu. Klopt het
+   teken niet, dan staat `invert` verkeerd.
+3. **Reken het terug op je eigen historie.**
+   ```
+   python3 da_fast.py simulate --days 14
+   ```
+   Dit speelt je gemeten verbruik twee keer af tegen je eigen historische planningen: een
+   keer zoals het nu gaat en een keer door dezelfde regellogica die live zou draaien. Je
+   krijgt de besparing, het aantal extra cycli, het SoC-verloop en het aantal
+   setpoint-schrijfacties. De terugrekening prijst ook de energie die aan het eind nog in de
+   accu zit, zodat "eindig leger" niet als winst wordt geboekt.
+
+   Let op de waarschuwing over de resolutie. Home Assistant bewaart standaard maar tien
+   dagen aan gedetailleerde historie (`purge_keep_days`), en de langetermijnstatistieken
+   zijn per uur. Op uurgemiddelden zijn korte verbruikspieken onzichtbaar en wordt de
+   besparing dus **onderschat**.
+4. **Zet `mode` op `active`.** Begin gerust met een klein `energy budget` (0,2 kWh) en een
+   hoge `min benefit` (0,05 euro/uur) en bouw dat op zodra je het gedrag vertrouwt.
+
+Wil je zonder herstarten kunnen schakelen, maak dan een `input_select` met de opties `off`,
+`shadow` en `active` en zet `"mode": "input_select.dao_fast_mode"`.
+
+### Wat je terugziet in Home Assistant
+
+De laag schrijft `sensor.dao_fast_control` via de states-api, dus je hoeft daar geen helper
+voor aan te maken. De attributen bevatten het hele beslisspoor:
+
+| Attribuut | Betekenis |
+|---|---|
+| `reason` | waarom deze beslissing: `plan`, `override`, `deadband`, `rate_limited`, `energy_budget`, `daily_budget`, `soc_limit`, `below_min_benefit`, `peak_shave`, `no_grid_charge`, `sensor_stale`, `soc_unknown`, `disabled`, `plan_expired` |
+| `house_w` | gereconstrueerd huisverbruik zonder accu |
+| `deviation_w` | verschil met wat het plan verwachtte |
+| `price_import` / `price_export` | de twee tarieven van dit interval |
+| `benefit_eur_h` | geschat voordeel van de correctie, in euro per uur |
+| `batteries[].storage_value` | de gebruikte marginale opslagwaarde in euro/kWh |
+| `batteries[].budget_used_kwh` | verbruik van het energiebudget in dit interval |
+| `batteries[].daily_used_kwh` | verbruik van het dagelijkse slijtagebudget |
+| `saved_today_eur` | geschatte besparing sinds middernacht |
+
+Optioneel kun je onder `diagnostics` ook losse helpers laten vullen: `entity active`
+(input_boolean), `entity setpoint`, `entity benefit` en `entity saved today` (input_number).
+
+### Slijtage in de hand houden
+
+Er zitten vier onafhankelijke remmen op de laag. Ze werken allemaal met een geleidelijke
+overgang, niet met een harde knip.
+
+1. **`min benefit`** (euro/uur). Een correctie wordt alleen doorgevoerd als het geschatte
+   voordeel hierboven ligt. Dit filtert alle kleine, kortdurende afwijkingen weg.
+   0,02 euro/uur komt ongeveer overeen met 100 W bij een spread van 0,20 euro/kWh.
+2. **`energy budget`** (kWh). Binnen een planinterval mag de laag hooguit dit aantal kWh
+   meer of minder verplaatsen dan het plan wilde. Dit is wat voorkomt dat een verkeerd
+   geschatte opslagwaarde je accu leegtrekt voor de avondpiek.
+3. **`daily extra throughput`** (kWh per dag). Harde bovengrens op de extra doorzet die de
+   laag mag veroorzaken, geteld als de integraal van het absolute verschil tussen het
+   werkelijke en het geplande accuvermogen. Op = plan volgen tot middernacht.
+4. **`deadband`**, **`min command interval`**, **`max ramp`**, **`release deviation`** en
+   **`release time`**. Deze houden het aantal schrijfacties en het heen-en-weer schakelen
+   laag. `urgent deviation` maakt hierop een uitzondering voor grote sprongen, zoals een
+   oven of een laadpaal die aanslaat.
+
+Drie profielen om mee te beginnen:
+
+| | maximale besparing | gebalanceerd | lage slijtage |
+|---|---|---|---|
+| `min benefit` | 0.01 | 0.02 | 0.06 |
+| `energy budget` | 1.5 | 0.5 | 0.15 |
+| `daily extra throughput` | 10.0 | 4.0 | 1.0 |
+| `deadband` | 100 | 150 | 300 |
+| `min command interval` | 30 | 60 | 180 |
+| `interval` | 10 | 15 | 30 |
+
+De terugrekening laat je het verschil gewoon zien: draai hem met verschillende waarden en
+kijk naar de regel "Besparing per extra kWh accudoorzet". Zit die onder je eigen
+cycluskosten, dan koop je de besparing te duur.
+
+### Piekscheren
+
+Zet `max grid import` om de laag ook als piekscheerder te gebruiken. Hij ontlaadt dan wat
+nodig is om de netafname onder die grens te houden, ongeacht de prijs, zolang er energie in
+de accu zit en het SoC-werkgebied het toelaat. Handig bij een capaciteitstarief of een
+krappe hoofdzekering. Piekscheren gaat vóór de economie, maar nooit vóór de hardware- en
+SoC-grenzen.
+
+### Veiligheid
+
+* De planwaarde ligt altijd binnen de toegestane verzameling. Het slechtste wat de laag kan
+  doen is precies wat de optimalisering al besloten had.
+* Een meting die ouder is dan `max sensor age` telt als verouderd; de laag valt terug op het
+  plan.
+* Een plan dat ouder is dan `max plan age` wordt niet meer vertrouwd; de laag valt terug op
+  het plan. Standaard staat dat op 90 minuten, ruim boven een gemiste uurberekening.
+* De laag houdt `soc margin` procent afstand tot de `lower limit` en `upper limit` van je
+  accu. De optimalisering mag het hele bereik gebruiken, de snelle correcties niet.
+* Een mislukte schrijfactie stopt de regellus niet; hij wordt gelogd en na drie keer alleen
+  nog elke twintigste keer, zodat een kapotte entity je log niet volschrijft.
+* De regellus draait als aparte thread in het scheduler-proces. Een vastlopende taak blokkeert
+  hem niet, en de watchdog herstart hem automatisch zodra `options.json` wijzigt.
+
+### Belasting van Home Assistant
+
+Eén cyclus is één api-aanroep, ongeacht het aantal sensoren: alle entiteiten worden in een
+enkele template opgehaald. Bij `interval: 15` zijn dat 4 aanroepen per minuut, plus een
+schrijfactie zodra het setpoint echt verandert. Ondersteunt jouw installatie de template-api
+niet, dan schakelt de laag automatisch over op losse state-verzoeken en meldt dat in het log.
+
+### Commando's
+
+```
+python3 da_fast.py once                  # eenmalige cyclus, print de beslissing
+python3 da_fast.py plan                  # toon het actuele plan
+python3 da_fast.py run                   # regellus op de voorgrond
+python3 da_fast.py simulate --days 14    # terugrekenen op je eigen historie
+python3 da_fast.py demo                  # terugrekenen op een synthetische dag
+```
+
+De terugrekening is ook bereikbaar via de api:
+`<url>/api/run/fast_control_simulate`. Het resultaat komt in
+`data/log/fast_simulate_<datum>.log`.
+
 
 ---
 

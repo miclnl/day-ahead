@@ -313,6 +313,12 @@ class DaBase(hass.Hass):
                 "function": "consolidate_data",
                 "file_name": "consolidate",
             },
+            "fast_control_simulate": {
+                "name": "Snelle regellaag: terugrekenen op historie",
+                "cmd": ["python3", "../prog/da_fast.py", "simulate"],
+                "function": "fast_control_simulate",
+                "file_name": "fast_simulate",
+            },
         }
         return tasks
 
@@ -585,6 +591,31 @@ class DaBase(hass.Hass):
 
         report = Report()
         report.calc_save_baseloads()
+
+    def fast_control_simulate(self):
+        """Backtest the fast control layer on the recorded history.
+
+        Exposed as a task so it can be started from the dashboard and from
+        ``GET /api/run/fast_control_simulate``; the result lands in the task
+        log. Use ``python3 da_fast.py simulate`` for other periods.
+        """
+        from da_fast import main as fast_main
+
+        days = 7
+        if len(sys.argv) > 2:
+            try:
+                days = int(sys.argv[2])
+            except ValueError:
+                logging.warning(f"Ongeldig aantal dagen: {sys.argv[2]}, 7 gebruikt")
+        fast_main(
+            [
+                "--options",
+                self.file_name or "../data/options.json",
+                "simulate",
+                "--days",
+                str(days),
+            ]
+        )
 
     def calc_solar_predictions(
         self,

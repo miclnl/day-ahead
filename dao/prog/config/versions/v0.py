@@ -15,6 +15,7 @@ from ..models.pricing import PricingConfig
 from ..models.graphics import GraphicsConfig
 from ..models.notifications import NotificationsConfig
 from ..models.grid import GridConfig
+from ..models.fastcontrol import FastControlConfig
 from ..models.history import HistoryConfig
 from ..models.dashboard import DashboardConfig
 from ..models.tibber import TibberConfig
@@ -229,6 +230,12 @@ class ConfigurationV0(DAOConfigBaseModel):
         default_factory=GridConfig,
         description="Grid connection settings",
         json_schema_extra={"x-ui-section": "Grid"},
+    )
+    fast_control: FastControlConfig = Field(
+        default_factory=FastControlConfig,
+        alias="fast control",
+        description="Realtime feedback layer that corrects the plan between optimizer runs",
+        json_schema_extra={"x-ui-section": "Fast control"},
     )
     history: HistoryConfig = Field(
         default_factory=HistoryConfig, description="History retention settings"

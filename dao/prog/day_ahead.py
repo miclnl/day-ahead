@@ -26,6 +26,12 @@ from utils import (
 )
 import logging
 from dao.prog.da_base import DaBase
+from dao.prog.fastctrl.plan import (
+    FAST_PLAN_FILE,
+    BatterySpec,
+    build_plan,
+    write_plan,
+)
 
 _libc = ctypes.CDLL(None)
 
@@ -3816,6 +3822,11 @@ class DaCalc(DaBase):
             )
         logging.debug("\n")
 
+        # Gevuld in het batterij-blok hieronder; hier alvast gedeclareerd zodat
+        # het wegschrijven van fast_plan.json ook lukt als het publiceren
+        # halverwege afbreekt.
+        published_battery: list[dict] = []
+
         try:
             if self.boiler_present:
                 if float(c_b[0].x) > 0.0:
@@ -4124,6 +4135,9 @@ class DaCalc(DaBase):
             ############################################
             # battery
             ############################################
+            # Wat er per batterij daadwerkelijk naar de omvormer gaat, wordt in
+            # de lus hieronder verzameld. De snelle regellaag krijgt dit mee in
+            # fast_plan.json zodat hij precies weet waar hij naar terug moet.
             for b in range(B):
                 # vermogen aan ac kant
                 netto_vermogen_bat = int(1000 * (ac_to_dc[b][0].x - ac_from_dc[b][0].x))
@@ -4219,6 +4233,13 @@ class DaCalc(DaBase):
                     first_row.from_ac.kWh * 1000 / hour_fraction_first_interval
                 )
                 calculated_soc = round(soc[b][1].x, 1)
+                published_battery.append(
+                    {
+                        "power_w": float(netto_vermogen_bat),
+                        "mode": new_state,
+                        "stop_inverter": stop_str,
+                    }
+                )
                 logging.info(f"Cycle cost {bat_name}: {cycle_cost[b].x:<0.2f} euro")
                 if self.debug:
                     logging.info(
@@ -4477,6 +4498,37 @@ class DaCalc(DaBase):
         except Exception as ex:
             error_handling(ex)
             logging.error(f"Onverwachte fout: {ex}")
+
+        #############################################
+        # hand-off naar de snelle regellaag
+        #############################################
+        try:
+            self.export_fast_plan(
+                tijd=tijd,
+                hour_fraction=hour_fraction,
+                pl=pl,
+                pt=pt,
+                c_l=c_l,
+                c_t=c_t,
+                solar_hour_sum_opt=solar_hour_sum_opt,
+                ac_to_dc=ac_to_dc,
+                ac_from_dc=ac_from_dc,
+                soc=soc,
+                max_charge_power=max_charge_power,
+                max_discharge_power=max_discharge_power,
+                kwh_cycle_cost=kwh_cycle_cost,
+                lower_limit=lower_limit,
+                upper_limit=upper_limit,
+                eff_dc_to_bat=eff_dc_to_bat,
+                eff_bat_to_dc=eff_bat_to_dc,
+                published_battery=published_battery,
+                p_avg=p_avg,
+                U=U,
+                B=B,
+            )
+        except Exception as ex:
+            error_handling(ex)
+            logging.error(f"Plan voor de snelle regellaag kon niet worden weggeschreven: {ex}")
 
         #############################################
         # graphs
@@ -5083,6 +5135,93 @@ class DaCalc(DaBase):
         plt.close("all")
         self.notify("DAO calc afgerond", self.notification_berekening)
         return None
+
+    def export_fast_plan(
+        self,
+        tijd: list,
+        hour_fraction: list,
+        pl: list,
+        pt: list,
+        c_l: list,
+        c_t: list,
+        solar_hour_sum_opt: list,
+        ac_to_dc: list,
+        ac_from_dc: list,
+        soc: list,
+        max_charge_power: list,
+        max_discharge_power: list,
+        kwh_cycle_cost: list,
+        lower_limit: list,
+        upper_limit: list,
+        eff_dc_to_bat: list,
+        eff_bat_to_dc: list,
+        published_battery: list,
+        p_avg: float,
+        U: int,
+        B: int,
+        path: str = FAST_PLAN_FILE,
+    ) -> None:
+        """Serialise the solution for the fast control layer.
+
+        Only what the realtime loop needs: per interval the two prices, the
+        planned net grid power and the planned house load, and per battery the
+        planned AC power and state of charge, plus the static battery
+        properties it needs to clamp its corrections.
+
+        Skipped in debug mode, so a debug run never disturbs a live fast loop.
+        """
+        if self.debug:
+            logging.info("Plan voor de snelle regellaag is niet opgeslagen (debug)")
+            return
+        if U <= 0:
+            return
+
+        specs = [
+            BatterySpec(
+                name=self.battery_options[b].name,
+                capacity_kwh=float(self.battery_options[b].capacity),
+                max_charge_w=float(max_charge_power[b]) * 1000.0,
+                max_discharge_w=float(max_discharge_power[b]) * 1000.0,
+                minimum_power_w=float(self.battery_options[b].minimum_power or 0),
+                soc_min=float(lower_limit[b]),
+                soc_max=float(upper_limit[b]),
+                cycle_cost=float(kwh_cycle_cost[b]),
+                charge_efficiency=float(eff_dc_to_bat[b]),
+                discharge_efficiency=float(eff_bat_to_dc[b]),
+                setpoint_entity=self.battery_options[b].entity_set_power_feedin,
+                mode_entity=self.battery_options[b].entity_set_operating_mode,
+                mode_on=self.battery_options[b].entity_set_operating_mode_on or "Aan",
+                mode_off=self.battery_options[b].entity_set_operating_mode_off or "Uit",
+                stop_inverter_entity=self.battery_options[b].entity_stop_inverter,
+                soc_entity=self.battery_options[b].entity_actual_level,
+            )
+            for b in range(B)
+        ]
+
+        plan = build_plan(
+            created_ts=int(time.time()),
+            interval_s=self.interval_s,
+            specs=specs,
+            start_ts=[int(tijd[u].timestamp()) for u in range(U)],
+            hour_fraction=[hour_fraction[u] for u in range(U)],
+            price_import=[float(pl[u]) for u in range(U)],
+            price_export=[float(pt[u]) for u in range(U)],
+            grid_kwh=[c_l[u].x - c_t[u].x for u in range(U)],
+            pv_kwh=[solar_hour_sum_opt[u] for u in range(U)],
+            battery_kw=[
+                [ac_to_dc[b][u].x - ac_from_dc[b][u].x for u in range(U)]
+                for b in range(B)
+            ],
+            soc=[[soc[b][u].x for u in range(U + 1)] for b in range(B)],
+            published=published_battery,
+            strategy=str(self.strategy),
+            price_average=float(p_avg),
+        )
+        write_plan(plan, path)
+        logging.info(
+            f"Plan voor de snelle regellaag opgeslagen: {len(plan.intervals)} "
+            f"intervallen, {len(specs)} batterij(en)"
+        )
 
     def calc_optimum_debug(self):
         self.debug = True
