@@ -1,6 +1,6 @@
 #include <tunables/global>
 
-profile day_ahead_opt flags=(attach_disconnected,mediate_deleted) {
+profile dao_plus flags=(attach_disconnected,mediate_deleted) {
 
   #include <abstractions/base>
 
