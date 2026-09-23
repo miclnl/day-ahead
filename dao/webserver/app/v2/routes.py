@@ -272,7 +272,7 @@ def get_solar_items_with_ml():
 def chart():
     kwargs = log_chart("images/", "*.png")
     if kwargs is None:
-        return render_template("v2/no-tasks.html", )
+        return render_template("v2/no-task.html", )
 
     kwargs["image"] = url_for('static', filename="data/images/" + kwargs["filename"])
     return render_template(
@@ -285,7 +285,7 @@ def chart():
 def log():
     kwargs = log_chart("log/", "*.log")
     if kwargs is None:
-        return render_template("v2/no-tasks.html", )
+        return render_template("v2/no-task.html", )
 
     log_file = app_datapath + "log/" + kwargs["filename"]
     with open(log_file, "r") as f:

@@ -113,14 +113,21 @@ while true; do
                 echo "Scheduler stopped normally"
             else
                 echo "Scheduler crashed with exit code $EXIT"
-                sleep 2
+                echo "Keeping the web UI up; restarting the scheduler with backoff."
+                echo "Edit the config from the settings page if it needs fixing."
+                # Backoff so we do not spam logs while the user fixes
+                # the config via the web UI. The inotify watcher picks
+                # up config edits on its own, so the user does not have
+                # to wait for this sleep to end.
+                sleep 30
             fi
 
-            # Gunicorn stoppen omdat we daarna beide opnieuw
-            # willen starten.
-            stop_gunicorn
-
-            break
+            # Alleen de scheduler herstarten. Gunicorn en daarmee de
+            # web UI blijven draaien zodat de gebruiker de config
+            # kan repareren. Inotify ook herstarten zodat
+            # config-wijzigingen nog steeds worden opgepikt.
+            start_scheduler
+            start_inotify
         fi
 
 
@@ -139,12 +146,13 @@ while true; do
                 echo "Gunicorn stopped normally"
             else
                 echo "Gunicorn crashed with exit code $EXIT"
-                sleep 2
+                echo "Keeping the scheduler up; restarting gunicorn with backoff."
+                sleep 30
             fi
 
-            stop_scheduler
-
-            break
+            # Alleen gunicorn herstarten; de scheduler doorlatend.
+            start_gunicorn
+            start_inotify
         fi
 
 

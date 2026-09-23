@@ -92,6 +92,8 @@ van zo'n acht waarnemingen per weekdag en uur, zonder enige bescherming.
   stilzwijgend `avg`, ook als het om kWh ging
 - `get_sensor_period_sum` telt sensoren nu altijd op tijdstempel bij elkaar op; de oude
   snelkoppeling op gelijke lengte leverde NaN zodra één sensor een gat had
+- `/v2/chart` en `/v2/log` riepen `v2/no-tasks.html` aan terwijl de template
+  `no-task.html` heet. Beide endpoints gaven een 500 zolang er nog geen run was
 
 # 2026.9.1
 - removed us of pipe, let the child inherit the scheduler's stdout/stderr: (#812)
