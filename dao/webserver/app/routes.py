@@ -436,7 +436,7 @@ def fast_control():
             is_entity = hasattr(mode_field, "is_entity_id") and mode_field.is_entity_id(raw)
             new_mode = request.form.get("mode", "").strip()
             if is_entity:
-                error = "Mode wordt gestuurd door een HA entity"
+                return "Mode wordt gestuurd door een HA entity", 400
             elif new_mode not in ("off", "shadow", "active"):
                 error = "Ongeldige modus"
             else:
