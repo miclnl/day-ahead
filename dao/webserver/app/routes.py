@@ -88,6 +88,10 @@ web_menu = {
     "run": {
         "name": "Run",
     },
+    "fast_control": {
+        "name": "Fast control",
+        "submenu": {},
+    },
     "reports": {
         "name": "Reports",
         "submenu": {
@@ -323,6 +327,8 @@ def menu():
             return home()
         elif current_menu == "run":
             return run_process()
+        elif current_menu == "fast_control":
+            return fast_control()
         elif current_menu == "reports" or current_menu == "savings":
             return reports(current_menu)
         elif current_menu == "solar" and "solar" in web_menu_items.keys():
@@ -336,6 +342,8 @@ def menu():
             return home()
         elif "menu_run" in lst:
             return run_process()
+        elif "menu_fast_control" in lst:
+            return fast_control()
         elif "menu_reports" in lst:
             return reports("reports")
         elif "menu_savings" in lst:
@@ -346,6 +354,13 @@ def menu():
             return settings()
         else:
             return home()
+
+
+# Temporary stub for Task 12 - replaced by the real view in Task 14.
+# This stub lets the menu() dispatch resolve the symbol so the file stays
+# importable; the 501 makes it clear the view has not landed yet.
+def fast_control():
+    return "fast_control view lands in Task 14", 501
 
 
 @app.route("/", methods=["POST", "GET"])
