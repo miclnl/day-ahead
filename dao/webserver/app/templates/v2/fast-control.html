@@ -9,12 +9,19 @@
   <span class="badge bg-{{ 'success' if mode == 'active' else ('warning' if mode == 'shadow' else 'secondary') }}">{{ mode|upper }}</span>
 </div>
 
-<form method="post" action="{{ url_for('v2.fast_control_mode') }}" class="mb-3">
+<form method="post" action="{{ url_for('v2.fast_control_mode') }}" class="mb-3"
+      title="{{ 'Mode wordt gestuurd door een HA entity' if mode_is_entity else '' }}">
   <div class="btn-group" role="group">
-    <button type="submit" name="mode" value="off" class="btn btn-outline-secondary" {{ 'disabled' if mode == 'off' else '' }}>Off</button>
-    <button type="submit" name="mode" value="shadow" class="btn btn-outline-warning" {{ 'disabled' if mode == 'shadow' else '' }}>Shadow</button>
-    <button type="submit" name="mode" value="active" class="btn btn-outline-success" {{ 'disabled' if mode == 'active' else '' }}>Active</button>
+    <button type="submit" name="mode" value="off" class="btn btn-outline-secondary"
+            {{ 'disabled' if (mode_is_entity or mode == 'off') else '' }}>Off</button>
+    <button type="submit" name="mode" value="shadow" class="btn btn-outline-warning"
+            {{ 'disabled' if (mode_is_entity or mode == 'shadow') else '' }}>Shadow</button>
+    <button type="submit" name="mode" value="active" class="btn btn-outline-success"
+            {{ 'disabled' if (mode_is_entity or mode == 'active') else '' }}>Active</button>
   </div>
+  {% if mode_is_entity %}
+  <small class="text-muted ms-2">Mode wordt gestuurd door een HA entity</small>
+  {% endif %}
 </form>
 
 <form method="post" action="{{ url_for('v2.task_exec') }}" class="mb-3 d-flex align-items-center gap-2">

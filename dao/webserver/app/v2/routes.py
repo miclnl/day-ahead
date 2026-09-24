@@ -6,6 +6,7 @@ from subprocess import Popen, PIPE, run, STDOUT, DEVNULL
 from pathlib import Path
 from dao.prog.da_report import Report
 from dao.prog.config.loader import ConfigurationLoader
+from dao.prog.config.models.base import FlexEnum
 
 v2 = Blueprint("v2", __name__)
 
@@ -715,27 +716,73 @@ def _load_config():
 
 
 def _resolved_mode(config):
+    """Return (display_string, is_entity_backed)."""
     if config is None:
-        return "off"
+        return "off", False
     fast = getattr(config, "fast_control", None)
     if fast is None:
-        return "off"
+        return "off", False
     mode_field = fast.mode
-    raw = str(getattr(mode_field, "value", mode_field)).strip().lower()
-    return raw if raw in ("off", "shadow", "active") else "off"
+    raw_value = getattr(mode_field, "value", mode_field)
+    is_entity = hasattr(mode_field, "is_entity_id") and mode_field.is_entity_id(raw_value)
+    if is_entity:
+        return "off", True
+    raw = str(raw_value).strip().lower()
+    return (raw if raw in ("off", "shadow", "active") else "off"), False
 
 
 @v2.route("/fast-control")
 def fast_control():
     state = _load_fast_state()
     config = _load_config()
-    mode = _resolved_mode(config)
+    mode, mode_is_entity = _resolved_mode(config)
     last_decision = state.get("last_decision")
     events = state.get("events", [])
     return render_template(
         "v2/fast-control.html",
         state=state,
         mode=mode,
+        mode_is_entity=mode_is_entity,
         last_decision=last_decision,
         events=events[-50:][::-1],   # last 50, newest first
     )
+
+
+@v2.route("/fast-control/state")
+def fast_control_state():
+    state = _load_fast_state()
+    last_decision = state.get("last_decision")
+    return render_template(
+        "v2/fast-control-state.html",
+        state=state,
+        last_decision=last_decision,
+    )
+
+
+@v2.route("/fast-control/mode", methods=["POST"])
+def fast_control_mode():
+    config = _load_config()
+    if config is None:
+        return "Config onleesbaar", 400
+    fast = getattr(config, "fast_control", None)
+    if fast is None:
+        return "Geen fast_control in config", 400
+
+    mode_field = fast.mode
+    raw_value = getattr(mode_field, "value", mode_field)
+    is_entity = hasattr(mode_field, "is_entity_id") and mode_field.is_entity_id(raw_value)
+    if is_entity:
+        return "Mode wordt gestuurd door een HA entity", 400
+
+    new_mode = request.form.get("mode", "").strip()
+    if new_mode not in ("off", "shadow", "active"):
+        return "Ongeldige modus", 400
+
+    fast.mode = FlexEnum(value=new_mode, enum_values=["off", "shadow", "active"])
+    config_path = app_datapath + "options.json"
+    tmp = config_path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(config.model_dump(mode="json", exclude_none=True), handle, indent=2)
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(tmp, config_path)
+    return redirect(url_for("v2.fast_control"))
