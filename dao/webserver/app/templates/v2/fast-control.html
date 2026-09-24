@@ -1,0 +1,61 @@
+{% extends "v2/base.html" %}
+
+{% block title %}Fast control - DAO+{% endblock %}
+{% block content %}
+<h1>Fast control</h1>
+
+<div class="d-flex align-items-center mb-3">
+  <span class="me-2">Modus:</span>
+  <span class="badge bg-{{ 'success' if mode == 'active' else ('warning' if mode == 'shadow' else 'secondary') }}">{{ mode|upper }}</span>
+</div>
+
+<form method="post" action="{{ url_for('v2.fast_control_mode') }}" class="mb-3">
+  <div class="btn-group" role="group">
+    <button type="submit" name="mode" value="off" class="btn btn-outline-secondary" {{ 'disabled' if mode == 'off' else '' }}>Off</button>
+    <button type="submit" name="mode" value="shadow" class="btn btn-outline-warning" {{ 'disabled' if mode == 'shadow' else '' }}>Shadow</button>
+    <button type="submit" name="mode" value="active" class="btn btn-outline-success" {{ 'disabled' if mode == 'active' else '' }}>Active</button>
+  </div>
+</form>
+
+<form method="post" action="{{ url_for('v2.task_exec') }}" class="mb-3 d-flex align-items-center gap-2">
+  <button type="submit" name="task" value="fast_once" class="btn btn-primary">Run once</button>
+  <label class="ms-2">Backtest dagen:
+    <input type="number" name="days" min="1" max="365" value="14" class="form-control d-inline-block" style="width: 5em">
+  </label>
+  <button type="submit" name="task" value="fast_simulate" class="btn btn-secondary">Backtest</button>
+</form>
+
+<div hx-get="{{ url_for('v2.fast_control_state') }}" hx-trigger="every 5s" hx-swap="outerHTML" id="fast-state">
+  {% include "v2/fast-control-state.html" %}
+</div>
+
+<h2 class="mt-4">Triggers (laatste 50)</h2>
+<table class="table table-sm">
+  <thead>
+    <tr><th>tijd</th><th>kind</th><th>reden</th><th>setpoint</th><th>plan</th><th>benefit €/h</th><th>verbruik W</th><th>SoC %</th><th>prijs in/uit</th></tr>
+  </thead>
+  <tbody>
+    {% for event in events %}
+    <tr>
+      <td>{{ event.ts | int }}</td>
+      <td>{{ event.kind }}</td>
+      <td>{{ event.reason }}</td>
+      <td>{{ event.setpoint_w | round(0, 'floor') }} W</td>
+      <td>{{ event.plan_w | round(0, 'floor') }} W</td>
+      <td>{{ event.benefit_eur_h | round(3) }}</td>
+      <td>{{ event.house_w }}</td>
+      <td>{{ event.soc_pct if event.soc_pct is not none else '—' }}</td>
+      <td>{{ event.price_import | round(4) }} / {{ event.price_export | round(4) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="text-muted">Nog geen events.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<script type="application/json" id="fast-events">
+  {{ events | tojson }}
+</script>
+<canvas id="fast-chart" height="120"></canvas>
+
+{% endblock %}
