@@ -283,6 +283,19 @@ bewerkingen = {
         "function": "train_ml_predictions",
         "file_name": "train",
     },
+    "fast_once": {
+        "name": "Fast control: run once",
+        "cmd": ["python3", "../prog/da_fast.py", "once"],
+        "task": "fast_once",
+        "file_name": "fast_once",
+    },
+    "fast_simulate": {
+        "name": "Fast control: backtest",
+        "cmd": ["python3", "../prog/da_fast.py", "simulate", "--days"],
+        "task": "fast_simulate",
+        "parameters": ["days"],
+        "file_name": "fast_simulate",
+    },
 }
 
 
