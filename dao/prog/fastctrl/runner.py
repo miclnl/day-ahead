@@ -66,6 +66,13 @@ MODE_OFF = "off"
 MODE_SHADOW = "shadow"
 MODE_ACTIVE = "active"
 
+EVENTS_KIND_MODE = "mode_change"
+EVENTS_KIND_OVERRIDE_START = "override_start"
+EVENTS_KIND_OVERRIDE_END = "override_end"
+EVENTS_KIND_SETPOINT = "setpoint_change"
+
+EVENTS_LIMIT = 200
+
 
 def _parse_float(raw: Any) -> Optional[float]:
     if raw is None:
@@ -271,7 +278,9 @@ class FastControlRunner:
         }
         self._time_zone = getattr(hass, "time_zone", None)
         self._tz_info: Optional[datetime.tzinfo] = None
-        self._last_mode: Optional[str] = None
+        self._last_mode: Optional[str] = self._initial_mode()
+        self._last_overrides: tuple = ()
+        self._last_setpoints: tuple = ()
         self._warned_no_grid = False
         self._warned_stale_plan = False
         self._last_state_save = 0.0
@@ -312,6 +321,9 @@ class FastControlRunner:
         if raw in {"shadow", "dry-run", "dryrun", "log"}:
             return MODE_SHADOW
         return MODE_OFF
+
+    def _initial_mode(self) -> str:
+        return self.mode()
 
     def limits(self) -> PolicyLimits:
         """Build the policy tunables, resolving anything backed by an entity."""
@@ -454,7 +466,6 @@ class FastControlRunner:
         mode = self.mode()
         if mode != self._last_mode:
             logging.info(f"Fast control: modus {mode}")
-            self._last_mode = mode
         if mode == MODE_OFF:
             return None
 
@@ -528,6 +539,7 @@ class FastControlRunner:
 
         self._actuate(decision, plan, mode)
         self._publish(decision, mode, measurement)
+        self._record_events(decision, mode)
         self._persist_state(now)
         return decision
 
@@ -700,6 +712,50 @@ class FastControlRunner:
             self.gateway.write_number(
                 diagnostics.entity_saved_today, round(self.state.saved_today_eur, 3)
             )
+
+    # -- event ring buffer ----------------------------------------------
+
+    def _record_events(self, decision, mode: str) -> None:
+        new_overrides = tuple(b.override for b in decision.batteries)
+        new_setpoints = tuple(b.setpoint_w for b in decision.batteries)
+        events = self.state.events
+
+        if mode != self._last_mode:
+            events.append(self._event_dict(decision, mode, EVENTS_KIND_MODE))
+        if self._last_overrides and any(self._last_overrides) and not any(new_overrides):
+            events.append(self._event_dict(decision, mode, EVENTS_KIND_OVERRIDE_END))
+        elif (not self._last_overrides or not any(self._last_overrides)) and any(new_overrides):
+            events.append(self._event_dict(decision, mode, EVENTS_KIND_OVERRIDE_START))
+
+        if self._last_setpoints and any(
+            abs(new - old) >= 1.0 for new, old in zip(new_setpoints, self._last_setpoints)
+        ):
+            events.append(self._event_dict(decision, mode, EVENTS_KIND_SETPOINT))
+
+        events[:] = events[-EVENTS_LIMIT:]
+
+        self._last_mode = mode
+        self._last_overrides = new_overrides
+        self._last_setpoints = new_setpoints
+
+    def _event_dict(self, decision, mode: str, kind: str) -> dict:
+        battery = decision.batteries[0] if decision.batteries else None
+        socs = [b.soc for b in decision.batteries if b.soc is not None]
+        soc_pct = round(sum(socs) / len(socs), 1) if socs else None
+        return {
+            "ts": decision.timestamp,
+            "kind": kind,
+            "mode": mode,
+            "reason": (battery.reason if battery else decision.reason),
+            "battery": (battery.name if battery else None),
+            "setpoint_w": battery.setpoint_w if battery else 0,
+            "plan_w": battery.plan_w if battery else 0,
+            "benefit_eur_h": max((b.benefit_eur_h for b in decision.batteries), default=0.0),
+            "house_w": round(decision.house_w),
+            "soc_pct": soc_pct,
+            "price_import": round(decision.price_import, 4),
+            "price_export": round(decision.price_export, 4),
+        }
 
     # -- the loop --------------------------------------------------------
 
