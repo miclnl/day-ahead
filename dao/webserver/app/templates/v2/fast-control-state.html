@@ -1,0 +1,29 @@
+<div id="fast-state">
+  <h2 class="mt-3">Status van de laatste beslissing</h2>
+  {% if last_decision %}
+  <dl class="row">
+    <dt class="col-sm-3">Override</dt><dd class="col-sm-9">{{ 'ja' if last_decision.override else 'nee' }}</dd>
+    <dt class="col-sm-3">Reden</dt><dd class="col-sm-9">{{ last_decision.reason }}</dd>
+    <dt class="col-sm-3">Setpoint</dt><dd class="col-sm-9">{{ last_decision.house_w }} W huis (batterij setpoint zie triggers)</dd>
+    <dt class="col-sm-3">Benefit</dt><dd class="col-sm-9">{{ last_decision.benefit_eur_h | round(4) }} euro/uur</dd>
+    <dt class="col-sm-3">PV</dt><dd class="col-sm-9">{{ last_decision.pv_w }} W</dd>
+  </dl>
+  {% else %}
+  <p class="text-muted">Nog geen beslissing vastgelegd. Fast control draait niet, of er is nog geen plan.</p>
+  {% endif %}
+
+  <h2 class="mt-3">Budget</h2>
+  {% set saved = last_decision.saved_today_eur if last_decision else 0 %}
+  <p>Bespaard vandaag: {{ saved | round(3) }} euro</p>
+  <p>Daily throughput: {{ state.get('daily_extra_throughput_used', 0) | round(2) }} / 4.0 kWh</p>
+  <div class="progress mb-2">
+    <div class="progress-bar" style="width: {{ ((state.get('daily_extra_throughput_used', 0) / 4.0) * 100) | round(1) }}%"></div>
+  </div>
+  <p>Energy budget: {{ state.get('energy_budget_used', 0) | round(2) }} / 0.5 kWh</p>
+  <div class="progress">
+    <div class="progress-bar bg-warning" style="width: {{ ((state.get('energy_budget_used', 0) / 0.5) * 100) | round(1) }}%"></div>
+  </div>
+
+  <h2 class="mt-3">Recente taak</h2>
+  <p><a href="{{ url_for('v2.log') }}">Bekijk logbestanden</a> om de uitvoer van de laatste fast-taak te zien.</p>
+</div>
