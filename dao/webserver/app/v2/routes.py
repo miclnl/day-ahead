@@ -331,24 +331,31 @@ def task_exec():
 
     task = request.form.to_dict()["task"]
 
-    cmd = None
+    extra = [request.form.get("days", "14")]
+
+    argv = None
+    script = None
     match task:
         case "optimize_debug":
-            cmd = ["debug", "calc"]
+            argv, script = ["debug", "calc"], "day_ahead.py"
         case "optimize_regular":
-            cmd = ["calc"]
+            argv, script = ["calc"], "day_ahead.py"
         case "calc_baseloads":
-            cmd = ["calc_baseloads"]
+            argv, script = ["calc_baseloads"], "day_ahead.py"
         case "update_tibber":
-            cmd = ["tibber"]
+            argv, script = ["tibber"], "day_ahead.py"
         case "update_meteo":
-            cmd = ["meteo"]
+            argv, script = ["meteo"], "day_ahead.py"
         case "update_prices":
-            cmd = ["prices"]
+            argv, script = ["prices"], "day_ahead.py"
         case "train_ml":
-            cmd = ["train"]
+            argv, script = ["train"], "day_ahead.py"
+        case "fast_once":
+            argv, script = ["once"], "da_fast.py"
+        case "fast_simulate":
+            argv, script = ["simulate", "--days", *extra], "da_fast.py"
 
-    if cmd is None:
+    if argv is None or script is None:
         return "Invalid action", 500
 
     # Save the state synchronous to prevent race condition
@@ -361,7 +368,7 @@ def task_exec():
     }
     save_task_state(state)
 
-    cmd = ["python3", "../prog/day_ahead.py", *cmd]
+    cmd = ["python3", f"../prog/{script}", *argv]
 
     threading.Thread(
         target=run_and_log,
