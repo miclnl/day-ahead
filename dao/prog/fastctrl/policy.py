@@ -199,6 +199,14 @@ class ControllerState:
     #: Estimated saving accumulated since midnight, in euro.
     saved_today_eur: float = 0.0
     last_tick_ts: float = 0.0
+    #: Snapshot of the most recent :class:`Decision` attributes, or ``None``
+    #: before the first tick. Used to surface the layer's last verdict to the
+    #: web UI without recomputing it.
+    last_decision: Optional[dict] = None
+    #: Rolling log of notable state transitions (override start, release,
+    #: budget exhausted, ...). Newest entries are appended at the end; the
+    #: runner trims this list to a bounded length on write.
+    events: list[dict] = field(default_factory=list)
 
     def battery(self, index: int) -> BatteryControllerState:
         while len(self.batteries) <= index:
@@ -213,6 +221,8 @@ class ControllerState:
             "day_key": self.day_key,
             "saved_today_eur": self.saved_today_eur,
             "last_tick_ts": self.last_tick_ts,
+            "last_decision": self.last_decision,
+            "events": list(self.events),
         }
 
     @classmethod
@@ -227,6 +237,8 @@ class ControllerState:
             day_key=str(data.get("day_key", "")),
             saved_today_eur=float(data.get("saved_today_eur", 0.0)),
             last_tick_ts=float(data.get("last_tick_ts", 0.0)),
+            last_decision=data.get("last_decision"),
+            events=list(data.get("events", [])),
         )
 
 
