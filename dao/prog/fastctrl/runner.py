@@ -672,10 +672,18 @@ class FastControlRunner:
         attributes["friendly_name"] = "DAO fast control"
         attributes["icon"] = "mdi:speedometer"
 
+        state = "override" if decision.override else decision.reason
+        if mode == MODE_SHADOW:
+            state = f"shadow:{state}"
+
+        self.state.last_decision = {
+            **attributes,
+            "ts": decision.timestamp,
+            "mode": mode,
+            "state": state,
+        }
+
         if diagnostics.entity_status:
-            state = "override" if decision.override else decision.reason
-            if mode == MODE_SHADOW:
-                state = f"shadow:{state}"
             self.gateway.publish_state(diagnostics.entity_status, state, attributes)
         if diagnostics.entity_active:
             self.gateway.switch(diagnostics.entity_active, decision.override)
