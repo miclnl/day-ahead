@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block selectie %}
+<h3>Fast control</h3>
+<form method="post" name="mode_form" id="mode_form">
+  <input type="hidden" name="active_menu" value="fast_control">
+  <p>Modus:
+    <button name="mode" value="off" class="btn btn_mid" {{ 'disabled' if (mode_is_entity or mode == 'off') else '' }}>Off</button>
+    <button name="mode" value="shadow" class="btn btn_mid" {{ 'disabled' if (mode_is_entity or mode == 'shadow') else '' }}>Shadow</button>
+    <button name="mode" value="active" class="btn btn_mid" {{ 'disabled' if (mode_is_entity or mode == 'active') else '' }}>Active</button>
+    {% if mode_is_entity %}<span class="ms-2 text-muted">Mode wordt gestuurd door een HA entity</span>{% endif %}
+  </p>
+  <p>Acties:
+    <button name="current_bewerking" value="fast_once" class="btn btn_mid" formaction="/run">Run once</button>
+    dagen <input type="number" name="days" min="1" max="365" value="14" style="width: 4em">
+    <button name="current_bewerking" value="fast_simulate" class="btn btn_mid" formaction="/run">Backtest</button>
+  </p>
+  {% if error %}<p style="color: red;">{{ error }}</p>{% endif %}
+  {% if success %}<p style="color: green;">{{ success }}</p>{% endif %}
+</form>
+
+<h3>Status van de laatste beslissing (auto-refresh 5 s)</h3>
+<div id="fast-state-block">
+  <p>Modus: <span id="fast-mode">{{ mode }}</span></p>
+  <p>Override: <span id="fast-override">{{ 'ja' if last_decision.override else 'nee' if last_decision else '—' }}</span></p>
+  <p>Reden: <span id="fast-reason">{{ last_decision.reason if last_decision else '—' }}</span></p>
+  <p>Setpoint: <span id="fast-house-w">{{ last_decision.house_w if last_decision else '—' }}</span> W</p>
+  <p>Benefit: <span id="fast-benefit">{{ '%.4f'|format(last_decision.benefit_eur_h) if last_decision else '—' }}</span> euro/uur</p>
+  <p>PV: <span id="fast-pv-w">{{ last_decision.pv_w if last_decision else '—' }}</span> W</p>
+  <p>Bespaard vandaag: <span id="fast-saved">{{ '%.3f'|format(state.get('saved_today_eur', 0)) }}</span> euro</p>
+</div>
+
+<script>
+  setInterval(function() {
+    fetch('/fast_control/state.json')
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        document.getElementById('fast-mode').textContent = j.mode || 'off';
+        document.getElementById('fast-override').textContent = (j.override === true ? 'ja' : (j.override === false ? 'nee' : '—'));
+        document.getElementById('fast-reason').textContent = j.reason || '—';
+        document.getElementById('fast-house-w').textContent = (j.house_w !== null && j.house_w !== undefined) ? j.house_w : '—';
+        document.getElementById('fast-benefit').textContent = (j.benefit_eur_h !== null && j.benefit_eur_h !== undefined) ? j.benefit_eur_h.toFixed(4) : '—';
+        document.getElementById('fast-pv-w').textContent = (j.pv_w !== null && j.pv_w !== undefined) ? j.pv_w : '—';
+        document.getElementById('fast-saved').textContent = (j.saved_today_eur !== undefined) ? j.saved_today_eur.toFixed(3) : '0.000';
+      });
+  }, 5000);
+</script>
+
+<h3>Triggers (laatste 50)</h3>
+<table border="1" cellpadding="4" cellspacing="0">
+  <tr><th>tijd</th><th>kind</th><th>reden</th><th>setpoint</th><th>plan</th><th>benefit €/h</th><th>verbruik</th><th>SoC %</th><th>prijs in/uit</th></tr>
+  {% for event in events %}
+  <tr>
+    <td>{{ event.ts | int }}</td>
+    <td>{{ event.kind }}</td>
+    <td>{{ event.reason }}</td>
+    <td>{{ event.setpoint_w | round(0, 'floor') }} W</td>
+    <td>{{ event.plan_w | round(0, 'floor') }} W</td>
+    <td>{{ event.benefit_eur_h | round(3) }}</td>
+    <td>{{ event.house_w }} W</td>
+    <td>{{ event.soc_pct if event.soc_pct is not none else '—' }}</td>
+    <td>{{ event.price_import | round(4) }} / {{ event.price_export | round(4) }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="9">Nog geen events.</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}
