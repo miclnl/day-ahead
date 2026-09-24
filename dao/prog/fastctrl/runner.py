@@ -540,6 +540,7 @@ class FastControlRunner:
         self._actuate(decision, plan, mode)
         self._publish(decision, mode, measurement)
         self._record_events(decision, mode)
+        self.state.refresh_budget_aggregates()
         self._persist_state(now)
         return decision
 

@@ -207,11 +207,35 @@ class ControllerState:
     #: budget exhausted, ...). Newest entries are appended at the end; the
     #: runner trims this list to a bounded length on write.
     events: list[dict] = field(default_factory=list)
+    #: Sum of all batteries' ``daily_deviation_kwh``. Refreshed by the runner
+    #: on every tick so the web UI can surface it without iterating over the
+    #: per-battery list.
+    daily_extra_throughput_used: float = 0.0
+    #: Sum of ``abs(interval_deviation_kwh)`` across all batteries. Counts both
+    #: the charge and the discharge side of an override cycle so the budget
+    #: cannot be silently exhausted by oscillating around zero.
+    energy_budget_used: float = 0.0
 
     def battery(self, index: int) -> BatteryControllerState:
         while len(self.batteries) <= index:
             self.batteries.append(BatteryControllerState())
         return self.batteries[index]
+
+    def refresh_budget_aggregates(self) -> None:
+        """Roll the per-battery deviation totals into the top-level budget fields.
+
+        The web UI reads ``daily_extra_throughput_used`` and
+        ``energy_budget_used`` directly so it can render the daily and interval
+        budget gauges without iterating over every battery. The runner calls
+        this once per tick, after the policy has finished updating each
+        battery's deviation counters.
+        """
+        self.daily_extra_throughput_used = sum(
+            b.daily_deviation_kwh for b in self.batteries
+        )
+        self.energy_budget_used = sum(
+            abs(b.interval_deviation_kwh) for b in self.batteries
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -223,6 +247,8 @@ class ControllerState:
             "last_tick_ts": self.last_tick_ts,
             "last_decision": self.last_decision,
             "events": list(self.events),
+            "daily_extra_throughput_used": self.daily_extra_throughput_used,
+            "energy_budget_used": self.energy_budget_used,
         }
 
     @classmethod
@@ -239,6 +265,10 @@ class ControllerState:
             last_tick_ts=float(data.get("last_tick_ts", 0.0)),
             last_decision=data.get("last_decision"),
             events=list(data.get("events", [])),
+            daily_extra_throughput_used=float(
+                data.get("daily_extra_throughput_used", 0.0)
+            ),
+            energy_budget_used=float(data.get("energy_budget_used", 0.0)),
         )
 
 

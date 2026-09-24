@@ -7,12 +7,20 @@ from typing import Optional
 import pytest
 
 from dao.prog.config.models.fastcontrol import FastControlConfig
+from dao.prog.fastctrl.plan import (
+    BatteryPlanStep,
+    BatterySpec,
+    FastPlan,
+    PlanInterval,
+)
 from dao.prog.fastctrl.policy import (
     BatteryDecision,
     ControllerState,
     Decision,
 )
 from dao.prog.fastctrl.runner import FastControlRunner, save_state
+
+T0 = 1_700_000_000
 
 
 @pytest.fixture
@@ -27,15 +35,21 @@ def test_controller_state_roundtrip_includes_new_fields():
     state = ControllerState()
     state.last_decision = {"ts": 1.0, "reason": "plan", "override": False}
     state.events = [{"ts": 1.0, "kind": "override_start"}]
+    state.daily_extra_throughput_used = 1.7
+    state.energy_budget_used = 0.3
 
     serialised = state.to_dict()
     assert "last_decision" in serialised
     assert serialised["last_decision"] == {"ts": 1.0, "reason": "plan", "override": False}
     assert serialised["events"] == [{"ts": 1.0, "kind": "override_start"}]
+    assert serialised["daily_extra_throughput_used"] == 1.7
+    assert serialised["energy_budget_used"] == 0.3
 
     restored = ControllerState.from_dict(serialised)
     assert restored.last_decision == {"ts": 1.0, "reason": "plan", "override": False}
     assert restored.events == [{"ts": 1.0, "kind": "override_start"}]
+    assert restored.daily_extra_throughput_used == 1.7
+    assert restored.energy_budget_used == 0.3
 
 
 @dataclass
@@ -205,3 +219,80 @@ def test_runner_persists_events():
             payload = json.load(handle)
 
         assert payload["events"] == [{"ts": 1.0, "kind": "override_start", "mode": "shadow"}]
+
+
+def test_refresh_budget_aggregates_sums_per_battery_deviation():
+    """refresh_budget_aggregates must roll per-battery deviation into the top-level budget fields."""
+    state = ControllerState()
+    state.battery(0).daily_deviation_kwh = 1.5
+    state.battery(0).interval_deviation_kwh = 0.2
+    state.battery(1).daily_deviation_kwh = 2.0
+    state.battery(1).interval_deviation_kwh = -0.1  # charge side of the cycle
+
+    state.refresh_budget_aggregates()
+
+    assert state.daily_extra_throughput_used == pytest.approx(3.5)   # 1.5 + 2.0
+    assert state.energy_budget_used == pytest.approx(0.3)            # abs(0.2) + abs(-0.1)
+
+
+def _stub_plan() -> FastPlan:
+    """Minimal one-battery plan that satisfies tick()'s early-return guards."""
+    return FastPlan(
+        created_ts=T0,
+        interval_s=900,
+        specs=[
+            BatterySpec(
+                name="accu",
+                capacity_kwh=10.0,
+                max_charge_w=5000.0,
+                max_discharge_w=5000.0,
+                soc_entity="sensor.soc",
+            ),
+        ],
+        intervals=[
+            PlanInterval(
+                start_ts=T0,
+                end_ts=T0 + 900,
+                price_import=0.30,
+                price_export=0.12,
+                grid_w=500.0,
+                house_w=500.0,
+                batteries=[
+                    BatteryPlanStep(
+                        ac_power_w=0.0,
+                        soc_begin=60.0,
+                        soc_end=60.0,
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def test_tick_refreshes_budget_aggregates(workspace, monkeypatch):
+    """Regression: the per-battery deviation roll-up must happen from tick(),
+    not only on tests that call refresh_budget_aggregates directly. Removing
+    the call in runner.tick would leave the web UI gauges stale.
+    """
+    runner = _make_runner(mode="active", state_path=workspace["state_path"])
+
+    # Skip disk I/O and the hass-facing side-effects so the test exercises
+    # only the aggregation call site.
+    monkeypatch.setattr(runner, "plan", _stub_plan)
+    monkeypatch.setattr(runner.gateway, "read", lambda ids: {})
+    monkeypatch.setattr(runner, "_actuate", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_publish", lambda *a, **kw: None)
+    monkeypatch.setattr(runner, "_persist_state", lambda *a, **kw: None)
+
+    calls = []
+    original = runner.state.refresh_budget_aggregates
+
+    def recording() -> None:
+        calls.append(1)
+        original()
+
+    monkeypatch.setattr(runner.state, "refresh_budget_aggregates", recording)
+
+    runner.tick(T0 + 60)
+
+    assert calls, "tick() must call refresh_budget_aggregates on the controller state"
