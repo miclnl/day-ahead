@@ -782,7 +782,7 @@ def fast_control_mode():
     config_path = app_datapath + "options.json"
     tmp = config_path + ".tmp"
     with open(tmp, "w") as handle:
-        json.dump(config.model_dump(mode="json", exclude_none=True), handle, indent=2)
+        json.dump(config.model_dump(mode="json", by_alias=True, exclude_none=True), handle, indent=2)
         handle.flush(); os.fsync(handle.fileno())
     os.replace(tmp, config_path)
     return redirect(url_for("v2.fast_control"))
