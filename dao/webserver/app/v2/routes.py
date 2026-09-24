@@ -691,3 +691,51 @@ def secrets():
         success=success,
         error=error,
     )
+
+
+FAST_STATE_PATH = "../data/fast_state.json"
+
+
+def _load_fast_state():
+    try:
+        with open(FAST_STATE_PATH, "r") as handle:
+            return json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _load_config():
+    from dao.prog.config.loader import ConfigurationLoader
+    from pathlib import Path
+    loader = ConfigurationLoader(Path(app_datapath + "options.json"))
+    try:
+        return loader.load_and_validate()
+    except Exception:
+        return None
+
+
+def _resolved_mode(config):
+    if config is None:
+        return "off"
+    fast = getattr(config, "fast_control", None)
+    if fast is None:
+        return "off"
+    mode_field = fast.mode
+    raw = str(getattr(mode_field, "value", mode_field)).strip().lower()
+    return raw if raw in ("off", "shadow", "active") else "off"
+
+
+@v2.route("/fast-control")
+def fast_control():
+    state = _load_fast_state()
+    config = _load_config()
+    mode = _resolved_mode(config)
+    last_decision = state.get("last_decision")
+    events = state.get("events", [])
+    return render_template(
+        "v2/fast-control.html",
+        state=state,
+        mode=mode,
+        last_decision=last_decision,
+        events=events[-50:][::-1],   # last 50, newest first
+    )
