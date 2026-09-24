@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -9,7 +12,7 @@ from dao.prog.fastctrl.policy import (
     ControllerState,
     Decision,
 )
-from dao.prog.fastctrl.runner import FastControlRunner
+from dao.prog.fastctrl.runner import FastControlRunner, save_state
 
 
 @pytest.fixture
@@ -189,3 +192,16 @@ def test_record_events_still_handles_override_and_setpoint_transitions(workspace
         "setpoint_change",
         "setpoint_change",
     ]
+
+
+def test_runner_persists_events():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "fast_state.json")
+        state = ControllerState()
+        state.events.append({"ts": 1.0, "kind": "override_start", "mode": "shadow"})
+        save_state(state, path)
+
+        with open(path, "r") as handle:
+            payload = json.load(handle)
+
+        assert payload["events"] == [{"ts": 1.0, "kind": "override_start", "mode": "shadow"}]

@@ -638,6 +638,8 @@ class FastControlRunner:
             self.state.plan_created_ts,
             self.state.interval_start_ts,
             tuple(b.override_active for b in self.state.batteries),
+            len(self.state.events),
+            self.state.events[-1] if self.state.events else None,
         )
         due = (now - self._last_state_save) >= STATE_SAVE_INTERVAL
         if not (force or due or signature != self._state_signature):
