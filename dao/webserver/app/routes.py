@@ -16,6 +16,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from dao.prog.config.loader import ConfigurationLoader
+from dao.prog.config.models.base import FlexEnum
 from dao.prog.da_report import Report
 from dao.prog.version import __version__
 import json
@@ -369,11 +370,116 @@ def menu():
             return home()
 
 
-# Temporary stub for Task 12 - replaced by the real view in Task 14.
-# This stub lets the menu() dispatch resolve the symbol so the file stays
-# importable; the 501 makes it clear the view has not landed yet.
+FAST_STATE_PATH_V1 = "../data/fast_state.json"
+
+
+def _load_fast_state_v1():
+    try:
+        with open(FAST_STATE_PATH_V1, "r") as handle:
+            return json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _config_v1():
+    """Return a freshly-loaded config object, mirroring v2's _load_config()."""
+    try:
+        loader = ConfigurationLoader(Path(app_datapath + "options.json"))
+        return loader.load_and_validate()
+    except Exception:
+        return None
+
+
+def _write_config_v1(config) -> bool:
+    """Atomically write a config object back to options.json."""
+    config_path = app_datapath + "options.json"
+    tmp = config_path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(config.model_dump(mode="json", exclude_none=True), handle, indent=2)
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(tmp, config_path)
+    return True
+
+
+def _resolved_mode_v1(config):
+    """Return (display_string, is_entity_backed) for v1 page rendering."""
+    if config is None:
+        return "off", False
+    fast = getattr(config, "fast_control", None)
+    if fast is None:
+        return "off", False
+    mode_field = fast.mode
+    raw_value = getattr(mode_field, "value", mode_field)
+    is_entity = hasattr(mode_field, "is_entity_id") and mode_field.is_entity_id(raw_value)
+    if is_entity:
+        return "off", True
+    raw = str(raw_value).strip().lower()
+    return (raw if raw in ("off", "shadow", "active") else "off"), False
+
+
+@app.route("/fast_control", methods=["GET", "POST"])
 def fast_control():
-    return "fast_control view lands in Task 14", 501
+    state = _load_fast_state_v1()
+    last_decision = state.get("last_decision")
+    events = list(reversed(state.get("events", [])[-50:]))
+    success = None
+    error = None
+    config = _config_v1()
+
+    if request.method == "POST":
+        if config is None:
+            error = "Config onleesbaar"
+        else:
+            fast = getattr(config, "fast_control", None)
+            mode_field = fast.mode if fast else None
+            raw = getattr(mode_field, "value", mode_field)
+            is_entity = hasattr(mode_field, "is_entity_id") and mode_field.is_entity_id(raw)
+            new_mode = request.form.get("mode", "").strip()
+            if is_entity:
+                error = "Mode wordt gestuurd door een HA entity"
+            elif new_mode not in ("off", "shadow", "active"):
+                error = "Ongeldige modus"
+            else:
+                fast.mode = FlexEnum(value=new_mode, enum_values=["off", "shadow", "active"])
+                _write_config_v1(config)
+                success = f"Modus gezet op {new_mode}"
+
+    mode, mode_is_entity = _resolved_mode_v1(config)
+
+    return render_template(
+        "fast_control.html",
+        title="Fast control",
+        active_menu_list=web_menu_items,
+        active_menu="fast_control",
+        state=state,
+        last_decision=last_decision,
+        events=events,
+        mode=mode,
+        mode_is_entity=mode_is_entity,
+        success=success,
+        error=error,
+        version=__version__,
+    )
+
+
+@app.route("/fast_control/state.json")
+def fast_control_state_json():
+    state = _load_fast_state_v1()
+    last_decision = state.get("last_decision") or {}
+    mode, mode_is_entity = _resolved_mode_v1(_config_v1())
+    return jsonify({
+        "mode": mode,
+        "mode_is_entity": mode_is_entity,
+        "override": last_decision.get("override"),
+        "reason": last_decision.get("reason"),
+        "house_w": last_decision.get("house_w"),
+        "benefit_eur_h": last_decision.get("benefit_eur_h"),
+        "pv_w": last_decision.get("pv_w"),
+        "saved_today_eur": state.get("saved_today_eur", 0),
+        "daily_extra_throughput_used": state.get("daily_extra_throughput_used", 0),
+        "energy_budget_used": state.get("energy_budget_used", 0),
+        "ts": last_decision.get("ts"),
+    })
 
 
 @app.route("/", methods=["POST", "GET"])
