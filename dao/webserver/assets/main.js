@@ -14,27 +14,33 @@ import {
     BarController,
     PieController,
     DoughnutController,
+    ScatterController,
     LineElement,
     BarElement,
     ArcElement,
     PointElement,
     LinearScale,
     CategoryScale,
+    TimeScale,
     Tooltip,
     Legend
 } from 'chart.js'
+
+import 'chartjs-adapter-date-fns'
 
 Chart.register(
     LineController,
     BarController,
     PieController,
     DoughnutController,
+    ScatterController,
     LineElement,
     BarElement,
     ArcElement,
     PointElement,
     LinearScale,
     CategoryScale,
+    TimeScale,
     Tooltip,
     Legend
 )
@@ -140,3 +146,53 @@ window.toDatetimeLocalValue = (date, withTime = true) => {
         pad(date.getMinutes()),
     ].join(':') : '');
 }
+
+function renderFastChart() {
+    const canvas = document.getElementById('fast-chart');
+    const dataEl = document.getElementById('fast-events');
+    if (!canvas || !dataEl) return;
+
+    const events = JSON.parse(dataEl.textContent);
+    if (!events.length) return;
+
+    const datasets = [
+        {
+            label: 'house_w',
+            data: events.map(e => ({ x: e.ts * 1000, y: e.house_w })),
+            showLine: true,
+            borderColor: '#888',
+            pointRadius: 0,
+        },
+    ];
+    const colors = {
+        override_start: '#dc3545',
+        override_end: '#198754',
+        mode_change: '#0d6efd',
+        setpoint_change: '#fd7e14',
+    };
+    ['override_start', 'override_end', 'mode_change', 'setpoint_change'].forEach(kind => {
+        const filtered = events.filter(e => e.kind === kind).map(e => ({ x: e.ts * 1000, y: e.house_w }));
+        if (!filtered.length) return;
+        datasets.push({
+            label: kind,
+            data: filtered,
+            showLine: false,
+            pointRadius: 5,
+            backgroundColor: colors[kind],
+        });
+    });
+
+    if (window.fastChart) window.fastChart.destroy();
+    window.fastChart = new Chart(canvas, {
+        type: 'scatter',
+        data: { datasets },
+        options: {
+            scales: {
+                x: { type: 'time', time: { tooltipFormat: 'HH:mm:ss' } },
+                y: { title: { display: true, text: 'W' } },
+            },
+        },
+    });
+}
+
+document.addEventListener('DOMContentLoaded', renderFastChart);

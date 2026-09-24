@@ -4,6 +4,7 @@
     "build": "vite build"
   },
   "dependencies": {
+    "chartjs-adapter-date-fns": "^3.0.0",
     "tom-select": "^2.6.2"
   },
   "devDependencies": {
