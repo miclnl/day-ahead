@@ -30,6 +30,16 @@
   <p>Bespaard vandaag: <span id="fast-saved">{{ '%.3f'|format(state.get('saved_today_eur', 0)) }}</span> euro</p>
 </div>
 
+<h3>Budget</h3>
+<p>Daily throughput: <span id="fast-daily">{{ '%.2f'|format(state.get('daily_extra_throughput_used', 0)) }}</span> / 4.0 kWh</p>
+<table border="1" cellpadding="0" cellspacing="0" style="width: 100%; height: 12px; padding: 0;">
+  <tr><td id="fast-daily-bar" style="background-color: #28a745; width: {{ (((state.get('daily_extra_throughput_used', 0) / 4.0) * 100) if state.get('daily_extra_throughput_used', 0) < 4.0 else 100) }}%; height: 12px;"></td></tr>
+</table>
+<p>Energy budget: <span id="fast-energy">{{ '%.2f'|format(state.get('energy_budget_used', 0)) }}</span> / 0.5 kWh</p>
+<table border="1" cellpadding="0" cellspacing="0" style="width: 100%; height: 12px; padding: 0;">
+  <tr><td id="fast-energy-bar" style="background-color: #ffc107; width: {{ (((state.get('energy_budget_used', 0) / 0.5) * 100) if state.get('energy_budget_used', 0) < 0.5 else 100) }}%; height: 12px;"></td></tr>
+</table>
+
 <script>
   setInterval(function() {
     fetch('/fast_control/state.json')
@@ -42,6 +52,12 @@
         document.getElementById('fast-benefit').textContent = (j.benefit_eur_h !== null && j.benefit_eur_h !== undefined) ? j.benefit_eur_h.toFixed(4) : '—';
         document.getElementById('fast-pv-w').textContent = (j.pv_w !== null && j.pv_w !== undefined) ? j.pv_w : '—';
         document.getElementById('fast-saved').textContent = (j.saved_today_eur !== undefined) ? j.saved_today_eur.toFixed(3) : '0.000';
+        var daily = (j.daily_extra_throughput_used !== undefined) ? j.daily_extra_throughput_used : 0;
+        var energy = (j.energy_budget_used !== undefined) ? j.energy_budget_used : 0;
+        document.getElementById('fast-daily').textContent = daily.toFixed(2);
+        document.getElementById('fast-energy').textContent = energy.toFixed(2);
+        document.getElementById('fast-daily-bar').style.width = Math.min(daily / 4.0 * 100, 100) + '%';
+        document.getElementById('fast-energy-bar').style.width = Math.min(energy / 0.5 * 100, 100) + '%';
       });
   }, 5000);
 </script>
