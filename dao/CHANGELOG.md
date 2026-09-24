@@ -33,6 +33,16 @@ het geplande SoC-verloop. Zie [DOCS.md](DOCS.md#snelle-regellaag-fast-control).
 - optioneel piekscheren met `max grid import`
 - een cyclus kost een enkele api-aanroep dankzij een gebundelde template-render, met
   automatische terugval op losse state-verzoeken
+- nieuwe pagina `/v2/fast-control` (en `/fast_control` in de v1 UI) met de
+  huidige modus, de laatste beslissing en het lopende budget
+- drie modus-knoppen op de pagina schakelen tussen off, shadow en active
+  zonder `options.json` te hoeven bewerken
+- knoppen voor `Run once` en `Backtest` roepen `da_fast.py once` en
+  `da_fast.py simulate` aan en tonen het resultaat in het bestaande
+  log-paneel
+- een ringbuffer van 200 events in `data/fast_state.json` legt elke
+  override-start, override-end, modus-wissel en setpoint-sprong vast met
+  verbruik, SoC en prijs; zichtbaar als tabel en (in v2) als scatter-grafiek
 
 ## Prognosefout meten
 Tot nu toe schreef DAO prognoses weg in `prognoses` en metingen in `values`, en trok
