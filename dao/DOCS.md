@@ -1889,6 +1889,16 @@ De terugrekening is ook bereikbaar via de api:
 `<url>/api/run/fast_control_simulate`. Het resultaat komt in
 `data/log/fast_simulate_<datum>.log`.
 
+### Web UI
+
+De web UI heeft een pagina op `/v2/fast-control` (v2) of `/fast_control`
+(v1) waar de huidige modus, de laatste beslissing en het lopende
+budget zichtbaar zijn. De pagina bevat knoppen om de modus te
+wijzigen en om een eenmalige beslissing (`Run once`) of een backtest
+(`Backtest`) te draaien. Triggers worden bewaard in een ringbuffer
+van 200 events in `data/fast_state.json`; in v2 verschijnen ze ook
+als scatter-grafiek.
+
 
 ---
 
