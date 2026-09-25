@@ -1,6 +1,6 @@
 ---
 name: DAO+
-version: 2026.9.1-2
+version: 2026.9.25
 slug: dao_plus
 description: Home Assistant Community Add-ons for day ahead optimizations
 url: https://github.com/miclnl/day-ahead
@@ -26,4 +26,4 @@ options:
   use_self_compiled_miplib: false
 schema:
   use_self_compiled_miplib: bool?
-image: "ghcr.io/corneel27/dao"
+image: "ghcr.io/miclnl/dao"
