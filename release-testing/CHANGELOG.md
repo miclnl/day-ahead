@@ -16,7 +16,7 @@ Fixed error when getting flex-value from HA (reported by $tomvandepoel3)
 # 2026.8.0.rc8
 ## Breaking change
 Users with a seperate container (no HA app/addon)change your pull command:
-`docker pull ghcr.io/corneel27/dao:testing`
+`docker pull ghcr.io/miclnl/dao:testing`
 
 Changes:
 - update workflows for (test)build images, packages are now oci-compliant

@@ -1,5 +1,39 @@
-# **刀 Day Ahead Optimizer**
+# **刀 DAO+ — persoonlijke fork van Day Ahead Optimizer**
 # Installatie en instellingen<br>
+
+> **Persoonlijke ontwikkelfork voor vibecoding.**
+> Deze repository (`miclnl/day-ahead`) is een persoonlijke fork van
+> [Day Ahead Optimizer](https://github.com/corneel27/day-ahead) van
+> Cees van Beek. De addon is in Home Assistant hernoemd naar
+> **DAO+** (slug `dao_plus`) zodat hij niet verward wordt met het
+> origineel; issues, wiki, docker-images en de codebase verwijzen
+> naar deze fork (`github.com/miclnl/day-ahead`,
+> `ghcr.io/miclnl/dao`).
+>
+> Het doel is niet om een eigen distributie te onderhouden, maar om
+> met behulp van AI-assisted coding nieuwe functies uit te proberen
+> in een afgeschermde omgeving. CODEOWNERS blijft daarom bewust op
+> `@corneel27` staan — merges richting het origineel lopen via
+> `corneel27/day-ahead`.
+>
+> **Vrij om te cherry-picken.** Alles wat in deze fork nuttig
+> blijkt, mag door derden overgenomen worden — functies, fixes,
+> documentatie, models. Geen attribution-eis. Als iets in deze
+> fork je aanspreekt: neem het mee, pas het aan, upstream het
+> wanneer dat kan. Een PR richting het origineel is welkom,
+> verplicht is het niet.
+>
+> **Licentie.** De oorspronkelijke Apache License 2.0 van Cees van
+> Beek blijft onverminderd van kracht op alle code die uit
+> `corneel27/day-ahead` afkomstig is; deze fork voegt daar niets
+> bovenop. Alles wat hier staat valt onder dezelfde Apache 2.0
+> (zie `LICENSE.txt`). Wie iets overneemt, neemt het mee onder
+> dezelfde voorwaarden — geen extra restricties, geen
+> attribution-eis bovenop wat de license zelf al voorschrijft.
+>
+> Voor de historische documentatie van de oorspronkelijke
+> "Day Ahead Optimizer" zie de CHANGELOG-secties onder aan dit
+> bestand — die verwijzingen laten we bewust staan.
 
 ## Inhoudsopgave  
 [Installatie](#installatie)<br> 
