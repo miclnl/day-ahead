@@ -1,6 +1,6 @@
 ---
 name: DAO+
-version: 2026.9.25
+version: 2026.9.26
 slug: dao_plus
 description: Home Assistant Community Add-ons for day ahead optimizations
 url: https://github.com/miclnl/day-ahead
