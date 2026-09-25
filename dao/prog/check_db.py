@@ -436,10 +436,16 @@ class CheckDB:
         if "forecasts" in inspector.get_table_names():
             return
         metadata = self.db_da.metadata
-        # The foreign key can only be resolved when "variabel" is known in the
-        # same metadata. Do not rely on an earlier call having defined it.
-        if "variabel" not in metadata.tables:
-            Table("variabel", metadata, autoload_with=self.engine)
+        # Replace the locally-defined "variabel" table in metadata with the
+        # actual schema loaded from the database. Without this, the FK on
+        # forecasts.variabel is resolved against the local Integer columns
+        # defined earlier in update_db_da, which can mismatch the real
+        # column types in MySQL/MariaDB (e.g. INT UNSIGNED vs INT) and
+        # cause errno 150 ("Foreign key constraint is incorrectly formed")
+        # when MySQL rejects the CREATE TABLE.
+        if "variabel" in metadata.tables:
+            metadata.remove(metadata.tables["variabel"])
+        Table("variabel", metadata, autoload_with=self.engine)
         forecasts = Table(
             "forecasts",
             metadata,
