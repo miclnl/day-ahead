@@ -1,4 +1,5 @@
 from flask import Flask
+import datetime
 
 
 class IngressMiddleware:
@@ -19,6 +20,25 @@ class IngressMiddleware:
 app = Flask(__name__)
 app.secret_key = "secret_cookie_key"
 app.wsgi_app = IngressMiddleware(app.wsgi_app)
+
+
+@app.template_filter("human_ts")
+def _human_ts(value):
+    """Render a Unix epoch as a human-readable local-time string.
+
+    Used by templates that need to show timestamps from fast-control
+    events and task metadata. Returns '—' for None or non-numeric
+    values so missing data shows as a placeholder rather than an
+    epoch dump.
+    """
+    if value is None:
+        return "—"
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
 
 from . import routes
 from .v2.routes import v2

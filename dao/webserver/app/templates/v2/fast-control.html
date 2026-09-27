@@ -44,7 +44,7 @@
   <tbody>
     {% for event in events %}
     <tr>
-      <td>{{ event.ts | int }}</td>
+      <td>{{ event.ts | human_ts }}</td>
       <td>{{ event.kind }}</td>
       <td>{{ event.reason }}</td>
       <td>{{ event.setpoint_w | round(0, 'floor') }} W</td>

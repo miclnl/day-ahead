@@ -67,7 +67,7 @@
   <tr><th>tijd</th><th>kind</th><th>reden</th><th>setpoint</th><th>plan</th><th>benefit €/h</th><th>verbruik</th><th>SoC %</th><th>prijs in/uit</th></tr>
   {% for event in events %}
   <tr>
-    <td>{{ event.ts | int }}</td>
+    <td>{{ event.ts | human_ts }}</td>
     <td>{{ event.kind }}</td>
     <td>{{ event.reason }}</td>
     <td>{{ event.setpoint_w | round(0, 'floor') }} W</td>
