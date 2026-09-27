@@ -322,6 +322,23 @@ def write_plan(plan: FastPlan, path: str = FAST_PLAN_FILE) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(handle.name, path)
+        # Ensure the rename is also durable before returning: on Linux the
+        # rename is only persisted to disk when the directory inode is
+        # fsync'd. Without this step a power cut between os.replace and
+        # the next sync can lose the new inode entry and leave the reader
+        # seeing the *old* (or no) file.
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Some filesystems (e.g. /proc-like mounts) refuse to open
+            # with O_RDONLY for fsync. Not fatal: the file itself is
+            # already durable, only the rename's directory entry might
+            # not be.
+            pass
     except BaseException:
         try:
             os.unlink(handle.name)

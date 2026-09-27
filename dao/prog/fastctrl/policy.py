@@ -529,7 +529,18 @@ class FastControlPolicy:
 
         if previous <= 0.0 or now <= previous:
             return
-        elapsed_h = min(now - previous, 600.0) / 3600.0
+        # Skip integration when the gap is suspiciously large: e.g. the
+        # add-on was stopped for hours and the state was reloaded from
+        # disk. Capping at 600s (10 minutes) would still invent ten minutes
+        # of "mid" power consumption that never happened. Treat anything
+        # longer than 10 plan intervals as a discontinuity and reset the
+        # budget accumulators instead.
+        plan_interval_s = plan.interval_s or 3600
+        if now - previous > 10 * max(5, plan_interval_s):
+            for battery in state.batteries:
+                battery.interval_deviation_kwh = 0.0
+            return
+        elapsed_h = (now - previous) / 3600.0
         if elapsed_h <= 0.0 or interval is None:
             return
 
@@ -844,11 +855,19 @@ class FastControlPolicy:
             override = (now - controller.quiet_since) < limits.release_time
             if not override:
                 controller.quiet_since = None
+                # Sync last_command_w to the released value so the next
+                # tick's deadband check sees change = 0 instead of an
+                # invented |plan - last_command| delta. Without this we
+                # force a redundant write on every release transition.
+                controller.last_command_w = plan_w
                 target_w = plan_w
                 reasons.append("released")
         else:
             controller.quiet_since = None
             override = False
+            # Same reasoning as above: keep last_command_w in lockstep
+            # with the non-override target so the deadband stays closed.
+            controller.last_command_w = plan_w
             target_w = plan_w
 
         releasing = controller.override_active and not override
@@ -893,7 +912,7 @@ class FastControlPolicy:
                 # honour the duty-cycle stop moment the optimizer published for
                 # a sub-minimum-power setpoint.
                 mode = spec.mode_off if abs(target_w) < POWER_EPS else spec.mode_on
-                stop_inverter = "2000-01-01 00:00:00"
+                stop_inverter = NO_STOP_SENTINEL
                 controller.stop_inverter_cleared = True
             elif controller.stop_inverter_cleared or releasing:
                 mode = step.mode if step.mode else (

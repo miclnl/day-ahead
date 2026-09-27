@@ -29,7 +29,7 @@ from dao.prog.config.models.fastcontrol import (
     PowerSensor,
 )
 
-from .plan import FAST_PLAN_FILE, FastPlan, load_plan
+from .plan import FAST_PLAN_FILE, FastPlan, NO_STOP_SENTINEL, load_plan
 from .policy import (
     BatteryMeasurement,
     ControllerState,
@@ -61,7 +61,7 @@ MEASUREMENT_MIN_COVERAGE = 0.8
 INVALID_STATES = frozenset({"unknown", "unavailable", "none", "", "null"})
 
 #: Sentinel the optimizer writes when the inverter must not stop.
-NO_STOP_SENTINEL = "2000-01-01 00:00:00"
+# Imported from .plan to keep a single source of truth.
 
 MODE_OFF = "off"
 MODE_SHADOW = "shadow"
@@ -305,7 +305,12 @@ class FastControlRunner:
             return self._batch[entity_id][0]
         try:
             return self.hass.get_state(entity_id).state
-        except Exception:  # noqa: BLE001
+        except Exception as exception:  # noqa: BLE001 - silent fallback by design
+            # Log at warning so a recurring failure is not invisible; the
+            # caller (mode/limits/_flex) will fall back to its default.
+            logging.warning(
+                f"Fast control: live fallback voor {entity_id} faalde: {exception}"
+            )
             return None
 
     def _flex(self, flex, default):
@@ -314,12 +319,16 @@ class FastControlRunner:
         try:
             value = flex.resolve(self._getter)
         except Exception as exception:  # noqa: BLE001
-            logging.debug(f"Fast control: waarde niet oplosbaar ({exception})")
+            logging.warning(f"Fast control: waarde niet oplosbaar ({exception})")
             return default
         return default if value is None else value
 
     def mode(self) -> str:
         """Current operating mode, resolved live so it can be switched from HA."""
+        # Normalize to lower-case so entity payloads (input_select) that use
+        # case other than the literal "shadow"/"active"/"off" still map
+        # correctly. Without this a value like "Shadow" silently turns into
+        # MODE_OFF because the membership test below only checks lowercase.
         raw = str(self._flex(self.config.mode, MODE_OFF)).strip().lower()
         if raw in {"on", "true", "1", "active"}:
             return MODE_ACTIVE
@@ -328,6 +337,11 @@ class FastControlRunner:
         return MODE_OFF
 
     def _initial_mode(self) -> str:
+        # Resolve once at startup so the very first tick has a baseline
+        # to compare against (logs a "modus" line if it differs from the
+        # next tick's reading). If the mode is backed by an HA entity
+        # and the entity is not yet warm we just see MODE_OFF; the first
+        # tick re-reads and triggers a mode_change log when it differs.
         return self.mode()
 
     def limits(self) -> PolicyLimits:
@@ -795,9 +809,25 @@ class FastControlRunner:
                         f"Fast control: fout in regellus ({failures}x): {exception}"
                     )
             # Back off after repeated failures so a broken Home Assistant does
-            # not turn into a request storm.
-            delay = period * min(8, 2 ** max(0, failures - 3)) if failures else period
-            stop_event.wait(max(1.0, delay - (time.time() - started)))
+            # not turn into a request storm, but cap at 2x period so the layer
+            # recovers quickly once HA is responsive again.
+            delay = period * min(2, 2 ** max(0, failures - 3)) if failures else period
+            # Wait with an absolute upper bound equal to the delay so a stop()
+            # call during a long backoff still returns promptly (otherwise we
+            # could be stuck waiting up to 8x period before noticing).
+            remaining = max(0.5, delay - (time.time() - started))
+            if stop_event.wait(remaining):
+                break
+        # On shutdown, dump any in-flight measurement integration into the
+        # values table even if its interval is not yet fully covered. The
+        # alternative is losing it on every restart, which biases the
+        # forecast error table.
+        try:
+            plan = self.plan()
+        except Exception:  # noqa: BLE001
+            plan = None
+        if plan is not None and self._measure_seconds > 0:
+            self._flush_measurement(plan)
         # Flush whatever the throttled writer was still holding back.
         self._persist_state(time.time(), force=True)
         logging.info("Fast control gestopt")
@@ -814,8 +844,14 @@ class FastControlThread(threading.Thread):
     def run(self) -> None:
         self.runner.run(self.stop_event)
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 35.0) -> None:
         self.stop_event.set()
+        # The run() loop is interrupted as soon as stop_event becomes set
+        # via the bounded wait, but join() still needs enough time for the
+        # thread to finish its current tick (typically <1s) and run the
+        # final force-flush. 35s covers the worst case (period=15s +
+        # final-tick time) with a comfortable margin; previous default of
+        # 5s would often cut off the flush and leave fast_state.json stale.
         self.join(timeout=timeout)
 
 

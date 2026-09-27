@@ -2,12 +2,17 @@ import datetime
 import logging
 import sys
 import time
+import os
 from da_base import DaBase
 from dao.prog.fastctrl.runner import start_if_enabled
 from subprocess import Popen
 
 
 class DaScheduler(DaBase):
+    # Resolve once at import time so all subprocesses share the same
+    # working directory regardless of where the watchdog started us.
+    PROG_DIR = os.path.dirname(os.path.abspath(__file__))
+
     def __init__(self, file_name: str = None):
         super().__init__(file_name)
         self.active = self.config.scheduler.active
@@ -18,7 +23,11 @@ class DaScheduler(DaBase):
 
     def run_task_process(self, key_task):
         run_task = self.tasks[key_task]
-        proc = Popen(run_task["cmd"])
+        # Pin CWD to the prog directory: the calc and forecast tasks use
+        # CWD-relative paths (../data, ../prog) and silently misbehave
+        # if the scheduler is started from a different working directory
+        # (e.g. by a manual /api/run trigger or a future debug entrypoint).
+        proc = Popen(run_task["cmd"], cwd=self.PROG_DIR)
         proc.wait()
         if proc.returncode != 0 and proc.returncode is not None:
             print(f"Task {key_task} crashed with exit code {proc.returncode}")

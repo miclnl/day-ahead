@@ -403,7 +403,13 @@ def _write_config_v1(config) -> bool:
 
 
 def _resolved_mode_v1(config):
-    """Return (display_string, is_entity_backed) for v1 page rendering."""
+    """Return (display_string, is_entity_backed) for v1 page rendering.
+
+    When mode is bound to an HA entity, the static config cannot tell us
+    the current value. Read the live state from fast_state.json instead
+    so the UI displays what the runner is actually doing rather than
+    always reporting "off".
+    """
     if config is None:
         return "off", False
     fast = getattr(config, "fast_control", None)
@@ -413,6 +419,12 @@ def _resolved_mode_v1(config):
     raw_value = getattr(mode_field, "value", mode_field)
     is_entity = hasattr(mode_field, "is_entity_id") and mode_field.is_entity_id(raw_value)
     if is_entity:
+        # Prefer the runtime value the runner last published; fall back
+        # to "off" only if no state file exists yet.
+        state = _load_fast_state_v1()
+        runtime_mode = state.get("last_decision", {}).get("mode")
+        if runtime_mode in ("off", "shadow", "active"):
+            return runtime_mode, True
         return "off", True
     raw = str(raw_value).strip().lower()
     return (raw if raw in ("off", "shadow", "active") else "off"), False
