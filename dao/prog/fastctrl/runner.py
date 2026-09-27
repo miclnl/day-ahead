@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 
+import pandas as pd
 import pytz
 from typing import Any, Callable, Iterable, Optional
 
@@ -281,6 +282,10 @@ class FastControlRunner:
         self._last_mode: Optional[str] = self._initial_mode()
         self._last_overrides: tuple = ()
         self._last_setpoints: tuple = ()
+        # Track whether the initial setpoint has been logged, so the
+        # first event after startup (or after a state reload) is captured
+        # instead of being swallowed by the empty-tuple short-circuit.
+        self._last_setpoints_recorded: bool = False
         self._warned_no_grid = False
         self._warned_stale_plan = False
         self._last_state_save = 0.0
@@ -514,6 +519,11 @@ class FastControlRunner:
             grid_valid=grid_w is not None and grid_fresh and not plan_stale,
         )
 
+        # Capture the previous tick timestamp BEFORE policy.account() resets
+        # it. Without this saved_today_eur would always integrate over
+        # elapsed_h = 0 (policy.account sets state.last_tick_ts = now).
+        previous_tick_ts = self.state.last_tick_ts
+
         policy = FastControlPolicy(self.limits())
         policy.account(
             self.state,
@@ -531,8 +541,8 @@ class FastControlRunner:
         self._measure(now, plan, decision.house_w, pv_w, measurement.grid_valid)
 
         elapsed_h = (
-            min(now - self.state.last_tick_ts, 600.0) / 3600.0
-            if self.state.last_tick_ts
+            min(now - previous_tick_ts, 600.0) / 3600.0
+            if previous_tick_ts
             else 0.0
         )
         self.state.saved_today_eur += decision.benefit_eur_h * elapsed_h
@@ -616,8 +626,6 @@ class FastControlRunner:
         if database is None:
             return
         try:
-            import pandas as pd
-
             database.savedata(
                 pd.DataFrame(rows, columns=["time", "code", "value"]),
                 tablename="values",
@@ -730,7 +738,12 @@ class FastControlRunner:
         elif (not self._last_overrides or not any(self._last_overrides)) and any(new_overrides):
             events.append(self._event_dict(decision, mode, EVENTS_KIND_OVERRIDE_START))
 
-        if self._last_setpoints and any(
+        # Record a SETPOINT event for any meaningful change. On the first
+        # tick _last_setpoints is empty; record the initial setpoint so the
+        # very first correction is visible in the event log.
+        if not self._last_setpoints_recorded:
+            events.append(self._event_dict(decision, mode, EVENTS_KIND_SETPOINT))
+        elif any(
             abs(new - old) >= 1.0 for new, old in zip(new_setpoints, self._last_setpoints)
         ):
             events.append(self._event_dict(decision, mode, EVENTS_KIND_SETPOINT))
@@ -740,6 +753,8 @@ class FastControlRunner:
         self._last_mode = mode
         self._last_overrides = new_overrides
         self._last_setpoints = new_setpoints
+        if new_setpoints:
+            self._last_setpoints_recorded = True
 
     def _event_dict(self, decision, mode: str, kind: str) -> dict:
         battery = decision.batteries[0] if decision.batteries else None

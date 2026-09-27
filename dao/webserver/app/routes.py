@@ -11,7 +11,7 @@ from markupsafe import escape
 import fnmatch
 import os
 import threading
-from subprocess import Popen, PIPE, run, STDOUT
+from subprocess import Popen, PIPE, run, STDOUT, TimeoutExpired
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -296,6 +296,7 @@ bewerkingen = {
         "task": "fast_simulate",
         "parameters": ["days"],
         "file_name": "fast_simulate",
+        "timeout_s": 600,
     },
 }
 
@@ -1114,10 +1115,29 @@ def api_report(fld: str, periode: str):
 @app.route("/api/run/<string:bewerking>", methods=["GET", "POST"])
 def run_api(bewerking: str):
     if bewerking in bewerkingen.keys():
-        proc = run(bewerkingen[bewerking]["cmd"], capture_output=True, text=True)
-        data = proc.stdout
-        err = proc.stderr
-        log_content = data + err
+        # Run synchronously but cap the wall-clock time so a long-running
+        # task (especially fast_simulate, which can take minutes) cannot
+        # block this Flask worker forever and starve other requests.
+        # 5 minutes matches the gunicorn per-request timeout with a safety
+        # margin; tasks that legitimately need more should be reworked
+        # into a background-task pattern.
+        timeout_s = bewerkingen[bewerking].get("timeout_s", 300)
+        try:
+            proc = run(
+                bewerkingen[bewerking]["cmd"],
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+            data = proc.stdout
+            err = proc.stderr
+            log_content = data + err
+        except TimeoutExpired as exception:
+            log_content = (
+                f"Taak {bewerking} afgebroken na {timeout_s}s timeout.\n"
+                f"stdout tot timeout:\n{exception.stdout or ''}\n"
+                f"stderr tot timeout:\n{exception.stderr or ''}\n"
+            )
         filename = (
             "../data/log/"
             + bewerkingen[bewerking]["file_name"]
