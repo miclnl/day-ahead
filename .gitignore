@@ -5,7 +5,8 @@ dao/data
 
 dao/prog/tst_py
 dao/prog/miplib
-dao/tests
+dao/tests/.pytest_cache
+.pytest_cache
 to_do
 whl
 .idea/
