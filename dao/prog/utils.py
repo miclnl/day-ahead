@@ -452,20 +452,33 @@ def interpolate(df: pd.DataFrame, field: str, quantity: bool = False) -> pd.Data
         DataFrame met kolommen:
         - "tijd": datetime (op hele uren, bv. 09:00 betekent waarde voor 09:30)
         - field: float/int, uurwaarden
+        - optioneel "time": epoch in seconden van het uur. Als die kolom
+          aanwezig is krijgt elk kwartier ``time + 900 * k``; dat is de enige
+          betrouwbare manier om aan een epoch te komen, want "tijd" is naieve
+          lokale tijd en mag niet als UTC worden gelezen.
     field: str, name of the column
     quantity: bool, is it a quantity
 
     Returns
     -------
     pd.DataFrame
-        DataFrame met kwartierwaarden in kolommen ["tijd", field]
+        DataFrame met kwartierwaarden in kolommen ["tijd", field] (en "time"
+        als de invoer die had)
     """
+    if len(df) < 2:
+        raise ValueError(
+            f"interpolate: minimaal twee uurwaarden nodig voor '{field}', "
+            f"{len(df)} ontvangen"
+        )
+    df = df.reset_index(drop=True)
+    has_time = "time" in df.columns
 
     result = []
 
     for i in range(len(df)):
         t_curr = df.loc[i, "tijd"]
         v_curr = df.loc[i, field]
+        epoch = int(df.loc[i, "time"]) if has_time else None
 
         if i == 0:
             # eerste uurblok (lineair richting volgende)
@@ -519,12 +532,13 @@ def interpolate(df: pd.DataFrame, field: str, quantity: bool = False) -> pd.Data
             quarters = quarters / 4
 
         for k in range(4):
-            result.append(
-                {
-                    "tijd": t_curr + datetime.timedelta(minutes=15 * k),
-                    field: float(quarters[k]),
-                }
-            )
+            row = {
+                "tijd": t_curr + datetime.timedelta(minutes=15 * k),
+                field: float(quarters[k]),
+            }
+            if has_time:
+                row["time"] = epoch + 900 * k
+            result.append(row)
     result_df = pd.DataFrame(result)
     result_df.index = pd.to_datetime(result_df["tijd"])
     return result_df

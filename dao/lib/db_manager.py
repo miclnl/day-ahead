@@ -482,21 +482,32 @@ class DBmanagerObj(object):
             df["tijd"] = pd.to_datetime(df["tijd"])
             return df
         else:  # interval == "15min"
+            # Every hourly field is interpolated to quarters separately and the
+            # results are joined on the epoch. interpolate() derives the quarter
+            # epochs from the hourly "time" column, so no local-time to epoch
+            # conversion is needed here (that conversion was wrong by the UTC
+            # offset and broke outright under pandas 3 unit inference).
             fields = [("temp", "temp"), ("gr", "glob_rad")]
+            columns = ["time", "tijd", "temp", "glob_rad"]
             result_df = None
             for field, new_field in fields:
                 fld_df = self.get_prognose_field(field, start, end, interval)
-                # fld_df.index = pd.to_datetime(fld_df["tijd"])
-                # fld_df = interpolate(fld_df, field, 15, (field == "gr"))
-                if fld_df is not None and len(fld_df) > 0:
-                    fld_df = interpolate(fld_df, field, False)
+                if fld_df is None or len(fld_df) < 2:
+                    logging.warning(
+                        f"Te weinig uurwaarden voor '{field}' om kwartierwaarden "
+                        f"te maken ({0 if fld_df is None else len(fld_df)})"
+                    )
+                    return pd.DataFrame(columns=columns)
+                fld_df = interpolate(fld_df, field, False).reset_index(drop=True)
+                fld_df = fld_df.rename(columns={field: new_field})
                 if result_df is None:
-                    result_df = fld_df
+                    result_df = fld_df[["time", "tijd", new_field]]
                 else:
-                    result_df[new_field] = fld_df[field]
-            if result_df is not None:
-                result_df["time"] = result_df["tijd"].astype(int) // 1e9
-            return result_df
+                    result_df = result_df.merge(
+                        fld_df[["time", new_field]], on="time", how="inner"
+                    )
+            result_df["time"] = result_df["time"].astype("int64")
+            return result_df[columns]
 
     def get_column_data(
         self,

@@ -828,6 +828,10 @@ class DaBase(hass.Hass):
                 solar_prog = solar_predictor.predict_solar_device(
                     solar_option, vanaf, tot
                 )
+                if len(solar_prog) < 2:
+                    raise ValueError(
+                        f"ML-model gaf {len(solar_prog)} voorspellingen terug"
+                    )
                 if solar_prog.isnull().any().any():
                     logging.warning(
                         f"NaN-waarden aangetroffen in voorspelling van {solar_name}"
@@ -847,6 +851,18 @@ class DaBase(hass.Hass):
                 if _ml_prediction:
                     result["prediction"] = pd.NA
                 return result
+            except Exception as ex:
+                # A stale model file (xgboost upgrade, changed feature set) or a
+                # gap in the weather data must not take the whole optimisation
+                # down; the physical DAO predictor is always available.
+                error_handling(ex)
+                logging.warning(
+                    f"ML-voorspelling voor {solar_option.name} mislukt ({ex}); "
+                    f"DAO-predictor wordt gebruikt"
+                )
+                return self.calc_solar_predictions(
+                    solar_option, vanaf, tot, interval=interval, _ml_prediction=False
+                )
             solar_prog["tijd"] = pd.to_datetime(solar_prog["date_time"])
             if interval == "15min":
                 solar_prog = interpolate(solar_prog, "prediction", quantity=True)
