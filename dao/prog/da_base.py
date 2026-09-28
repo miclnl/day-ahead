@@ -83,6 +83,12 @@ class DaBase(hass.Hass):
         self.log_level = logging.INFO
         self.notification_entity = None
         self.ha_context: HAContext | None = None
+        # Subclasses and main() test `self.config is None` to detect a failed
+        # configuration load. Set the attribute before anything can return,
+        # otherwise that check raises AttributeError instead of telling the
+        # user what was wrong with the configuration.
+        self.config = None
+        self.loader = None
         logging.basicConfig(
             level=self.log_level,
             format="%(asctime)s %(levelname)s: %(message)s",
@@ -104,7 +110,7 @@ class DaBase(hass.Hass):
                 except FileNotFoundError as e:
                     logging.error(f"Configuratiebestand niet gevonden: {e}")
                     return
-                except (ValueError, RuntimeError) as e:
+                except (ValueError, TypeError, RuntimeError) as e:
                     logging.error(f"Configuratie kon niet worden geladen: {e}")
                     return
 

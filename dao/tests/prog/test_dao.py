@@ -1,11 +1,26 @@
+"""Integration tests against live databases and a live Home Assistant.
+
+These need the options files under tests/data to point at reachable MySQL,
+PostgreSQL and SQLite databases plus a Home Assistant instance, so they cannot
+run in CI. Set DAO_INTEGRATION_TESTS=1 to enable them locally.
+"""
+
 import datetime
+import os
 import pandas as pd
 import logging
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("DAO_INTEGRATION_TESTS") != "1",
+    reason="needs live databases and Home Assistant; set DAO_INTEGRATION_TESTS=1",
+)
+
 sys.path.append("../../../dao/prog")
-import dao.prog.da_report
-import dao.prog.day_ahead
+import dao.prog.da_report  # noqa: E402
+import dao.prog.day_ahead  # noqa: E402
 
 
 def test_get_grid_data_sqlite():
