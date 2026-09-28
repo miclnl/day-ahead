@@ -8,6 +8,7 @@ import threading
 import pytz
 import warnings
 from dataclasses import dataclass
+import requests
 from requests import get
 import json
 import hassapi as hass
@@ -161,15 +162,26 @@ class DaBase(hass.Hass):
             "Authorization": "Bearer " + self.hasstoken,
             "content-type": "application/json",
         }
-        resp = get(self.hassurl + "api/config", headers=headers)
-        resp_dict = json.loads(resp.text)
-        logging.debug(f"hass/api/config: {resp.text}")
-        self.ha_context = HAContext(
-            latitude=resp_dict["latitude"],
-            longitude=resp_dict["longitude"],
-            time_zone=resp_dict["time_zone"],
-            country=resp_dict["country"] or "NL",
-        )
+        try:
+            resp = get(self.hassurl + "api/config", headers=headers, timeout=(5, 30))
+            resp.raise_for_status()
+            resp_dict = resp.json()
+        except requests.RequestException as ex:
+            raise RuntimeError(
+                f"Home Assistant API niet bereikbaar op {self.hassurl}api/config: {ex}"
+            ) from ex
+        logging.debug(f"hass/api/config: {resp_dict}")
+        try:
+            self.ha_context = HAContext(
+                latitude=resp_dict["latitude"],
+                longitude=resp_dict["longitude"],
+                time_zone=resp_dict["time_zone"],
+                country=resp_dict.get("country") or "NL",
+            )
+        except (KeyError, TypeError) as ex:
+            raise RuntimeError(
+                f"Onverwacht antwoord van Home Assistant api/config: {resp_dict!r}"
+            ) from ex
         self.time_zone = self.ha_context.time_zone
         self.meteo = Meteo(
             self.config,

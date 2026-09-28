@@ -7,6 +7,7 @@ import os
 import sys
 import numpy as np
 import pandas as pd
+import requests
 from requests import post
 import logging
 import traceback
@@ -207,12 +208,25 @@ def get_tibber_data():
         year=now.year, month=now.month, day=now.day
     ).timestamp()
     logging.debug(query)
-    resp = post(url, headers=headers, data=query)
-    tibber_dict = json.loads(resp.text)
-    production_nodes = tibber_dict["data"]["viewer"]["homes"][0]["production"]["nodes"]
-    consumption_nodes = tibber_dict["data"]["viewer"]["homes"][0]["consumption"][
-        "nodes"
-    ]
+    try:
+        resp = post(url, headers=headers, data=query, timeout=(5, 30))
+        resp.raise_for_status()
+        tibber_dict = resp.json()
+    except (requests.RequestException, ValueError) as ex:
+        logging.error(f"Ophalen verbruiksgegevens bij Tibber mislukt: {ex}")
+        return
+    if tibber_dict.get("errors"):
+        logging.error(f"Tibber API gaf fouten terug: {tibber_dict['errors']}")
+        return
+    try:
+        home = tibber_dict["data"]["viewer"]["homes"][0]
+        production_nodes = home["production"]["nodes"]
+        consumption_nodes = home["consumption"]["nodes"]
+    except (KeyError, IndexError, TypeError) as ex:
+        logging.error(
+            f"Onverwacht antwoord van Tibber ({ex}): {str(tibber_dict)[:200]}"
+        )
+        return
     tibber_df = pd.DataFrame(columns=["time", "code", "value"])
     for node in production_nodes:
         timestamp = int(get_datetime_from_str(node["from"]).timestamp())

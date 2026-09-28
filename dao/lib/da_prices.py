@@ -3,6 +3,7 @@ from dao.lib.db_manager import DBmanagerObj
 from entsoe import EntsoePandasClient
 import datetime
 import sys
+import requests
 from requests import get, post
 from nordpool.elspot import Prices
 import pytz
@@ -166,16 +167,26 @@ class DaPrices:
             # 2022-06-25T00:00:00
             startstr = start.strftime("%Y-%m-%dT%H:%M:%S")
             endstr = end.strftime("%Y-%m-%dT%H:%M:%S")
-            url = (
-                "https://mijn.easyenergy.com/nl/api/tariff/getapxtariffs?startTimestamp="
-                + startstr
-                + "&endTimestamp="
-                + endstr
-            )
-            resp = get(url)
-            logging.debug(resp.text)
-            json_object = json.loads(resp.text)
+            url = "https://mijn.easyenergy.com/nl/api/tariff/getapxtariffs"
+            try:
+                resp = get(
+                    url,
+                    params={"startTimestamp": startstr, "endTimestamp": endstr},
+                    timeout=(5, 30),
+                )
+                resp.raise_for_status()
+                json_object = resp.json()
+            except (requests.RequestException, ValueError) as ex:
+                logging.error(f"Ophalen day-ahead prijzen bij EasyEnergy mislukt: {ex}")
+                return
+            logging.debug(json_object)
             df = pd.DataFrame.from_records(json_object)
+            if df.empty or not {"Timestamp", "TariffReturn"} <= set(df.columns):
+                logging.error(
+                    f"Onverwacht antwoord van EasyEnergy, geen prijzen opgeslagen: "
+                    f"{str(json_object)[:200]}"
+                )
+                return
             logging.info(
                 f"Day ahead prijzen van Easyenergy:\n {df.to_string(index=False)}"
             )
@@ -252,17 +263,29 @@ class DaPrices:
                 "Authorization": "Bearer " + api_token,
                 "content-type": "application/json",
             }
-            resp = post(url, headers=headers, data=query)
-            tibber_dict = json.loads(resp.text)
-            today_nodes = tibber_dict["data"]["viewer"]["homes"][0][
-                "currentSubscription"
-            ]["priceInfo"]["today"]
-            tomorrow_nodes = tibber_dict["data"]["viewer"]["homes"][0][
-                "currentSubscription"
-            ]["priceInfo"]["tomorrow"]
-            range_nodes = tibber_dict["data"]["viewer"]["homes"][0][
-                "currentSubscription"
-            ]["priceInfoRange"]["nodes"]
+            try:
+                resp = post(url, headers=headers, data=query, timeout=(5, 30))
+                resp.raise_for_status()
+                tibber_dict = resp.json()
+            except (requests.RequestException, ValueError) as ex:
+                logging.error(f"Ophalen day-ahead prijzen bij Tibber mislukt: {ex}")
+                return
+            if tibber_dict.get("errors"):
+                logging.error(f"Tibber API gaf fouten terug: {tibber_dict['errors']}")
+                return
+            try:
+                subscription = tibber_dict["data"]["viewer"]["homes"][0][
+                    "currentSubscription"
+                ]
+                today_nodes = subscription["priceInfo"]["today"]
+                tomorrow_nodes = subscription["priceInfo"]["tomorrow"]
+                range_nodes = subscription["priceInfoRange"]["nodes"]
+            except (KeyError, IndexError, TypeError) as ex:
+                logging.error(
+                    f"Onverwacht antwoord van Tibber ({ex}), geen prijzen opgeslagen: "
+                    f"{str(tibber_dict)[:200]}"
+                )
+                return
             df_db = pd.DataFrame(columns=["time", "code", "value"])
             for lst in [today_nodes, tomorrow_nodes, range_nodes]:
                 for node in lst:

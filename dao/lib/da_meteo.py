@@ -2,9 +2,11 @@ import datetime
 import json
 import math
 import logging
+import time
 import pandas as pd
 import pytz
 import ephem
+import requests
 from requests import get
 import matplotlib.pyplot as plt
 import knmi
@@ -395,42 +397,59 @@ class Meteo:
         """
 
     def get_from_meteoserver(self, model: str) -> pd.DataFrame:
-        parameters = (
-            "?lat="
-            + str(self.latitude)
-            + "&long="
-            + str(self.longitude)
-            + "&key="
-            + self.meteoserver_key
-        )
-        count = 0
-        data = {}
+        if not self.meteoserver_key:
+            logging.error("Geen meteoserver key geconfigureerd, geen meteodata opgehaald")
+            return pd.DataFrame()
+        params = {
+            "lat": str(self.latitude),
+            "long": str(self.longitude),
+            "key": self.meteoserver_key,
+        }
+        data = None
         if model == "harmonie":
             url = "https://data.meteoserver.nl/api/uurverwachting.php"
         else:
             url = "https://data.meteoserver.nl/api/uurverwachting_gfs.php"
-        while count <= self.meteoserver_attempts:
-            resp = get(url + parameters)
-            logging.debug(resp.text)
-            json_object = {}
+        # attempts is the number of retries on top of the first request, so the
+        # loop runs attempts + 1 times. A hung socket must never block the
+        # scheduler, hence the explicit timeout; a short pause between attempts
+        # keeps a meteoserver outage from turning into a request storm.
+        max_attempts = max(1, int(self.meteoserver_attempts or 0) + 1)
+        for attempt in range(1, max_attempts + 1):
             try:
-                json_object = json.loads(resp.text)
-            except Exception as ex:
-                logging.info(ex)
-            if "data" in json_object:
+                resp = get(url, params=params, timeout=(5, 30))
+                resp.raise_for_status()
+                json_object = resp.json()
+            except (requests.RequestException, ValueError) as ex:
+                logging.warning(
+                    f"Meteoserver poging {attempt} van {max_attempts} mislukt: {ex}"
+                )
+                json_object = {}
+            if isinstance(json_object, dict) and json_object.get("data"):
                 data = json_object["data"]
                 break
-            count += 1
+            if attempt < max_attempts:
+                time.sleep(min(30, 2**attempt))
 
-        if count > self.meteoserver_attempts:
+        if data is None:
+            logging.error(
+                f"Geen meteodata ontvangen van meteoserver na {max_attempts} pogingen"
+            )
             return pd.DataFrame()
 
         df = pd.DataFrame.from_records(data)
+        missing = [
+            c for c in ["tijd", "tijd_nl", "gr", "temp", "winds", "neersl"]
+            if c not in df.columns
+        ]
+        if missing:
+            logging.error(f"Meteoserver antwoord mist kolommen {missing}")
+            return pd.DataFrame()
         df1 = df[["tijd", "tijd_nl", "gr", "temp", "winds", "neersl"]]
         df1 = df1[:96]
         logging.info(f"Meteodata model {model}")
         logging.info(
-            f"Aantal uitgevoerde ophaalpogingen: {count + 1} van maximaal: {self.meteoserver_attempts}"
+            f"Aantal uitgevoerde ophaalpogingen: {attempt} van maximaal: {max_attempts}"
         )
         logging.info(f"Aantal records: {len(df1)}")
         logging.info(f"Data {model}: \n{df1.to_string(index=True)}")
