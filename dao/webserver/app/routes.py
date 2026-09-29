@@ -5,8 +5,15 @@ import time
 
 # from sqlalchemy.sql.coercions import expect_col_expression_collection
 
-from . import app
-from flask import render_template, request, jsonify, session as flask_session
+from . import app, csrf
+from flask import (
+    abort,
+    render_template,
+    request,
+    jsonify,
+    session as flask_session,
+    url_for,
+)
 from markupsafe import escape
 import fnmatch
 import os
@@ -15,16 +22,20 @@ from subprocess import Popen, PIPE, run, STDOUT, TimeoutExpired
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from dao.prog.config.loader import ConfigurationLoader
-from dao.prog.config.models.base import FlexEnum
+from dao.prog.config.loader import (
+    ConfigurationLoader,
+    atomic_write_text,
+    set_fast_control_mode,
+    validate_config_data,
+)
 from dao.prog.da_report import Report
 from dao.prog.version import __version__
 import json
 
 # globals
-web_datapath = "static/data/"
-app_datapath = "app/static/data/"
-images_folder = os.path.join(web_datapath, "images")
+# The data directory lives outside Flask's static folder on purpose: it holds
+# secrets.json and the database. Graphs are served through the /images route.
+app_datapath = "../data/"
 config = None
 
 # Introduced previous_time and active_view as global variables
@@ -38,10 +49,24 @@ def create_config():
     try:
         loader = ConfigurationLoader(Path(app_datapath + "options.json"))
         config = loader.load_and_validate()
-    except (ValueError, RuntimeError) as ex:
+    except (ValueError, RuntimeError, OSError) as ex:
         logging.error(app_datapath)
         logging.error(ex)
         config = None
+
+
+def validate_settings_document(setting: str, text: str) -> None:
+    """Check an options.json or secrets.json document before it is written.
+
+    Raises ValueError with a message that can be shown to the user. A config
+    that does not validate would otherwise put the scheduler into a restart
+    loop until the user notices the log.
+    """
+    data = json.loads(text)
+    if setting == "options":
+        validate_config_data(data)
+    elif not isinstance(data, dict):
+        raise ValueError("secrets.json moet een JSON-object met sleutel/waarde zijn")
 
 
 logname = "dashboard.log"
@@ -391,17 +416,6 @@ def _config_v1():
         return None
 
 
-def _write_config_v1(config) -> bool:
-    """Atomically write a config object back to options.json."""
-    config_path = app_datapath + "options.json"
-    tmp = config_path + ".tmp"
-    with open(tmp, "w") as handle:
-        json.dump(config.model_dump(mode="json", by_alias=True, exclude_none=True), handle, indent=2)
-        handle.flush(); os.fsync(handle.fileno())
-    os.replace(tmp, config_path)
-    return True
-
-
 def _resolved_mode_v1(config):
     """Return (display_string, is_entity_backed) for v1 page rendering.
 
@@ -440,22 +454,15 @@ def fast_control():
     config = _config_v1()
 
     if request.method == "POST":
-        if config is None:
-            error = "Config onleesbaar"
-        else:
-            fast = getattr(config, "fast_control", None)
-            mode_field = fast.mode if fast else None
-            raw = getattr(mode_field, "value", mode_field)
-            is_entity = hasattr(mode_field, "is_entity_id") and mode_field.is_entity_id(raw)
-            new_mode = request.form.get("mode", "").strip()
-            if is_entity:
-                return "Mode wordt gestuurd door een HA entity", 400
-            elif new_mode not in ("off", "shadow", "active"):
-                error = "Ongeldige modus"
-            else:
-                fast.mode = FlexEnum(value=new_mode, enum_values=["off", "shadow", "active"])
-                _write_config_v1(config)
-                success = f"Modus gezet op {new_mode}"
+        new_mode = request.form.get("mode", "").strip()
+        try:
+            # Edits only the mode key in the raw document; dumping the whole
+            # model would rewrite the user's file with every default pinned.
+            set_fast_control_mode(Path(app_datapath + "options.json"), new_mode)
+            success = f"Modus gezet op {new_mode}"
+            config = _config_v1()
+        except (ValueError, OSError) as ex:
+            error = str(ex)
 
     mode, mode_is_entity = _resolved_mode_v1(config)
 
@@ -602,7 +609,7 @@ def home():
         # print(flist[index]["name"], datetime.datetime.fromtimestamp(flist[index]["time"]))
         active_time = str(flist[index]["time"])
         if active_view == "grafiek":
-            image = os.path.join(web_datapath + active_map, flist[index]["name"])
+            image = url_for("image", name=flist[index]["name"])
             tabel = None
         else:
             image = None
@@ -1020,14 +1027,15 @@ def solar():
     )
 
 
+@app.route("/settings", methods=["POST", "GET"])
 @app.route("/settings/<filename>", methods=["POST", "GET"])
-def settings():
+def settings(filename: str | None = None):
     def get_file(fname):
         with open(fname, "r") as file:
             return file.read()
 
     settngs = ["options", "secrets"]
-    active_setting = "options"
+    active_setting = filename or "options"
     cur_setting = ""
     lst = request.form.to_dict(flat=False)
     if request.method in ["POST", "GET"]:
@@ -1036,6 +1044,10 @@ def settings():
             cur_setting = active_setting
         if "setting" in lst:
             active_setting = lst["setting"][0]
+    # The form value names the file that is read and written. Anything other
+    # than the two known files is a traversal attempt.
+    if active_setting not in settngs or cur_setting not in ("", *settngs):
+        abort(400)
     message = None
     filename_ext = app_datapath + active_setting + ".json"
 
@@ -1050,14 +1062,14 @@ def settings():
                 action = request.form["action"]
                 if action == "update":
                     try:
-                        # json_data = json.loads(updated_data)
-                        # Update the JSON data
-                        with open(filename_ext, "w") as f:
-                            f.write(updated_data)
+                        validate_settings_document(active_setting, updated_data)
+                        atomic_write_text(Path(filename_ext), updated_data)
                         message = "JSON data updated successfully"
                         check_web_menu_items()
-                    except Exception as err:
-                        message = "Error: " + err.args[0]
+                    except ValueError as err:
+                        message = "Error: " + str(err)
+                    except OSError as err:
+                        message = "Error: " + str(err)
                     options = updated_data
                 if action == "cancel":
                     options = get_file(filename_ext)
@@ -1094,6 +1106,7 @@ def api_prognose(fld: str):
 
 
 @app.route("/api/report/<string:fld>/<string:periode>", methods=["GET"])
+@csrf.exempt
 def api_report(fld: str, periode: str):
     """
     Retourneert in json de data van
@@ -1125,6 +1138,7 @@ def api_report(fld: str, periode: str):
 
 
 @app.route("/api/run/<string:bewerking>", methods=["GET", "POST"])
+@csrf.exempt
 def run_api(bewerking: str):
     if bewerking in bewerkingen.keys():
         # Run synchronously but cap the wall-clock time so a long-running
@@ -1165,5 +1179,6 @@ def run_api(bewerking: str):
             version=__version__,
             active_menu_list=web_menu_items,
         )
-    else:
-        return "Onbekende bewerking: " + bewerking
+    # Never echo the path segment back: it is attacker controlled and the
+    # response is HTML.
+    abort(404)

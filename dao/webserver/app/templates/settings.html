@@ -2,6 +2,7 @@
 {% block selectie %}{% endblock %}
 {% block content %}
 <form id="json-form" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
 
 <div class="selector-container">
   <input type="hidden" id="current_menu" name="current_menu" value="settings">

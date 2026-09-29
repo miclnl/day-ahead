@@ -29,14 +29,20 @@ else
   ln -s /config/dao_data $file
 fi
 
+# Older versions linked the data directory into the web server's static
+# folder, which made secrets.json and the database downloadable. Remove the
+# link if it is still there; the dashboard reads ../data directly now.
 cd /root/dao/webserver/
-file=app/static/data
-if [ -L "$file" ]
-then
-  bashio::log.info "=> /root/dao/webserver/app/static/data exist"
-else
-  bashio::log.info "=> /root/dao/webserver/app/static/data doesn't exist, made"
-  ln -s /config/dao_data $file
+if [ -L app/static/data ]; then
+  bashio::log.info "=> removing obsolete link /root/dao/webserver/app/static/data"
+  rm -f app/static/data
+fi
+
+# The dashboard only answers requests that come through Home Assistant's
+# ingress unless the operator opts in to direct access on the mapped port.
+if bashio::config.true 'allow_direct_access'; then
+  bashio::log.warning "Dashboard is bereikbaar zonder Home Assistant login (allow_direct_access)"
+  export DAO_ALLOW_DIRECT=1
 fi
 
 export PYTHONPATH="/root:/root/dao:/root/dao/lib:/root/dao/prog"

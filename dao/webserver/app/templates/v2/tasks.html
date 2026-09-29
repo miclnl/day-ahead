@@ -5,6 +5,7 @@
 <div class="col flex-grow-0">
     <h1>Run</h1>
     <form method="POST" action="{{url_for('v2.task_exec')}}" hx-boost="true" hx-target="#status-target" hx-push-url="false" hx-replace-url="false">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
         <button type="submit" name="task" value="optimize_debug" class="btn btn-outline-secondary">Calc optimize
             debug
         </button>

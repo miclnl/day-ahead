@@ -85,10 +85,13 @@ op het informatiescherm van de add-on.
 # DAO eerste keer starten
 Klik op **Starten** om de add-on te starten. Je moet nu het dashboard kunnen benaderen via de zijbalk 
 of via de knop **Open web-ui**. 
-De addon opent het dashboard/web-gui op poort 5000:<br>
+Het dashboard is standaard alleen bereikbaar via Home Assistant (ingress), dus met je HA-login.
+Wil je het dashboard ook rechtstreeks op een poort benaderen (bijvoorbeeld voor de REST-api vanuit
+een ander systeem), zet dan in de add-on configuratie **allow_direct_access** aan en wijs in het
+netwerk-gedeelte van de add-on een poort toe (standaard staat de poort uit). Let op: zonder ingress
+is er geen login; iedereen op je netwerk kan dan de configuratie (en secrets) lezen en wijzigen.<br>
  ![home_1.png](./images/home_1.png) <br>
-Het kan zijn dat die 
-poort op jouw machine in gebruik is door een ander proces. 
+Het kan zijn dat de interne poort (5000) op jouw machine in gebruik is door een ander proces. 
 Je kunt dan onder de menu-optie **Configuratie** een andere poort instellen 
 die wel vrij is
 Als je geen dashboard te zien krijgt is er iets fout gegaan.
@@ -212,7 +215,6 @@ staan (klik evt op "Vernieuwen"):
 ```
 => directory dao_data exist
 => /root/dao/data doesn't exist, made
-=> /root/dao/webserver/app/static/data exist
 info:root:Table "variabel" met inhoud gecreeerd.
 info:root:Table "values" gecreeerd.
 info:root:Table "prognoses" gecreeerd.
@@ -459,7 +461,9 @@ Je kunt het dashboard op drie manieren benaderen:
 * Via het informatiescherm van de add-on en dan de knop **Open web-ui**
 * Via de zijbalk in Home Assistant (als je dat hebt ingesteld)
 * Via je browser:
-* Je benadert de webserver/het dashboard met een browser als volgt:<br>
+* Je benadert de webserver/het dashboard via de zijbalk van Home Assistant of de knop
+  **Open web-ui** van de add-on (ingress). Alleen als je **allow_direct_access** in de add-on
+  configuratie hebt aangezet en een poort hebt toegewezen kun je ook rechtstreeks:<br>
   * ```http://<ip-adres>:<ip-poort>/```, waarbij je voor:<br />
   * ```<ip-adres>``` het ip-adres invult van ja HA machine waarop ook de webserver draait<br>
   * ```<ip-poort``` het poortnummer invult waarop je de webserver kunt bereiken (zie verder).<br/>
@@ -620,7 +624,7 @@ Ga je hier voor de eerste keer mee aan gang volg dan de volgende aanpak:
   * tibber nog niet invullen of wijzigen
   * scheduler: alles laten staan
 * Kijk nu of de add-on wil opstarten, kijk na ca 10 seconden naar de logging en probeer
-in je browser het dashboard van de add-on te bereiken: `http://<ipadres van homeassistant>:5000`
+in je browser het dashboard van de add-on te bereiken via de zijbalk of de knop **Open web-ui**.
 * Als dit allemaal werkt kun je een verbruiksonderdeel invullen waarmee het programma het verbruik kan "schuiven".
 Als je dit hebt ingevuld laat dan het programma via het menu van het dashboard rekenen:<br> 
 \Run\Optimaliseringsberekening met debug. Dit duurt een aantal seconden. Inspecteer het resultaat en pas
@@ -2147,7 +2151,10 @@ Bijvoorbeeld (zie voor meer uitleg hierna):
 * \<url>/api/report/\<variable>/\<period>?parameter=parameter_value <br/>
 
 De ```<url>``` bestaat uit: ```http://<ip-adres>:<ip-poort>```.
-Het ```<ip-adres>``` en de```<ip-poort>``` zijn hetzelfde als bij het dashboard.<br/> 
+Het ```<ip-adres>``` en de```<ip-poort>``` zijn hetzelfde als bij het dashboard.<br/>
+Deze api-aanroepen komen niet via Home Assistant ingress binnen. Ze werken alleen als je in de
+add-on configuratie **allow_direct_access** hebt aangezet en in het netwerk-gedeelte van de add-on
+een poort hebt toegewezen. Zonder die optie antwoordt de add-on met `401 Unauthorized`.<br/>
 
 ## \<url>/api/run/\<commando><br />
 Met dit onderdeel van de api kun je via het dashboard alle berekeningen en bewerkingen

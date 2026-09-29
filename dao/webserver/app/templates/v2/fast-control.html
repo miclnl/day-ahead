@@ -11,6 +11,7 @@
 
 <form method="post" action="{{ url_for('v2.fast_control_mode') }}" class="mb-3"
       title="{{ 'Mode wordt gestuurd door een HA entity' if mode_is_entity else '' }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
   <div class="btn-group" role="group">
     <button type="submit" name="mode" value="off" class="btn btn-outline-secondary"
             {{ 'disabled' if (mode_is_entity or mode == 'off') else '' }}>Off</button>
@@ -25,6 +26,7 @@
 </form>
 
 <form method="post" action="{{ url_for('v2.task_exec') }}" class="mb-3 d-flex align-items-center gap-2">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
   <button type="submit" name="task" value="fast_once" class="btn btn-primary">Run once</button>
   <label class="ms-2">Backtest dagen:
     <input type="number" name="days" min="1" max="365" value="14" class="form-control d-inline-block" style="width: 5em">

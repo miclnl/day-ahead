@@ -27,6 +27,7 @@
 <div class="body">
     <header>
         <form method="post" name="menu_form" id="menu_form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
             <input type="hidden" id="active_menu" name="active_menu" value="{{active_menu}}">
             <div class="spacer">
             <div class="selector-container">

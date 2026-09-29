@@ -3,6 +3,7 @@
 {% block selectie %}
 <h3>Fast control</h3>
 <form method="post" name="mode_form" id="mode_form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
   <input type="hidden" name="active_menu" value="fast_control">
   <p>Modus:
     <button name="mode" value="off" class="btn btn_mid" {{ 'disabled' if (mode_is_entity or mode == 'off') else '' }}>Off</button>
@@ -11,9 +12,9 @@
     {% if mode_is_entity %}<span class="ms-2 text-muted">Mode wordt gestuurd door een HA entity</span>{% endif %}
   </p>
   <p>Acties:
-    <button name="current_bewerking" value="fast_once" class="btn btn_mid" formaction="/run">Run once</button>
+    <button name="current_bewerking" value="fast_once" class="btn btn_mid" formaction="{{ url_for('run_process') }}">Run once</button>
     dagen <input type="number" name="days" min="1" max="365" value="14" style="width: 4em">
-    <button name="current_bewerking" value="fast_simulate" class="btn btn_mid" formaction="/run">Backtest</button>
+    <button name="current_bewerking" value="fast_simulate" class="btn btn_mid" formaction="{{ url_for('run_process') }}">Backtest</button>
   </p>
   {% if error %}<p style="color: red;">{{ error }}</p>{% endif %}
   {% if success %}<p style="color: green;">{{ success }}</p>{% endif %}
@@ -42,7 +43,7 @@
 
 <script>
   setInterval(function() {
-    fetch('/fast_control/state.json')
+    fetch('{{ url_for("fast_control_state_json") }}')
       .then(function(r) { return r.json(); })
       .then(function(j) {
         document.getElementById('fast-mode').textContent = j.mode || 'off';

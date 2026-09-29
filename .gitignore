@@ -27,3 +27,5 @@ dao/webserver/app/static/build
 /dao/data/meta
 /config2.txt
 /docs/superpowers/
+.pytest_tmp
+dao/webserver/app/static/data

@@ -2,6 +2,7 @@
 
 {% block selectie %}
 <form method="post" name="bewerk_form" id="bewerk_form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
 <h3>Voer een bewerking, berekening of actie uit door een van onderstaande onderdelen aan te klikken</h3>
   <input type="hidden" id="current_menu" name="current_menu" value="run">
   {% set disabled = "" %}

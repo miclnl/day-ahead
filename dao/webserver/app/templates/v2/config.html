@@ -5,6 +5,7 @@
 <h1>Config</h1>
 <p>For all options visit: <a href="https://github.com/miclnl/day-ahead/wiki/5.-Overzicht-alle-instellingen" target="_blank">https://github.com/miclnl/day-ahead/wiki/5.-Overzicht-alle-instellingen</a></p>
 <form method="POST" class="flex-grow-1 d-flex flex-column">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
     <code-input
         template="syntax-highlighted"
         language="json"

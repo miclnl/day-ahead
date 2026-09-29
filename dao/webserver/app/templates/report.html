@@ -2,6 +2,7 @@
 
 {% block selectie %}
 <form method="post" id="content_form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
 <div class="selector-container">
   <input type="hidden" id="current_menu" name="current_menu" value={{ active_menu }}>
   <div class="spacer">

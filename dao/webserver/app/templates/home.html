@@ -80,6 +80,7 @@
   });
 </script>
 <form method="post" id="content_form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
 <div class="selector-container">
   <div class="spacer">
     <div class="select subject">

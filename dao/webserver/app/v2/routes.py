@@ -1,12 +1,16 @@
 import time, os, fnmatch, re, datetime, time, threading, json
-from flask import Blueprint, render_template, request, redirect, url_for
+from flask import Blueprint, abort, render_template, request, redirect, url_for
 
 from dao.prog.version import __version__
 from subprocess import Popen, PIPE, run, STDOUT, DEVNULL
 from pathlib import Path
 from dao.prog.da_report import Report
-from dao.prog.config.loader import ConfigurationLoader
-from dao.prog.config.models.base import FlexEnum
+from dao.prog.config.loader import (
+    ConfigurationLoader,
+    atomic_write_text,
+    set_fast_control_mode,
+    validate_config_data,
+)
 
 v2 = Blueprint("v2", __name__)
 
@@ -18,7 +22,9 @@ def inject_data():
     }
 
 # globals
-app_datapath = "app/static/data/"
+# The data directory lives outside Flask's static folder on purpose: it holds
+# secrets.json and the database. Graphs are served through the /images route.
+app_datapath = "../data/"
 
 VITE_DEV_SERVER = "http://localhost:5173"
 VITE_MANIFEST = Path("app/static/build/.vite/manifest.json")
@@ -275,7 +281,7 @@ def chart():
     if kwargs is None:
         return render_template("v2/no-task.html", )
 
-    kwargs["image"] = url_for('static', filename="data/images/" + kwargs["filename"])
+    kwargs["image"] = url_for("image", name=kwargs["filename"])
     return render_template(
         "v2/chart.html",
         **kwargs
@@ -302,10 +308,19 @@ def log():
 def delete_file():
     post_data = request.form.to_dict(flat=True)
 
-    if post_data["confirm"] == "1" and re.match(r'^(images|log)/[^/]+\.(log|png)$', post_data["file"]):
-        os.remove(app_datapath + post_data["file"])
+    action = post_data.get("action", "")
+    if action not in ("chart", "log"):
+        abort(400)
+    target = post_data.get("file", "")
+    if post_data.get("confirm") == "1" and re.match(
+        r"^(images|log)/[\w.\-]+\.(log|png)$", target
+    ):
+        try:
+            os.remove(app_datapath + target)
+        except FileNotFoundError:
+            pass
 
-    return redirect(url_for('v2.' + post_data["action"], i=post_data["show_index"]))
+    return redirect(url_for("v2." + action, i=post_data.get("show_index", 0)))
 
 
 @v2.route("/tasks")
@@ -641,16 +656,16 @@ def config():
     error = None
     success = None
 
-    if request.method == "POST" and request.form.to_dict()["config"] is not None:
+    if request.method == "POST" and "config" in request.form:
+        newconfig = request.form["config"]
         try:
-            newconfig = request.form.to_dict()["config"]
-            # try loading json
-            json.loads(newconfig)
-            with open(path, "w") as f:
-                f.write(newconfig)
+            # Syntax and schema: a config that does not validate would put
+            # the scheduler in a restart loop.
+            validate_config_data(json.loads(newconfig))
+            atomic_write_text(Path(path), newconfig)
             success = "Config updated successfully"
-        except Exception as err:
-            error = "Error: " + err.args[0]
+        except (ValueError, OSError) as err:
+            error = "Error: " + str(err)
 
     with open(path, "r") as file:
         content = file.read()
@@ -669,19 +684,15 @@ def secrets():
     error = None
     success = None
 
-    if request.method == "POST" and request.form.to_dict()["secrets"] is not None:
+    if request.method == "POST" and "secrets" in request.form:
+        newsecrets = request.form["secrets"]
         try:
-            newsecrets = request.form.to_dict()["secrets"]
-            # try loading json
-            json.loads(newsecrets)
-            with open(path, "w") as f:
-                f.write(newsecrets)
+            if not isinstance(json.loads(newsecrets), dict):
+                raise ValueError("secrets.json moet een JSON-object met sleutel/waarde zijn")
+            atomic_write_text(Path(path), newsecrets)
             success = "Secrets updated successfully"
-        except Exception as err:
-            error = "Error: " + err.args[0]
-
-    with open(path, "r") as file:
-        content = file.read()
+        except (ValueError, OSError) as err:
+            error = "Error: " + str(err)
 
     with open(path, "r") as file:
         content = file.read()
@@ -761,28 +772,11 @@ def fast_control_state():
 
 @v2.route("/fast-control/mode", methods=["POST"])
 def fast_control_mode():
-    config = _load_config()
-    if config is None:
-        return "Config onleesbaar", 400
-    fast = getattr(config, "fast_control", None)
-    if fast is None:
-        return "Geen fast_control in config", 400
-
-    mode_field = fast.mode
-    raw_value = getattr(mode_field, "value", mode_field)
-    is_entity = hasattr(mode_field, "is_entity_id") and mode_field.is_entity_id(raw_value)
-    if is_entity:
-        return "Mode wordt gestuurd door een HA entity", 400
-
     new_mode = request.form.get("mode", "").strip()
-    if new_mode not in ("off", "shadow", "active"):
-        return "Ongeldige modus", 400
-
-    fast.mode = FlexEnum(value=new_mode, enum_values=["off", "shadow", "active"])
-    config_path = app_datapath + "options.json"
-    tmp = config_path + ".tmp"
-    with open(tmp, "w") as handle:
-        json.dump(config.model_dump(mode="json", by_alias=True, exclude_none=True), handle, indent=2)
-        handle.flush(); os.fsync(handle.fileno())
-    os.replace(tmp, config_path)
+    try:
+        # Edits only the mode key in the raw document; dumping the whole model
+        # would rewrite the user's file with every default pinned.
+        set_fast_control_mode(Path(app_datapath + "options.json"), new_mode)
+    except (ValueError, OSError) as ex:
+        return str(ex), 400
     return redirect(url_for("v2.fast_control"))

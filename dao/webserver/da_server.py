@@ -1,8 +1,12 @@
-import os
-import argparse
+"""Development entry point: run the dashboard with Flask's built-in server.
 
-if not os.path.lexists("app/static/data"):
-    os.symlink("../data", "app/static/data")
+The data directory is ../data relative to dao/webserver, the same layout the
+add-on uses. Set DAO_ALLOW_DIRECT=1 when running outside Home Assistant,
+otherwise every request is refused because it does not come through ingress.
+"""
+
+import argparse
+import os
 
 from app import app
 
