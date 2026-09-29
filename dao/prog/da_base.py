@@ -12,11 +12,23 @@ import requests
 from requests import get
 import json
 import hassapi as hass
+from hassapi.exceptions import (
+    BadGateway,
+    InternalServerError,
+    ServiceUnavailable,
+    TooManyRequests,
+)
 import pandas as pd
 from subprocess import PIPE, run
 import logging
 from logging import Handler
 from sqlalchemy import Table, select, func, and_
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 # from dao.prog.solar_predictor import SolarPredictor
 from dao.prog.utils import get_tibber_data, error_handling
@@ -47,6 +59,30 @@ class HAContext:
     longitude: float
     time_zone: str
     country: str
+
+
+#: A network hiccup or a momentarily overloaded Home Assistant must not
+#: itself take down calc_optimum (~40 HA reads per run); three attempts with
+#: a short backoff absorb a single blip. hassapi's own exceptions carry the
+#: HTTP status code in their type: only the transient ones (429/500/502/503)
+#: are retried here, a 401/403/404 is a configuration error retrying cannot
+#: fix and would only delay the FlexValue default-fallback (see
+#: models/base.py) by several seconds for nothing.
+_retry_ha_call = retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+    retry=retry_if_exception_type(
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            TooManyRequests,
+            InternalServerError,
+            BadGateway,
+            ServiceUnavailable,
+        )
+    ),
+)
 
 
 class NotificationHandler(Handler):
@@ -255,6 +291,21 @@ class DaBase(hass.Hass):
         self.graphics_options = self.config.graphics
         self.db_da.log_pool_status()
         warnings.simplefilter("ignore", ResourceWarning)
+
+    @_retry_ha_call
+    def get_state(self, entity_id: str, *args, **kwargs):
+        return super().get_state(entity_id, *args, **kwargs)
+
+    @_retry_ha_call
+    def call_service(self, service: str, *args, **kwargs):
+        # turn_on/turn_off/select_option/open_cover/... are all thin
+        # wrappers around call_service (see hassapi.client.services), so
+        # this one override also covers every one of them.
+        return super().call_service(service, *args, **kwargs)
+
+    @_retry_ha_call
+    def set_state(self, entity_id: str, *args, **kwargs):
+        return super().set_state(entity_id, *args, **kwargs)
 
     # Callable passed to FlexValue.resolve() — returns HA state as a plain string.
     def ha_getter(self, eid):
