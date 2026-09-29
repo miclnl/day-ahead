@@ -20,28 +20,9 @@ from dao.prog import tasks as task_registry
 from .conftest import INGRESS, SUPERVISOR, csrf_token
 
 
-@pytest.fixture(autouse=True)
-def no_threads(client, monkeypatch):
-    """Keep the routes from actually spawning tasks.
-
-    These tests are about the guard, not about running anything; a real
-    thread would start a real day_ahead.py subprocess.
-    """
-    import importlib
-
-    started = []
-    for module_name in ("app.routes", "app.v2.routes"):
-        module = importlib.import_module(module_name)
-
-        class FakeThread:
-            def __init__(self, target=None, args=(), daemon=None, **kwargs):
-                started.append(args)
-
-            def start(self):
-                pass
-
-        monkeypatch.setattr(module.threading, "Thread", FakeThread)
-    return started
+# No fixture needed to stop the routes running anything: they only record a
+# request now. Starting the task is the scheduler process's job, which is
+# exactly the point of moving it out of the gunicorn worker.
 
 
 class TestV2Dashboard:
@@ -61,7 +42,7 @@ class TestV2Dashboard:
         assert response.status_code == 409
         assert b"scheduler" in response.data
 
-    def test_a_free_task_starts_and_is_claimed(self, client, no_threads):
+    def test_a_free_task_is_requested_for_the_scheduler(self, client):
         response = client.post(
             "/v2/task-exec",
             data={
@@ -73,10 +54,30 @@ class TestV2Dashboard:
         )
 
         assert response.status_code in (302, 303)
-        assert task_state.is_running("calc_optimum") is True
-        assert task_state.running_tasks()["calc_optimum"]["source"] == "dashboard"
-        # The canonical key is what gets claimed, whichever alias was posted.
-        assert no_threads and no_threads[-1][1] == "calc_optimum"
+        # The canonical key is what gets claimed, whichever alias was posted,
+        # and it is pending rather than running: the dashboard no longer runs
+        # anything itself.
+        entry = task_state.running_tasks()["calc_optimum"]
+        assert entry["state"] == "pending"
+        assert entry["source"] == "dashboard"
+        assert task_state.pending_requests().keys() == {"calc_optimum"}
+
+    def test_the_parameters_travel_with_the_request(self, client):
+        """The scheduler builds the command, so it needs the form values the
+        dashboard collected."""
+        client.post(
+            "/v2/task-exec",
+            data={
+                "task": "fast_simulate",
+                "days": "21",
+                "csrf_token": csrf_token(client, "/v2/tasks"),
+            },
+            headers=INGRESS,
+            environ_base=SUPERVISOR,
+        )
+
+        entry = task_state.running_tasks()["fast_control_simulate"]
+        assert entry["parameters"] == {"days": "21"}
 
     def test_a_different_task_may_run_alongside(self, client):
         task_state.claim("calc_optimum", source="scheduler")

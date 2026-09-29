@@ -29,6 +29,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from da_base import DaBase
 from dao.prog import task_state
+from dao.prog import tasks as task_registry
 from dao.prog.fastctrl.runner import start_if_enabled
 
 #: How late a job may still be started when the scheduler was busy or the
@@ -45,6 +46,17 @@ MAX_PARALLEL_TASKS = 4
 #: enough that a multi-hour ML training does not rewrite the state file
 #: thousands of times.
 HEARTBEAT_S = 30
+
+#: How often the dashboards' requests are picked up. Short enough that
+#: pressing a button feels immediate, and well under
+#: task_state.PENDING_TIMEOUT_S.
+REQUEST_POLL_S = 5
+
+#: How often liveness is recorded while polling. Deliberately much longer
+#: than REQUEST_POLL_S: it only has to stay fresher than the pending
+#: timeout, and writing on every poll would be thousands of small writes a
+#: day to an SD card.
+ALIVE_NOTE_S = 20
 
 
 def cron_trigger(pattern: str, timezone) -> CronTrigger:
@@ -73,6 +85,7 @@ class DaScheduler(DaBase):
         self.schedule = list(self.config.scheduler.schedule)
         self.fast_control = None
         self.scheduler: BlockingScheduler | None = None
+        self._last_alive_note = 0.0
 
 
     # -- running one task ---------------------------------------------------
@@ -84,31 +97,85 @@ class DaScheduler(DaBase):
                 return key
         return None
 
-    def run_task_process(self, key_task: str) -> bool:
+    @property
+    def log_dir(self) -> str:
+        return os.path.join(self.PROG_DIR, "..", "data", "log")
+
+    def _newest_log_for(self, key_task: str) -> str | None:
+        """The newest log file belonging to *key_task*, or None.
+
+        Each task writes its own log through DaBase.run_task_function, named
+        "<file_name>_<timestamp>.log". The dashboard needs that path to show
+        the output, and only the registry knows the prefix -- the v2
+        dashboard used to watch for the newest *.log of any kind, which
+        picked up another task's output when two ran at once.
+        """
+        prefix = self.tasks[key_task]["file_name"]
+        try:
+            names = [
+                name
+                for name in os.listdir(self.log_dir)
+                if name.startswith(prefix + "_") and name.endswith(".log")
+            ]
+        except OSError:
+            return None
+        if not names:
+            return None
+        return os.path.join("../data/log", max(names))
+
+    def run_task_process(
+        self, key_task: str, parameters: dict | None = None
+    ) -> tuple[str, int | None, str | None]:
+        """Run the task and report (status, returncode, logfile).
+
+        Deliberately does not touch the claim: _run_exclusive owns that
+        from start to finish, so there is one place responsible for
+        releasing it however the run ends.
+        """
         run_task = self.tasks[key_task]
+        cmd = task_registry.build_cmd(key_task, parameters) or list(run_task["cmd"])
         # Pin CWD to the prog directory: the calc and forecast tasks use
         # CWD-relative paths (../data, ../prog) and silently misbehave
         # if the scheduler is started from a different working directory
         # (e.g. by a manual /api/run trigger or a future debug entrypoint).
         logging.info(f"Taak {key_task} gestart")
         started = datetime.datetime.now()
-        proc = Popen(run_task["cmd"], cwd=self.PROG_DIR)
+        before = self._newest_log_for(key_task)
+        # start_new_session=True: the task gets its own process group, so a
+        # cancel reaches anything it spawned rather than just the direct
+        # child.
+        proc = Popen(cmd, cwd=self.PROG_DIR, start_new_session=True)
+        logfile = None
+        cancelled = False
         # Keep the claim fresh while the task runs, so a long one (ML
         # training) is not mistaken for a dead claim and started a second
         # time by the dashboard. Polling instead of proc.wait() is what
-        # makes that possible.
+        # makes that possible, and it is also how a cancel request gets
+        # noticed.
         while proc.poll() is None:
-            task_state.heartbeat(key_task)
+            if logfile is None:
+                found = self._newest_log_for(key_task)
+                if found is not None and found != before:
+                    logfile = found
+            entry = task_state.heartbeat(key_task, logfile=logfile)
+            if entry.get("cancel"):
+                logging.warning(f"Taak {key_task} wordt afgebroken op verzoek")
+                task_registry.kill_process_group(proc)
+                cancelled = True
+                break
             time.sleep(HEARTBEAT_S)
+        proc.wait()
         duration = (datetime.datetime.now() - started).total_seconds()
+        if cancelled:
+            return "cancelled", proc.returncode, logfile
         if proc.returncode != 0:
             logging.error(
                 f"Taak {key_task} eindigde met exit code {proc.returncode} "
                 f"na {duration:.0f} s"
             )
-            return False
+            return "error", proc.returncode, logfile
         logging.info(f"Taak {key_task} klaar na {duration:.0f} s")
-        return True
+        return "done", proc.returncode, logfile
 
     def _run_exclusive(self, key_task: str) -> None:
         """Run a task unless the same task is already running.
@@ -128,13 +195,81 @@ class DaScheduler(DaBase):
                 f"(gestart door {holder.get('source', 'onbekend')})"
             )
             return
+        self._run_claimed(key_task)
+
+    def _run_claimed(self, key_task: str, parameters: dict | None = None) -> None:
+        """Run a task whose claim this process already holds, and release it.
+
+        Shared by the cron path (_run_exclusive, which just claimed) and the
+        request path (_pick_up_requests, which took over a claim the
+        dashboard made), so both release on exactly the same paths.
+        """
         try:
-            ok = self.run_task_process(key_task)
+            status, returncode, logfile = self.run_task_process(
+                key_task, parameters
+            )
         except Exception:  # noqa: BLE001 - the scheduler must keep running
             logging.exception(f"Taak {key_task} is mislukt")
             task_state.release(key_task, "error")
         else:
-            task_state.release(key_task, "done" if ok else "error")
+            task_state.release(
+                key_task, status, returncode=returncode, logfile=logfile
+            )
+
+    # -- requests from the dashboards ---------------------------------------
+
+    def _pick_up_requests(self) -> None:
+        """Run whatever the dashboards have asked for.
+
+        This is what takes task execution out of the gunicorn worker. The
+        dashboards used to run tasks themselves in a daemon thread; that
+        worker is recycled on every configuration change (the watchdog sends
+        gunicorn a HUP), which killed the thread while its subprocess kept
+        running, leaving nothing to record the result and the task registered
+        as running until its claim went stale. With two workers a request
+        could also land in either one.
+
+        Requests are claims in the "pending" state, so they already exclude
+        everything else; take_pending flips one to "running" atomically,
+        which is what stops two poll cycles from starting the same request.
+        """
+        task_state.expire_overdue_pending()
+        self._note_alive()
+        for key_task in task_state.pending_requests():
+            if key_task not in self.tasks:
+                logging.error(
+                    f"Aanvraag voor onbekende taak {key_task!r}, overgeslagen"
+                )
+                task_state.release(key_task, "error")
+                continue
+            entry = task_state.take_pending(key_task)
+            if entry is None:
+                continue  # another poll got there first
+            logging.info(
+                f"Taak {key_task} opgepakt "
+                f"(aangevraagd door {entry.get('source', 'onbekend')})"
+            )
+            self.scheduler.add_job(
+                self._run_claimed,
+                args=[key_task, entry.get("parameters") or {}],
+                id=f"request-{key_task}-{int(time.time() * 1000)}",
+                misfire_grace_time=None,
+            )
+
+    def _note_alive(self) -> None:
+        """Record liveness now and then, so the dashboard can warn when this
+        process is not running and a request would sit there unanswered.
+
+        Rate-limited rather than written on every poll: at a five second
+        interval that would be some seventeen thousand small writes a day to
+        what is often an SD card, for a signal that only needs to be fresher
+        than the pending timeout.
+        """
+        now = time.time()
+        if now - self._last_alive_note < ALIVE_NOTE_S:
+            return
+        self._last_alive_note = now
+        task_state.note_scheduler_alive()
 
     # -- fast control -------------------------------------------------------
 
@@ -174,8 +309,28 @@ class DaScheduler(DaBase):
             },
             timezone=timezone,
         )
+        # Added before the active check on purpose: scheduler.active = false
+        # means "run no cron schedule", not "ignore the dashboard". Without
+        # this, every button in the web UI would silently do nothing on an
+        # installation with the schedule switched off.
+        scheduler.add_job(
+            self._pick_up_requests,
+            "interval",
+            seconds=REQUEST_POLL_S,
+            id="pick-up-task-requests",
+            name="taakaanvragen oppakken",
+            # The poll is idempotent and cheap; a missed one just means the
+            # next runs a few seconds later, so there is nothing to catch up.
+            misfire_grace_time=None,
+            coalesce=True,
+            max_instances=1,
+            next_run_time=datetime.datetime.now(timezone),
+        )
         if not self.active:
-            logging.warning("Scheduler staat uit (scheduler.active = false); geen taken gepland")
+            logging.warning(
+                "Scheduler staat uit (scheduler.active = false); geen taken "
+                "gepland. Taken uit het dashboard worden nog wel uitgevoerd."
+            )
             return scheduler
         for index, entry in enumerate(self.schedule):
             key_task = self.task_key_for(entry.action)

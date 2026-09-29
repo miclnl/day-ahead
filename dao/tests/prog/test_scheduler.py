@@ -7,7 +7,6 @@ the parts that hold the scheduling logic.
 
 import datetime
 import threading
-import time
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -52,9 +51,18 @@ def _bare_scheduler(monkeypatch, schedule, active=True):
     instance.time_zone = "Europe/Amsterdam"
     instance.fast_control = None
     instance.scheduler = None
-    instance._task_locks = {}
-    instance._locks_guard = threading.Lock()
+    instance._last_alive_note = 0.0
     return instance
+
+
+def cron_jobs(scheduler):
+    """The scheduled tasks, without the request-pickup job.
+
+    The pickup job is added for every scheduler, including an inactive one,
+    because scheduler.active = false means "run no cron schedule", not
+    "ignore the dashboard".
+    """
+    return [job for job in scheduler.get_jobs() if job.id != "pick-up-task-requests"]
 
 
 class Entry:
@@ -69,7 +77,7 @@ def test_every_entry_becomes_a_job_including_duplicates(monkeypatch):
         [Entry("xx00", "calc_optimum"), Entry("xx00", "get_meteo_data"), Entry("0544", "get_meteo_data")],
     )
     scheduler = instance.build_scheduler()
-    names = sorted(job.name for job in scheduler.get_jobs())
+    names = sorted(job.name for job in cron_jobs(scheduler))
     assert names == ["0544 get_meteo_data", "xx00 calc_optimum", "xx00 get_meteo_data"]
     # Job defaults are applied when the scheduler starts; check the configured defaults.
     assert scheduler._job_defaults["max_instances"] == 1
@@ -79,11 +87,11 @@ def test_every_entry_becomes_a_job_including_duplicates(monkeypatch):
 
 def test_unknown_actions_are_skipped_and_inactive_schedules_are_empty(monkeypatch, caplog):
     instance = _bare_scheduler(monkeypatch, [Entry("xx00", "no_such_task")])
-    assert instance.build_scheduler().get_jobs() == []
+    assert cron_jobs(instance.build_scheduler()) == []
     assert "no_such_task" in caplog.text
 
     instance = _bare_scheduler(monkeypatch, [Entry("xx00", "calc_optimum")], active=False)
-    assert instance.build_scheduler().get_jobs() == []
+    assert cron_jobs(instance.build_scheduler()) == []
 
 
 def test_the_same_task_never_overlaps_itself(monkeypatch, caplog):
@@ -92,12 +100,12 @@ def test_the_same_task_never_overlaps_itself(monkeypatch, caplog):
     release = threading.Event()
     runs = []
 
-    def slow_task(key_task):
+    def slow_task(key_task, parameters=None):
         runs.append(key_task)
         if key_task == "calc_optimum" and not release.is_set():
             running.set()
             release.wait(5)
-        return True
+        return "done", 0, None
 
     monkeypatch.setattr(instance, "run_task_process", slow_task)
 
@@ -121,7 +129,7 @@ def test_the_same_task_never_overlaps_itself(monkeypatch, caplog):
 def test_a_failing_task_does_not_propagate(monkeypatch, caplog):
     instance = _bare_scheduler(monkeypatch, [])
 
-    def boom(key_task):
+    def boom(key_task, parameters=None):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(instance, "run_task_process", boom)
@@ -142,10 +150,10 @@ def test_the_scheduler_claim_is_visible_outside_this_process(monkeypatch):
     running = threading.Event()
     release = threading.Event()
 
-    def slow_task(key_task):
+    def slow_task(key_task, parameters=None):
         running.set()
         release.wait(5)
-        return True
+        return "done", 0, None
 
     monkeypatch.setattr(instance, "run_task_process", slow_task)
 
@@ -168,7 +176,11 @@ def test_a_task_started_elsewhere_makes_the_scheduler_skip(monkeypatch, caplog):
     not be started a second time when its cron time comes around."""
     instance = _bare_scheduler(monkeypatch, [])
     runs = []
-    monkeypatch.setattr(instance, "run_task_process", lambda key: runs.append(key))
+    monkeypatch.setattr(
+        instance,
+        "run_task_process",
+        lambda key, parameters=None: (runs.append(key), ("done", 0, None))[1],
+    )
 
     task_state.claim("calc_optimum", "dashboard")
     instance._run_exclusive("calc_optimum")

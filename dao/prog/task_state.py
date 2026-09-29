@@ -59,6 +59,17 @@ LOCK_PATH = "../data/task_state.lock"
 #: unstartable until someone deleted the file by hand.
 STALE_AFTER_S = 600
 
+#: A request that the scheduler has not picked up within this many seconds
+#: is reported as failed. Much shorter than STALE_AFTER_S on purpose: the
+#: scheduler polls every few seconds, so anything longer than this means it
+#: is not running, and leaving the dashboard on "wordt gestart" for ten
+#: minutes tells the operator nothing.
+PENDING_TIMEOUT_S = 60
+
+#: Written by the scheduler while it polls for requests, so the dashboard can
+#: say "the planner is not running" instead of letting a request sit there.
+SCHEDULER_SEEN_KEY = "scheduler_seen"
+
 _EMPTY: dict[str, Any] = {"running": {}, "last": {}, "last_update": 0.0}
 
 
@@ -97,22 +108,44 @@ def _read_raw() -> dict[str, Any]:
         return dict(_EMPTY)
     running = data.get("running")
     last = data.get("last")
-    return {
+    result = {
         "running": running if isinstance(running, dict) else {},
         "last": last if isinstance(last, dict) else {},
         "last_update": data.get("last_update", 0.0),
     }
+    if data.get(SCHEDULER_SEEN_KEY):
+        result[SCHEDULER_SEEN_KEY] = data[SCHEDULER_SEEN_KEY]
+    return result
+
+
+def _age_limit(entry: dict[str, Any]) -> float:
+    """How long *entry* may go without an update before it is dead.
+
+    A pending request gets much less rope than a running task: the
+    scheduler polls every few seconds, so a request still pending after a
+    minute means nobody is going to pick it up.
+    """
+    if entry.get("state") == "pending":
+        return PENDING_TIMEOUT_S
+    return STALE_AFTER_S
 
 
 def _drop_stale(state: dict[str, Any], now: float) -> dict[str, Any]:
     fresh = {}
     for key, entry in state["running"].items():
         heartbeat = entry.get("heartbeat", entry.get("started", 0.0))
-        if now - heartbeat > STALE_AFTER_S:
-            logging.warning(
-                f"Taak {key} stond nog als lopend geregistreerd maar is "
-                f"{now - heartbeat:.0f} s niet meer bijgewerkt; claim vrijgegeven"
-            )
+        limit = _age_limit(entry)
+        if now - heartbeat > limit:
+            if entry.get("state") == "pending":
+                logging.warning(
+                    f"Aanvraag voor taak {key} is na {now - heartbeat:.0f} s "
+                    f"niet opgepakt; draait de planner?"
+                )
+            else:
+                logging.warning(
+                    f"Taak {key} stond nog als lopend geregistreerd maar is "
+                    f"{now - heartbeat:.0f} s niet meer bijgewerkt; claim vrijgegeven"
+                )
             continue
         fresh[key] = entry
     state["running"] = fresh
@@ -153,8 +186,10 @@ def claim(
     source: str,
     logfile: Optional[str] = None,
     pid: Optional[int] = None,
+    state_name: str = "running",
+    parameters: Optional[dict[str, Any]] = None,
 ) -> bool:
-    """Register *task_key* as running, unless it already is.
+    """Register *task_key* as claimed, unless it already is.
 
     Returns True when the caller may start the task and is now responsible
     for calling :func:`release` (and :func:`heartbeat` while it runs).
@@ -162,22 +197,146 @@ def claim(
 
     *source* is recorded purely so a log line or the dashboard can say where
     a run came from ("scheduler", "dashboard", "api").
+
+    *state_name* is "running" for a caller that is about to do the work
+    itself, or "pending" for a request the scheduler still has to pick up
+    (see :func:`request`). Either way the claim blocks everyone else, so the
+    exclusion is the same.
     """
     now = time.time()
     with _locked():
-        state = _drop_stale(_read_raw(), now)
-        if task_key in state["running"]:
+        current = _drop_stale(_read_raw(), now)
+        if task_key in current["running"]:
             return False
-        state["running"][task_key] = {
+        current["running"][task_key] = {
+            "state": state_name,
             "started": now,
             "heartbeat": now,
             "source": source,
             "logfile": logfile,
             "pid": pid,
             "cancel": False,
+            "parameters": parameters or {},
         }
-        _write(state)
+        _write(current)
     return True
+
+
+def request(
+    task_key: str,
+    source: str,
+    parameters: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Ask the scheduler to run *task_key*.
+
+    The dashboards used to run tasks themselves, in a daemon thread inside a
+    gunicorn worker. That worker is recycled on every configuration change
+    (the watchdog sends it a HUP), which killed the thread while its
+    subprocess kept running, with nothing left to notice the result. And
+    with two workers, a request could land in either one.
+
+    Now they record what should happen and the scheduler process, which is
+    long-lived and already owns task execution for the cron schedule, does
+    it. Returns False when the task is already claimed.
+    """
+    return claim(task_key, source, state_name="pending", parameters=parameters)
+
+
+def pending_requests() -> dict[str, Any]:
+    """Claims that are waiting for the scheduler to pick them up."""
+    return {
+        key: entry
+        for key, entry in running_tasks().items()
+        if entry.get("state") == "pending"
+    }
+
+
+def take_pending(task_key: str) -> Optional[dict[str, Any]]:
+    """Move *task_key* from pending to running and return its entry.
+
+    Only succeeds for a claim that is still pending, so two scheduler
+    threads polling at the same time cannot both start the same request.
+    Returns None when there was nothing to take.
+    """
+    now = time.time()
+    with _locked():
+        current = _read_raw()
+        entry = current["running"].get(task_key)
+        if entry is None or entry.get("state") != "pending":
+            return None
+        entry["state"] = "running"
+        entry["heartbeat"] = now
+        entry["taken"] = now
+        _write(current)
+        return dict(entry)
+
+
+def expire_overdue_pending() -> list[str]:
+    """Record overdue requests as failed and give up their claims.
+
+    Called by the scheduler when it resumes polling. A request that has been
+    waiting this long means the scheduler was down while it was made, and
+    silently running it now would fire an optimisation the operator asked
+    for twenty minutes ago. Recording it as failed is both safer and more
+    informative than letting the claim quietly expire, which would leave the
+    dashboard showing nothing at all.
+
+    Returns the task keys that were expired.
+    """
+    now = time.time()
+    expired = []
+    with _locked():
+        current = _read_raw()
+        for key, entry in list(current["running"].items()):
+            if entry.get("state") != "pending":
+                continue
+            waited = now - entry.get("heartbeat", entry.get("started", now))
+            if waited <= PENDING_TIMEOUT_S:
+                continue
+            current["running"].pop(key)
+            current["last"][key] = {
+                "status": "error",
+                "returncode": None,
+                "finished": now,
+                "started": entry.get("started"),
+                "source": entry.get("source"),
+                "logfile": None,
+                "message": (
+                    f"Niet opgepakt binnen {PENDING_TIMEOUT_S} s; "
+                    f"de planner draaide op dat moment niet."
+                ),
+            }
+            expired.append(key)
+        if expired:
+            _write(current)
+    for key in expired:
+        logging.warning(
+            f"Aanvraag voor taak {key} is verlopen: de planner heeft hem niet "
+            f"opgepakt en hij wordt niet meer uitgevoerd."
+        )
+    return expired
+
+
+def note_scheduler_alive() -> None:
+    """Record that the scheduler is polling, for :func:`scheduler_alive`."""
+    with _locked():
+        current = _read_raw()
+        current[SCHEDULER_SEEN_KEY] = time.time()
+        _write(current)
+
+
+def scheduler_alive(within_s: float = PENDING_TIMEOUT_S) -> Optional[bool]:
+    """Whether the scheduler has been seen polling recently.
+
+    Returns None when it has never been seen at all, which is what an
+    installation that has not yet run this version looks like -- callers
+    should treat that as "unknown" rather than "down" and not scare the
+    operator with a warning that is really about a missing field.
+    """
+    seen = read().get(SCHEDULER_SEEN_KEY)
+    if not seen:
+        return None
+    return (time.time() - seen) <= within_s
 
 
 def heartbeat(task_key: str, logfile: Optional[str] = None) -> dict[str, Any]:

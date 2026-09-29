@@ -1,7 +1,6 @@
 import collections
 import datetime
 import re
-import time
 
 # from sqlalchemy.sql.coercions import expect_col_expression_collection
 
@@ -17,8 +16,7 @@ from flask import (
 from markupsafe import escape
 import fnmatch
 import os
-import threading
-from subprocess import Popen, PIPE, run, STDOUT, TimeoutExpired
+from subprocess import TimeoutExpired, run
 import logging
 from pathlib import Path
 from dao.prog.config.loader import (
@@ -664,12 +662,6 @@ task_state = {
     "returncode": None
 }
 """
-lock = threading.Lock()
-
-#: How often a running task refreshes its claim, and how often it checks
-#: whether a cancel was requested. Well under task_state.STALE_AFTER_S.
-HEARTBEAT_S = 5
-
 
 def _tracked_task() -> tuple:
     """The task this dashboard's status and log polling should report on.
@@ -689,54 +681,6 @@ def _tracked_task() -> tuple:
         key = max(finished, key=lambda k: finished[k].get("finished") or 0)
         return key, finished[key]
     return None, {"status": "idle", "logfile": None}
-
-
-def run_and_log(cmd, task_key, logfile):
-    """Run a claimed task, streaming its output into *logfile*.
-
-    The caller must already hold the claim on *task_key* (see run_process);
-    taking it here would reopen the check-then-act race this is meant to
-    close. Releasing it is this function's job, including when the task
-    fails, so a crashed run does not block the next one for the full
-    staleness window.
-    """
-    status = "error"
-    returncode = None
-    try:
-        with open(logfile, "w") as handle:
-            # start_new_session=True: the task gets its own process group, so
-            # a cancel reaches everything it spawned and a signal aimed at
-            # the web server does not kill it halfway through.
-            proc = Popen(
-                cmd, stdout=PIPE, stderr=STDOUT, text=True, start_new_session=True
-            )
-            task_state.heartbeat(task_key, logfile=logfile)
-            cancelled = False
-            last_beat = time.time()
-            for line in proc.stdout:
-                handle.write(line)
-                handle.flush()
-                now = time.time()
-                if now - last_beat >= HEARTBEAT_S:
-                    last_beat = now
-                    entry = task_state.heartbeat(task_key)
-                    if entry.get("cancel"):
-                        cancelled = True
-                        handle.write("\nOpdracht afgebroken op verzoek.\n")
-                        handle.flush()
-                        task_registry.kill_process_group(proc)
-                        break
-            proc.wait()
-            returncode = proc.returncode
-            if cancelled:
-                status = "cancelled"
-            else:
-                status = "done" if returncode == 0 else "error"
-    except Exception:
-        logging.exception(f"Taak {task_key} is mislukt")
-        raise
-    finally:
-        task_state.release(task_key, status, returncode=returncode, logfile=logfile)
 
 
 @app.route("/run", methods=["POST", "GET"])
@@ -763,32 +707,28 @@ def run_process():
                     for parameter in run_bewerking["parameters"]
                     if parameter in dct
                 }
-                cmd = task_registry.build_cmd(canonical, values)
-                logfile = (
-                    "../data/log/"
-                    + run_bewerking["file_name"]
-                    + "_tmp_"
-                    + datetime.datetime.now().strftime("%Y-%m-%d__%H:%M:%S")
-                    + ".log"
-                )
-                # Claim before starting the thread, not inside it. The old
-                # code read the state here and only wrote "running" once the
-                # worker thread got scheduled, so two near-simultaneous
-                # requests both passed the check above and started the task
-                # twice. claim() does the check and the write atomically.
-                if not task_state.claim(
-                    canonical, source="dashboard", logfile=logfile
+                # Hand the work to the scheduler process rather than doing
+                # it here. This request is served by a gunicorn worker that
+                # is recycled on every configuration change (the watchdog
+                # HUPs gunicorn), which killed the thread that used to do
+                # the work while its subprocess carried on, leaving nothing
+                # to record the result. The request is a claim in the
+                # "pending" state, so cron and the v2 dashboard are excluded
+                # from the same task immediately.
+                if not task_state.request(
+                    canonical, source="dashboard", parameters=values
                 ):
                     log_content = "Er draait al een opdracht."
                     state = "running"
                 else:
                     bewerking = ""
-                    threading.Thread(
-                        target=run_and_log,
-                        args=(cmd, canonical, logfile),
-                        daemon=True,
-                    ).start()
-                    log_content = "Opdracht is gestart"
+                    if task_state.scheduler_alive() is False:
+                        log_content = (
+                            "Opdracht aangevraagd, maar de planner lijkt niet "
+                            "te draaien. Controleer het add-on-log."
+                        )
+                    else:
+                        log_content = "Opdracht is gestart"
                     state = "running"
             else:
                 for i in range(len(dct.keys())):

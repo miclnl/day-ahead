@@ -1,8 +1,7 @@
-import time, os, fnmatch, re, datetime, threading, json, logging
+import time, os, fnmatch, re, datetime, json, logging
 from flask import Blueprint, abort, render_template, request, redirect, url_for
 
 from dao.prog.version import __version__
-from subprocess import Popen, PIPE, run, STDOUT, DEVNULL
 from pathlib import Path
 from dao.prog.da_report import Report
 from dao.prog import task_state
@@ -134,61 +133,6 @@ def get_task_state() -> dict:
             "returncode": entry.get("returncode"),
         }
     return {"status": "idle", "task": None, "logfile": None, "started": None}
-
-
-def run_and_log(cmd, task_key):
-    """Run a claimed task and keep its claim fresh until it finishes.
-
-    The caller must already hold the claim on *task_key* (see task_exec);
-    releasing it is this function's job, on every path, so a crashed run
-    does not block the next one for the full staleness window.
-
-    The task writes its own log file, so the name is discovered by watching
-    the log directory for a file that appeared after the start. This used to
-    be tangled up with ownership detection -- comparing its own log file
-    against the one in the shared single-slot state and killing itself when
-    they differed -- which is no longer needed now that a claim is per task
-    and belongs unambiguously to this run.
-    """
-    log_dir = os.path.join(app_datapath, "log")
-    existing = get_file_list_with_ts(log_dir, "*.log")
-    newest_before = existing[-1]["name"] if existing else None
-
-    logfile = None
-    status = "error"
-    returncode = None
-    try:
-        proc = Popen(
-            cmd,
-            stdout=DEVNULL,
-            stderr=DEVNULL,
-            text=True,
-            start_new_session=True,
-        )
-        cancelled = False
-        while proc.poll() is None:
-            entry = task_state.heartbeat(task_key, logfile=logfile)
-            if entry.get("cancel"):
-                cancelled = True
-                task_registry.kill_process_group(proc)
-                break
-            if logfile is None:
-                flist = get_file_list_with_ts(log_dir, "*.log")
-                if flist and flist[-1]["name"] != newest_before:
-                    logfile = os.path.join(log_dir, flist[-1]["name"])
-            time.sleep(HEARTBEAT_S)
-        proc.wait()
-        returncode = proc.returncode
-        if cancelled:
-            status = "cancelled"
-            # A cancelled run's partial log is not worth keeping around.
-            if logfile and os.path.exists(logfile):
-                os.remove(logfile)
-            logfile = None
-        else:
-            status = "done" if returncode == 0 else "error"
-    finally:
-        task_state.release(task_key, status, returncode=returncode, logfile=logfile)
 
 
 def log_chart(datapath: str, pattern: str):
@@ -326,15 +270,15 @@ def task_exec():
         return "Invalid action", 400
 
     values = {"days": request.form.get("days", "14")}
-    cmd = task_registry.build_cmd(canonical, values)
 
-    # Claim before starting the thread. The check and the write happen
-    # together under a lock, so two near-simultaneous posts cannot both get
-    # past it, and a run started by cron for the same task blocks this one
-    # (and the other way around) -- the scheduler takes its claims from the
-    # same registry.
-    logfile = None
-    if not task_state.claim(canonical, source="dashboard", logfile=logfile):
+    # Hand the work to the scheduler process instead of running it here.
+    # This request is served by a gunicorn worker that gets recycled on
+    # every configuration change (the watchdog sends gunicorn a HUP), which
+    # used to kill the thread doing the work while its subprocess carried
+    # on, leaving nothing to record the result. The request is a claim in
+    # the "pending" state, so it excludes cron and the other dashboard from
+    # the same task straight away.
+    if not task_state.request(canonical, source="dashboard", parameters=values):
         holder = task_state.running_tasks().get(canonical, {})
         return (
             f"Taak draait al (gestart door {holder.get('source', 'onbekend')}): "
@@ -342,11 +286,11 @@ def task_exec():
             409,
         )
 
-    threading.Thread(
-        target=run_and_log,
-        args=(cmd, canonical),
-        daemon=True,
-    ).start()
+    if task_state.scheduler_alive() is False:
+        logging.warning(
+            f"Taak {canonical} aangevraagd terwijl de planner niet lijkt te "
+            f"draaien; de aanvraag verloopt als hij niet wordt opgepakt."
+        )
 
     return redirect(url_for('v2.task_state'))
 

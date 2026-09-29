@@ -271,3 +271,134 @@ class TestCrossProcessAtomicity:
         assert results.count("WON") == 1, results
         assert results.count("LOST") == 7, results
         assert task_state.is_running("calc_optimum") is True
+
+
+class TestRequests:
+    """A request is a claim in the "pending" state, so it excludes everything
+    else from the moment the dashboard records it, before the scheduler has
+    even seen it."""
+
+    def test_a_request_blocks_cron_from_the_same_task(self):
+        assert task_state.request("calc_optimum", "dashboard") is True
+        assert task_state.claim("calc_optimum", "scheduler") is False
+
+    def test_a_request_carries_its_parameters(self):
+        task_state.request("prices", "dashboard", parameters={"prijzen_start": "x"})
+
+        entry = task_state.pending_requests()["prices"]
+        assert entry["parameters"] == {"prijzen_start": "x"}
+        assert entry["state"] == "pending"
+
+    def test_a_running_task_is_not_a_pending_request(self):
+        task_state.claim("meteo", "scheduler")
+        assert task_state.pending_requests() == {}
+
+    def test_taking_it_flips_the_state(self):
+        task_state.request("meteo", "dashboard")
+
+        entry = task_state.take_pending("meteo")
+
+        assert entry["state"] == "running"
+        assert task_state.pending_requests() == {}
+        assert task_state.is_running("meteo") is True
+
+    def test_only_one_taker_wins(self):
+        """Two scheduler poll cycles must not both start the same request."""
+        task_state.request("meteo", "dashboard")
+
+        first = task_state.take_pending("meteo")
+        second = task_state.take_pending("meteo")
+
+        assert first is not None
+        assert second is None
+
+    def test_taking_something_that_is_not_pending_yields_none(self):
+        task_state.claim("meteo", "scheduler")
+        assert task_state.take_pending("meteo") is None
+        assert task_state.take_pending("never_requested") is None
+
+
+class TestPendingExpiry:
+    def test_a_request_expires_much_sooner_than_a_running_task(self):
+        """The scheduler polls every few seconds, so a request still pending
+        after a minute means nobody is going to pick it up. Leaving the
+        dashboard on "wordt gestart" for the full ten minutes tells the
+        operator nothing."""
+        task_state.request("meteo", "dashboard")
+
+        state = json.loads(Path(task_state.STATE_PATH).read_text())
+        state["running"]["meteo"]["heartbeat"] = (
+            time.time() - task_state.PENDING_TIMEOUT_S - 1
+        )
+        Path(task_state.STATE_PATH).write_text(json.dumps(state))
+
+        assert task_state.pending_requests() == {}
+        assert task_state.claim("meteo", "scheduler") is True
+
+    def test_a_running_task_survives_the_pending_timeout(self):
+        task_state.claim("train_ml_predictions", "scheduler")
+
+        state = json.loads(Path(task_state.STATE_PATH).read_text())
+        state["running"]["train_ml_predictions"]["heartbeat"] = (
+            time.time() - task_state.PENDING_TIMEOUT_S - 1
+        )
+        Path(task_state.STATE_PATH).write_text(json.dumps(state))
+
+        assert task_state.is_running("train_ml_predictions") is True
+
+    def test_expiring_records_an_outcome_the_dashboard_can_show(self):
+        """Letting the claim quietly lapse would leave the dashboard showing
+        nothing at all; the operator pressed a button and deserves to know it
+        did not happen."""
+        task_state.request("meteo", "dashboard")
+        state = json.loads(Path(task_state.STATE_PATH).read_text())
+        state["running"]["meteo"]["heartbeat"] = (
+            time.time() - task_state.PENDING_TIMEOUT_S - 1
+        )
+        Path(task_state.STATE_PATH).write_text(json.dumps(state))
+
+        expired = task_state.expire_overdue_pending()
+
+        assert expired == ["meteo"]
+        result = task_state.last_result("meteo")
+        assert result["status"] == "error"
+        assert "planner" in result["message"]
+
+    def test_a_fresh_request_is_left_alone(self):
+        task_state.request("meteo", "dashboard")
+
+        assert task_state.expire_overdue_pending() == []
+        assert task_state.pending_requests().keys() == {"meteo"}
+
+    def test_a_running_task_is_never_expired_this_way(self):
+        task_state.claim("meteo", "scheduler")
+        assert task_state.expire_overdue_pending() == []
+        assert task_state.is_running("meteo") is True
+
+
+class TestSchedulerLiveness:
+    def test_unknown_before_the_scheduler_has_ever_been_seen(self):
+        """An installation that has not yet run this version has no such
+        field; callers must not report that as "the planner is down"."""
+        assert task_state.scheduler_alive() is None
+
+    def test_alive_right_after_being_noted(self):
+        task_state.note_scheduler_alive()
+        assert task_state.scheduler_alive() is True
+
+    def test_not_alive_once_the_note_is_old(self):
+        task_state.note_scheduler_alive()
+        state = json.loads(Path(task_state.STATE_PATH).read_text())
+        state[task_state.SCHEDULER_SEEN_KEY] = (
+            time.time() - task_state.PENDING_TIMEOUT_S - 1
+        )
+        Path(task_state.STATE_PATH).write_text(json.dumps(state))
+
+        assert task_state.scheduler_alive() is False
+
+    def test_the_note_survives_other_writes(self):
+        task_state.note_scheduler_alive()
+        task_state.claim("meteo", "scheduler")
+        task_state.release("meteo", "done")
+
+        assert task_state.scheduler_alive() is True
