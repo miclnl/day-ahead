@@ -699,7 +699,12 @@ class DaCalc(DaBase):
             for s in range(pv_dc_num[b]):
                 pv_prod_dc[b].append([])
                 pv_prod_ac[b].append([])
-                solar_name = self.battery_options[b].solar[s].name.replace(" ", "_")
+                solar_name = (
+                    self.battery_options[b]
+                    .solar[s]
+                    .name.replace(" ", "_")
+                    .replace("-", "_")
+                )
                 solar_series = prog_data[solar_name]
                 for u in range(U):
                     # pv_prod productie van batterij b van solar s in uur u, in kWh
@@ -2682,7 +2687,7 @@ class DaCalc(DaBase):
             elif run_hours > 0:
                 logging.info(f"Warmtepomp draait al minimaal {run_hours} uur")
             # number of bloks
-            if hp_hours / hours_avail > 0.8:
+            if hours_avail <= 0 or hp_hours / hours_avail > 0.8:
                 blocks_num = 0  # dus geen block-optimalisering
             else:
                 if self.hp_adjustment == "on/off":
