@@ -51,8 +51,6 @@ def calc_r2(serie_x: pd.Series, serie_y: pd.Series) -> float:
 
 
 class Report(DaBase):
-    periodes = {}
-
     def __init__(
             self, file_name: str = "../data/options.json", _now: datetime.datetime = None
     ):
@@ -63,6 +61,10 @@ class Report(DaBase):
         self.report_options = self.config.report
         if self.report_options is None:
             logging.error(f"Er zijn geen report-instellingen gevonden")
+        # Per-instance, not a class attribute: it used to be declared on the
+        # class body, so every Report instance (a new one per web request)
+        # mutated the same shared dict via self.periodes.update(...) below.
+        self.periodes = {}
         self.make_periodes(_now=_now)
         _r = self.report_options
         self.grid_consumption_sensors = _r.entities_grid_consumption if _r else []
@@ -70,7 +72,13 @@ class Report(DaBase):
         self.battery_production_sensors = _r.entities_battery_production if _r else []
         self.battery_consumption_sensors = _r.entities_battery_consumption if _r else []
         self.solar_production_ac_sensors = _r.entities_solar_production_ac if _r else []
-        self.co2_intensity_sensor = _r.co2_intensity_sensor if _r else []
+        # co2_intensity_sensor is a single entity id (Optional[EntityId] on the
+        # model), but every "sensors" dict elsewhere in this class is iterated
+        # as a list of entity ids. A bare string was iterated character by
+        # character, so every CO2 lookup silently found nothing.
+        self.co2_intensity_sensor = (
+            [_r.co2_intensity_sensor] if _r and _r.co2_intensity_sensor else []
+        )
         self.ev_consumption_sensors = _r.entities_ev_consumption if _r else []
         self.wp_consumption_sensors = _r.entities_wp_consumption if _r else []
         self.boiler_consumption_sensors = _r.entities_boiler_consumption if _r else []
@@ -1664,14 +1672,28 @@ class Report(DaBase):
         # Aliases for the variabel table
         v1 = variabel_table.alias("v1")
         groupby_str = interval
+        # column2, when set, is the bucket's own start moment (the 1st of
+        # the month, midnight, or the hour mark) rather than the earliest
+        # timestamp that happens to have data in it. Using min(time) as the
+        # label made the first, partial bucket of a period that does not
+        # start on a bucket boundary (a "dit contractjaar" or "365 dagen"
+        # view starting mid-month) fail to match generate_df's bucket-start
+        # label further down, silently dropping that bucket from the report.
+        column2 = None
         if interval == "maand":
             column = self.db_da.month(t1.c.time).label("maand")
+            column2 = func.min(self.db_da.month_start(t1.c.time)).label("tijd")
         elif interval == "dag":
             column = self.db_da.day(t1.c.time).label("dag")
+            column2 = func.min(self.db_da.day_start(t1.c.time)).label("tijd")
         else:  # interval == "uur"
             if interval == periode_d["interval"]:
                 column = self.db_da.hour(t1.c.time).label("uur")
+                column2 = func.min(self.db_da.hour_start(t1.c.time)).label("tijd")
             else:
+                # get_interval is finer than rep_interval: each group is a
+                # single exact timestamp already, so it needs no separate
+                # bucket-start column.
                 column = self.db_da.from_unixtime(t1.c.time).label("tijd")
                 groupby_str = "tijd"
         if field is not None and col_dict[field]["sensors"] == "calc":
@@ -1716,13 +1738,18 @@ class Report(DaBase):
             code_result = self.db_da.run_select_query(sql)
             """
 
-            query = (
-                select(
-                    column,
+            select_columns = [column]
+            if column2 is not None:
+                select_columns.append(column2)
+            select_columns.extend(
+                [
                     func.min(self.db_da.from_unixtime(t1.c.time)).label("vanaf"),
                     func.max(self.db_da.from_unixtime(t1.c.time)).label("tot"),
                     func.sum(t1.c.value).label(key),
-                )
+                ]
+            )
+            query = (
+                select(*select_columns)
                 .where(
                     and_(
                         v1.c.code == key,
@@ -1741,7 +1768,11 @@ class Report(DaBase):
             with self.db_da.engine.connect() as connection:
                 code_result = pd.read_sql(query, connection)
             code_result["vanaf"] = pd.to_datetime(code_result["vanaf"])
-            code_result["tijd"] = pd.to_datetime(code_result["vanaf"])
+            # "tijd" already holds the bucket start (column2) or the exact
+            # timestamp (column, in the finer-than-bucket case); do not
+            # overwrite it with "vanaf" (the earliest timestamp that
+            # happened to have data), which broke the first partial bucket.
+            code_result["tijd"] = pd.to_datetime(code_result["tijd"])
             code_result["tot"] = pd.to_datetime(code_result["tot"])
 
             # if len(code_result) > 0:
@@ -1977,7 +2008,12 @@ class Report(DaBase):
 
         with self.db_da.engine.connect() as connection:
             code_result = pd.read_sql(query, connection)
-        code_result["tijd"] = pd.to_datetime(code_result["vanaf"])
+        # "tijd" already holds the bucket start (column2, month_start/
+        # day_start/hour_start) from the query; it used to be overwritten
+        # with "vanaf" (the earliest timestamp that happened to have data),
+        # which broke the first, partial bucket of any period that does not
+        # start exactly on a bucket boundary.
+        code_result["tijd"] = pd.to_datetime(code_result["tijd"])
         code_result["tot"] = pd.to_datetime(code_result["tot"])
         code_result.index = code_result["tijd"]
         return code_result
@@ -2054,13 +2090,16 @@ class Report(DaBase):
             elif calc_dict["series"][key]["source"] == "prices":
                 if key not in result.columns:
                     df_prices = self.get_price_data(vanaf, tot)
-                    df_prices.reset_index(drop=True, inplace=True)
-                    result.reset_index(drop=True, inplace=True)
-                    # df_prices.rename(columns={'time': 'tijd'}, inplace=True)
-                    # df_prices["tijd"] = pd.to_datetime(df_prices["tijd"])
-                    # df_prices.index = df_prices["tijd"]
-                    result["da_cons"] = df_prices["da_cons"]
-                    result["da_prod"] = df_prices["da_prod"]
+                    # Merge on the actual timestamp, not row position: a gap
+                    # or a different length between result and df_prices
+                    # (missing prices, DST, ...) used to shift every price
+                    # onto the wrong row instead of leaving it blank.
+                    prices = df_prices.rename(columns={"time": "tijd"})[
+                        ["tijd", "da_cons", "da_prod"]
+                    ]
+                    result = result.reset_index(drop=True).merge(
+                        prices, on="tijd", how="left"
+                    )
                     result.index = result["tijd"]
         return result
 
@@ -2249,8 +2288,12 @@ class Report(DaBase):
                 if len(df_ha) > 0:
                     last_moment = df_ha["tijd"].iloc[-1] + datetime.timedelta(hours=1)
                     df_ha["datasoort"] = "recorded"
-                else:
-                    last_moment = vanaf
+                # An empty HA query keeps last_moment as it already was (set
+                # above from the "values"/da table): HA's own statistics
+                # compile a few minutes after the hour, so an empty result
+                # here is routine and must not throw away already-known
+                # progress by resetting to the start of the whole period,
+                # which duplicated every already-fetched hour below.
                 df_prices = self.get_price_data(vanaf, last_moment, interval="1hour")
 
             if source == "all" or source == "da":
