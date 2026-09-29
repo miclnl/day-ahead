@@ -263,7 +263,14 @@ Define power levels and corresponding COP values:
 
     @model_validator(mode="after")
     def validate_stages(self) -> "HeatingEnabled":
-        """Validate stages: required for 'power' adjustment, must be sorted, and get a zero-power sentinel."""
+        """Stages are required for 'power' adjustment and must be sorted.
+
+        The zero-power sentinel the optimiser needs is *not* added here; see
+        :attr:`effective_stages`. Injecting it made the validated model
+        report a stage the operator never wrote, which
+        ``model_dump(exclude_unset=True)`` then returned as if it had been
+        configured.
+        """
         if len(self.stages) == 0:
             if self.adjustment in ("power", "heating curve"):
                 raise ValueError(
@@ -273,11 +280,23 @@ Define power levels and corresponding COP values:
         powers = [stage.max_power for stage in self.stages]
         if powers != sorted(powers):
             raise ValueError("Heating stages must be sorted by max_power (ascending)")
-        if self.stages[0].max_power != 0.0:
-            # Prepend a zero-power sentinel so interpolation always has a lower
-            # bound of 0 W — the heat pump is fully off at power=0, cop=8 (unused).
-            self.stages = [HeatingStage(max_power=0.0, cop=8.0)] + self.stages
         return self
+
+    @property
+    def effective_stages(self) -> list[HeatingStage]:
+        """The stages as the optimiser needs them, zero stage included.
+
+        Interpolation needs a lower bound of 0 W: the heat pump is fully off
+        at max_power=0, where the cop is irrelevant. An empty list stays
+        empty -- no stages configured means the optimiser builds no stage
+        variables at all, which is valid for the adjustment modes that do
+        not use them.
+        """
+        if not self.stages:
+            return []
+        if self.stages[0].max_power == 0.0:
+            return list(self.stages)
+        return [HeatingStage(max_power=0.0, cop=8.0)] + list(self.stages)
 
 
 # Discriminated union: routes on heater_present (Literal[True] → HeatingEnabled,

@@ -518,12 +518,17 @@ class DaCalc(DaBase):
             # dict-subscript notation can be used throughout the MIP model build loop.
             # Converting to attribute access would require changing hundreds of
             # downstream ["power"] / ["efficiency"] references.
-            # The zero-power sentinel is guaranteed by BatteryConfig.validate_stages_sorted.
+            # effective_*_stages is the configured curve with the zero-power
+            # stage prepended; the model no longer injects that into the
+            # stored list, so options.json keeps exactly what was written.
             charge_stages.append(
-                [s.model_dump() for s in self.battery_options[b].charge_stages]
+                [s.model_dump() for s in self.battery_options[b].effective_charge_stages]
             )
             discharge_stages.append(
-                [s.model_dump() for s in self.battery_options[b].discharge_stages]
+                [
+                    s.model_dump()
+                    for s in self.battery_options[b].effective_discharge_stages
+                ]
             )
 
             # noinspection PyTypeChecker
@@ -1692,9 +1697,9 @@ class DaCalc(DaBase):
             # keys ("power" and "accu_power") are injected into each dict at runtime
             # based on ampere × voltage and efficiency.  These derived values don't
             # exist on EVChargeStage, so plain mutable dicts are necessary.
-            ev_stages = [s.model_dump() for s in self.ev_options[e].charge_stages]
-            if ev_stages[0]["ampere"] != 0.0:
-                ev_stages = [{"ampere": 0.0, "efficiency": 1}] + ev_stages
+            ev_stages = [
+                s.model_dump() for s in self.ev_options[e].effective_charge_stages
+            ]
             if instant_charge:
                 ev_stages = [ev_stages[0], ev_stages[-1]]
             ev_charge_stages.append(ev_stages)
@@ -2532,9 +2537,12 @@ class DaCalc(DaBase):
                 # dict-subscript notation can be used throughout the MIP model build loop.
                 # Could be converted to attribute access (only ~8 downstream references),
                 # but kept consistent with the battery stage pattern above.
-                # The zero-power sentinel and sort order are guaranteed by
-                # HeatingConfig.validate_stages_sorted.
-                hp_stages = [s.model_dump() for s in self.heating_options.stages]
+                # Sort order is guaranteed by HeatingEnabled.validate_stages;
+                # effective_stages adds the zero-power stage on the way out,
+                # so an empty configured list still yields S = 0.
+                hp_stages = [
+                    s.model_dump() for s in self.heating_options.effective_stages
+                ]
                 S = len(hp_stages)
                 # p_hp[s][u]: het gevraagde vermogen in W in dat uur
                 p_hp = [

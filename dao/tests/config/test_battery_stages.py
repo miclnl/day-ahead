@@ -46,10 +46,13 @@ def test_only_the_zero_stage_is_rejected():
         make(**{"discharge stages": [{"power": 0, "efficiency": 1.0}]})
 
 
-def test_the_zero_stage_is_added_automatically_when_missing():
+def test_the_zero_stage_is_not_injected_into_the_stored_list():
+    """It is added by effective_discharge_stages on the way out instead, so
+    options.json keeps exactly what the operator wrote. See
+    dao/tests/config/test_derived_stages.py for the derived curve itself."""
     battery = make(**{"discharge stages": [{"power": 3000, "efficiency": 0.95}]})
-    assert battery.discharge_stages[0].power == 0.0
-    assert len(battery.discharge_stages) == 2
+    assert [s.power for s in battery.discharge_stages] == [3000.0]
+    assert [s.power for s in battery.effective_discharge_stages] == [0.0, 3000.0]
 
 
 def test_equal_consecutive_powers_are_rejected():

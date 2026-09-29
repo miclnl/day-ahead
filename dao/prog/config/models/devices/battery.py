@@ -451,11 +451,18 @@ Configure your home battery storage system for optimal energy management and cos
     @field_validator("charge_stages", "discharge_stages", mode="after")
     @classmethod
     def validate_stages_sorted(cls, v: list[BatteryStage], info) -> list[BatteryStage]:
-        """Ensure stages are sorted by power and always start with a zero-power sentinel.
+        """Strictly increasing by power, with at least one real stage.
 
         At least one stage with power > 0 is required: day_ahead.py divides
         by (number of stages - 1) to average the discharge efficiency, which
         is only defined once a real (non-zero) stage exists.
+
+        The zero-power sentinel the optimiser needs is *not* added here; see
+        :attr:`effective_charge_stages`. Injecting it made the validated
+        model report a stage the operator never wrote, so
+        ``model_dump(exclude_unset=True)`` -- whose whole point is "only what
+        was actually set" -- returned it too, and any future code writing
+        the model back would have quietly added it to options.json.
         """
         powers = [stage.power for stage in v]
         if any(a >= b for a, b in zip(powers, powers[1:])):
@@ -464,10 +471,60 @@ Configure your home battery storage system for optimal energy management and cos
             raise ValueError(
                 f"{info.field_name} needs at least one stage with power > 0"
             )
+        return v
 
-        if v[0].power != 0.0:
-            v = [BatteryStage(power=0.0, efficiency=1.0)] + v
+    @staticmethod
+    def _with_zero_stage(stages: list[BatteryStage]) -> list[BatteryStage]:
+        """*stages* preceded by a zero-power stage, unless it already starts at 0.
 
+        The optimiser interpolates between consecutive stages and needs a
+        lower bound of 0 W: at zero power the converter passes nothing, so
+        the efficiency there is 1 by definition.
+        """
+        if stages and stages[0].power == 0.0:
+            return list(stages)
+        return [BatteryStage(power=0.0, efficiency=1.0)] + list(stages)
+
+    @property
+    def effective_charge_stages(self) -> list[BatteryStage]:
+        """The charge curve as the optimiser needs it, zero stage included."""
+        return self._with_zero_stage(self.charge_stages)
+
+    @property
+    def effective_discharge_stages(self) -> list[BatteryStage]:
+        """The discharge curve as the optimiser needs it, zero stage included."""
+        return self._with_zero_stage(self.discharge_stages)
+
+    @field_validator("reduced_hours", mode="after")
+    @classmethod
+    def validate_reduced_hours(
+        cls, v: Optional[dict[str, int]]
+    ) -> Optional[dict[str, int]]:
+        """Keys must be whole hours 0-23, values a power in watts.
+
+        day_ahead.py does ``int(key)`` on these, so a key that is not a
+        number used to raise halfway through an optimisation run rather than
+        when the setting was saved. An hour outside 0-23 was worse: it
+        matched no interval, so the limit was silently never applied and the
+        battery kept running at full power all night.
+        """
+        if not v:
+            return v
+        for key, value in v.items():
+            try:
+                hour = int(key)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"reduced hours: {key!r} is not an hour; use a whole hour 0-23"
+                ) from None
+            if not 0 <= hour <= 23:
+                raise ValueError(
+                    f"reduced hours: hour {hour} is outside 0-23"
+                )
+            if value < 0:
+                raise ValueError(
+                    f"reduced hours: power for hour {hour} cannot be negative"
+                )
         return v
 
     @field_validator("reduce_power_low_soc", "reduce_power_high_soc", mode="after")

@@ -3,7 +3,7 @@ Electric Vehicle configuration models.
 """
 
 from typing import Optional
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from ..base import EntityId, FlexBool
 
 
@@ -237,6 +237,39 @@ class EVConfig(BaseModel):
             "x-ui-widget-filter": "input_datetime,datetime",
         },
     )
+
+    @field_validator("charge_stages", mode="after")
+    @classmethod
+    def validate_charge_stages_sorted(
+        cls, v: list[EVChargeStage]
+    ) -> list[EVChargeStage]:
+        """Strictly increasing by ampere, with at least one real stage.
+
+        day_ahead.py takes ``charge_stages[-1]["ampere"]`` as the maximum
+        charging current without checking the order, so an unsorted curve
+        silently capped the car at whatever happened to be listed last. It
+        then falls back to 10 A when that value will not parse, which hides
+        the mistake instead of reporting it.
+        """
+        amperes = [stage.ampere for stage in v]
+        if any(a >= b for a, b in zip(amperes, amperes[1:])):
+            raise ValueError("charge stages must be strictly increasing by ampere")
+        if not any(a > 0 for a in amperes):
+            raise ValueError("charge stages need at least one stage with ampere > 0")
+        return v
+
+    @property
+    def effective_charge_stages(self) -> list[EVChargeStage]:
+        """The charging curve as the optimiser needs it, zero stage included.
+
+        Interpolation needs a lower bound of 0 A, where the charger draws
+        nothing and the efficiency is 1 by definition. day_ahead.py used to
+        prepend this itself, on a dict copy, which left the rule in the
+        optimiser instead of with the model that owns the curve.
+        """
+        if self.charge_stages and self.charge_stages[0].ampere == 0.0:
+            return list(self.charge_stages)
+        return [EVChargeStage(ampere=0.0, efficiency=1.0)] + list(self.charge_stages)
 
     @model_validator(mode="after")
     def validate_charging_method(self) -> "EVConfig":
