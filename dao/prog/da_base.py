@@ -23,13 +23,14 @@ from dao.prog.utils import get_tibber_data, error_handling
 from dao.prog.version import __version__
 from pathlib import Path
 from dao.prog.config.loader import ConfigurationLoader
+from dao.prog.config.models.base import UNUSABLE_STATES
 from dao.lib.db_connections import make_db_da, make_db_ha
 from dao.lib.da_meteo import Meteo
 from dao.lib.da_prices import DaPrices
 from dao.prog.utils import interpolate
 
 # from db_manager import DBmanagerObj
-from typing import Union
+from typing import Optional, Union
 from hassapi.models import StateList
 
 
@@ -241,7 +242,9 @@ class DaBase(hass.Hass):
         self.salderen = self.prices_options.tax_refund if self.prices_options else True
 
         self.history_options = self.config.history
-        self.strategy = self.config.strategy.resolve(self.ha_getter)
+        self.strategy = self.config.strategy.resolve(
+            self.ha_getter, default="minimize cost"
+        )
         self.tibber_options = self.config.tibber
         notif = self.config.notifications
         self.notification_entity = notif.notification_entity
@@ -257,20 +260,114 @@ class DaBase(hass.Hass):
     def ha_getter(self, eid):
         return self.get_state(eid).state
 
+    # -- guarded reads ----------------------------------------------------
+    #
+    # Home Assistant reports "unavailable" or "unknown" while an integration
+    # starts, reconnects or is broken, and a misspelled entity id gives a 404.
+    # An optimisation run must survive that: it logs what it assumed and
+    # carries on with a default instead of crashing before the battery gets
+    # its setpoint. These helpers are the only sanctioned way to read a state
+    # inside calc_optimum.
+
+    def read_state(self, entity_id: str, what: str = "") -> Optional[str]:
+        """The raw state string of *entity_id*, or None when it has no usable value."""
+        label = what or entity_id
+        try:
+            raw = self.get_state(entity_id).state
+        except Exception as ex:  # noqa: BLE001 - REST/HTTP failures of any kind
+            logging.warning(f"{label}: entity {entity_id} niet leesbaar ({ex})")
+            return None
+        if raw is None or str(raw).strip().lower() in UNUSABLE_STATES:
+            logging.warning(f"{label}: entity {entity_id} heeft state {raw!r}")
+            return None
+        return str(raw)
+
+    def get_str(self, entity_id: str, default: str, what: str = "") -> str:
+        raw = self.read_state(entity_id, what)
+        if raw is None:
+            logging.warning(f"{what or entity_id}: standaardwaarde {default!r} gebruikt")
+            return default
+        return raw
+
+    def get_float(self, entity_id: str, default: float, what: str = "") -> float:
+        raw = self.read_state(entity_id, what)
+        if raw is not None:
+            try:
+                return float(raw)
+            except ValueError:
+                logging.warning(
+                    f"{what or entity_id}: state {raw!r} van {entity_id} is geen getal"
+                )
+        logging.warning(f"{what or entity_id}: standaardwaarde {default} gebruikt")
+        return default
+
+    def get_bool(self, entity_id: str, default: bool, what: str = "") -> bool:
+        """True for "on"/"true"/"1"/"yes", False for their opposites, default otherwise."""
+        raw = self.read_state(entity_id, what)
+        if raw is not None:
+            lowered = raw.strip().lower()
+            if lowered in ("on", "true", "1", "yes"):
+                return True
+            if lowered in ("off", "false", "0", "no"):
+                return False
+            logging.warning(
+                f"{what or entity_id}: state {raw!r} van {entity_id} is geen aan/uit"
+            )
+        logging.warning(f"{what or entity_id}: standaardwaarde {default} gebruikt")
+        return default
+
+    def get_datetime(
+        self,
+        entity_id: str,
+        default: Optional[datetime.datetime],
+        what: str = "",
+        formats: tuple = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"),
+    ) -> Optional[datetime.datetime]:
+        """Parse an input_datetime style state; default when missing or malformed."""
+        raw = self.read_state(entity_id, what)
+        if raw is not None:
+            for fmt in formats:
+                try:
+                    return datetime.datetime.strptime(raw.strip(), fmt)
+                except ValueError:
+                    continue
+            logging.warning(
+                f"{what or entity_id}: state {raw!r} van {entity_id} is geen datum/tijd"
+            )
+        logging.warning(f"{what or entity_id}: standaardwaarde {default} gebruikt")
+        return default
+
     def set_value(self, entity_id: str, value: Union[int, float, str]) -> StateList:
+        """Write *value* through the set_value service and check the result.
+
+        A failing service call is an error and is raised. A read-back that does
+        not match is only reported: entities backed by a device (a `number.`
+        of an inverter integration, for instance) update their state after the
+        device confirms, which can be later than this read. Raising there
+        aborted the rest of the device block, leaving for example the battery
+        power written but its operating mode not.
+        """
         try:
             result = super().set_value(entity_id, value)
-            state = self.get_state(entity_id).state
-            if isinstance(value, (int, float)):
-                if round(float(state), 5) != round(float(value), 5):
-                    raise ValueError
-            else:
-                if state != value:
-                    raise ValueError
         except Exception:
             logging.error(f"Fout bij schrijven naar {entity_id}, waarde {value}")
-            # error_handling(ex)
             raise
+        try:
+            state = self.get_state(entity_id).state
+            if isinstance(value, (int, float)):
+                mismatch = round(float(state), 5) != round(float(value), 5)
+            else:
+                mismatch = state != value
+        except Exception as ex:  # noqa: BLE001 - read-back is best effort
+            logging.warning(
+                f"Waarde {value} naar {entity_id} geschreven, controle lezen mislukt: {ex}"
+            )
+            return result
+        if mismatch:
+            logging.warning(
+                f"Waarde {value} naar {entity_id} geschreven, maar de entity meldt "
+                f"nog {state!r}"
+            )
         return result
 
     @staticmethod

@@ -8,6 +8,7 @@ This module provides:
 - Base configuration utilities
 """
 
+import logging
 import re
 from typing import Any, ClassVar, Optional, Union
 from pydantic import (
@@ -28,6 +29,19 @@ _HA_ENTITY_ID_RE = re.compile(r"^[a-z_][a-z0-9_]*\.[a-zA-Z0-9_]+$")
 # Re-use a single TypeAdapter for bool coercion — Pydantic's lax bool validator
 # accepts "true"/"false", "1"/"0", "on"/"off", "yes"/"no", integers, etc.
 _bool_adapter = TypeAdapter(bool)
+
+# Home Assistant states that carry no value. An entity reports these while its
+# integration is starting, reconnecting or broken.
+UNUSABLE_STATES = frozenset({"unavailable", "unknown", "none", "null", ""})
+
+# Sentinel for "no default given" so that None can be a legitimate default.
+_MISSING = object()
+
+_log = logging.getLogger(__name__)
+
+
+class FlexResolveError(ValueError):
+    """The Home Assistant entity behind a FlexValue has no usable state."""
 
 
 def _validate_entity_id(v: str) -> str:
@@ -142,7 +156,22 @@ class FlexValue(BaseModel):
         """
         return isinstance(value, str) and bool(_HA_ENTITY_ID_RE.match(value))
 
-    def resolve(self, ha_state_getter: callable) -> Any:
+    def _coerce(self, raw: Any) -> Any:
+        """Cast *raw* to the class's resolve type."""
+        target_type = self._resolve_type
+        if target_type is Any:
+            return raw
+        if target_type == bool:
+            return _bool_adapter.validate_python(raw)
+        if target_type == int:
+            return raw if isinstance(raw, int) and not isinstance(raw, bool) else int(float(raw))
+        if target_type == float:
+            return float(raw)
+        if target_type == str:
+            return raw if isinstance(raw, str) else str(raw)
+        return raw
+
+    def resolve(self, ha_state_getter: callable, default: Any = _MISSING) -> Any:
         """
         Resolve to the final value.
 
@@ -162,37 +191,40 @@ class FlexValue(BaseModel):
                 this to the AppDaemon ``self.get_state(eid).state`` call (or a test
                 mock).  It is **always required** — pass a no-op mock in tests where
                 you know the value is literal.
+            default: Returned (with a warning) when the entity cannot be read, is
+                ``unavailable``/``unknown``, or its state does not convert to the
+                resolve type. Without a default such a state raises
+                :class:`FlexResolveError` so the caller can decide; a single
+                flaky sensor must not silently become a wrong number.
 
         Returns:
             The resolved value cast to the class's ``_resolve_type``.
             For bare ``FlexValue`` (``_resolve_type is Any``) no coercion is applied.
         """
-        target_type = self._resolve_type
+        if not self.is_entity_id(self.value):
+            return self._coerce(self.value)
 
-        if self.is_entity_id(self.value):
-            state_value = ha_state_getter(self.value)
-            if target_type is Any:
-                return state_value
-            elif target_type == bool:
-                return _bool_adapter.validate_python(state_value)
-            elif target_type == int:
-                return int(float(state_value))  # handle "95.0" → 95
-            elif target_type == float:
-                return float(state_value)
-            else:
-                return str(state_value)
-        else:
-            if target_type is Any:
-                return self.value
-            elif target_type == bool:
-                return _bool_adapter.validate_python(self.value)
-            elif target_type == int and not isinstance(self.value, int):
-                return int(self.value)
-            elif target_type == float and not isinstance(self.value, (int, float)):
-                return float(self.value)
-            elif target_type == str and not isinstance(self.value, str):
-                return str(self.value)
-            return self.value
+        entity_id = self.value
+        try:
+            state_value = ha_state_getter(entity_id)
+        except Exception as ex:  # noqa: BLE001 - any HA/network failure
+            return self._fallback(default, f"{entity_id} kon niet worden gelezen: {ex}")
+        if state_value is None or str(state_value).strip().lower() in UNUSABLE_STATES:
+            return self._fallback(default, f"{entity_id} heeft state {state_value!r}")
+        try:
+            return self._coerce(state_value)
+        except (TypeError, ValueError) as ex:
+            return self._fallback(
+                default,
+                f"{entity_id} heeft state {state_value!r}, geen "
+                f"{getattr(self._resolve_type, '__name__', 'waarde')} ({ex})",
+            )
+
+    def _fallback(self, default: Any, reason: str) -> Any:
+        if default is _MISSING:
+            raise FlexResolveError(reason)
+        _log.warning(f"{reason}; standaardwaarde {default!r} gebruikt")
+        return default
 
 
 class FlexFloat(FlexValue):
@@ -258,6 +290,19 @@ class FlexEnum(FlexValue):
 
     _resolve_type: ClassVar[type] = str
     enum_values: Optional[list[str]] = Field(default=None, exclude=True)
+
+    def _coerce(self, raw: Any) -> Any:
+        """Entity states are checked against the same list as literals.
+
+        An input_select that was renamed or reports "unknown" would otherwise
+        hand the consumer a value it has no branch for.
+        """
+        text = str(raw)
+        if self.enum_values is not None and text not in self.enum_values:
+            raise ValueError(
+                f"{text!r} is geen van {', '.join(repr(v) for v in self.enum_values)}"
+            )
+        return text
 
     @model_validator(mode="after")
     def validate_enum_value(self):

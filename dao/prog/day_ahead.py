@@ -555,13 +555,19 @@ class DaCalc(DaBase):
             max_dc_from_bat_power.append(
                 max_discharge_power[b] * 2
                 if _bat_to_dc_max is None
-                else _bat_to_dc_max.resolve(self.ha_getter) / 1000
+                else _bat_to_dc_max.resolve(
+                    self.ha_getter, default=max_discharge_power[b] * 2000
+                )
+                / 1000
             )
             _dc_to_bat_max = self.battery_options[b].dc_to_bat_max_power
             max_dc_to_bat_power.append(
                 max_charge_power[b] * 2
                 if _dc_to_bat_max is None
-                else _dc_to_bat_max.resolve(self.ha_getter) / 1000
+                else _dc_to_bat_max.resolve(
+                    self.ha_getter, default=max_charge_power[b] * 2000
+                )
+                / 1000
             )
 
             # reduce power low soc
@@ -635,11 +641,17 @@ class DaCalc(DaBase):
             eff_bat_to_dc.append(float(self.battery_options[b].bat_to_dc_efficiency))
             # fractie van 1
 
-            lower_limit.append(self.battery_options[b].lower_limit.resolve(self.ha_getter))
-            upper_limit.append(self.battery_options[b].upper_limit.resolve(self.ha_getter))
+            # Unreadable limits fall back to conservative values (20/100 %):
+            # the plan is then a little cautious instead of absent.
+            lower_limit.append(
+                self.battery_options[b].lower_limit.resolve(self.ha_getter, default=20)
+            )
+            upper_limit.append(
+                self.battery_options[b].upper_limit.resolve(self.ha_getter, default=100)
+            )
             _opt_lvl_field = self.battery_options[b].optimal_lower_level
             opt_low_lvl = float(
-                _opt_lvl_field.resolve(self.ha_getter)
+                _opt_lvl_field.resolve(self.ha_getter, default=lower_limit[b])
                 if _opt_lvl_field is not None
                 else lower_limit[b]
             )
@@ -657,22 +669,13 @@ class DaCalc(DaBase):
             penalty_low_soc.append(self.battery_options[b].penalty_low_soc)
 
             if _start_soc is None:
-                try:
-                    start_soc_str = ""
-                    start_soc_str = self.get_state(
-                        self.battery_options[b].entity_actual_level
-                    ).state
-                    start_soc_num = float(start_soc_str)
-                    start_soc.append(start_soc_num)
-                except Exception as ex:
-                    logging.warning(
-                        f"{ex} :"
-                        f"No actual level info recieved from "
-                        f"{self.battery_options[b].entity_actual_level}, "
-                        f"but recieved '{start_soc_str}', "
-                        f"assumed 50%"
+                start_soc.append(
+                    self.get_float(
+                        self.battery_options[b].entity_actual_level,
+                        50.0,
+                        f"SoC {self.battery_options[b].name}",
                     )
-                    start_soc.append(50)
+                )
             else:
                 start_soc.append(_start_soc)
             logging.info(
@@ -1063,13 +1066,17 @@ class DaCalc(DaBase):
             if entity_min_soc_end is None:
                 min_soc_end_opt = 0
             else:
-                min_soc_end_opt = float(self.get_state(entity_min_soc_end).state)
+                min_soc_end_opt = self.get_float(
+                    entity_min_soc_end, 0.0, f"min SoC einde {self.battery_options[b].name}"
+                )
 
             entity_max_soc_end = self.battery_options[b].entity_max_soc_end_opt
             if entity_max_soc_end is None:
                 max_soc_end_opt = 100
             else:
-                max_soc_end_opt = float(self.get_state(entity_max_soc_end).state)
+                max_soc_end_opt = self.get_float(
+                    entity_max_soc_end, 100.0, f"max SoC einde {self.battery_options[b].name}"
+                )
             if max_soc_end_opt <= min_soc_end_opt:
                 logging.error(
                     f"'max soc end opt' ({max_soc_end_opt}) moet groter zijn dan "
@@ -1127,14 +1134,37 @@ class DaCalc(DaBase):
         )
         boiler_start = None
         boiler_heated_by_heatpump = False
+        boiler_act_temp = boiler_setpoint = boiler_hysterese = None
         if self.boiler_present:
             entity_boiler_enabled = self.boiler_options.entity_enabled
             if entity_boiler_enabled is None:
                 self.boiler_enabled = True
             else:
-                self.boiler_enabled = (
-                    self.get_state(entity_boiler_enabled).state == "on"
+                self.boiler_enabled = self.get_bool(
+                    entity_boiler_enabled, True, "Boiler ingeschakeld"
                 )
+            if self.boiler_enabled:
+                # Without these three readings the boiler cannot be planned at
+                # all; skip it for this run rather than aborting everything.
+                boiler_act_temp = self.read_state(
+                    self.boiler_options.entity_actual_temp, "Boiler temperatuur"
+                )
+                boiler_setpoint = self.read_state(
+                    self.boiler_options.entity_setpoint, "Boiler setpoint"
+                )
+                boiler_hysterese = self.read_state(
+                    self.boiler_options.entity_hysterese, "Boiler hysterese"
+                )
+                try:
+                    boiler_act_temp = float(boiler_act_temp)
+                    boiler_setpoint = float(boiler_setpoint)
+                    boiler_hysterese = float(boiler_hysterese)
+                except (TypeError, ValueError):
+                    logging.warning(
+                        "Boiler temperatuur, setpoint of hysterese is niet leesbaar; "
+                        "de boiler wordt deze run niet ingepland"
+                    )
+                    self.boiler_enabled = False
         else:
             self.boiler_enabled = False
 
@@ -1164,19 +1194,13 @@ class DaCalc(DaBase):
             if entity_boiler_instant_start is None:
                 boiler_instant_start = False
             else:
-                boiler_instant_start = (
-                    self.get_state(entity_boiler_instant_start).state == "on"
+                boiler_instant_start = self.get_bool(
+                    entity_boiler_instant_start, False, "Boiler direct opwarmen"
                 )
             logging.info(
                 f"Boiler direct opwarmen staat {'aan' if boiler_instant_start else 'uit'}"
             )
-            # 50 huidige boilertemperatuur ophalen uit ha
-            boiler_act_temp = float(
-                self.get_state(self.boiler_options.entity_actual_temp).state
-            )
-            boiler_setpoint = float(
-                self.get_state(self.boiler_options.entity_setpoint).state
-            )
+            # boiler_act_temp, boiler_setpoint and boiler_hysterese were read above
             if boiler_act_temp > boiler_setpoint + 1:
                 logging.warning(
                     f"Je setpoint ({boiler_setpoint}) is lager de actuele "
@@ -1185,21 +1209,18 @@ class DaCalc(DaBase):
                 )
             boiler_setpoint = max(boiler_setpoint, boiler_act_temp)
             logging.info(f"Boiler setpoint {boiler_setpoint} °C")
-            boiler_hysterese = float(
-                self.get_state(self.boiler_options.entity_hysterese).state
-            )
             # 0.5 K/uur afkoeling per uur, omrekenen naar afkoeling per interval
             logging.info(f"Boiler hysterese {boiler_hysterese} K")
 
             cooling_rate = self.boiler_options.cooling_rate.resolve(
-                self.ha_getter
-            )  # FlexFloat
+                self.ha_getter, default=0.5
+            )  # FlexFloat, K/uur
             logging.info(f"Boiler cooling rate {cooling_rate} K/uur")
             boiler_cooling = cooling_rate * self.interval_s / 3600
 
             # 45 °C grens daaronder kan worden verwarmd
             boiler_bovengrens = self.boiler_options.heating_allowed_below.resolve(
-                self.ha_getter
+                self.ha_getter, default=boiler_setpoint - boiler_hysterese + 1
             )  # FlexFloat
             logging.info(f"Boiler heating allowed below {boiler_bovengrens} °C")
 
@@ -1220,7 +1241,7 @@ class DaCalc(DaBase):
             # spec heat in kJ/K = vol in liter * 4,2 kJ/k.liter + 100 kg boiler * 0,5 kJ/k.kg
             spec_heat_boiler = 1.1 * (vol * 4.2 + 100 * 0.5)  # kJ/K
             # cop flexfloat
-            cop_boiler = self.boiler_options.cop.resolve(self.ha_getter)
+            cop_boiler = self.boiler_options.cop.resolve(self.ha_getter, default=3.0)
             # kWh elektriciteit / K
             # spec_elec_boiler = spec_heat_boiler / 3600 * cop_boiler
             # elektrisch vermogen in W
@@ -1571,29 +1592,22 @@ class DaCalc(DaBase):
         ev_capacity = []
         ECS = []
         for e in range(EV):
+            ev_name = self.ev_options[e].name
             ev_capacity.append(self.ev_options[e].capacity)
-            # plugged = self.get_state(self.ev_options["entity plugged in"]).state
-            try:
-                plugged_in = (
-                    self.get_state(self.ev_options[e].entity_plugged_in).state == "on"
-                )
-            except Exception as ex:
-                logging.error(f"EV: entity plugged in: {ex}")
-                plugged_in = False
+            # Every Home Assistant read below falls back to "no charging" when
+            # the entity is unavailable: an EV that cannot be read must not
+            # take the whole optimisation (and the battery setpoint) down.
+            plugged_in = self.get_bool(
+                self.ev_options[e].entity_plugged_in, False, f"EV {ev_name} ingeplugd"
+            )
             ev_plugged_in.append(plugged_in)
-            try:
-                position = self.get_state(self.ev_options[e].entity_position).state
-            except Exception as ex:
-                logging.error(f"EV: entity position: {ex}")
-                position = "away"
+            position = self.get_str(
+                self.ev_options[e].entity_position, "away", f"EV {ev_name} positie"
+            )
             ev_position.append(position)
-            try:
-                soc_state = float(
-                    self.get_state(self.ev_options[e].entity_actual_level).state
-                )
-            except Exception as ex:
-                logging.error(f"EV: entity actual level: {ex}")
-                soc_state = 100.0
+            soc_state = self.get_float(
+                self.ev_options[e].entity_actual_level, 100.0, f"EV {ev_name} laadniveau"
+            )
             if _start_ev_soc is not None:
                 soc_state = _start_ev_soc
 
@@ -1605,47 +1619,53 @@ class DaCalc(DaBase):
             if entity_ev_instant_start is None:
                 instant_charge = False
             else:
-                instant_charge = self.get_state(entity_ev_instant_start).state == "on"
+                instant_charge = self.get_bool(
+                    entity_ev_instant_start, False, f"EV {ev_name} direct laden"
+                )
             ev_instant_charge.append(instant_charge)
+            # The scheduler section is optional: an EV with only the instant
+            # charging entities has no target level and no deadline outside
+            # instant mode, so it is simply not planned then.
+            scheduler = self.ev_options[e].charge_scheduler
             if instant_charge:
                 entity_ev_instant_level = self.ev_options[e].entity_instant_level
                 if entity_ev_instant_level is None:
                     wished_lvl = 100.0
                 else:
-                    wished_lvl = float(self.get_state(entity_ev_instant_level).state)
-            else:
-                wished_lvl = float(
-                    self.get_state(
-                        self.ev_options[e].charge_scheduler.entity_set_level
-                    ).state
+                    wished_lvl = self.get_float(
+                        entity_ev_instant_level, 100.0, f"EV {ev_name} direct laden tot"
+                    )
+            elif scheduler is not None:
+                # Unknown target: assume nothing is needed rather than a full charge.
+                wished_lvl = self.get_float(
+                    scheduler.entity_set_level, soc_state, f"EV {ev_name} gewenst niveau"
                 )
+            else:
+                logging.info(
+                    f"EV {ev_name}: geen 'charge scheduler' geconfigureerd en direct "
+                    f"laden staat uit, laden wordt niet ingepland"
+                )
+                wished_lvl = soc_state
             wished_level.append(wished_lvl)
             ev_switch_cost.append(self.ev_options[e].switch_cost)
             ev_low_soc_cost.append(self.ev_options[e].low_soc_cost)
-            level_margin.append(
-                self.ev_options[e].charge_scheduler.level_margin
-                if self.ev_options[e].charge_scheduler
-                else 0
-            )
-            ready_str = self.get_state(
-                self.ev_options[e].charge_scheduler.entity_ready_datetime
-            ).state
-            if len(ready_str) > 9:
-                # dus met datum en tijd
-                ready = dt.datetime.strptime(ready_str, "%Y-%m-%d %H:%M:%S")
-            else:
-                ready = dt.datetime.strptime(ready_str, "%H:%M:%S")
-                ready = dt.datetime(
-                    start_dt.year,
-                    start_dt.month,
-                    start_dt.day,
-                    ready.hour,
-                    ready.minute,
+            level_margin.append(scheduler.level_margin if scheduler else 0)
+            ready = None
+            if scheduler is not None:
+                ready_str = self.read_state(
+                    scheduler.entity_ready_datetime, f"EV {ev_name} klaar om"
                 )
-                if (ready.hour == start_dt.hour and ready.minute < start_dt.minute) or (
-                    ready.hour < start_dt.hour
-                ):
-                    ready = ready + dt.timedelta(days=1)
+                if ready_str is not None:
+                    ready = self._parse_ev_ready(ready_str, start_dt)
+                    if ready is None:
+                        logging.warning(
+                            f"EV {ev_name}: '{ready_str}' is geen geldig tijdstip, "
+                            f"laden wordt niet ingepland"
+                        )
+            if ready is None:
+                # No usable deadline: the checks below treat this as "expired"
+                # and the EV is left alone. Instant charging overrides it.
+                ready = start_dt
             hours_avail = max(0, (ready - start_dt).total_seconds() / 3600)
             if instant_charge:
                 # instant charge has no real deadline, so bound hours_avail by the
@@ -1744,10 +1764,12 @@ class DaCalc(DaBase):
                 ready = start_dt + datetime.timedelta(
                     hours=hrs_needed, minutes=min_needed
                 )
-            old_switch_state = self.get_state(self.ev_options[e].charge_switch).state
-            old_ampere_state = self.get_state(
-                self.ev_options[e].entity_set_charging_ampere
-            ).state
+            old_switch_state = self.get_str(
+                self.ev_options[e].charge_switch, "unknown", f"EV {ev_name} schakelaar"
+            )
+            old_ampere_state = self.get_str(
+                self.ev_options[e].entity_set_charging_ampere, "0", f"EV {ev_name} ampere"
+            )
             # afgerond naar boven in hele uren
             int_needed = math.ceil(
                 time_needed if self.interval == "1hour" else time_needed * 4
@@ -2180,8 +2202,8 @@ class DaCalc(DaBase):
             self.hp_enabled = False
         else:
             entity_hp_enabled = self.heating_options.entity_hp_enabled
-            self.hp_enabled = (entity_hp_enabled is None) or (
-                self.get_state(entity_hp_enabled).state == "on"
+            self.hp_enabled = (entity_hp_enabled is None) or self.get_bool(
+                entity_hp_enabled, True, "Warmtepomp ingeschakeld"
             )
             if not self.hp_enabled:
                 logging.info("Warmtepomp staat uit - warmtepomp wordt niet ingepland")
@@ -2206,7 +2228,7 @@ class DaCalc(DaBase):
 
             # degree days factor kWh th / K.day
             degree_days_factor = self.heating_options.degree_days_factor.resolve(
-                self.ha_getter
+                self.ha_getter, default=0.0
             )
             if degree_days_factor < 0.1:
                 logging.warning(
@@ -2222,7 +2244,9 @@ class DaCalc(DaBase):
             # heat produced
             entity_heat_produced = self.heating_options.entity_heat_produced
             if entity_heat_produced is not None:
-                heat_produced = float(self.get_state(entity_heat_produced).state)
+                heat_produced = self.get_float(
+                    entity_heat_produced, 0.0, "Geproduceerde warmte"
+                )
             else:
                 heat_produced = 0
             logging.info(f"Reeds geproduceerde warmte: {heat_produced:.1f} kWh")
@@ -2250,7 +2274,9 @@ class DaCalc(DaBase):
             if entity_hp_heat_demand is None:
                 self.hp_heat_demand = "eco"
             else:
-                self.hp_heat_demand = self.get_state(entity_hp_heat_demand).state
+                self.hp_heat_demand = self.get_str(
+                    entity_hp_heat_demand, "eco", "Warmtevraag"
+                ).lower()
             if self.hp_heat_demand == "on":
                 self.hp_heat_demand = "max"
             logging.info(f"Actuele warmtevraag: {self.hp_heat_demand}")
@@ -2317,22 +2343,25 @@ class DaCalc(DaBase):
                     # Get COP and heatpump power from HA
                     entity_hp_cop = self.heating_options.entity_hp_cop
                     if entity_hp_cop is not None:
-                        cop = float(self.get_state(entity_hp_cop).state)
+                        cop = self.get_float(entity_hp_cop, 4.0, "COP warmtepomp")
                     else:
                         cop = 4
                     logging.info(f"COP: {cop:.1f}")
                     # Default COP if no entity from HA
                     entity_hp_power = self.heating_options.entity_hp_power
                     if entity_hp_power is not None:
-                        hp_power = float(self.get_state(entity_hp_power).state)
+                        hp_power = self.get_float(
+                            entity_hp_power, 1.5, "Elektrisch vermogen warmtepomp"
+                        )
                     else:
                         hp_power = 1.5  # Default power in kW if no entity from HA
-                    if hp_power > 50:
+                    if hp_power > 50 or hp_power <= 0:
                         logging.warning(
-                            f"Het elektrisch-vermogen van de wp is te hoog: "
-                            f"{hp_power:.1f} kW-e"
+                            f"Het elektrisch-vermogen van de wp is niet bruikbaar: "
+                            f"{hp_power:.1f} kW-e. "
                             f"Voor de planning wordt uitgegaan van 1,5 kW-e"
                         )
+                        hp_power = 1.5
                     else:
                         logging.info(f"Elektrisch vermogen: {hp_power:.1f} kW-e")
                     logging.info(f"Thermisch vermogen: {hp_power * cop:.1f} kW-th")
@@ -2794,13 +2823,18 @@ class DaCalc(DaBase):
             ma_entity_plan_start.append(self.machines[m].entity_calculated_start)
             ma_entity_plan_end.append(self.machines[m].entity_calculated_end)
             entity_machine_program = self.machines[m].entity_selected_program
+            # Unknown selection: fall back to the first program, which by
+            # convention is the "do not run" program. The list must get one
+            # entry per machine, the code below indexes it with m.
+            fallback_program = self.machines[m].programs[0].name
             if entity_machine_program:
-                try:
-                    program_selected.append(
-                        self.get_state(entity_machine_program).state
+                program_selected.append(
+                    self.get_str(
+                        entity_machine_program, fallback_program, f"Programma {ma_name[m]}"
                     )
-                except Exception as ex:
-                    logging.error(f"Machines: entity_machine_program: {ex}")
+                )
+            else:
+                program_selected.append(fallback_program)
             p = next(
                 (
                     i
@@ -2815,8 +2849,8 @@ class DaCalc(DaBase):
             if entity_machine_instant_start is None:
                 machine_instant_start = False
             else:
-                machine_instant_start = (
-                    self.get_state(entity_machine_instant_start).state == "on"
+                machine_instant_start = self.get_bool(
+                    entity_machine_instant_start, False, f"Direct starten {ma_name[m]}"
                 )
             ma_instant_start.append(machine_instant_start)
             logging.info(
@@ -2829,6 +2863,7 @@ class DaCalc(DaBase):
                 start_dt.year, start_dt.month, start_dt.day
             ) - dt.timedelta(days=1)
             planned_end_dt = planned_start_dt
+            yesterday = planned_start_dt
             if ma_entity_plan_start[m] is None:
                 if ma_entity_plan_end[m] is None:
                     error = True
@@ -2837,20 +2872,19 @@ class DaCalc(DaBase):
                         f"bij de instellingen van {ma_name[m]}."
                     )
                 else:
-                    planned_end_str = self.get_state(ma_entity_plan_end[m]).state
-                    planned_end_dt = dt.datetime.strptime(
-                        planned_end_str, "%Y-%m-%d %H:%M:%S"
+                    planned_end_dt = self.get_datetime(
+                        ma_entity_plan_end[m], yesterday, f"Geplande eindtijd {ma_name[m]}"
                     )
                     planned_start_dt = planned_end_dt - dt.timedelta(minutes=RL[m] * 15)
             else:
-                planned_start_str = self.get_state(ma_entity_plan_start[m]).state
-                planned_start_dt = dt.datetime.strptime(
-                    planned_start_str, "%Y-%m-%d %H:%M:%S"
+                planned_start_dt = self.get_datetime(
+                    ma_entity_plan_start[m], yesterday, f"Geplande starttijd {ma_name[m]}"
                 )
                 if ma_entity_plan_end[m] is not None:
-                    planned_end_str = self.get_state(ma_entity_plan_end[m]).state
-                    planned_end_dt = dt.datetime.strptime(
-                        planned_end_str, "%Y-%m-%d %H:%M:%S"
+                    planned_end_dt = self.get_datetime(
+                        ma_entity_plan_end[m],
+                        planned_start_dt + dt.timedelta(minutes=RL[m] * 15),
+                        f"Geplande eindtijd {ma_name[m]}",
                     )
                 else:
                     planned_end_dt = planned_start_dt + dt.timedelta(minutes=RL[m] * 15)
@@ -2860,42 +2894,39 @@ class DaCalc(DaBase):
             ma_planned_end_dt.append(planned_end_dt)
             start_opt = start_dt  # now
             # ready_ma_dt = uur[U - 1] # het laatste moment van planningshorizon
+            # Both window bounds must be known before any window arithmetic; an
+            # unreadable helper means the machine is skipped for this run.
+            start_window_dt = end_window_dt = None
             if machine_instant_start:
                 start_window_dt = start_dt
                 end_window_dt = start_dt + dt.timedelta(minutes=RL[m] * 15)
             else:
-                if start_window_entity is None:
-                    logging.error(
-                        f"De 'entity start window' is niet gedefinieerd bij de instellingen "
-                        f"van {ma_name[m]}."
-                    )
+                start_window_dt = self._read_window_time(
+                    start_window_entity, start_dt, f"Start window {ma_name[m]}"
+                )
+                end_window_dt = self._read_window_time(
+                    end_window_entity, start_dt, f"Eind window {ma_name[m]}"
+                )
+                if start_window_dt is None or end_window_dt is None:
                     logging.error(f"Apparaat {ma_name[m]} wordt niet ingepland.")
                     error = True
-                else:
-                    start_window_hm = self.get_state(start_window_entity).state
-                    start_window_dt = convert_timestr(start_window_hm, start_dt)
-                if end_window_entity is None:
-                    logging.error(
-                        f"De 'entity end window' is niet gedefinieerd bij de instellingen "
-                        f"van {ma_name[m]}."
+            if not error:
+                if end_window_dt < start_window_dt:
+                    start_window_dt -= dt.timedelta(days=1)
+                if end_window_dt < start_opt:
+                    start_window_dt += dt.timedelta(days=1)
+                    end_window_dt += dt.timedelta(days=1)
+                if end_window_dt > tijd[U - 1]:
+                    error = True
+                    logging.info(
+                        f"Machine {ma_name[m]} wordt niet ingepland, want "
+                        f"het planning-window ligt voorbij einde optimalisering"
                     )
-                    if not error:
-                        logging.error(f"Apparaat {ma_name[m]} wordt niet ingepland.")
-                        error = True
-                else:
-                    end_window_hm = self.get_state(end_window_entity).state
-                    end_window_dt = convert_timestr(end_window_hm, start_dt)
-            if end_window_dt < start_window_dt:
-                start_window_dt -= dt.timedelta(days=1)
-            if end_window_dt < start_opt:
-                start_window_dt += dt.timedelta(days=1)
-                end_window_dt += dt.timedelta(days=1)
-            if end_window_dt > tijd[U - 1]:
-                error = True
-                logging.info(
-                    f"Machine {ma_name[m]} wordt niet ingepland, want "
-                    f"het planning-window ligt voorbij einde optimalisering"
-                )
+            if error:
+                # Placeholder window so the bookkeeping below stays aligned per
+                # machine; kw_num is forced to 0 for machines with an error.
+                start_window_dt = start_window_dt or start_dt
+                end_window_dt = end_window_dt or start_dt
 
             # ready_ma_dt += dt.timedelta(days=1)
             """
@@ -3261,7 +3292,7 @@ class DaCalc(DaBase):
         #        strategy optimization
         #####################################################
         # settings
-        max_gap = abs(self.config.max_gap.resolve(self.ha_getter))
+        max_gap = abs(self.config.max_gap.resolve(self.ha_getter, default=0.005))
         max_gap = max(0.00001, min(max_gap, 1.0))  # clamp to [0.00001, 1.0]
 
         model.max_mip_gap_abs = max_gap
@@ -3834,6 +3865,13 @@ class DaCalc(DaBase):
         # halverwege afbreekt.
         published_battery: list[dict] = []
 
+        # Pure solver results used by more than one block below; computed here so
+        # a failing Home Assistant write in one block cannot leave them undefined.
+        grid_balance = abs(c_l[0].x - c_t[0].x) <= 0.01
+        balance_state = "on" if grid_balance else "off"
+
+        # Every device gets its own try/except: an unreadable EV or boiler entity
+        # must never keep the battery setpoint from being written.
         try:
             if self.boiler_present:
                 if float(c_b[0].x) > 0.0:
@@ -3881,11 +3919,15 @@ class DaCalc(DaBase):
                     f"Boiler temperatuur {boiler_temp[U].x:.1f} °C, "
                     f" waardering: {boiler_waarde_el:.3f} kWh = {boiler_waarde_fin:.2f} euro"
                 )
+
+        except Exception as ex:
+            error_handling(ex)
+            logging.error(f"Publiceren naar HA mislukt voor boiler: {ex}")
+
+        try:
             ###########################################
             # grid
             ###########################################
-            grid_balance = abs(c_l[0].x - c_t[0].x) <= 0.01
-            balance_state = "on" if grid_balance else "off"
             if self.debug:
                 logging.info(f"Grid balanceren zou zijn: {balance_state}")
             else:
@@ -3902,6 +3944,11 @@ class DaCalc(DaBase):
                 )
             #####################################
 
+        except Exception as ex:
+            error_handling(ex)
+            logging.error(f"Publiceren naar HA mislukt voor grid: {ex}")
+
+        try:
             ###########################################
             # ev
             ##########################################
@@ -3982,8 +4029,12 @@ class DaCalc(DaBase):
                     entity_stop_laden = None
                 else:
                     entity_stop_laden = self.ev_options[e].entity_stop_charging
-                old_switch_state = self.get_state(entity_charge_switch).state
-                old_ampere_state = self.get_state(entity_charging_ampere).state
+                old_switch_state = self.get_str(
+                    entity_charge_switch, "unknown", f"EV {ev_name} schakelaar"
+                )
+                old_ampere_state = self.get_str(
+                    entity_charging_ampere, "0", f"EV {ev_name} ampere"
+                )
                 new_ampere_state = 0
                 new_switch_state = "off"
                 new_state_stop_laden = None  # "2000-01-01 00:00:00"
@@ -4110,20 +4161,29 @@ class DaCalc(DaBase):
                     f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
                 )
                 logging.info(
-                    f"- schakelaar laden: {self.get_state(entity_charge_switch).state}"
+                    f"- schakelaar laden: "
+                    f"{self.get_str(entity_charge_switch, 'unknown', f'EV {ev_name} schakelaar')}"
                 )
                 logging.info(
-                    f"- aantal ampere: {self.get_state(entity_charging_ampere).state}"
+                    f"- aantal ampere: "
+                    f"{self.get_str(entity_charging_ampere, '0', f'EV {ev_name} ampere')}"
                 )
 
+        except Exception as ex:
+            error_handling(ex)
+            logging.error(f"Publiceren naar HA mislukt voor EV: {ex}")
+
+        try:
             #######################################
             # solar
             ######################################
             for s in range(solar_num):
                 if entity_pv_ac_switch[s] is not None:
                     entity_pv_switch = entity_pv_ac_switch[s]
-                    switch_state = self.get_state(entity_pv_switch).state
                     pv_name = self.solar[s].name
+                    switch_state = self.get_str(
+                        entity_pv_switch, "unknown", f"PV schakelaar {pv_name}"
+                    )
                     if (pv_ac_on_off[s][0].x == 1.0) or (solar_prod[s][0] == 0.0):
                         if switch_state == "off":
                             if self.debug:
@@ -4139,6 +4199,11 @@ class DaCalc(DaBase):
                                 self.turn_off(entity_pv_switch)
                                 logging.info(f"PV {pv_name} uitgezet")
 
+        except Exception as ex:
+            error_handling(ex)
+            logging.error(f"Publiceren naar HA mislukt voor PV-schakelaars: {ex}")
+
+        try:
             ############################################
             # battery
             ############################################
@@ -4297,8 +4362,10 @@ class DaCalc(DaBase):
                     if entity_pv_switch == "":
                         entity_pv_switch = None
                     if entity_pv_switch is not None:
-                        switch_state = self.get_state(entity_pv_switch).state
                         pv_name = self.battery_options[b].solar[s].name
+                        switch_state = self.get_str(
+                            entity_pv_switch, "unknown", f"PV schakelaar {pv_name}"
+                        )
                         if pv_dc_on_off[b][s][0].x == 1 or pv_prod_dc[b][s][0] == 0.0:
                             if switch_state == "off":
                                 if self.debug:
@@ -4314,6 +4381,11 @@ class DaCalc(DaBase):
                                     self.turn_off(entity_pv_switch)
                                     logging.info(f"PV {pv_name} uitgezet")
 
+        except Exception as ex:
+            error_handling(ex)
+            logging.error(f"Publiceren naar HA mislukt voor batterij: {ex}")
+
+        try:
             ############################################
             # battery next action (HA standby scheduling)
             ############################################
@@ -4370,6 +4442,11 @@ class DaCalc(DaBase):
                         datetime=next_action_str,
                     )
 
+        except Exception as ex:
+            error_handling(ex)
+            logging.error(f"Publiceren naar HA mislukt voor batterij volgende actie: {ex}")
+
+        try:
             ##################################################
             # heatpump
             ##################################################
@@ -4383,7 +4460,9 @@ class DaCalc(DaBase):
                         )
                 else:
                     logging.debug(f"Warmtepomp entity: {entity_hp_switch}")
-                    switch_state = self.get_state(entity_hp_switch).state
+                    switch_state = self.get_str(
+                        entity_hp_switch, "unknown", "Warmtepomp schakelaar"
+                    )
                     if hp_on[0].x == 1:
                         if switch_state == "off":
                             if self.debug:
@@ -4420,8 +4499,8 @@ class DaCalc(DaBase):
                     self.heating_options.entity_adjust_heating_curve
                 )
                 if entity_curve_adjustment is not None:
-                    old_adjustment = float(
-                        self.get_state(entity_curve_adjustment).state
+                    old_adjustment = self.get_float(
+                        entity_curve_adjustment, 0.0, "Stooklijn aanpassing"
                     )
                     #  adjustment factor (K/%) bijv 0.4 K/10% = 0.04
                     adjustment_factor = self.heating_options.adjustment_factor or 0.0
@@ -4436,6 +4515,11 @@ class DaCalc(DaBase):
                         logging.info(f"Aanpassing stooklijn: {adjustment:<0.2f}")
                         self.set_value(entity_curve_adjustment, adjustment)
 
+        except Exception as ex:
+            error_handling(ex)
+            logging.error(f"Publiceren naar HA mislukt voor warmtepomp: {ex}")
+
+        try:
             ########################################################################
             # apparaten /machines
             ########################################################################
@@ -4504,7 +4588,7 @@ class DaCalc(DaBase):
 
         except Exception as ex:
             error_handling(ex)
-            logging.error(f"Onverwachte fout: {ex}")
+            logging.error(f"Publiceren naar HA mislukt voor apparaten: {ex}")
 
         #############################################
         # hand-off naar de snelle regellaag
@@ -5229,6 +5313,57 @@ class DaCalc(DaBase):
             f"Plan voor de snelle regellaag opgeslagen: {len(plan.intervals)} "
             f"intervallen, {len(specs)} batterij(en)"
         )
+
+    def _read_window_time(
+        self, entity_id: str | None, start_dt: dt.datetime, what: str
+    ) -> dt.datetime | None:
+        """Read a time-of-day helper (input_datetime without date) of a machine.
+
+        Returns the moment on the day of *start_dt*, or None when the entity is
+        missing, unavailable or does not hold a time.
+        """
+        if entity_id is None:
+            logging.error(f"{what}: geen entity gedefinieerd bij de instellingen")
+            return None
+        raw = self.read_state(entity_id, what)
+        if raw is None:
+            return None
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return convert_timestr(raw.strip(), start_dt, fmt)
+            except ValueError:
+                continue
+        logging.error(f"{what}: '{raw}' van {entity_id} is geen tijdstip")
+        return None
+
+    @staticmethod
+    def _parse_ev_ready(
+        ready_str: str, start_dt: dt.datetime
+    ) -> dt.datetime | None:
+        """Parse the 'ready at' helper of an EV.
+
+        Accepts an input_datetime with date ("2026-09-29 07:30:00") or time
+        only ("07:30:00" / "07:30"). A time that has already passed today is
+        taken to mean tomorrow. Returns None when the text is not a moment.
+        """
+        text = ready_str.strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return dt.datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                clock = dt.datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+            ready = dt.datetime(
+                start_dt.year, start_dt.month, start_dt.day, clock.hour, clock.minute
+            )
+            if ready <= start_dt.replace(second=0, microsecond=0):
+                ready += dt.timedelta(days=1)
+            return ready
+        return None
 
     def calc_optimum_debug(self):
         self.debug = True

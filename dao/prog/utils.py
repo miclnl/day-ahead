@@ -84,8 +84,11 @@ def get_value_from_dict(dag: str, options: dict) -> float:
     return result
 
 
-def convert_timestr(time_str: str, now_dt: datetime.datetime) -> datetime.datetime:
-    result_hm = datetime.datetime.strptime(time_str, "%H:%M:%S")
+def convert_timestr(
+    time_str: str, now_dt: datetime.datetime, fmt: str = "%H:%M:%S"
+) -> datetime.datetime:
+    """Combine a time-of-day string with the date of *now_dt*."""
+    result_hm = datetime.datetime.strptime(time_str, fmt)
     result = datetime.datetime(
         now_dt.year, now_dt.month, now_dt.day, result_hm.hour, result_hm.minute
     )
