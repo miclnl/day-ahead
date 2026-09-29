@@ -18,8 +18,6 @@ import knmi
 import copy
 import math
 
-from pip._internal.utils import datetime
-
 # ML imports
 from xgboost import XGBRegressor
 from sklearn.model_selection import GridSearchCV

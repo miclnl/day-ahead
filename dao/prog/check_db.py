@@ -159,9 +159,20 @@ class CheckDB:
             # get the data from "values"
             if var[0] != 6:
                 df_data = self.get_all_var_data("values", var[1])
-                # save the data in "prognose"
-                df_data["time"] = df_data["time"].astype(str)
-                self.db_da.savedata(df_data, "prognoses")
+                # "prognoses" may already hold a genuine forecast for a
+                # moment that also has a measured value in "values" (the
+                # measurement overtook the forecast). savedata() upserts, so
+                # moving the measurement in as-is would silently replace that
+                # forecast, destroying exactly the forecast-vs-measured
+                # comparison this database is for. Only the rows "prognoses"
+                # does not have yet are moved.
+                existing = self.get_all_var_data("prognoses", var[1])
+                if len(existing) > 0:
+                    df_data = df_data[~df_data["time"].isin(existing["time"])]
+                if len(df_data) > 0:
+                    # save the data in "prognose"
+                    df_data["time"] = df_data["time"].astype(str)
+                    self.db_da.savedata(df_data, "prognoses")
             # delete the data from "values"
             self.delete_all_var_data("values", var[0])
             print(f"Moved {var[2]} data")
