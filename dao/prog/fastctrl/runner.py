@@ -282,10 +282,6 @@ class FastControlRunner:
         self._last_mode: Optional[str] = self._initial_mode()
         self._last_overrides: tuple = ()
         self._last_setpoints: tuple = ()
-        # Track whether the initial setpoint has been logged, so the
-        # first event after startup (or after a state reload) is captured
-        # instead of being swallowed by the empty-tuple short-circuit.
-        self._last_setpoints_recorded: bool = False
         self._warned_no_grid = False
         self._warned_stale_plan = False
         self._last_state_save = 0.0
@@ -486,6 +482,7 @@ class FastControlRunner:
         if mode != self._last_mode:
             logging.info(f"Fast control: modus {mode}")
         if mode == MODE_OFF:
+            self._release_when_switched_off(plan, now, mode)
             return None
 
         if not self.config.grid_power.configured:
@@ -537,6 +534,12 @@ class FastControlRunner:
         # it. Without this saved_today_eur would always integrate over
         # elapsed_h = 0 (policy.account sets state.last_tick_ts = now).
         previous_tick_ts = self.state.last_tick_ts
+        # The setpoints the batteries were left at before this tick; decide()
+        # overwrites last_command_w, so the baseline for the event log has to
+        # be taken here. After a restart this comes from the persisted state.
+        previous_setpoints = tuple(
+            self.state.battery(index).last_command_w for index in range(len(plan.specs))
+        )
 
         policy = FastControlPolicy(self.limits())
         policy.account(
@@ -563,10 +566,39 @@ class FastControlRunner:
 
         self._actuate(decision, plan, mode)
         self._publish(decision, mode, measurement)
-        self._record_events(decision, mode)
+        self._record_events(decision, mode, previous_setpoints)
         self.state.refresh_budget_aggregates()
         self._persist_state(now)
         return decision
+
+    def _release_when_switched_off(self, plan: FastPlan, now: float, mode: str) -> None:
+        """Undo an active override when the layer is turned off.
+
+        Without this the inverter kept the overridden setpoint, with the
+        optimizer's stop moment cleared, until the next optimisation run.
+        The restore is only written when the previous mode was active; in
+        shadow mode nothing was ever written, so there is nothing to undo.
+        """
+        pending = any(
+            b.override_active or b.stop_inverter_cleared for b in self.state.batteries
+        )
+        if not pending:
+            self._last_mode = mode
+            return
+        measurement = Measurement(
+            timestamp=now,
+            grid_w=0.0,
+            batteries=[BatteryMeasurement(valid=False) for _ in plan.specs],
+            grid_valid=False,
+        )
+        decision = FastControlPolicy(self.limits()).release(
+            plan, measurement, self.state, "mode_off"
+        )
+        if self._last_mode == MODE_ACTIVE:
+            logging.info("Fast control: uitgeschakeld, plan-setpoint hersteld")
+            self._actuate(decision, plan, MODE_ACTIVE)
+        self._record_events(decision, mode)
+        self._persist_state(now, force=True)
 
     # -- measurement for the forecast side -------------------------------
 
@@ -740,7 +772,9 @@ class FastControlRunner:
 
     # -- event ring buffer ----------------------------------------------
 
-    def _record_events(self, decision, mode: str) -> None:
+    def _record_events(
+        self, decision, mode: str, previous_setpoints: Optional[tuple] = None
+    ) -> None:
         new_overrides = tuple(b.override for b in decision.batteries)
         new_setpoints = tuple(b.setpoint_w for b in decision.batteries)
         events = self.state.events
@@ -752,14 +786,20 @@ class FastControlRunner:
         elif (not self._last_overrides or not any(self._last_overrides)) and any(new_overrides):
             events.append(self._event_dict(decision, mode, EVENTS_KIND_OVERRIDE_START))
 
-        # Record a SETPOINT event for any meaningful change. On the first
-        # tick _last_setpoints is empty; record the initial setpoint so the
-        # very first correction is visible in the event log.
-        if not self._last_setpoints_recorded:
-            events.append(self._event_dict(decision, mode, EVENTS_KIND_SETPOINT))
-        elif any(
-            abs(new - old) >= 1.0 for new, old in zip(new_setpoints, self._last_setpoints)
-        ):
+        # A setpoint event marks a real change. On the first tick after a
+        # start there is no previous decision yet; compare against what the
+        # batteries were last commanded to (persisted across restarts), so a
+        # correction in the very first tick is logged and a plain
+        # plan-following start is not.
+        if self._last_setpoints:
+            baseline = self._last_setpoints
+        elif previous_setpoints is not None:
+            baseline = previous_setpoints
+        else:
+            baseline = tuple(
+                self.state.battery(b.index).last_command_w for b in decision.batteries
+            )
+        if any(abs(new - old) >= 1.0 for new, old in zip(new_setpoints, baseline)):
             events.append(self._event_dict(decision, mode, EVENTS_KIND_SETPOINT))
 
         events[:] = events[-EVENTS_LIMIT:]
@@ -767,8 +807,6 @@ class FastControlRunner:
         self._last_mode = mode
         self._last_overrides = new_overrides
         self._last_setpoints = new_setpoints
-        if new_setpoints:
-            self._last_setpoints_recorded = True
 
     def _event_dict(self, decision, mode: str, kind: str) -> dict:
         battery = decision.batteries[0] if decision.batteries else None

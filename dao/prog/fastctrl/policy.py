@@ -802,6 +802,23 @@ class FastControlPolicy:
         decision.reason = "override" if any_override else "plan"
         return decision
 
+    def release(
+        self,
+        plan: FastPlan,
+        measurement: Measurement,
+        state: ControllerState,
+        reason: str,
+    ) -> Decision:
+        """Hand every battery back to the optimizer's published command.
+
+        Used when the layer is switched off while an override is active: the
+        inverter must not be left on the overridden setpoint with its stop
+        moment cleared until the next optimisation happens to run.
+        """
+        return self._all_plan(
+            plan, measurement, state, reason, plan.interval_at(measurement.timestamp)
+        )
+
     def _hard_bounds(
         self, spec: BatterySpec, soc: Optional[float], plan_w: float
     ) -> tuple[float, float]:

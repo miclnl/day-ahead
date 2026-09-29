@@ -305,6 +305,70 @@ class TestTick:
         runner.tick(T0 + 120)
         assert "input_number.feedin" in hass.values
 
+    def test_switching_off_during_an_override_restores_the_plan(self, workspace):
+        """The layer must not leave the inverter on its overridden setpoint
+        with the optimizer's stop moment cleared when it is turned off."""
+        make_plan(workspace["plan_path"], battery_w=0.0)
+        hass = FakeHass(
+            {
+                "input_select.fast_mode": "active",
+                "sensor.p1_power": "3500",
+                "sensor.battery_power": "0",
+                "sensor.soc": "60",
+            }
+        )
+        runner = FastControlRunner(
+            hass, make_config(mode="input_select.fast_mode"), **workspace
+        )
+        decision = runner.tick(T0 + 60)
+        assert decision is not None and decision.override
+        assert hass.values["input_number.feedin"] == pytest.approx(-3500.0, abs=1.0)
+        assert runner.state.battery(0).override_active
+
+        hass.states["input_select.fast_mode"] = "off"
+        assert runner.tick(T0 + 120) is None
+
+        assert hass.values["input_number.feedin"] == pytest.approx(0.0, abs=1.0)
+        assert hass.options["input_select.mode"] == "Aan"
+        assert ("set_datetime", {"entity_id": "input_datetime.stop",
+                                 "datetime": "2000-01-01 00:00:00"}) in hass.services
+        assert not runner.state.battery(0).override_active
+        assert not runner.state.battery(0).stop_inverter_cleared
+        kinds = [e["kind"] for e in runner.state.events]
+        assert kinds == [
+            "override_start",
+            "setpoint_change",
+            "mode_change",
+            "override_end",
+            "setpoint_change",
+        ]
+        # Once released, further ticks in off mode write nothing.
+        hass.values.clear()
+        assert runner.tick(T0 + 180) is None
+        assert hass.values == {}
+
+    def test_switching_off_from_shadow_writes_nothing(self, workspace):
+        make_plan(workspace["plan_path"], battery_w=0.0)
+        hass = FakeHass(
+            {
+                "input_select.fast_mode": "shadow",
+                "sensor.p1_power": "3500",
+                "sensor.battery_power": "0",
+                "sensor.soc": "60",
+            }
+        )
+        runner = FastControlRunner(
+            hass, make_config(mode="input_select.fast_mode", **{"max sensor age": 999999}),
+            **workspace,
+        )
+        decision = runner.tick(T0 + 60)
+        assert decision is not None and decision.override
+        hass.states["input_select.fast_mode"] = "off"
+        assert runner.tick(T0 + 120) is None
+        assert hass.values == {}
+        assert hass.options == {}
+        assert not runner.state.battery(0).override_active
+
     def test_a_missing_plan_is_survivable(self, workspace):
         hass = FakeHass({"sensor.p1_power": "3500"})
         runner = FastControlRunner(hass, make_config(), **workspace)
