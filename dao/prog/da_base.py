@@ -396,7 +396,7 @@ class DaBase(hass.Hass):
             },
             "meteo": {
                 "name": "Meteoprognoses ophalen",
-                "cmd": ["python3", "day_ahead.py", "meteo"],
+                "cmd": ["python3", "../prog/day_ahead.py", "meteo"],
                 "function": "get_meteo_data",
                 "file_name": "meteo",
             },

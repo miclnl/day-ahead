@@ -5,7 +5,38 @@ Basis: commit `2971722` (Format fast-control event timestamps as human-readable)
 
 **Scope**: alle Python in `dao/` (~30.700 regels) volledig gelezen; `day_ahead.py`, `da_base.py`, `utils.py`, `da_scheduler.py`, `da_fast.py`, `fastctrl/*` direct; `lib/`, `webserver/`, `config/`, `da_report.py`, `solar_predictor.py`, `baseload.py`, `check_db.py` via parallelle deelreviews die zijn gecontroleerd. Claims met **[geverifieerd]** zijn gereproduceerd in `.venv` (pandas 3.0.6, pydantic 2.13.4, SQLAlchemy 2.0.54, Python 3.14).
 
-**Feiten vooraf**
+## Status van de reparaties (bijgewerkt 2026-09-29)
+
+Fase 1 en het grootste deel van Fase 2 zijn uitgevoerd in de commits `5eef5da` t/m `c07e4e3`. Testsuite na afloop: `667 passed, 5 skipped` (de 5 zijn integratietests die live databases en HA nodig hebben; zet `DAO_INTEGRATION_TESTS=1` om ze lokaal te draaien). CI draait pytest nu als eerste job in `test_build.yaml`.
+
+| Bevinding | Status | Commit |
+|---|---|---|
+| Bug #1 datamap via `/static/data` | opgelost: symlink verwijderd (stond in git), `/images/<name>`-route | `14337f8` |
+| Bug #2 geen auth / traversal / XSS / CSRF | opgelost: ingress-guard, poort standaard uit + optie `allow_direct_access`, whitelist, `abort(404)`, Flask-WTF | `14337f8` |
+| Bug #3 crash op `unavailable` | opgelost: `read_state/get_float/get_bool/get_str/get_datetime`, `FlexValue.resolve(default=)`, alle 39 callsites | `6112eeb` |
+| Bug #4 15-min epoch | opgelost: epoch uit DB door `interpolate()` heen, join op `time` | `98daac1` |
+| Bug #5 scheduler-migratie | opgelost: alleen legacy-vorm converteren, loader-test op `options_example.json` | `ce14162` |
+| Bug #6 v1→v2 alias-keys (+ v0→v1 meteoserver) | opgelost | `db2a5cb` |
+| Bug #7 loader/model dump, enum-injectie | opgelost: migratie schrijft het document zelf, atomair; `inject_flex_enum_values` kopieert | `ce14162`, `db2a5cb` |
+| Bug #8 `savedata` race | opgelost: dialect-upsert per batch, `URL.create` | `5a5903b` |
+| Bug #9 machines IndexError/UnboundLocal | opgelost | `6112eeb` |
+| Bug #10 EV zonder `charge_scheduler` | opgelost in de consumer (niet ingepland buiten instant-modus) | `6112eeb` |
+| Bug #11 één try/except om publicatie | opgelost: try/except per device, `grid_balance` vooraf berekend; `set_value` waarschuwt i.p.v. raise bij read-back | `6112eeb` |
+| Bug #12 scheduler mist ticks | opgelost: APScheduler, per-taak lock, misfire grace | `417d09a` |
+| Bug #13 consolidatie | opgelost (drie oorzaken), incl. gap-fill epoch | `7f5985e` |
+| Bug #14 PostgreSQL DDL | opgelost, creates idempotent | `7f5985e` |
+| Bug #15 `self.config` ontbreekt | opgelost | `5eef5da` |
+| Bug #16 HTTP zonder timeout | opgelost, incl. retry met backoff voor meteoserver | `d163398` |
+| Bug #17 `da_prices` argv/Nordpool | opgelost; ENTSO-E 0.8.1 levert zelf de juiste resolutie | `622ac52` |
+| Bug #18 fast-control regressies | opgelost: override vrijgeven bij `off`, eventlog-baseline | `d166e04` |
+| Verbetering #1 APScheduler | uitgevoerd | `417d09a` |
+| Verbetering #4 config write path | uitgevoerd: `validate_config_data`, `atomic_write_*`, `set_fast_control_mode` | `ce14162` |
+| Verbetering #6 requirements/Dockerfile | uitgevoerd: 5 packages weg, mariadb-toolchain weg, `requirements-dev.txt` | `5bd7a07` |
+| Feestdagen via `holidays` | uitgevoerd | `c07e4e3` |
+| Verbetering #2 (HA-client), #3 (tijdzone epoch-in/uit), #5 (taken uit gunicorn), #7 (pandas), #8 (ML) | open (Fase 3) | |
+| Bijlage (medium/low) | grotendeels open; opgelost: `hp_power`-warning, `da_base.py` meteo-cmd pad, `settings/<filename>` route, `fast_control.html` URL's, secret key, `set_value` read-back | |
+
+**Feiten vooraf (bij aanvang van de review)**
 - Testsuite: `591 passed, 7 failed`. 2 failures zijn echte regressies uit commit `c30494f` (`test_runner_events.py`), 5 komen door bug #15. **CI draait pytest niet** (alleen build + docs-check).
 - Dependencies: `mysql`, `mysql-connector-python`, `mariadb`, `cffi` en `freezegun` staan in `requirements.txt` maar worden in productiecode niet gebruikt (alleen `pymysql` en `psycopg2` via SQLAlchemy). `mariadb` is de enige reden voor `gcc/g++/libmariadb-dev` en de aarch64-hack in de Dockerfile.
 - `calc_optimum` is één methode van ~5000 regels (`day_ahead.py:103-5144`).
