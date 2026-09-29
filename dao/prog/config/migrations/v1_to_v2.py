@@ -5,6 +5,7 @@ TEMPLATE: This file is commented out and serves as a template for future migrati
 Uncomment and modify when you need to create a real v0→v1 migration.
 """
 
+import copy
 import logging
 from typing import Any
 
@@ -26,54 +27,36 @@ def migrate_v1_to_v2(config: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Version 2 configuration
     """
-    # Create a copy to avoid modifying original
-    migrated = config.copy()
+    # Deep copy: nested dicts (batteries, grid) are modified in place below.
+    migrated = copy.deepcopy(config)
 
-    # Example: Add required field to all batteries
-    # if 'battery' in migrated:
-    #     for battery in migrated['battery']:
-    #         if 'efficiency' not in battery:
-    #             battery['efficiency'] = 0.95  # Migration default
-    #             logger.info(f"Added efficiency=0.95 to battery '{battery.get('name', 'unknown')}'")
-
-    if not ("grid" in migrated):
+    if not isinstance(migrated.get("grid"), dict):
         migrated["grid"] = {}
+    grid = migrated["grid"]
     if "battery" in migrated and isinstance(migrated["battery"], list):
-        # entity_balance_switch
-        value = None
-        for battery in migrated["battery"]:
-            if "entity_balance_switch" in battery:
-                if value is None:
-                    value = battery["entity_balance_switch"]
-                    migrated["grid"]["entity_balance_switch"] = value
-                    logger.info(
-                        f"Moved 'entity_balance_switch' from battery "
-                        f"{battery.get('name', 'unknown')} -> grid"
-                    )
-                else:
-                    logger.info(
-                        "Removed 'entity_balance_switch' from battery "
-                        f"{battery.get('name', 'unknown')}"
-                    )
-                del battery["entity_balance_switch"]
-
-        # entity_grid_setpoint
-        value = None
-        for battery in migrated["battery"]:
-            if "entity_grid_setpoint" in battery:
-                if value is None:
-                    value = battery["entity_grid_setpoint"]
-                    migrated["grid"]["entity_grid_setpoint"] = value
-                    logger.info(
-                        f"Moved 'entity_grid_setpoint' from battery "
-                        f"{battery.get('name', 'unknown')} -> grid"
-                    )
-                else:
-                    logger.info(
-                        "Removed 'entity_grid_setpoint' from battery "
-                        f"{battery.get('name', 'unknown')}"
-                    )
-                del battery["entity_grid_setpoint"]
+        # Real configurations use the aliases with spaces ("entity balance
+        # switch"); the snake_case spelling is what populate_by_name allows.
+        # Both must be moved, otherwise the key silently lingers in the
+        # battery as an unknown extra and the grid feature stays off.
+        for snake, spaced in (
+            ("entity_balance_switch", "entity balance switch"),
+            ("entity_grid_setpoint", "entity grid setpoint"),
+        ):
+            already = grid.get(spaced) or grid.get(snake)
+            for battery in migrated["battery"]:
+                if not isinstance(battery, dict):
+                    continue
+                for key in (spaced, snake):
+                    if key not in battery:
+                        continue
+                    value = battery.pop(key)
+                    name = battery.get("name", "unknown")
+                    if already is None and value:
+                        grid[spaced] = value
+                        already = value
+                        logger.info(f"Moved '{spaced}' from battery {name} -> grid")
+                    else:
+                        logger.info(f"Removed '{key}' from battery {name}")
 
     # Update version
     migrated["config_version"] = 2

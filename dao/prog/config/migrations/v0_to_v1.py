@@ -5,6 +5,7 @@ TEMPLATE: This file is commented out and serves as a template for future migrati
 Uncomment and modify when you need to create a real v0→v1 migration.
 """
 
+import copy
 import logging
 from typing import Any
 
@@ -26,27 +27,24 @@ def migrate_v0_to_v1(config: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Version 1 configuration
     """
-    # Create a copy to avoid modifying original
-    migrated = config.copy()
+    # Deep copy: nested dicts (EVs) are modified in place below.
+    migrated = copy.deepcopy(config)
 
-    # Example: Add required field to all batteries
-    # if 'battery' in migrated:
-    #     for battery in migrated['battery']:
-    #         if 'efficiency' not in battery:
-    #             battery['efficiency'] = 0.95  # Migration default
-    #             logger.info(f"Added efficiency=0.95 to battery '{battery.get('name', 'unknown')}'")
-
-    # meteo_attempts
+    # meteoserver attempts: the v0 model spelled the field "meteoserver_attemps"
+    # with alias "meteoserver-attemps"; v1 fixes the typo. Move whichever
+    # spelling the document uses to the v1 alias, but never overwrite a value
+    # that is already there under the new name.
     value = None
-    if "meteo_attemps" in migrated:
-        value = migrated["meteo_attemps"]
-        del migrated["meteo_attemps"]
-    if "meteo attemps" in migrated:
-        value = migrated["meteo attemps"]
-        del migrated["meteo attemps"]
-    if value:
-        migrated["meteo_attempts"] = value
-        logger.info("changed meteo_attemps -> meteo_attempts")
+    for old_key in ("meteoserver-attemps", "meteoserver_attemps", "meteo_attemps", "meteo attemps"):
+        if old_key in migrated:
+            if value is None:
+                value = migrated[old_key]
+            del migrated[old_key]
+    if value is not None and not (
+        "meteoserver-attempts" in migrated or "meteoserver_attempts" in migrated
+    ):
+        migrated["meteoserver-attempts"] = value
+        logger.info(f"changed meteoserver-attemps -> meteoserver-attempts ({value})")
 
     # entity_stop_charging
     if "electric_vehicle" in migrated and isinstance(

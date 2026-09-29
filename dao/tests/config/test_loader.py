@@ -86,6 +86,34 @@ class TestConfigurationLoader:
         # Config file should have been updated with a version field
         migrated = json.loads(config_path.read_text())
         assert migrated["config_version"] == CURRENT_VERSION
+
+    def test_migration_writes_the_document_not_a_model_dump(
+        self, temp_config_dir, sample_unversioned_config
+    ):
+        """The user's key spelling, unknown keys and explicit nulls survive a
+        migration, and defaults are not frozen into the file."""
+        config_path = temp_config_dir / "options.json"
+        document = {
+            **sample_unversioned_config,
+            "//note": "kept as is",
+            "history": {"save days": 7, "half life days": None},
+        }
+        config_path.write_text(json.dumps(document))
+
+        ConfigurationLoader(config_path).load_and_validate()
+
+        migrated = json.loads(config_path.read_text())
+        assert migrated["config_version"] == CURRENT_VERSION
+        assert migrated["//note"] == "kept as is"
+        assert migrated["history"] == {"save days": 7, "half life days": None}
+        # Aliases with spaces stay as the user wrote them.
+        assert "meteoserver-key" in migrated and "meteoserver_key" not in migrated
+        # Defaults that the user never set are not written.
+        assert "fast control" not in migrated and "fast_control" not in migrated
+        # Loading again is a no-op: same document, no second backup.
+        before = config_path.read_text()
+        ConfigurationLoader(config_path).load_and_validate()
+        assert config_path.read_text() == before
     
     def test_backup_creation(self, temp_config_dir, sample_unversioned_config):
         """Test backup creation before migration."""

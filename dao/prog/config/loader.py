@@ -218,22 +218,22 @@ class ConfigurationLoader:
                     config_data, target_version=CURRENT_VERSION
                 )
 
-                # Get the model class for current version
+                # Validate before anything is written; a migration that
+                # produces an invalid document must not replace the file.
                 version = migrated_data.get("config_version", CURRENT_VERSION)
                 model_class = VERSION_MODELS[version]
+                try:
+                    model_class(**migrated_data)
+                except ValidationError as e:
+                    raise ConfigValidationError(e) from e
 
-                # Create model instance and dump to dict for saving
-                model = model_class(**migrated_data)
-                save_data = model.model_dump(mode="json", exclude_none=True)
-
-                # Update raw options with dumped version
-                self._raw_options = save_data.copy()
-
-                # Save migrated config back to disk
-                f.seek(0)
-                f.truncate(0)
-                json.dump(save_data, f, indent=2, ensure_ascii=False)
-                f.flush()
+                # Write the migrated *document*, not a dump of the model. A
+                # model dump renamed every key to its python name, froze every
+                # default into the user's file and dropped explicit nulls, so
+                # the file looked different depending on who saved it last and
+                # later default changes never reached existing installations.
+                self._raw_options = copy.deepcopy(migrated_data)
+                atomic_write_json(self.config_path, migrated_data)
                 logger.info(f"Saved migrated configuration to {self.config_path}")
             else:
                 logger.debug("Configuration is up to date, no migration needed")
@@ -301,10 +301,7 @@ class ConfigurationLoader:
         else:
             save_data = config_data
 
-        # Write to disk
-        with open(save_path, "w", encoding="utf-8") as f:
-            json.dump(save_data, f, indent=2, ensure_ascii=False)
-
+        atomic_write_json(save_path, save_data)
         logger.info(f"Saved configuration to {save_path}")
 
     @property

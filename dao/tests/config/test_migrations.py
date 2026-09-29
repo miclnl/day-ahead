@@ -327,5 +327,75 @@ def test_migrate_v1_to_v2():
     new_config = migrate_v1_to_v2(old_config)
 
     assert new_config['config_version'] == 2
-    assert new_config['grid']["entity_balance_switch"] == "input_boolean.nom"
-    assert new_config['grid']["entity_grid_setpoint"] == "input_number.grid_setpoint"
+    assert new_config['grid']["entity balance switch"] == "input_boolean.nom"
+    assert new_config['grid']["entity grid setpoint"] == "input_number.grid_setpoint"
+    assert "entity_balance_switch" not in new_config["battery"][0]
+    assert "entity_grid_setpoint" not in new_config["battery"][1]
+    # The input document is not modified.
+    assert "entity_balance_switch" in old_config["battery"][0]
+
+
+def test_migrate_v1_to_v2_moves_the_spaced_aliases_too():
+    """Real configurations use the aliases with spaces. The migration only
+    looked for the snake_case spelling, so the key lingered in the battery as
+    an unknown extra and grid balancing silently stopped working."""
+    old_config = {
+        "config_version": 1,
+        "battery": [
+            {
+                "name": "Accu",
+                "entity balance switch": "input_boolean.balanceer_grid",
+                "entity grid setpoint": "input_number.grid_setpoint",
+            }
+        ],
+    }
+
+    new_config = migrate_v1_to_v2(old_config)
+
+    assert new_config["grid"]["entity balance switch"] == "input_boolean.balanceer_grid"
+    assert new_config["grid"]["entity grid setpoint"] == "input_number.grid_setpoint"
+    assert "entity balance switch" not in new_config["battery"][0]
+    assert "entity grid setpoint" not in new_config["battery"][0]
+
+    from dao.prog.config.versions.v2 import ConfigurationV2
+
+    model = ConfigurationV2(**{**new_config, "battery": [], "meteoserver-key": "x"})
+    assert model.grid.entity_balance_switch == "input_boolean.balanceer_grid"
+    assert model.grid.entity_grid_setpoint == "input_number.grid_setpoint"
+
+
+def test_migrate_v1_to_v2_keeps_an_existing_grid_value():
+    old_config = {
+        "config_version": 1,
+        "grid": {"entity balance switch": "input_boolean.keep_me"},
+        "battery": [{"name": "Accu", "entity balance switch": "input_boolean.old"}],
+    }
+
+    new_config = migrate_v1_to_v2(old_config)
+
+    assert new_config["grid"]["entity balance switch"] == "input_boolean.keep_me"
+    assert "entity balance switch" not in new_config["battery"][0]
+
+
+def test_migrate_v1_to_v2_survives_grid_null():
+    new_config = migrate_v1_to_v2({"config_version": 1, "grid": None, "battery": []})
+    assert new_config["grid"] == {}
+
+
+def test_migrate_v0_to_v1_renames_the_meteoserver_attempts_alias():
+    """The v0 model spelled it 'meteoserver-attemps'; the migration looked for
+    'meteo_attemps' and never matched, so a raised retry count fell back to
+    the default of 2."""
+    from dao.prog.config.migrations.v0_to_v1 import migrate_v0_to_v1
+    from dao.prog.config.versions.v1 import ConfigurationV1
+
+    new_config = migrate_v0_to_v1({"config_version": 0, "meteoserver-attemps": 5})
+
+    assert new_config["meteoserver-attempts"] == 5
+    assert "meteoserver-attemps" not in new_config
+    assert ConfigurationV1(**{**new_config, "meteoserver-key": "x"}).meteoserver_attempts == 5
+
+    kept = migrate_v0_to_v1(
+        {"config_version": 0, "meteoserver-attemps": 5, "meteoserver-attempts": 7}
+    )
+    assert kept["meteoserver-attempts"] == 7
