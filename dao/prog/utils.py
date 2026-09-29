@@ -228,7 +228,10 @@ def get_tibber_data():
             f"Onverwacht antwoord van Tibber ({ex}): {str(tibber_dict)[:200]}"
         )
         return
-    tibber_df = pd.DataFrame(columns=["time", "code", "value"])
+    # Collect a plain list of (time, code, value) tuples and build the
+    # frame once, instead of tibber_df.loc[tibber_df.shape[0]] = row per
+    # node/field pair: that copies the whole frame on every append.
+    rows = []
     for node in production_nodes:
         timestamp = int(get_datetime_from_str(node["from"]).timestamp())
         if timestamp < today_ts:
@@ -237,12 +240,12 @@ def get_tibber_data():
                 code = "prod"
                 value = float(node["production"])
                 logging.info(f"{node} {time_stamp} {value}")
-                tibber_df.loc[tibber_df.shape[0]] = [time_stamp, code, value]
+                rows.append((time_stamp, code, value))
             if not (node["profit"] is None):
                 code = "profit"
                 value = float(node["profit"])
                 logging.info(f"{node} {time_stamp} {value}")
-                tibber_df.loc[tibber_df.shape[0]] = [time_stamp, code, value]
+                rows.append((time_stamp, code, value))
 
     for node in consumption_nodes:
         timestamp = int(get_datetime_from_str(node["from"]).timestamp())
@@ -252,12 +255,13 @@ def get_tibber_data():
                 code = "cons"
                 value = float(node["consumption"])
                 logging.info(f"{node} {time_stamp} {value}")
-                tibber_df.loc[tibber_df.shape[0]] = [time_stamp, code, value]
+                rows.append((time_stamp, code, value))
             if not (node["cost"] is None):
                 code = "cost"
                 value = float(node["cost"])
                 logging.info(f"{node} {time_stamp} {value}")
-                tibber_df.loc[tibber_df.shape[0]] = [time_stamp, code, value]
+                rows.append((time_stamp, code, value))
+    tibber_df = pd.DataFrame(rows, columns=["time", "code", "value"])
     logging.info(
         f"Opgehaalde data bij Tibber (database records):"
         f"\n{tibber_df.to_string(index=False)}"
