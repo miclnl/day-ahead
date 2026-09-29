@@ -1,4 +1,3 @@
-from dateutil import easter
 import datetime
 import bisect
 import math
@@ -23,27 +22,14 @@ def make_data_path():
 
 
 def is_laagtarief(dtime, switch_hour):
-    jaar = dtime.year
-    datum = datetime.datetime(dtime.year, dtime.month, dtime.day)
-    if datum.weekday() >= 5:  # zaterdag en zondag
+    """Dutch dual-tariff low rate: weekends, public holidays and the night."""
+    from dao.prog.baseload import is_holiday
+
+    if dtime.weekday() >= 5:  # zaterdag en zondag
         return True
     if (dtime.hour < 7) or (dtime.hour >= switch_hour):  # door de week van 7 tot 21/23
         return True
-    feestdagen = [
-        datetime.datetime(jaar, 1, 1),
-        datetime.datetime(jaar, 4, 27),
-        datetime.datetime(jaar, 12, 25),
-        datetime.datetime(jaar, 12, 26),
-    ]
-    pasen = easter.easter(jaar)
-    feestdagen.append(pasen + datetime.timedelta(days=1))  # 2e paasdag
-    feestdagen.append(pasen + datetime.timedelta(days=39))  # hemelvaart
-    feestdagen.append(pasen + datetime.timedelta(days=50))  # 2e pinksterdag
-
-    for day in feestdagen:
-        if day == datum:  # dag is een feestdag
-            return True
-    return False
+    return is_holiday(dtime.date())
 
 
 def calc_adjustment_heatcurve(

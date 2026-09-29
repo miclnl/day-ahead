@@ -8,6 +8,7 @@ numpy~=2.5.3
 cffi~=2.1.1
 hassapi~=0.3.0
 python-dateutil~=2.9.0.post0
+holidays~=0.105
 nordpool~=0.5.1
 entsoe-py~=0.8.1
 beautifulsoup4~=4.15.0

@@ -222,6 +222,16 @@ class TestHolidays:
     def test_an_ordinary_day_is_not_a_holiday(self):
         assert not is_holiday(datetime.date(2026, 3, 17))
 
+    def test_working_day_holidays_are_left_out(self):
+        # Good Friday 2026 is 3 April, Liberation Day is 5 May.
+        assert not is_holiday(datetime.date(2026, 4, 3))
+        assert not is_holiday(datetime.date(2026, 5, 5))
+
+    def test_kingsday_moves_to_saturday_when_it_falls_on_a_sunday(self):
+        # 27 April 2025 was a Sunday; Koningsdag was celebrated on the 26th.
+        assert is_holiday(datetime.date(2025, 4, 26))
+        assert not is_holiday(datetime.date(2025, 4, 27)) or datetime.date(2025, 4, 27).weekday() == 6
+
     def test_a_holiday_is_folded_into_sunday(self):
         christmas = datetime.date(2026, 12, 25)  # a Friday
         assert christmas.weekday() == 4

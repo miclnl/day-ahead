@@ -24,11 +24,12 @@ Four things are layered on top of a plain average, in this order:
 from __future__ import annotations
 
 import datetime
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
-from dateutil import easter
+import holidays
 
 #: Cells with fewer observations than this after filtering fall back to the
 #: pooled estimate for the same hour across all weekdays.
@@ -83,23 +84,25 @@ class BaseloadProfile:
 # ---------------------------------------------------------------------------
 
 
-def dutch_holidays(year: int) -> set:
+#: Legal holidays that are working days for most households and therefore do
+#: not change the consumption pattern.
+_WORKING_DAY_HOLIDAYS = {"Goede vrijdag", "Bevrijdingsdag"}
+
+
+@functools.lru_cache(maxsize=16)
+def dutch_holidays(year: int) -> frozenset:
     """The public holidays that change household behaviour.
 
     Deliberately the set that makes a weekday look like a Sunday. Not an
     exhaustive legal list: Good Friday and Liberation Day are working days for
-    most people and are left out on purpose.
+    most people and are left out on purpose. The dates themselves come from
+    the holidays package, which also knows that Koningsdag moves to Saturday
+    when 27 April is a Sunday.
     """
-    pasen = easter.easter(year)
-    return {
-        datetime.date(year, 1, 1),
-        datetime.date(year, 4, 27),
-        datetime.date(year, 12, 25),
-        datetime.date(year, 12, 26),
-        pasen + datetime.timedelta(days=1),  # tweede paasdag
-        pasen + datetime.timedelta(days=39),  # hemelvaart
-        pasen + datetime.timedelta(days=50),  # tweede pinksterdag
-    }
+    calendar = holidays.NL(years=year, language="nl")
+    return frozenset(
+        day for day, name in calendar.items() if name not in _WORKING_DAY_HOLIDAYS
+    )
 
 
 def is_holiday(day: datetime.date) -> bool:
