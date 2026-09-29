@@ -3542,7 +3542,11 @@ class DaCalc(DaBase):
                 ],
                 ["", "kWh", "%", "kWh", "kWh", "kWh", "%", "kWh", "%", "%"],
             ]
-            df_accu.append(pd.DataFrame(columns=cols))
+            # Collected as plain tuples and turned into a DataFrame once
+            # after the loop, instead of df_accu[b].loc[shape[0]] = row per
+            # interval (up to 96 in 15-minute mode): that copies the whole
+            # frame on every append.
+            accu_rows = []
             for u in range(U):
                 """
                 for cs in range(CS[b]):
@@ -3639,8 +3643,9 @@ class DaCalc(DaBase):
                     overall_eff,
                     soc[b][u + 1].x,
                 ]
-                df_accu[b].loc[df_accu[b].shape[0]] = row
+                accu_rows.append(tuple(row))
 
+            df_accu.append(pd.DataFrame(accu_rows, columns=cols))
             # df_accu[b].loc['total'] = df_accu[b].select_dtypes(numpy.number).sum()
             # df_accu[b] = df_accu[b].astype({"uur": int})
             # df_accu[b].set_index(["uur"])
@@ -3678,8 +3683,11 @@ class DaCalc(DaBase):
         tijd_soc = tijd.copy()
         tijd_soc.append(tijd_soc[U - 1] + datetime.timedelta(hours=1))
         if B > 0:
-            for b in range(B):
-                df_soc["soc_" + str(b)] = None
+            soc_columns = ["tijd", "soc"] + ["soc_" + str(b) for b in range(B)]
+            # Collected as plain tuples and turned into a DataFrame once
+            # after the loop, instead of df_soc.loc[shape[0]] = row per
+            # interval: that copies the whole frame on every append.
+            soc_rows = []
             for u in range(U + 1):
                 row_soc = []
                 for b in range(B):
@@ -3688,7 +3696,8 @@ class DaCalc(DaBase):
                         row_soc = [tijd_soc[u], soc_value, soc_value]
                     else:
                         row_soc += [soc_value]
-                df_soc.loc[df_soc.shape[0]] = row_soc
+                soc_rows.append(tuple(row_soc))
+            df_soc = pd.DataFrame(soc_rows, columns=soc_columns)
 
             df_soc.index = pd.to_datetime(df_soc["tijd"])
             sum_cap = 0
@@ -3705,15 +3714,15 @@ class DaCalc(DaBase):
 
         # voorspelling pv_dc opslaan.
         if B > 0:
-            df_pv_dc = pd.DataFrame(columns=["tijd", "pv_dc"])
-            df_pv_dc.index = pd.to_datetime(df_pv_dc["tijd"])
             tijd_pv = tijd.copy()
+            pv_dc_rows = []
             for u in range(U):
                 prod_pc_sum = 0
                 for b in range(B):
                     prod_pc_sum += pv_prod_dc_sum[b][u].x * hour_fraction[u]
-                row_pv_dc = [tijd_pv[u], prod_pc_sum]
-                df_pv_dc.loc[df_pv_dc.shape[0]] = row_pv_dc
+                pv_dc_rows.append((tijd_pv[u], prod_pc_sum))
+            df_pv_dc = pd.DataFrame(pv_dc_rows, columns=["tijd", "pv_dc"])
+            df_pv_dc.index = pd.to_datetime(df_pv_dc["tijd"])
             if not self.debug:
                 self.save_df(tablename="prognoses", tijd=tijd_pv, df=df_pv_dc)
 
@@ -3752,7 +3761,11 @@ class DaCalc(DaBase):
         ]
         if M > 0:
             cols = cols + ["mach"]
-        d_f = pd.DataFrame(columns=cols)
+        # Collected as plain tuples and turned into a DataFrame once after
+        # the loop, instead of d_f.loc[d_f.shape[0]] = row per interval (up
+        # to 96 in 15-minute mode): that copies the whole frame on every
+        # append.
+        d_f_rows = []
         for u in range(U):
             row = [uur[u], accu_in_sum[u], accu_out_sum[u]]
             row = row + [
@@ -3773,7 +3786,8 @@ class DaCalc(DaBase):
             ]
             if M > 0:
                 row = row + [c_ma_sum[u]]
-            d_f.loc[d_f.shape[0]] = row
+            d_f_rows.append(tuple(row))
+        d_f = pd.DataFrame(d_f_rows, columns=cols)
         if not self.debug:
             d_f_save = d_f.drop(["b_tem"], axis=1)
             save_tijd = tijd.copy()
