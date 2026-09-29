@@ -206,7 +206,7 @@ class CheckDB:
         if l_version <= 472:
             # check variabel
             # Create the variabel table (if not exists)
-            variabel_tabel.create(self.engine)
+            variabel_tabel.create(self.engine, checkfirst=True)
             records = [
                 [1, "cons", "Verbruik", "kWh"],
                 [2, "prod", "Productie", "kWh"],
@@ -249,7 +249,7 @@ class CheckDB:
                 UniqueConstraint("variabel", "time"),
                 sqlite_autoincrement=True,  # Ensure SQLite uses AUTOINCREMENT
             )
-            values_tabel.create(self.engine)
+            values_tabel.create(self.engine, checkfirst=True)
 
             print('Table "values" gecreeerd.')
             prognoses_tabel = Table(
@@ -267,7 +267,7 @@ class CheckDB:
                 UniqueConstraint("variabel", "time"),
                 sqlite_autoincrement=True,  # Ensure SQLite uses AUTOINCREMENT
             )
-            prognoses_tabel.create(self.engine)
+            prognoses_tabel.create(self.engine, checkfirst=True)
             print('Table "prognoses" gecreeerd.')
 
         if l_version < 20240307:
@@ -363,10 +363,13 @@ class CheckDB:
             with self.engine.begin() as connection:
                 quoted_aggregate = self.engine.dialect.identifier_preparer.quote("aggregate")
 
+                # Single quotes: a double-quoted "avg" is an identifier in
+                # PostgreSQL (and MySQL with ANSI_QUOTES), which made this
+                # migration fail and roll back on every start.
                 connection.execute(
                     text(
-                        f'ALTER TABLE variabel '
-                        f'ADD COLUMN {quoted_aggregate} VARCHAR(3) NOT NULL DEFAULT "avg"'
+                        f"ALTER TABLE variabel "
+                        f"ADD COLUMN {quoted_aggregate} VARCHAR(3) NOT NULL DEFAULT 'avg'"
                     )
                 )
 

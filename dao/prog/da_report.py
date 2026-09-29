@@ -1112,7 +1112,9 @@ class Report(DaBase):
                         new_tijd.strftime("%Y-%m-%d %H:%M")[11:14] + "00",
                         pd.to_datetime(new_tijd),
                         pd.to_datetime(new_tijd),
-                        new_tijd.timestamp(),
+                        # to_pydatetime(): a naive pandas Timestamp reads its
+                        # wall clock as UTC in .timestamp(), datetime as local
+                        pd.Timestamp(new_tijd).to_pydatetime().timestamp(),
                         0,
                         row.dim,
                     ]
@@ -1128,7 +1130,9 @@ class Report(DaBase):
                         new_tijd.strftime("%Y-%m-%d %H:%M")[11:14] + "00",
                         pd.to_datetime(new_tijd),
                         pd.to_datetime(new_tijd),
-                        new_tijd.timestamp(),
+                        # to_pydatetime(): a naive pandas Timestamp reads its
+                        # wall clock as UTC in .timestamp(), datetime as local
+                        pd.Timestamp(new_tijd).to_pydatetime().timestamp(),
                         0,
                         row.dim,
                     ]
@@ -1290,19 +1294,20 @@ class Report(DaBase):
         v1 = variabel_table.alias("v1")
 
         query = (
-            select(t1.c.time, v1.c.id, t1.c.value)
+            select(t1.c.time)
             .where(
                 and_(
                     v1.c.code == code,
                     t1.c.variabel == v1.c.id,
                 )
             )
-            .order_by(t1.c.time)
+            .order_by(t1.c.time.desc())
+            .limit(1)
         )
         with self.db_da.engine.connect() as connection:
-            result_row = connection.execute(query).first()
-        if result_row is not None:
-            result = datetime.datetime.fromtimestamp(dict(result_row)["time"])
+            latest = connection.execute(query).scalar()
+        if latest is not None:
+            result = datetime.datetime.fromtimestamp(int(latest))
         else:
             result = datetime.datetime(year=2020, month=1, day=1)
         return result
@@ -1334,65 +1339,92 @@ class Report(DaBase):
             counter = +1
         return result
 
-    def calc_cost(
-            self, vanaf: datetime.datetime, tot: datetime.datetime
-    ) -> pd.DataFrame:
-        cons_df = self.get_sensor_sum(
-            self.grid_dict["cons"]["sensors"], vanaf, tot, "cons"
-        )
-        prod_df = self.get_sensor_sum(
-            self.grid_dict["prod"]["sensors"], vanaf, tot, "prod"
-        )
+    CONSOLIDATE_COLUMNS = ["time", "code", "value", "tijd"]
 
-        da_df = self.get_price_data(vanaf, tot)
-        da_df.index = pd.to_datetime(da_df["time"])
-        data = self.copy_col_df(cons_df, da_df, "cons")
-        data = self.copy_col_df(prod_df, data, "prod")
-        result = pd.DataFrame(columns=["time", "code", "value"])
-        for row in data.itertuples():
-            cost = row.cons * row.da_cons
-            db_row = [str(int(row.time.timestamp())), "cost", cost]
-            result.loc[result.shape[0]] = db_row
-            profit = row.prod * row.da_prod
-            db_row = [str(int(row.time.timestamp())), "profit", profit]
-            result.loc[result.shape[0]] = db_row
-            print(result)
-        return data
+    def calc_cost(
+            self, vanaf: datetime.datetime, tot: datetime.datetime, code: str
+    ) -> pd.DataFrame | None:
+        """Hourly cost ("cost") or revenue ("profit") from the grid sensors and
+        the tariff of that hour, as rows ready for savedata()."""
+        if code == "cost":
+            sensors, price_column = self.grid_dict["cons"]["sensors"], "da_cons"
+        else:
+            sensors, price_column = self.grid_dict["prod"]["sensors"], "da_prod"
+        energy = self.get_sensor_sum(sensors, vanaf, tot, "energy")
+        if energy is None or len(energy) == 0:
+            return None
+        prices = self.get_price_data(vanaf, tot)
+        if len(prices) == 0:
+            logging.warning(f"Geen tarieven tussen {vanaf} en {tot}, {code} niet berekend")
+            return None
+        energy = energy.reset_index(drop=True)
+        energy["tijd"] = pd.to_datetime(energy["tijd"])
+        prices = prices.rename(columns={"time": "tijd"})
+        prices["tijd"] = pd.to_datetime(prices["tijd"])
+        merged = energy.merge(prices[["tijd", price_column]], on="tijd", how="inner")
+        rows = [
+            {
+                # utc is the recorder's start_ts, the true epoch of the hour.
+                "time": str(int(row.utc)),
+                "code": code,
+                "value": float(row.energy) * float(getattr(row, price_column)),
+                "tijd": row.tijd,
+            }
+            for row in merged.itertuples()
+            if pd.notna(row.energy) and pd.notna(getattr(row, price_column))
+        ]
+        return pd.DataFrame(rows, columns=self.CONSOLIDATE_COLUMNS)
 
     def consolidate_data(self, _start=None, _end=None) -> None:
+        """Copy the hourly grid consumption, production, cost and revenue from
+        the Home Assistant recorder into the day-ahead database.
+
+        Each code continues where the database stops. The epoch stored is the
+        recorder's own start_ts; deriving it from the naive local "tijd" column
+        would shift every value by the UTC offset.
+        """
         if _end is None:
             now = datetime.datetime.now()
             tot = datetime.datetime(now.year, now.month, now.day)
         else:
             tot = _end
-        for code, categorie in itertools.chain(self.grid_dict.items()):
+        for code, categorie in self.grid_dict.items():
             if _start is None:
                 start = self.get_latest_present(code) + datetime.timedelta(hours=1)
             else:
                 start = _start
-            if categorie["sensors"] == "calc":
-                function = categorie["function"]
-                data = getattr(self, function)(start, tot, code)
+            if start >= tot:
+                logging.info(f"Consolideren {code}: al bijgewerkt tot {start}")
                 continue
+            if categorie["sensors"] == "calc":
+                df_db = getattr(self, categorie["function"])(start, tot, code)
             else:
                 data = self.get_sensor_sum(categorie["sensors"], start, tot, code)
-                if data is None:
-                    continue
-                df_db = pd.DataFrame(columns=["time", "code", "value", "tijd"])
-                data = data.rename(columns={code: "value"})
-                data["tijd"] = pd.to_datetime(data["tijd"])
-            for row in data.itertuples():
-                db_row = [
-                    str(int(row.tijd.timestamp())),
-                    code,
-                    float(row.value),
-                    row.tijd,
-                ]
-                # print(db_row)
-                df_db.loc[df_db.shape[0]] = db_row
-            print(df_db)
+                if data is None or len(data) == 0:
+                    df_db = None
+                else:
+                    data = data.reset_index(drop=True)
+                    data["tijd"] = pd.to_datetime(data["tijd"])
+                    rows = [
+                        {
+                            "time": str(int(row.utc)),
+                            "code": code,
+                            "value": float(getattr(row, code)),
+                            "tijd": row.tijd,
+                        }
+                        for row in data.itertuples()
+                        if pd.notna(getattr(row, code)) and pd.notna(row.utc)
+                    ]
+                    df_db = pd.DataFrame(rows, columns=self.CONSOLIDATE_COLUMNS)
+            if df_db is None or df_db.empty:
+                logging.info(f"Consolideren {code}: geen nieuwe gegevens vanaf {start}")
+                continue
+            logging.info(
+                f"Consolideren {code}: {len(df_db)} uren vanaf "
+                f"{df_db['tijd'].iloc[0]} tot en met {df_db['tijd'].iloc[-1]}"
+            )
+            logging.debug(f"\n{df_db.to_string(index=False)}")
             self.db_da.savedata(df_db, tablename="values")
-        return
 
     def recalc_df_ha(self, org_data_df: pd.DataFrame, interval: str) -> pd.DataFrame:
         def get_datasoort(ds):
