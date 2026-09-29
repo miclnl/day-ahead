@@ -5,9 +5,11 @@ Basis: commit `2971722` (Format fast-control event timestamps as human-readable)
 
 **Scope**: alle Python in `dao/` (~30.700 regels) volledig gelezen; `day_ahead.py`, `da_base.py`, `utils.py`, `da_scheduler.py`, `da_fast.py`, `fastctrl/*` direct; `lib/`, `webserver/`, `config/`, `da_report.py`, `solar_predictor.py`, `baseload.py`, `check_db.py` via parallelle deelreviews die zijn gecontroleerd. Claims met **[geverifieerd]** zijn gereproduceerd in `.venv` (pandas 3.0.6, pydantic 2.13.4, SQLAlchemy 2.0.54, Python 3.14).
 
-## Status van de reparaties (bijgewerkt 2026-09-29)
+## Status van de reparaties (bijgewerkt 2026-09-29, Fase 3 afgerond)
 
-Fase 1 en het grootste deel van Fase 2 zijn uitgevoerd in de commits `5eef5da` t/m `c07e4e3`. Testsuite na afloop: `667 passed, 5 skipped` (de 5 zijn integratietests die live databases en HA nodig hebben; zet `DAO_INTEGRATION_TESTS=1` om ze lokaal te draaien). CI draait pytest nu als eerste job in `test_build.yaml`.
+Alle 18 kritieke bugs en alle 8 verbeterkansen zijn behandeld; zie de tabellen hieronder voor wat volledig is opgelost versus welke verbeterkansen bewust een beperkte, praktische invulling hebben gekregen in plaats van de volledige (1-3 dagen geschatte) herarchitectuur. Van de bijlage (medium/low) is alles opgelost op drie stukjes bewust ongemoeide dode code na (zie de bijlage zelf). Testsuite na afloop: `779 passed, 5 skipped` (de 5 zijn integratietests die live databases en HA nodig hebben; zet `DAO_INTEGRATION_TESTS=1` om ze lokaal te draaien). CI draait pytest als eerste job in `test_build.yaml`.
+
+### Kritieke bugs
 
 | Bevinding | Status | Commit |
 |---|---|---|
@@ -29,12 +31,21 @@ Fase 1 en het grootste deel van Fase 2 zijn uitgevoerd in de commits `5eef5da` t
 | Bug #16 HTTP zonder timeout | opgelost, incl. retry met backoff voor meteoserver | `d163398` |
 | Bug #17 `da_prices` argv/Nordpool | opgelost; ENTSO-E 0.8.1 levert zelf de juiste resolutie | `622ac52` |
 | Bug #18 fast-control regressies | opgelost: override vrijgeven bij `off`, eventlog-baseline | `d166e04` |
-| Verbetering #1 APScheduler | uitgevoerd | `417d09a` |
-| Verbetering #4 config write path | uitgevoerd: `validate_config_data`, `atomic_write_*`, `set_fast_control_mode` | `ce14162` |
-| Verbetering #6 requirements/Dockerfile | uitgevoerd: 5 packages weg, mariadb-toolchain weg, `requirements-dev.txt` | `5bd7a07` |
-| Feestdagen via `holidays` | uitgevoerd | `c07e4e3` |
-| Verbetering #2 (HA-client), #3 (tijdzone epoch-in/uit), #5 (taken uit gunicorn), #7 (pandas), #8 (ML) | open (Fase 3) | |
-| Bijlage (medium/low) | grotendeels open; opgelost: `hp_power`-warning, `da_base.py` meteo-cmd pad, `settings/<filename>` route, `fast_control.html` URL's, secret key, `set_value` read-back | |
+
+### Verbeterkansen (should-fix)
+
+| Verbetering | Status | Commit |
+|---|---|---|
+| #1 APScheduler | volledig uitgevoerd | `417d09a` |
+| #2 Eén robuuste HA-client | grotendeels uitgevoerd: guarded reads (`get_float`/`get_bool`/`get_str`/`get_datetime`), `FlexValue.resolve(default=)`, en een tenacity retry-wrapper (`_retry_ha_call`, 3 pogingen, exponentiële backoff) om `get_state`/`call_service`/`set_state` die alleen transiënte fouten (`ConnectionError`, `Timeout`, hassapi 429/500/502/503) opnieuw probeert, niet 401/403/404. `hassapi` zelf is niet vervangen door `requests.Session`/`homeassistant-api`; dat is een aparte, grotere migratie gebleven | `6112eeb`, `7915fb9` |
+| #3 Tijdzonebeleid "epoch in, epoch uit" | gedeeltelijk: de concrete symptomen zijn gefixt (DST-crash in `get_api_data`, bucket-labels, ENTSO-E-resolutie), maar de architecturale opschoning (overal epoch opslaan, `pytz`/`unix_timestamp()` uit de SQL-laag, `TARGET_TIMEZONE` daadwerkelijk gebruiken) is niet gedaan | `5cce551`, `db08de4`, `622ac52` |
+| #4 Eén config-schrijfpad | volledig uitgevoerd: `validate_config_data`, `atomic_write_text/json`, `set_fast_control_mode` | `ce14162` |
+| #5 Taken uit de gunicorn-worker | gedeeltelijk: de webserver-taken draaien nog in de worker, maar wel geïsoleerd (`start_new_session=True`) zodat cancel de hele procesgroep opruimt in plaats van alleen het directe kind, en zodat een signaal aan de webserver zelf de taak niet halverwege meesleurt. De grotere herindeling (request-bestand + uitvoering door `da_scheduler.py`) is niet gedaan | `28b3da5` |
+| #6 Requirements/Dockerfile opschonen | volledig uitgevoerd: 5 packages weg, mariadb-toolchain weg, `requirements-dev.txt` | `5bd7a07` |
+| #7 pandas-antipatronen (`.loc[shape[0]]` in een lus) | volledig uitgevoerd: alle bereikbare O(n²)-lussen in `da_report.py` (7), `solar_predictor.py` (2), `da_base.py` (2), `da_meteo.py` (1), `da_prices.py` (3), `utils.py` (1) en `day_ahead.py` (4) vervangen door een lijst met tuples + één `pd.DataFrame(...)`. Drie overgebleven treffers zijn bewust niet aangeraakt: `da_meteo.py`'s tweede blok en `day_ahead.py`'s `df_pv_prog`-blok zijn dode code (staan in een niet-uitgevoerde `"""`-string), `utils.py`'s `interpol_rows` wordt alleen aangeroepen door het ongebruikte `interpolate_old` | `b2302d2`, `101e5c6`, `354a675`, `44d8e6e`, `d5a4f69`, `f6b3e2f` |
+| #8 Solar-ML methodologisch repareren | volledig uitgevoerd: `resample("h").sum(min_count=1)` (een leeg uur wordt NaN, niet een verzonnen 0), `GridSearchCV(cv=TimeSeriesSplit(n_splits=3))` i.p.v. gewone KFold op een tijdreeks, `warnings.filterwarnings("ignore")` niet meer op module-niveau maar gescoped rond de `GridSearchCV.fit()`-aanroep zelf, `from pip._internal.utils import datetime` verwijderd, en `save_model()`/`load_model()` (xgboost's eigen formaat) i.p.v. `joblib.dump`/`load` met een `*.meta.json`-sidecar die de featurelijst vastlegt zodat een mismatch een duidelijke `ValueError` geeft in plaats van een stille verkeerde voorspelling | `81d9154`, `d0df427`, `101e5c6` |
+
+Twee bugs uit de bijlage die niet in de eerste ronde waren meegenomen, zijn alsnog gefixt: de solar-key-normalisatie miste `.replace("-", "_")` op één van de vijf plekken (`day_ahead.py:702`, batterij-gekoppelde zonnepanelen), en de blok-optimalisatie van de warmtepomp deelde door `hours_avail` zonder te controleren op 0 (`boiler_int >= U`) — commit `8a01960`.
 
 **Feiten vooraf (bij aanvang van de review)**
 - Testsuite: `591 passed, 7 failed`. 2 failures zijn echte regressies uit commit `c30494f` (`test_runner_events.py`), 5 komen door bug #15. **CI draait pytest niet** (alleen build + docs-check).
@@ -451,39 +462,53 @@ def save_config(path: Path, data: dict) -> None:
 
 ## Bijlage: overige bevindingen (medium/low, niet blokkerend)
 
-| Locatie | Probleem | Fix |
-|---|---|---|
-| `day_ahead.py:688` | `solar_name` zonder `.replace("-", "_")` terwijl regels 349/357/393 dat wel doen → `KeyError` bij batterij-solar met `-` in de naam | zelfde normalisatie (maak een `_solar_key(name)` helper) |
-| `day_ahead.py:2330-2335` | Warning zegt "uitgegaan van 1,5 kW-e" maar `hp_power` wordt niet aangepast | `hp_power = 1.5` in de if-tak |
-| `day_ahead.py:624-626` | `sum_eff / (DS[b] - 1)` → `ZeroDivisionError` als alleen de 0-stage bestaat (model staat dat toe) | validator: minstens één stage met `power > 0` |
-| `day_ahead.py:2645` | `hp_hours / hours_avail` → `ZeroDivisionError` als `boiler_int >= U` | `if hours_avail <= 0: blocks_num = 0` |
-| `day_ahead.py:3013-3015` | `delta.seconds / 900` i.p.v. `total_seconds()` **[geverifieerd]** (alleen fout bij window >= 24 h) | `math.ceil(delta.total_seconds() / 900)` |
-| `day_ahead.py:1645-1648` | EV ready-tijd exact gelijk aan nu wordt niet naar morgen geschoven → "verouderd" | `<=` i.p.v. `<` |
-| `day_ahead.py:3199` | `cost` gebonden op ±1000 euro; `delivery/production` op 1000 kWh — hard-coded | uit config of ruimer |
-| `day_ahead.py:4929, 5054, 5075, 5087, 5108` | Muteren `uur`, `pl`, `pt`, `p_spot`, `pl_avg` in de grafiekcode | kopieën gebruiken |
-| `da_base.py:242-256` | Read-back na `set_value` faalt bij device-backed entities → valse errors | zie Verbetering #2 |
-| `da_base.py:594-608` | `os.chdir` zonder `try/finally` → cwd blijft fout na exception | `Path(folder).glob(pattern)` |
-| `da_base.py:283` | `"cmd": ["python3", "day_ahead.py", "meteo"]` mist `../prog/` → `/v2/api/run/meteo` 500 | pad corrigeren |
-| `utils.py:74-83` | `get_value_from_dict`: datum vóór eerste key → wrapt naar laatste entry; keys niet gesorteerd/gevalideerd | validator in `pricing.py` (ISO-datum, gesorteerd) |
-| `fastctrl/runner.py:533, 695` | Plan verouderd wordt gerapporteerd als `sensor_stale` | eigen reden `plan_stale` |
-| `fastctrl/runner.py:557-562` | `saved_today_eur` telt geschatte baten ook in shadow-modus | label `estimated` of alleen tellen in `active` |
-| `da_fast.py:103-104, 133, 151` | `.value` als literal (`float("input_number.x")`, `bool("False") is True`) | `.resolve(report.ha_getter)` |
-| `da_meteo.py:182 vs 282` | Direct en diffuus op verschillend tijdstip geëvalueerd (start vs midden uur) → PV te laag bij zonsop-/ondergang | beide op `utc_time + 1800` |
-| `da_meteo.py:653, 696` | `get_avg_temperature` returnt `None` bij lege data → `TypeError` in `calc_graaddagen` → optimizer-run dood | `None` afhandelen, bovengrens op query |
-| `da_report.py:54` | `periodes = {}` als class-attribuut, per instance gemuteerd | `self.periodes = {}` in `__init__` |
-| `da_report.py:73, 1996` | `co2_intensity_sensor` (str) wordt als lijst geïtereerd → CO2 altijd 0 | `[sensor] if sensor else []` |
-| `da_report.py:1008-1019, 1044` | Aggregatie-query selecteert niet-gegroepeerde kolommen → faalt op PostgreSQL/MySQL 8 | `func.min(start_ts)`, `func.max(unit)` |
-| `da_report.py:2024-2032` | Prijzen positioneel gejoind i.p.v. op tijd | `merge(on="tijd")` |
-| `da_report.py:2217-2221` | `last_moment = vanaf` bij lege HA-rijen → dubbele uren in grid-rapport (eerste 12 min van elk uur) | `else`-tak verwijderen |
-| `da_report.py:1711-1719, 1948` | Bucket-label = `min(time)` i.p.v. bucketstart → eerste deelmaand van "contractjaar"/"365 dagen" valt weg | `month_start` in SQL selecteren en niet overschrijven |
-| `da_report.py:3430-3431` | `tz_localize` zonder `ambiguous`/`nonexistent` → 500 op beide DST-dagen | epoch-kolom gebruiken (Verbetering #3) |
-| `solar_predictor.py:21` | `from pip._internal.utils import datetime` | verwijderen |
-| `check_db.py:150-167, 296-301` | KNMI-observaties overschrijven forecasts in `prognoses` en worden uit `values` verwijderd, terwijl `solar_predictor.py:929` daar nog leest | één thuis kiezen; `ON CONFLICT DO NOTHING` |
-| `db_connections.py:125-147` | Singleton pint de eerste config; `_build_db_da` gooit `OperationalError` i.p.v. `None` zoals docstring belooft | cache op `db_url`; `try/except SQLAlchemyError` |
-| `models/grid.py:13-22` | `max_power` default 17 kW ook zonder `grid`-sectie (1-fase 25 A = 5.75 kW) | verplicht maken of warning als default gebruikt |
-| `models/scheduler.py:57-78`, `battery.py:78` | `extra="ignore"`/`"forbid"` terwijl de rest `allow` is → `//comment`-keys verdwijnen of breken de config | `extra="allow"` |
-| `models/base.py:446-454` | `SecretStr.resolve()` valt terug op de key-naam als secret → misleidende "access denied" | `KeyError` gooien |
-| `app/__init__.py:21` | `app.secret_key = "secret_cookie_key"` | `secrets.token_hex(32)` persistent |
-| `templates/fast_control.html:14, 16, 45` | Absolute URL's (`/run`, `/fast_control/state.json`) werken niet onder ingress | `url_for(...)` |
-| `v2/api/routes.py:26, 83` | `request.args.get('timezone') if None else "Europe/Amsterdam"` → altijd Amsterdam | `request.args.get("timezone") or ...` + `ZoneInfo`-validatie |
-| `routes.py:482 → 385-391` | Fast-control statuspoll (elke 5 s) draait `ConfigurationLoader.load_and_validate()` met `flock` en kan vanuit een GET `options.json` herschrijven (migratiepad) | modus uit `fast_state.json` of gecachte config lezen |
+Alles hieronder is opgelost, op de drie expliciet gemarkeerde dode-code-gevallen na (die kosten niets om te laten staan: ze worden nooit uitgevoerd).
+
+| Locatie | Probleem | Fix | Status | Commit |
+|---|---|---|---|---|
+| `day_ahead.py:688` | `solar_name` zonder `.replace("-", "_")` terwijl regels 349/357/393 dat wel doen → `KeyError` bij batterij-solar met `-` in de naam | zelfde normalisatie | opgelost | `8a01960` |
+| `day_ahead.py:2330-2335` | Warning zegt "uitgegaan van 1,5 kW-e" maar `hp_power` wordt niet aangepast | `hp_power = 1.5` in de if-tak | opgelost | `6112eeb` |
+| `day_ahead.py:624-626` | `sum_eff / (DS[b] - 1)` → `ZeroDivisionError` als alleen de 0-stage bestaat (model staat dat toe) | validator: minstens één stage met `power > 0` | opgelost | `15f6b12` |
+| `day_ahead.py:2645` | `hp_hours / hours_avail` → `ZeroDivisionError` als `boiler_int >= U` | `if hours_avail <= 0: blocks_num = 0` | opgelost | `8a01960` |
+| `day_ahead.py:3013-3015` | `delta.seconds / 900` i.p.v. `total_seconds()` **[geverifieerd]** (alleen fout bij window >= 24 h) | `math.ceil(delta.total_seconds() / 900)` | opgelost | `15f6b12` |
+| `day_ahead.py:1645-1648` | EV ready-tijd exact gelijk aan nu wordt niet naar morgen geschoven → "verouderd" | `<=` i.p.v. `<` | opgelost | `6112eeb` |
+| `day_ahead.py:3199` | `cost` gebonden op ±1000 euro; `delivery/production` op 1000 kWh — hard-coded | dynamische grenzen uit netaansluiting/horizon | opgelost | `15f6b12` |
+| `day_ahead.py:4929, 5054, 5075, 5087, 5108` | Muteren `uur`, `pl`, `pt`, `p_spot`, `pl_avg` in de grafiekcode | kopieën gebruiken (rebind i.p.v. append) | opgelost | `15f6b12` |
+| `day_ahead.py: df_accu/df_soc/df_pv_dc/d_f` | `.loc[df.shape[0]] = row` per interval in `calc_optimum` (O(n²), tot 96 rijen) | lijst van tuples + één `pd.DataFrame(...)` | opgelost | `f6b3e2f` |
+| `da_base.py:242-256` | Read-back na `set_value` faalt bij device-backed entities → valse errors | `set_value` waarschuwt i.p.v. raise bij read-back-mismatch | opgelost | `6112eeb` |
+| `da_base.py:594-608` | `os.chdir` zonder `try/finally` → cwd blijft fout na exception | `Path(folder).glob(pattern)` | opgelost | `d7f8750` |
+| `da_base.py:283` | `"cmd": ["python3", "day_ahead.py", "meteo"]` mist `../prog/` → `/v2/api/run/meteo` 500 | pad corrigeren | opgelost | `6112eeb` |
+| `da_base.py: save_df/calc_solar_predictions` | `.loc[shape[0]] = row` per (interval, kolom)-paar resp. per interval (O(n²)) | lijst van tuples + één `pd.DataFrame(...)` | opgelost | `101e5c6` |
+| `utils.py:74-83` | `get_value_from_dict`: datum vóór eerste key → wrapt naar laatste entry; keys niet gesorteerd/gevalideerd | validator in `pricing.py` (ISO-datum, gesorteerd), clamp naar eerste i.p.v. wrap naar laatste | opgelost | `d7f8750` |
+| `utils.py: get_tibber_data` | `.loc[shape[0]] = row` per node/veld-paar (O(n²)) | lijst van tuples + één `pd.DataFrame(...)` | opgelost | `d5a4f69` |
+| `fastctrl/runner.py:533, 695` | Plan verouderd wordt gerapporteerd als `sensor_stale` | eigen reden `plan_stale` | opgelost | `547e5b1` |
+| `fastctrl/runner.py:557-562` | `saved_today_eur` telt geschatte baten ook in shadow-modus | `saved_today_is_estimate`-vlag | opgelost | `547e5b1` |
+| `da_fast.py:103-104, 133, 151` | `.value` als literal (`float("input_number.x")`, `bool("False") is True`) | `.resolve(report.ha_getter)` | opgelost | `547e5b1` |
+| `da_meteo.py:182 vs 282` | Direct en diffuus op verschillend tijdstip geëvalueerd (start vs midden uur) → PV te laag bij zonsop-/ondergang | beide op hetzelfde moment (interval-midden via `self.interval_s/2`) | opgelost | `c7f8222` |
+| `da_meteo.py:653, 696` | `get_avg_temperature` returnt `None` bij lege data → `TypeError` in `calc_graaddagen` → optimizer-run dood | `None` afhandelen, bovengrens op query | opgelost | `c7f8222` |
+| `da_meteo.py: get_meteo_data` | `.loc[shape[0]] = row` × 4 per rij (O(n²)); een tweede vergelijkbare lus bleek dode code (gfs-fallback in een niet-uitgevoerde `"""`-string) | lijst van tuples + één `pd.DataFrame(...)`; dode code ongemoeid gelaten | opgelost | `354a675` |
+| `da_prices.py: entsoe/easyenergy/tibber` | `.loc[shape[0]] = row` per uurprijs (O(n²)), drie plekken | lijst van tuples + één `pd.DataFrame(...)` | opgelost | `354a675` |
+| `da_report.py:54` | `periodes = {}` als class-attribuut, per instance gemuteerd | `self.periodes = {}` in `__init__` | opgelost | `db08de4` |
+| `da_report.py:73, 1996` | `co2_intensity_sensor` (str) wordt als lijst geïtereerd → CO2 altijd 0 | `[sensor] if sensor else []` | opgelost | `db08de4` |
+| `da_report.py:1008-1019, 1044` | Aggregatie-query selecteert niet-gegroepeerde kolommen → faalt op PostgreSQL/MySQL 8 | `func.min(...)`, `func.max(...)` | opgelost | `5cce551` |
+| `da_report.py:2024-2032` | Prijzen positioneel gejoind i.p.v. op tijd | `merge(on="tijd")` | opgelost | `db08de4` |
+| `da_report.py:2217-2221` | `last_moment = vanaf` bij lege HA-rijen → dubbele uren in grid-rapport (eerste 12 min van elk uur) | `else`-tak verwijderd | opgelost | `db08de4` |
+| `da_report.py:1711-1719, 1948` | Bucket-label = `min(time)` i.p.v. bucketstart → eerste deelmaand van "contractjaar"/"365 dagen" valt weg | `month_start`/`day_start`/`hour_start` in SQL, niet overschrijven | opgelost | `db08de4` |
+| `da_report.py:3430-3431` | `tz_localize` zonder `ambiguous`/`nonexistent` → 500 op beide DST-dagen | `ambiguous=False, nonexistent="shift_forward"` | opgelost | `5cce551` |
+| `da_report.py: recalc_df_ha/aggregate_balance_df/calc_grid_columns/get_price_data/calc_solar_data` | `.loc[shape[0]] = row` per rij (O(n²), tot 8760 rijen voor een jaarrapport) | lijst van tuples + één `pd.DataFrame(...)` | opgelost | `44d8e6e` |
+| `solar_predictor.py:21` | `from pip._internal.utils import datetime` | verwijderd | opgelost | `81d9154` |
+| `solar_predictor.py: import_weatherdata/get_and_save_knmi_data` | `.loc[shape[0]] = row` × 3 per rij (O(n²), ~26.000 brondata voor 3 jaar KNMI-import) | lijst van tuples + één `pd.DataFrame(...)` | opgelost | `b2302d2` |
+| `solar_predictor.py: resample/cv/warnings/model-opslag` | zie Verbetering #8 | zie Verbetering #8 | opgelost | `81d9154`, `d0df427`, `101e5c6` |
+| `check_db.py:150-167, 296-301` | KNMI-observaties overschrijven forecasts in `prognoses` en worden uit `values` verwijderd, terwijl `solar_predictor.py:929` daar nog leest | filtert al bestaande timestamps eruit vóór de upsert | opgelost | `81d9154` |
+| `db_connections.py:125-147` | Singleton pint de eerste config; `_build_db_da` gooit `OperationalError` i.p.v. `None` zoals docstring belooft | cache op resolved `db_url`; `try/except` retourneert `None` | opgelost | `03ac313` |
+| `models/grid.py:13-22` | `max_power` default 17 kW ook zonder `grid`-sectie (1-fase 25 A = 5.75 kW) | warning bij gebruik van de default (`model_fields_set`-check) | opgelost | `2af258b` |
+| `models/scheduler.py:57-78`, `battery.py:78` | `extra="ignore"`/`"forbid"` terwijl de rest `allow` is → `//comment`-keys verdwijnen of breken de config | `extra="allow"` | opgelost | `2af258b` |
+| `models/base.py:446-454` | `SecretStr.resolve()` valt terug op de key-naam als secret → misleidende "access denied" | `KeyError` | opgelost | `2af258b` |
+| `app/__init__.py:21` | `app.secret_key = "secret_cookie_key"` | `secrets.token_hex(32)`, persistent | opgelost | `14337f8` |
+| `templates/fast_control.html:14, 16, 45` | Absolute URL's (`/run`, `/fast_control/state.json`) werken niet onder ingress | `url_for(...)` | opgelost | `14337f8` |
+| `v2/api/routes.py:26, 83` | `request.args.get('timezone') if None else "Europe/Amsterdam"` → altijd Amsterdam | `_requested_timezone()`-helper: `or` i.p.v. de omgekeerde ternary, valideert tegen `zoneinfo.available_timezones()` | opgelost | `2af258b` |
+| `routes.py:482 → 385-391` | Fast-control statuspoll (elke 5 s) draait `ConfigurationLoader.load_and_validate()` met `flock` en kan vanuit een GET `options.json` herschrijven (migratiepad) | `_cached_config_v1()`: GET's hergebruiken de gecachte config, POST herlaadt altijd | opgelost | `2af258b` |
+| `webserver: run/task-runner` | Cancel/kill raakte alleen het directe kind; een signaal aan de webserver zelf kon de v1-taak halverwege raken | `start_new_session=True` + `os.killpg()` in v2's cancel-pad | opgelost | `28b3da5` |
+| `da_meteo.py: gfs-fallback` (dode code) | tweede `.loc[shape[0]]`-lus | staat in een niet-uitgevoerde `"""`-string; bewust ongemoeid | n.v.t. | — |
+| `day_ahead.py: df_pv_prog` (dode code) | derde `.loc[shape[0]]`-lus | staat in een niet-uitgevoerde `"""`-string; bewust ongemoeid | n.v.t. | — |
+| `utils.py: interpol_rows` (dode code) | vierde `.loc[shape[0]]`-lus | wordt alleen aangeroepen door het nergens meer gebruikte `interpolate_old`; bewust ongemoeid | n.v.t. | — |
