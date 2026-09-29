@@ -2,6 +2,83 @@
 # Day Ahead Optimizer
 # Unreleased
 
+## Codereview: beveiliging, betrouwbaarheid en snelheid
+Een volledige review van de Python-code heeft 18 kritieke bugs en alle acht
+verbeterpunten opgeleverd; die zijn nu doorgevoerd. De testsuite is meegegroeid
+naar 874 tests en draait als eerste stap in CI.
+
+**Let op bij het bijwerken**
+
+- **ML-zonnemodellen moeten opnieuw getraind worden.** Ze werden opgeslagen als
+  pickle (`.pkl`), wat stuk kan gaan bij een nieuwe xgboost-versie. Nu wordt
+  xgboost' eigen formaat gebruikt (`.json`), met een bestandje ernaast dat de
+  featurelijst vastlegt. Een oud model wordt niet gevonden; draai "ML modellen
+  trainen" opnieuw. Zolang dat niet gebeurd is, valt de voorspelling terug op de
+  DAO-predictor.
+- **Het dashboard is standaard alleen via Home Assistant bereikbaar.** De poort
+  staat niet meer open. Gebruik je de pagina rechtstreeks op poort 5000, zet dan
+  de nieuwe add-on-optie `allow_direct_access` aan.
+
+**Beveiliging**
+
+- `secrets.json`, de database en alle logbestanden waren te downloaden via
+  `/static/data/`. Die symlink is weg; afbeeldingen gaan via een eigen route.
+- De instellingen-editor kon willekeurige bestanden lezen en schrijven
+  (path traversal) en gaf ongefilterde invoer terug in de pagina (XSS).
+- Het dashboard accepteert alleen nog verzoeken via de ingress van Home
+  Assistant, heeft CSRF-bescherming en een eigen, blijvende sessiesleutel in
+  plaats van een vaste sleutel in de code.
+
+**Betrouwbaarheid**
+
+- Een entity die `unavailable` of `unknown` is laat de optimalisering niet meer
+  crashen: er wordt gelogd waarvan uitgegaan is en met een standaardwaarde
+  doorgerekend. Voorheen stopte de run voordat de accu zijn setpoint kreeg.
+- De planner sloeg elke minuut over die verstreek terwijl een lange taak liep
+  (ML-trainen, een trage optimalisering); die taken werden stil overgeslagen.
+  Nu is elke regel een eigen job.
+- De planner en het dashboard konden dezelfde taak tegelijk starten, met twee
+  optimaliseringen die dezelfde tabellen schreven en tegenstrijdige setpoints
+  naar Home Assistant stuurden. Beide gebruiken nu één vergrendelde
+  administratie.
+- In kwartiermodus kregen de PV-prognoses een verkeerd tijdstip, waardoor de
+  voorspelling nergens op leek.
+- Een fout in de boiler- of warmtepompsectie blokkeerde de rest van de
+  aansturing, inclusief de accu. Elk apparaat wordt nu apart afgehandeld.
+- Een typefout in de instellingen kon een niet-laadbare `options.json`
+  achterlaten, waarna de planner in een herstartlus kwam. Schrijven gebeurt nu
+  gevalideerd en atomair.
+- Consolidatie was op drie punten stuk, en was bovendien niet planbaar hoewel de
+  taak bestond. Beide opgelost.
+- Op PostgreSQL kon het opstarten vastlopen op een migratie, en stonden alle
+  tijden 1 tot 2 uur verschoven.
+- Uitgaande verzoeken (prijzen, meteo, Home Assistant) hadden geen timeout en
+  konden de planner onbeperkt laten hangen. Er zit nu een timeout op, plus
+  opnieuw proberen bij tijdelijke storingen.
+- Nederlandse feestdagen komen uit de `holidays`-bibliotheek in plaats van een
+  eigen, incomplete lijst.
+
+**Rapporten**
+
+- De API gaf een foutmelding op beide dagen dat de klok verzet wordt.
+- Bij "dit contractjaar" en "365 dagen" viel de eerste, gedeeltelijke maand weg.
+- De CO2-rapporten stonden altijd op 0.
+- Het netrapport toonde dubbele uren.
+- Prijzen werden op positie in plaats van op tijd samengevoegd, wat de verkeerde
+  prijs bij een uur kon zetten.
+- Grote rapporten (een jaar aan uurwaarden) zijn aanzienlijk sneller: het
+  opbouwen van de tabellen was kwadratisch in het aantal rijen.
+
+**Logging**
+
+- Wat het dashboard logde kwam nergens in het add-on-log terecht, terwijl
+  planner en taken daar wel in stonden. Bovendien schreven twee werkprocessen
+  door elkaar in hetzelfde roterende logbestand. Alles gaat nu naar het
+  add-on-log; taken houden hun eigen logbestand.
+- Een mislukte taak liet logbestanden open staan en kon meldingen dubbel naar
+  Home Assistant sturen.
+
+
 ## Rename to DAO+
 The addon is renamed from "Day Ahead Optimizer" to "DAO+" so it stands
 out in the Home Assistant Add-on Store. The old name blends in with
