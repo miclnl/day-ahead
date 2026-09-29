@@ -448,12 +448,41 @@ Configure your home battery storage system for optimal energy management and cos
     @field_validator("charge_stages", "discharge_stages", mode="after")
     @classmethod
     def validate_stages_sorted(cls, v: list[BatteryStage], info) -> list[BatteryStage]:
-        """Ensure stages are sorted by power and always start with a zero-power sentinel."""
+        """Ensure stages are sorted by power and always start with a zero-power sentinel.
+
+        At least one stage with power > 0 is required: day_ahead.py divides
+        by (number of stages - 1) to average the discharge efficiency, which
+        is only defined once a real (non-zero) stage exists.
+        """
         powers = [stage.power for stage in v]
-        if powers != sorted(powers):
-            raise ValueError(f"{info.field_name} must be sorted by power (ascending)")
+        if any(a >= b for a, b in zip(powers, powers[1:])):
+            raise ValueError(f"{info.field_name} must be strictly increasing by power")
+        if not any(p > 0 for p in powers):
+            raise ValueError(
+                f"{info.field_name} needs at least one stage with power > 0"
+            )
 
         if v[0].power != 0.0:
             v = [BatteryStage(power=0.0, efficiency=1.0)] + v
 
         return v
+
+    @field_validator("reduce_power_low_soc", "reduce_power_high_soc", mode="after")
+    @classmethod
+    def validate_soc_power_limits(
+        cls, v: list["SocPowerLimit"], info
+    ) -> list["SocPowerLimit"]:
+        """Two or more entries with strictly increasing SoC, or none at all.
+
+        day_ahead.py derives a slope from the SoC gap between consecutive
+        entries; a single entry has nothing to derive a slope from (it is
+        dropped, with a warning, at that point already) and duplicate SoC
+        values would divide by zero there.
+        """
+        if len(v) == 1:
+            return v  # day_ahead.py warns and drops this case itself
+        ordered = sorted(v, key=lambda entry: entry.soc)
+        socs = [entry.soc for entry in ordered]
+        if any(a >= b for a, b in zip(socs, socs[1:])):
+            raise ValueError(f"{info.field_name}: soc values must be strictly increasing")
+        return ordered

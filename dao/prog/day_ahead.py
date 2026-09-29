@@ -3042,8 +3042,10 @@ class DaCalc(DaBase):
                 kw_num = 0
             else:
                 delta = end_window_dt - max(start_opt, start_window_dt)
-                # aantal kwartieren in planningsperiode
-                kw_num = math.ceil(delta.seconds / 900)
+                # aantal kwartieren in planningsperiode. total_seconds(), niet
+                # .seconds: dat laatste is alleen het sub-dag deel en zou een
+                # venster van een dag of langer stilletjes afknippen.
+                kw_num = math.ceil(delta.total_seconds() / 900)
             KW.append(kw_num)
             if RL[m] == 0:
                 logging.info(
@@ -3227,9 +3229,17 @@ class DaCalc(DaBase):
             )
 
         # cost variabele
-        cost = model.add_var(var_type=CONTINUOUS, lb=-1000, ub=1000)
-        delivery = model.add_var(var_type=CONTINUOUS, lb=0, ub=1000)
-        production = model.add_var(var_type=CONTINUOUS, lb=0, ub=1000)
+        # Bounds derived from the configured grid power and the horizon,
+        # matching the per-interval bound already enforced on c_l/c_t
+        # (grid_max_power * hour_fraction[u]). A fixed 1000 kWh/1000 euro
+        # bound made the model infeasible for any installation whose grid
+        # connection plus horizon exceeds household scale.
+        max_energy = self.grid_max_power * sum(hour_fraction)
+        max_price = max(max(pl, default=0.0), abs(min(pt, default=0.0)), 1.0)
+        cost_bound = max_energy * max_price + 500.0  # margin for cycle/switch/boiler terms
+        cost = model.add_var(var_type=CONTINUOUS, lb=-cost_bound, ub=cost_bound)
+        delivery = model.add_var(var_type=CONTINUOUS, lb=0, ub=max_energy)
+        production = model.add_var(var_type=CONTINUOUS, lb=0, ub=max_energy)
         model += delivery == xsum(c_l[u] for u in range(U))
         model += production == xsum(c_t[u] for u in range(U))
 
@@ -5010,8 +5020,12 @@ class DaCalc(DaBase):
         gr_no = 1
         if show_battery_balance:
             ind = np.arange(U + 1)
-            uur.append("24:00")
-            uur_labels.append("24")
+            # Rebind to a new list instead of mutating the shared one in
+            # place: uur/uur_labels are not used again after this graph
+            # section, but a future addition after this point should not
+            # inherit a silently-extended array.
+            uur = uur + ["24:00"]
+            uur_labels = uur_labels + ["24"]
             for b in range(B):
                 # make graph of battery
                 gr_no += 1
@@ -5104,8 +5118,8 @@ class DaCalc(DaBase):
         line_styles = ["solid", "dashed", "dotted"]
         ind = np.arange(U + 1)
         if len(uur) < U + 1:
-            uur.append("24:00")
-            uur_labels.append("24")
+            uur = uur + ["24:00"]
+            uur_labels = uur_labels + ["24"]
         if B > 0:
             ln1 = axis[gr_no].plot(
                 ind, soc_t, label="SoC", linestyle=line_styles[0], color="olive"
@@ -5135,7 +5149,7 @@ class DaCalc(DaBase):
 
         axis22 = axis[gr_no].twinx()
         if prices_consumption:
-            pl.append(pl[-1])
+            pl = pl + [pl[-1]]
             ln2 = axis22.step(
                 ind,
                 np.array(pl),
@@ -5156,7 +5170,7 @@ class DaCalc(DaBase):
         prices_production = prices_production_str.lower() == "true"
 
         if prices_production:
-            pt.append(pt[-1])
+            pt = pt + [pt[-1]]
             ln3 = axis22.step(
                 ind,
                 np.array(pt),
@@ -5168,7 +5182,7 @@ class DaCalc(DaBase):
             ln3 = None
 
         if str((_g.prices_spot if _g else True) or "true").lower() == "true":
-            p_spot.append(p_spot[-1])
+            p_spot = p_spot + [p_spot[-1]]
             ln5 = axis22.step(
                 ind,
                 np.array(p_spot),
@@ -5189,7 +5203,7 @@ class DaCalc(DaBase):
         average_consumption = average_consumption_str.lower() == "true"
 
         if average_consumption:
-            pl_avg.append(pl_avg[-1])
+            pl_avg = pl_avg + [pl_avg[-1]]
             ln4 = axis22.plot(
                 ind,
                 np.array(pl_avg),
