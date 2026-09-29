@@ -1,4 +1,5 @@
 import datetime
+import re
 import sys
 import os
 import fnmatch
@@ -496,10 +497,34 @@ class DaBase(hass.Hass):
         report.consolidate_data(start_dt)
 
     def get_day_ahead_prices(self):
+        """Fetch day-ahead prices; ``day_ahead.py prices [start [end]]`` backfills.
+
+        The optional dates (YYYY-MM-DD) come from the command line. They are
+        interpreted here, at the entry point, so the fetch itself never looks
+        at sys.argv (it also runs inside the web server, where argv is
+        gunicorn's).
+        """
         source = (
             self.prices_options.source_day_ahead if self.prices_options else "nordpool"
         )
-        self.prices.get_prices(source)
+        start = end = None
+        # Other tokens on the command line are task keywords ("debug", "calc");
+        # only date-shaped tokens are taken as the range.
+        dates = [a for a in sys.argv[1:] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", a)][:2]
+        try:
+            if len(dates) >= 1:
+                start = datetime.datetime.strptime(dates[0], "%Y-%m-%d")
+            if len(dates) >= 2:
+                end = datetime.datetime.strptime(dates[1], "%Y-%m-%d")
+        except ValueError:
+            logging.error(
+                f"Ongeldige datum in argumenten {dates}; gebruik YYYY-MM-DD "
+                f"(bijvoorbeeld: day_ahead.py prices 2026-01-01 2026-01-03)"
+            )
+            return
+        if start is not None and end is None:
+            end = start + datetime.timedelta(days=1)
+        self.prices.get_prices(source, _start=start, _end=end)
 
     def save_df(
         self, tablename: str, tijd: list, df: pd.DataFrame, vintage: bool = False
