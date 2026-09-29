@@ -45,15 +45,16 @@ def db(tmp_path):
         Column("dim", String(10), nullable=False),
         Column("aggregate", String(3), nullable=False, default="avg"),
     )
-    Table(
-        "prognoses",
-        metadata,
-        Column("id", Integer, primary_key=True),
-        Column("variabel", Integer, ForeignKey("variabel.id"), nullable=False),
-        Column("time", BigInteger, nullable=False),
-        Column("value", Float),
-        UniqueConstraint("variabel", "time"),
-    )
+    for name in ("prognoses", "values"):
+        Table(
+            name,
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("variabel", Integer, ForeignKey("variabel.id"), nullable=False),
+            Column("time", BigInteger, nullable=False),
+            Column("value", Float),
+            UniqueConstraint("variabel", "time"),
+        )
     metadata.create_all(manager.engine)
     with manager.engine.begin() as connection:
         connection.execute(
@@ -140,3 +141,61 @@ def test_too_few_hours_returns_an_empty_frame_instead_of_raising(db):
 
     assert df.empty
     assert list(df.columns) == ["time", "tijd", "temp", "glob_rad"]
+
+
+def _rows(db, table):
+    import pandas as pd
+    from sqlalchemy import Table, select
+
+    t = Table(table, db.metadata, autoload_with=db.engine)
+    with db.engine.connect() as connection:
+        result = connection.execute(select(t.c.variabel, t.c.time, t.c.value).order_by(t.c.time))
+        return [tuple(r) for r in result]
+
+
+def test_savedata_inserts_and_updates_in_one_statement(db):
+    import pandas as pd
+
+    t0 = _t0()
+    first = pd.DataFrame(
+        [[str(t0), "gr", 10.0], [str(t0 + HOUR), "gr", 20.0], [t0, "temp", 15]],
+        columns=["time", "code", "value"],
+    )
+    db.savedata(first, tablename="values")
+    assert _rows(db, "values") == [(1, t0, 10.0), (2, t0, 15.0), (1, t0 + HOUR, 20.0)]
+
+    # Same keys again: the values are replaced, no duplicate rows, no error.
+    second = pd.DataFrame(
+        [[str(t0), "gr", 11.0], [str(t0), "gr", 12.0]], columns=["time", "code", "value"]
+    )
+    db.savedata(second, tablename="values")
+    assert _rows(db, "values") == [(1, t0, 12.0), (2, t0, 15.0), (1, t0 + HOUR, 20.0)]
+
+
+def test_savedata_skips_garbage_and_unknown_codes(db, caplog):
+    import pandas as pd
+
+    t0 = _t0()
+    frame = pd.DataFrame(
+        [
+            [str(t0), "gr", float("nan")],
+            [str(t0), "gr", float("inf")],
+            [str(t0), "gr", float("-inf")],
+            [str(t0), "gr", "abc"],
+            [str(t0), "gr", True],
+            [str(t0), "nope", 1.0],
+            ["not-a-time", "gr", 1.0],
+            [str(t0 + HOUR), "gr", 5],
+        ],
+        columns=["time", "code", "value"],
+    )
+    db.savedata(frame, tablename="values")
+    assert _rows(db, "values") == [(1, t0 + HOUR, 5.0)]
+    assert "Onbekende code opslaan data: nope" in caplog.text
+
+
+def test_savedata_with_an_empty_frame_is_a_no_op(db):
+    import pandas as pd
+
+    db.savedata(pd.DataFrame(columns=["time", "code", "value"]), tablename="values")
+    assert _rows(db, "values") == []

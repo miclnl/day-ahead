@@ -1,3 +1,5 @@
+import math
+import numbers
 import pandas as pd
 import numpy as np
 import datetime
@@ -13,6 +15,10 @@ from sqlalchemy import (
     text,
     TIMESTAMP,
 )
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import URL
 import sqlalchemy_utils
 import os
 import logging
@@ -125,28 +131,29 @@ class DBmanagerObj(object):
         db_password=None,
         db_port=0,
         db_path=None,
-    ) -> str:
-        if db_dialect == "mysql":
-            if db_port == 0:
-                result = (
-                    f"mysql+pymysql://{db_user}:{db_password}@{db_server}/{db_name}"
-                )
-            else:
-                result = f"mysql+pymysql://{db_user}:{db_password}@{db_server}:{db_port}/{db_name}"
-        elif db_dialect == "postgresql":
-            if db_port == 0:
-                result = f"postgresql+psycopg2://{db_user}:{db_password}@{db_server}/{db_name}"
-            else:
-                result = (
-                    f"postgresql+psycopg2://{db_user}:{db_password}@{db_server}:"
-                    f"{db_port}/{db_name}"
-                )
+    ) -> URL:
+        """Build the SQLAlchemy URL.
+
+        URL.create() escapes the credentials, so a password with '@', '/' or
+        '%' works, and the URL renders with the password hidden in logs.
+        """
+        if db_dialect in ("mysql", "postgresql"):
+            driver = "mysql+pymysql" if db_dialect == "mysql" else "postgresql+psycopg2"
+            result = URL.create(
+                driver,
+                username=db_user,
+                password=db_password,
+                host=db_server,
+                port=int(db_port) if db_port else None,
+                database=db_name,
+            )
         else:  # sqlite3
             if db_path is None:
                 db_path = "../data"
-            abs_db_path = os.path.abspath(db_path)
-            result = f"sqlite:////{abs_db_path}/{db_name}"
-        logging.debug(f"db_url: {result}")
+            result = URL.create(
+                "sqlite", database=os.path.join(os.path.abspath(db_path), db_name)
+            )
+        logging.debug(f"db_url: {result.render_as_string(hide_password=True)}")
         return result
 
     def log_pool_status(self):
@@ -266,72 +273,64 @@ class DBmanagerObj(object):
                value	float
             tablename: values or prognoses
         """
-        logging.debug(f"Opslaan dataframe:\n{df.to_string()}")
+        if df is None or len(df) == 0:
+            return
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"Opslaan dataframe:\n{df.to_string()}")
 
-        # with self.engine.connect() as connection:
-        connection = self.engine.connect()
-        try:
-            self.log_pool_status()
-            # Reflect existing tables from the database
-            values_table = Table(tablename, self.metadata, autoload_with=self.engine)
-            variabel_table = Table("variabel", self.metadata, autoload_with=self.engine)
-            df = df.reset_index()  # make sure indexes pair with number of rows
-            df["tijd"] = df["time"].apply(
-                lambda x: datetime.datetime.fromtimestamp(int(float(x))).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-            )
-            for index, dfrow in df.iterrows():
-                logging.debug(
-                    f"Save record: {dfrow['tijd']} {dfrow['code']} "
-                    f"{dfrow['time']} {dfrow['value']}"
-                )
-                code = dfrow["code"]
-                time = dfrow["time"]
-                value = dfrow["value"]
-                if not isinstance(value, (int, float)):
-                    continue
-                if pd.isna(value):
-                    continue
-                if value == float("inf"):
-                    continue
+        # One statement per batch instead of three round trips per row, and
+        # atomic: the table has UNIQUE(variabel, time), so two writers (the
+        # fast-control thread and a scheduler subprocess, for instance) used
+        # to race between the SELECT and the INSERT, and the IntegrityError
+        # rolled back the whole batch.
+        table = Table(tablename, self.metadata, autoload_with=self.engine)
+        ids = self.variabel_ids(list(df["code"].unique()))
+        records = []
+        skipped_codes = set()
+        for row in df.itertuples(index=False):
+            code = row.code
+            if code not in ids:
+                skipped_codes.add(code)
+                continue
+            value = row.value
+            if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                continue
+            value = float(value)
+            if not math.isfinite(value):
+                continue
+            try:
+                stamp = int(float(row.time))
+            except (TypeError, ValueError):
+                logging.warning(f"Ongeldig tijdstip {row.time!r} voor {code}, overgeslagen")
+                continue
+            records.append({"variabel": ids[code], "time": stamp, "value": value})
+        for code in sorted(skipped_codes):
+            logging.error(f"Onbekende code opslaan data: {code}")
+        if not records:
+            return
+        # The last value for a (variabel, time) pair wins, as with the old
+        # row-by-row update; duplicates within one statement would otherwise
+        # make the upsert ambiguous on PostgreSQL.
+        deduplicated = {(r["variabel"], r["time"]): r for r in records}
+        records = list(deduplicated.values())
 
-                # Get the variabel_id
-                select_variabel = select(variabel_table.c.id).where(
-                    variabel_table.c.code == code
-                )
-                variabel_result = connection.execute(select_variabel).first()
-                if variabel_result:
-                    variabel_id = variabel_result[0]
-                else:
-                    logging.error(f"Onbekende code opslaan data: {code}")
-                    continue
-
-                # Query to check if the record exists
-                select_value = select(values_table.c.id).where(
-                    (values_table.c.variabel == variabel_id)
-                    & (values_table.c.time == time)
-                )
-                value_result = connection.execute(select_value).first()
-                if value_result:
-                    # Update existing record
-                    value_id = value_result[0]
-                    update_value = (
-                        update(values_table)
-                        .values(value=value)
-                        .where(values_table.c.id == value_id)
-                    )
-                    connection.execute(update_value)
-                else:
-                    # Record does not exist, perform insert
-                    insert_value = insert(values_table).values(
-                        variabel=variabel_id, time=time, value=value
-                    )
-                    connection.execute(insert_value)
-            connection.commit()
-        finally:
-            connection.close()
         self.log_pool_status()
+        with self.engine.begin() as connection:
+            connection.execute(self._upsert_statement(table), records)
+        self.log_pool_status()
+
+    def _upsert_statement(self, table: Table):
+        """INSERT ... ON CONFLICT/DUPLICATE KEY UPDATE for the current dialect."""
+        if self.db_dialect == "mysql":
+            statement = mysql_insert(table)
+            return statement.on_duplicate_key_update(value=statement.inserted.value)
+        if self.db_dialect == "postgresql":
+            statement = postgresql_insert(table)
+        else:
+            statement = sqlite_insert(table)
+        return statement.on_conflict_do_update(
+            index_elements=["variabel", "time"], set_={"value": statement.excluded.value}
+        )
 
     def get_time_border_record(
         self, code: str, latest: bool = True, table_name: str = "values"
