@@ -74,6 +74,13 @@ EVENTS_KIND_SETPOINT = "setpoint_change"
 
 EVENTS_LIMIT = 200
 
+#: How often to repeat the warning that the plan no longer covers the
+#: current moment. The condition is persistent and only the optimiser can
+#: fix it, so warning once and then falling silent for days -- which is what
+#: it used to do -- leaves the layer parked at 0 W with nothing in the log
+#: to say why.
+EXPIRED_WARN_EVERY_S = 1800
+
 
 def _parse_float(raw: Any) -> Optional[float]:
     if raw is None:
@@ -284,6 +291,7 @@ class FastControlRunner:
         self._last_setpoints: tuple = ()
         self._warned_no_grid = False
         self._warned_stale_plan = False
+        self._expired_warned_at = 0.0
         self._last_state_save = 0.0
         self._state_signature: Optional[tuple] = None
         self._measure_start: Optional[int] = None
@@ -555,6 +563,7 @@ class FastControlRunner:
             use_measured=mode == MODE_ACTIVE,
         )
         decision = policy.decide(plan, measurement, self.state, enabled)
+        self._warn_if_plan_expired(decision, plan, now)
 
         # decision.house_w is the reconstructed site demand excluding the
         # battery, which is exactly the quantity the optimizer forecasts as
@@ -580,6 +589,36 @@ class FastControlRunner:
         self.state.refresh_budget_aggregates()
         self._persist_state(now)
         return decision
+
+    def _warn_if_plan_expired(self, decision, plan: FastPlan, now: float) -> None:
+        """Keep saying so while the plan does not cover the current moment.
+
+        An expired plan parks every battery at 0 W, which is the safe thing
+        to do, but it means the layer does nothing at all until the optimiser
+        writes a new plan. That used to be reported once and never again:
+        because the event log only records a setpoint *change*, a plan that
+        stayed expired for days showed up as a single "plan_expired" entry
+        with everything at 0 W and no further trace, in the log or anywhere
+        else. This repeats, so the condition stays visible and names the
+        cause.
+        """
+        if decision.reason != "plan_expired":
+            self._expired_warned_at = 0.0
+            return
+        if now - self._expired_warned_at < EXPIRED_WARN_EVERY_S:
+            return
+        self._expired_warned_at = now
+        age_h = plan.age(now) / 3600.0
+        created = datetime.datetime.fromtimestamp(plan.created_ts).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        logging.warning(
+            f"Fast control: het plan van {created} ({age_h:.1f} uur oud) dekt "
+            f"dit moment niet meer, alle batterijen staan op 0 W. De snelle "
+            f"laag doet niets tot de optimalisering een nieuw plan schrijft "
+            f"in {self.plan_path}; zoek in het log naar \"Plan voor de snelle "
+            f"regellaag\" om te zien waarom dat niet gebeurt."
+        )
 
     def _release_when_switched_off(self, plan: FastPlan, now: float, mode: str) -> None:
         """Undo an active override when the layer is turned off.

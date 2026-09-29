@@ -5317,6 +5317,19 @@ class DaCalc(DaBase):
             logging.info("Plan voor de snelle regellaag is niet opgeslagen (debug)")
             return
         if U <= 0:
+            # Used to return without a word, so a run that produced no
+            # intervals left the fast layer on its previous plan with nothing
+            # in the log to explain it.
+            logging.warning(
+                "Plan voor de snelle regellaag niet opgeslagen: de "
+                "optimalisering leverde geen intervallen op"
+            )
+            return
+        if B <= 0:
+            logging.info(
+                "Plan voor de snelle regellaag niet opgeslagen: geen batterij "
+                "geconfigureerd"
+            )
             return
 
         specs = [
