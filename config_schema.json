@@ -3084,14 +3084,15 @@
       "x-ui-group": "Reporting"
     },
     "ScheduleEntry": {
+      "additionalProperties": true,
       "description": "A single scheduled task entry.",
       "properties": {
         "time": {
           "description": "Time pattern in HHMM format",
           "title": "Time",
           "type": "string",
-          "x-help": "Time pattern: specific time like '0435' or wildcard like 'xx00' (every hour at :00)",
-          "x-validation-hint": "Format: HHMM (24-hour, e.g., '0435', 'xx15')"
+          "x-help": "Time pattern: specific time like '0435', 'xx00' (every hour at :00) or '02xx' (every minute between 02:00 and 02:59)",
+          "x-validation-hint": "Format: HHMM (24-hour, e.g., '0435', 'xx15', '02xx')"
         },
         "action": {
           "description": "Action to execute at this time",
@@ -3103,6 +3104,7 @@
             "calc_optimum_met_debug",
             "clean_data",
             "calc_baseloads",
+            "consolidate_data",
             "train_ml_predictions",
             "forecast_accuracy"
           ],
@@ -3119,6 +3121,7 @@
       "type": "object"
     },
     "SchedulerConfig": {
+      "additionalProperties": true,
       "description": "Task scheduler configuration.",
       "properties": {
         "active": {
@@ -3155,7 +3158,7 @@
       "x-help": "Secret reference or plain string. Use \"!secret key_name\" format to reference secrets from secrets.json. Plain strings are also accepted."
     },
     "SocPowerLimit": {
-      "additionalProperties": false,
+      "additionalProperties": true,
       "description": "A SOC threshold with a corresponding maximum power limit.\n\nUsed in ``reduce_power_low_soc`` / ``reduce_power_high_soc`` to protect the\nbattery by reducing charge/discharge power as SOC approaches its limits.\nMultiple stages define a piecewise-linear power derating curve.",
       "properties": {
         "soc": {

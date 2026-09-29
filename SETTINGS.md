@@ -2408,15 +2408,15 @@ _A single scheduled task entry._
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `time` | string | Yes | — | Time pattern in HHMM format _Format: HHMM (24-hour, e.g., '0435', 'xx15')_ |
-| `action` | string | Yes | — | Action to execute at this time. Options: `get_meteo_data`, `get_tibber_data`, `get_day_ahead_prices`, `calc_optimum`, `calc_optimum_met_debug`, `clean_data`, `calc_baseloads`, `train_ml_predictions`, `forecast_accuracy` |
+| `time` | string | Yes | — | Time pattern in HHMM format _Format: HHMM (24-hour, e.g., '0435', 'xx15', '02xx')_ |
+| `action` | string | Yes | — | Action to execute at this time. Options: `get_meteo_data`, `get_tibber_data`, `get_day_ahead_prices`, `calc_optimum`, `calc_optimum_met_debug`, `clean_data`, `calc_baseloads`, `consolidate_data`, `train_ml_predictions`, `forecast_accuracy` |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
 
 **`time`**
 
-Time pattern: specific time like '0435' or wildcard like 'xx00' (every hour at :00)
+Time pattern: specific time like '0435', 'xx00' (every hour at :00) or '02xx' (every minute between 02:00 and 02:59)
 
 **`action`**
 
