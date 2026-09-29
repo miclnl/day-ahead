@@ -142,14 +142,47 @@ class PricingConfig(BaseModel):
         },
     )
 
+    @field_validator(
+        "energy_taxes_consumption",
+        "energy_taxes_production",
+        "cost_supplier_consumption",
+        "cost_supplier_production",
+        "vat_consumption",
+        "vat_production",
+        "multiplier_consumption",
+        "multiplier_production",
+    )
+    @classmethod
+    def validate_dated_dict(cls, v: Optional[dict[str, float]], info) -> Optional[dict[str, float]]:
+        """Every key must be an ISO date; the dict is returned sorted by date.
+
+        utils.get_value_from_dict() looks up "the tariff in effect on this
+        date" with a binary search over the keys, which silently returns the
+        wrong tariff if the dict is not sorted, and an unparsable date breaks
+        that lookup with a confusing string-comparison error instead of a
+        clear configuration error at load time.
+        """
+        if v is None:
+            return v
+        if not v:
+            raise ValueError(f"{info.field_name} must have at least one dated entry")
+        for key in v:
+            try:
+                date.fromisoformat(key)
+            except ValueError as ex:
+                raise ValueError(
+                    f"{info.field_name}: key {key!r} is not a valid date (YYYY-MM-DD)"
+                ) from ex
+        return dict(sorted(v.items()))
+
     @field_validator("vat_consumption", "vat_production")
     @classmethod
     def validate_vat_percentages(cls, v: dict[str, float]) -> dict[str, float]:
         """Validate VAT percentages are between 0 and 100."""
-        for date, percentage in v.items():
+        for date_key, percentage in v.items():
             if not (0 <= percentage <= 100):
                 raise ValueError(
-                    f"VAT percentage must be between 0 and 100, got {percentage} for date {date}"
+                    f"VAT percentage must be between 0 and 100, got {percentage} for date {date_key}"
                 )
         return v
 

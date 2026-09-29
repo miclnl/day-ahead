@@ -32,10 +32,10 @@ def test_migrate_unversioned_to_v0_with_vat():
         "latitude": 52.0,
         "prices": {
             "source day ahead": "nordpool",
-            "energy taxes consumption": {},
-            "energy taxes production": {},
-            "cost supplier consumption": {},
-            "cost supplier production": {},
+            "energy taxes consumption": {"2020-01-01": 0.0},
+            "energy taxes production": {"2020-01-01": 0.0},
+            "cost supplier consumption": {"2020-01-01": 0.0},
+            "cost supplier production": {"2020-01-01": 0.0},
             "last invoice": "2024-01-01",
             "vat": {"2024-01-01": 21}
         }

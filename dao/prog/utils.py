@@ -60,14 +60,26 @@ def calc_adjustment_heatcurve(
 
 def get_value_from_dict(dag: str, options: dict) -> float:
     """
-    Selecteert uit een dict van datum/value paren de juiste value
+    Selecteert uit een dict van datum/value paren de laatst geldende waarde
+    op of voor 'dag'.
     :param dag: string van de dag format yyyy-mm-dd
     :param options: dict van datum/value paren bijv. {'2022-01-01': 0.002, '2023-03-01': 0.018}
     :return: de correcte value
     """
-    o_list = list(options.keys())
-    result = options.get(dag, options[o_list[bisect.bisect_left(o_list, dag) - 1]])
-    return result
+    if not options:
+        raise ValueError("get_value_from_dict: geen datum/waarde paren opgegeven")
+    if dag in options:
+        return options[dag]
+    # Niet aannemen dat de dict al gesorteerd is; insertion-order uit JSON
+    # is geen garantie, ook al valideert het pydantic-model dat inmiddels wel.
+    o_list = sorted(options.keys())
+    index = bisect.bisect_left(o_list, dag) - 1
+    if index < 0:
+        # dag ligt voor de eerste bekende datum: er is nog geen tarief bekend.
+        # De vroegst bekende waarde is een betere benadering dan de laatste
+        # (toekomstige) waarde, waar bisect's wrap-around (-1) naar zou wijzen.
+        index = 0
+    return options[o_list[index]]
 
 
 def convert_timestr(

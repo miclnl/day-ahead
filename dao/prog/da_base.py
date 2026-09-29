@@ -2,7 +2,6 @@ import datetime
 import re
 import sys
 import os
-import fnmatch
 import math
 import time
 import threading
@@ -732,20 +731,19 @@ class DaBase(hass.Hass):
         """
 
         def clean_folder(folder: str, pattern: str):
+            # Path.glob() instead of os.chdir(): chdir changes the working
+            # directory of the whole process, and every other CWD-relative
+            # path in this codebase (../data, ../prog, ...) would resolve
+            # wrongly for the rest of the run if this method raised before
+            # its own os.chdir(current_dir) ran.
             current_time = time.time()
             day = 24 * 60 * 60
             logging.info(f"Start removing files in {folder} with pattern {pattern}")
-            current_dir = os.getcwd()
-            os.chdir(os.path.join(os.getcwd(), folder))
-            list_files = os.listdir()
-            for f in list_files:
-                if fnmatch.fnmatch(f, pattern):
-                    creation_time = os.path.getctime(f)
-                    save_days = self.history_options.save_days
-                    if (current_time - creation_time) >= save_days * day:
-                        os.remove(f)
-                        logging.info(f"{f} removed")
-            os.chdir(current_dir)
+            save_days = self.history_options.save_days
+            for path in Path(folder).glob(pattern):
+                if (current_time - path.stat().st_ctime) >= save_days * day:
+                    path.unlink()
+                    logging.info(f"{path.name} removed")
 
         clean_folder("../data/log", "*.log")
         clean_folder("../data/log", "dashboard.log.*")

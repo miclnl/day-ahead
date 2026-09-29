@@ -207,3 +207,62 @@ class TestSocPowerLimit:
         dumped = s.model_dump()
         assert dumped == {"soc": 95, "power": 2500}
         assert "helling" not in dumped
+
+class TestPricingDatedDicts:
+    """PricingConfig.validate_dated_dict: ISO dates, sorted, at least one entry.
+
+    utils.get_value_from_dict() looks these up with a binary search that
+    silently returns the wrong tariff on an unsorted dict.
+    """
+
+    BASE = {
+        "source day ahead": "nordpool",
+        "energy taxes consumption": {"2024-01-01": 0.1},
+        "energy taxes production": {"2024-01-01": 0.0},
+        "cost supplier consumption": {"2024-01-01": 0.02},
+        "cost supplier production": {"2024-01-01": 0.0},
+        "vat consumption": {"2024-01-01": 21},
+        "vat production": {"2024-01-01": 21},
+        "last invoice": "2024-01-01",
+    }
+
+    def _make(self, **overrides):
+        from dao.prog.config.models.pricing import PricingConfig
+
+        return PricingConfig(**{**self.BASE, **overrides})
+
+    def test_a_valid_dict_is_accepted(self):
+        pricing = self._make()
+        assert pricing.energy_taxes_consumption == {"2024-01-01": 0.1}
+
+    def test_an_unsorted_dict_is_returned_sorted(self):
+        pricing = self._make(
+            **{
+                "energy taxes consumption": {
+                    "2025-01-01": 0.2,
+                    "2023-01-01": 0.08,
+                    "2024-01-01": 0.1,
+                }
+            }
+        )
+        assert list(pricing.energy_taxes_consumption.keys()) == [
+            "2023-01-01",
+            "2024-01-01",
+            "2025-01-01",
+        ]
+
+    def test_an_empty_dict_is_rejected(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="at least one dated entry"):
+            self._make(**{"energy taxes consumption": {}})
+
+    def test_a_non_iso_key_is_rejected(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="not a valid date"):
+            self._make(**{"energy taxes consumption": {"01-01-2024": 0.1}})
+
+    def test_multiplier_is_optional_and_may_be_none(self):
+        pricing = self._make(**{"multiplier consumption": None})
+        assert pricing.multiplier_consumption is None
