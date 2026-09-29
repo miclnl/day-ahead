@@ -75,7 +75,10 @@ class SocPowerLimit(BaseModel):
     # Runtime-only computed attribute (slope between adjacent stages); not persisted.
     _helling: float = PrivateAttr(default=0.0)
 
-    model_config = ConfigDict(extra="forbid")
+    # Every other model in this package allows unknown keys; "forbid" here
+    # was the odd one out and broke on a stray key that every other model
+    # would just carry along untouched.
+    model_config = ConfigDict(extra="allow")
 
 
 class BatteryConfig(BaseModel):

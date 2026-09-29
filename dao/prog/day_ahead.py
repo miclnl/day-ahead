@@ -97,6 +97,17 @@ class DaCalc(DaBase):
         self.boiler_enabled = False
         self.grid_max_power = self.config.grid.max_power
         self.grid = self.config.grid
+        if "max_power" not in self.config.grid.model_fields_set:
+            # The fuse rating is installation-specific; silently assuming a
+            # 3-phase 17 kW connection for a 1-phase 25A home (5.75 kW) would
+            # let the optimizer co-schedule EV, heat pump and battery
+            # charging well above the main fuse.
+            logging.warning(
+                f"'grid' -> 'max power' is niet ingesteld, er wordt "
+                f"{self.grid_max_power:.1f} kW aangenomen (3x25A). Stel dit in op "
+                f"de daadwerkelijke aansluitwaarde om overbelasting van de "
+                f"hoofdzekering te voorkomen."
+            )
         self.machines = self.config.machines
         # self.start_logging()
 

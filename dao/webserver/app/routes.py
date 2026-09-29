@@ -416,6 +416,23 @@ def _config_v1():
         return None
 
 
+def _cached_config_v1():
+    """The module-level config already loaded at import time, for read-only
+    display paths that are hit on every poll.
+
+    _config_v1() re-parses and re-validates options.json from scratch and
+    takes the same fcntl.flock() the migration path uses; a GET request
+    polled every 5 seconds (the fast-control status widget) doing that on
+    every tick is needless load, and it can even *write* options.json (the
+    migration branch) from what looks like a read-only GET. The watchdog
+    already restarts this worker on every options.json change (see
+    watchdog.sh), which re-runs create_config() at import and keeps this
+    cache current; a fresh load is only necessary right after this process
+    itself just wrote the file (see the POST handler below).
+    """
+    return config if config is not None else _config_v1()
+
+
 def _resolved_mode_v1(config):
     """Return (display_string, is_entity_backed) for v1 page rendering.
 
@@ -451,7 +468,7 @@ def fast_control():
     events = list(reversed(state.get("events", [])[-50:]))
     success = None
     error = None
-    config = _config_v1()
+    config = _cached_config_v1()
 
     if request.method == "POST":
         new_mode = request.form.get("mode", "").strip()
@@ -460,6 +477,9 @@ def fast_control():
             # model would rewrite the user's file with every default pinned.
             set_fast_control_mode(Path(app_datapath + "options.json"), new_mode)
             success = f"Modus gezet op {new_mode}"
+            # A fresh load here (not the cache): the mode was just written to
+            # disk by this same request and must be reflected immediately,
+            # not after the next worker restart.
             config = _config_v1()
         except (ValueError, OSError) as ex:
             error = str(ex)
@@ -486,7 +506,9 @@ def fast_control():
 def fast_control_state_json():
     state = _load_fast_state_v1()
     last_decision = state.get("last_decision") or {}
-    mode, mode_is_entity = _resolved_mode_v1(_config_v1())
+    # Polled every 5 seconds by the page's own JS: the cached config, not a
+    # fresh parse+validate+possible-migration-write of options.json.
+    mode, mode_is_entity = _resolved_mode_v1(_cached_config_v1())
     return jsonify({
         "mode": mode,
         "mode_is_entity": mode_is_entity,

@@ -3,7 +3,13 @@ Scheduler configuration models.
 """
 
 from typing import Literal
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Every other model in this package allows unknown keys (a "//comment" key,
+# or a field from a newer schema version being read by an older build); only
+# these two scheduler models used pydantic's implicit default of "ignore",
+# which drops such a key silently on the next save instead of keeping it.
+_ALLOW_EXTRA = ConfigDict(extra="allow")
 
 
 # Valid scheduler actions
@@ -22,6 +28,8 @@ SchedulerAction = Literal[
 
 class ScheduleEntry(BaseModel):
     """A single scheduled task entry."""
+
+    model_config = _ALLOW_EXTRA
 
     time: str = Field(
         description="Time pattern in HHMM format",
@@ -79,6 +87,7 @@ class SchedulerConfig(BaseModel):
         },
     )
     model_config = ConfigDict(
+        extra="allow",
         json_schema_extra={
             "x-ui-group": "DAO",
             "x-order": 18,

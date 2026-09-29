@@ -181,11 +181,13 @@ class TestSecretStr:
         ss = SecretStr("plain_password")
         assert ss.is_secret_reference() is False
 
-    def test_resolve_missing_key_falls_back_to_key_name(self):
-        """Missing key in secrets dict falls back to the key name itself."""
+    def test_resolve_missing_key_raises_a_clear_error(self):
+        """A missing key must not silently resolve to the key name itself:
+        that string would then be used as if it were the actual password,
+        turning a config typo into a confusing 'access denied' elsewhere."""
         ss = SecretStr("!secret missing_key")
-        result = ss.resolve({})
-        assert result == "missing_key"
+        with pytest.raises(KeyError, match="missing_key"):
+            ss.resolve({})
 
 
 class TestSocPowerLimit:

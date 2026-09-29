@@ -1,12 +1,27 @@
-from flask import Blueprint, render_template, request, redirect, url_for
+from flask import Blueprint, abort, render_template, request, redirect, url_for
 from markupsafe import escape
 from dao.prog.da_report import Report
 from subprocess import run as subprocess_run
 from dao.prog.da_base import DaBase
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, available_timezones
 
 api = Blueprint("api", __name__)
+
+_DEFAULT_TIMEZONE = "Europe/Amsterdam"
+
+
+def _requested_timezone() -> str:
+    """The 'timezone' query parameter, or the default when it is absent.
+
+    ``x if None else y`` is always y (None is falsy), so this used to return
+    the default unconditionally and every request's own timezone parameter
+    was silently ignored.
+    """
+    raw = request.args.get("timezone") or _DEFAULT_TIMEZONE
+    if raw not in available_timezones():
+        abort(400, description=f"Unknown timezone: {raw!r}")
+    return raw
 
 @api.route("/data/")
 def data():
@@ -23,7 +38,7 @@ def data():
     if fields:
         fields = fields.split(",")
 
-    timezone_raw = request.args.get('timezone') if None else "Europe/Amsterdam"
+    timezone_raw = _requested_timezone()
 
     try:
         data = data_report.get_data(
@@ -62,7 +77,7 @@ def run(task: str):
 
         return log_content, {"Content-Type": "text/plain"}
     else:
-        return "Unknown task: " + escape(task)
+        return f"Unknown task: {escape(task)}", 404
 
 
 @api.route("/data-sql-ha/")
@@ -80,7 +95,7 @@ def data_sql_ha():
     if fields:
         fields = fields.split(",")
 
-    timezone_raw = request.args.get("timezone") if None else "Europe/Amsterdam"
+    timezone_raw = _requested_timezone()
 
     query = data_report.get_ha_data_query(
             start=datetime.fromisoformat(start).replace(tzinfo=ZoneInfo(timezone_raw)),

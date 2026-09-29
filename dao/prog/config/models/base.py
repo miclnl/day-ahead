@@ -501,5 +501,14 @@ class SecretStr(str):
         # Extract the key from "!secret key_name"
         key = self.get_secret_key()
 
-        # Look up in secrets dict, fallback to the key itself if not found
-        return secrets.get(key, key)
+        if key not in secrets:
+            # Silently falling back to the key name here used to hand back
+            # e.g. "db_password" as if it were the actual password: a typo
+            # in secrets.json then surfaced as a confusing "access denied"
+            # from the database or API instead of a clear configuration
+            # error naming exactly what is missing.
+            raise KeyError(
+                f"Secret '{key}' (referenced as '!secret {key}') is not defined "
+                f"in secrets.json"
+            )
+        return secrets[key]
