@@ -724,7 +724,14 @@ def run_and_log(cmd, task, logfile):
         {"status": "running", "task": task, "returncode": None, "logfile": logfile}
     )
     with open(logfile, "w") as f:
-        proc = Popen(cmd, stdout=PIPE, stderr=STDOUT, text=True)
+        # start_new_session=True: isolate the task from the web server's own
+        # process group so a signal sent to the foreground group (e.g. a
+        # terminal Ctrl+C during interactive debugging) doesn't also kill
+        # the task mid-run and leave the log file and state file out of
+        # sync with what actually happened.
+        proc = Popen(
+            cmd, stdout=PIPE, stderr=STDOUT, text=True, start_new_session=True
+        )
 
         for line in proc.stdout:
             f.write(line)

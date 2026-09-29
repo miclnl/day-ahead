@@ -1,4 +1,4 @@
-import time, os, fnmatch, re, datetime, time, threading, json
+import time, os, fnmatch, re, datetime, time, threading, json, signal
 from flask import Blueprint, abort, render_template, request, redirect, url_for
 
 from dao.prog.version import __version__
@@ -142,6 +142,20 @@ def get_task_state() -> dict:
 
     return state
 
+def _kill_process_group(proc):
+    """Kill the task subprocess and anything it spawned.
+
+    The task is started with start_new_session=True, giving it its own
+    process group. A bare proc.kill() only reaches that one process; if
+    the script it runs forks or execs a helper of its own, that helper
+    would otherwise be left running as an orphan after "cancel".
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # already exited
+
+
 def run_and_log(cmd, state):
     flist = get_file_list_with_ts(os.path.join(app_datapath, "log"),"*.log",)
 
@@ -155,6 +169,7 @@ def run_and_log(cmd, state):
         stdout=DEVNULL,
         stderr=DEVNULL,
         text=True,
+        start_new_session=True,
     )
 
     while proc.poll() is None:
@@ -164,7 +179,7 @@ def run_and_log(cmd, state):
             if state["logfile"] and os.path.exists(state["logfile"]):
                 os.remove(state["logfile"])
 
-            proc.kill()
+            _kill_process_group(proc)
             break
 
         if state["logfile"] is None:
@@ -188,7 +203,7 @@ def run_and_log(cmd, state):
             if os.path.exists(state["logfile"]):
                 os.remove(state["logfile"])
 
-            proc.kill()
+            _kill_process_group(proc)
             break
 
         # Neem de actuele status over voordat de heartbeat geschreven wordt.
