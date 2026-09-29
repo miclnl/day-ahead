@@ -3005,8 +3005,47 @@ class Report(DaBase):
                 )
                 problems.append(message)
                 logging.warning(f"Baseload: {message}")
+        problems.extend(self._check_sensor_kinds())
         if not problems:
             logging.info("Baseload: de meetpunten voor de apparaten zijn consistent")
+        return problems
+
+    def _baseload_sensor_groups(self) -> dict:
+        """The configured sensors per component group of the history reader."""
+        return {
+            "grid_in": list(self.grid_consumption_sensors or []),
+            "grid_out": list(self.grid_production_sensors or []),
+            "pv_ac": list(self.solar_production_ac_sensors or []),
+            "ev": list(self.ev_consumption_sensors or []),
+            "wp": list(self.wp_consumption_sensors or []),
+            "boiler": list(self.boiler_consumption_sensors or []),
+            "machines": list(self.machine_consumption_sensors or []),
+            "bat_in": list(self.battery_consumption_sensors or []),
+            "bat_out": list(self.battery_production_sensors or []),
+        }
+
+    def _check_sensor_kinds(self) -> list:
+        """Every configured meter must be an energy or a power sensor.
+
+        A state-of-charge or temperature sensor in one of the lists used to
+        contribute nothing, silently. Reported per sensor so the operator can
+        see which entry to fix.
+        """
+        db_ha = getattr(self, "db_ha", None)
+        if db_ha is None:
+            return []
+        from dao.forecast.history import HistoryReader, UnsupportedSensorError
+
+        reader = HistoryReader(db_ha, getattr(self, "time_zone", None) or "UTC")
+        problems = []
+        for sensors in self._baseload_sensor_groups().values():
+            for sensor in sensors:
+                try:
+                    reader.sensor_meta([sensor])
+                except UnsupportedSensorError as ex:
+                    message = f"{ex}; deze meter telt niet mee in de baseload"
+                    problems.append(message)
+                    logging.warning(f"Baseload: {message}")
         return problems
 
     def calc_baseload_frame(self) -> pd.DataFrame:
@@ -3015,40 +3054,37 @@ class Report(DaBase):
         baseload = grid in - grid out + pv ac - ev - heat pump - boiler
                    - machines - battery in + battery out
 
-        One pass over the history, so the result can be sliced per weekday
-        afterwards instead of re-querying the database seven times.
+        Read through the history reader, which takes the right statistics
+        column for each sensor kind and leaves hours without a measurement
+        as NaN instead of zero.
         """
-        calc_periode = self.config.baseload_calc_periode
-        now = datetime.datetime.now()
-        tot = datetime.datetime(now.year, now.month, now.day)
-        vanaf = datetime.datetime.combine(
-            (now - datetime.timedelta(days=calc_periode)).date(), datetime.time()
+        from zoneinfo import ZoneInfo
+
+        from dao.forecast.history import (
+            HistoryReader,
+            baseload_from_components,
+            component_caps,
         )
 
-        groups = [
-            (self.grid_consumption_sensors, "grid_consumption", False),
-            (self.grid_production_sensors, "grid_production", True),
-            (self.solar_production_ac_sensors, "solar_production", False),
-            (self.ev_consumption_sensors, "ev_consumption", True),
-            (self.wp_consumption_sensors, "wp_consumption", True),
-            (self.boiler_consumption_sensors, "boiler_consumption", True),
-            (self.machine_consumption_sensors, "machine_consumption", True),
-            (self.battery_consumption_sensors, "battery_consumption", True),
-            (self.battery_production_sensors, "battery_production", False),
-        ]
+        zone = ZoneInfo(self.time_zone)
+        calc_periode = self.config.baseload_calc_periode
+        now = datetime.datetime.now(tz=zone)
+        tot = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        vanaf = tot - datetime.timedelta(days=calc_periode)
 
-        result = None
-        for sensors, col_name, subtract in groups:
-            frame = self.get_sensor_period_sum(sensors, vanaf, tot, col_name)
-            if result is None:
-                result = frame.rename(columns={col_name: "baseload"})
-                if subtract:
-                    result["baseload"] = -result["baseload"]
-                continue
-            result = Report.add_col_df(frame, result, col_name, "baseload", subtract)
-
-        if result is None:
-            return pd.DataFrame(columns=["tijd", "weekdag", "uur", "baseload"])
+        reader = HistoryReader(self.db_ha, self.time_zone)
+        frame = reader.read_components(
+            self._baseload_sensor_groups(), vanaf, tot, component_caps(self.config)
+        )
+        base = baseload_from_components(frame)
+        result = pd.DataFrame(
+            {
+                "tijd": base.index,
+                "weekdag": base.index.weekday,
+                "uur": base.index.hour,
+                "baseload": base.values,
+            }
+        )
         logging.debug(f"Baseload berekening per uur:\n {result.to_string()}\n")
         return result
 
