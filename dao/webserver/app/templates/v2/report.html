@@ -30,20 +30,13 @@
         </div>
         {% if not hide_period %}
         <div class="col-6 col-md-4 col-lg-3">
+            {# Supplied by the route rather than hard-coded here: the CO2
+               report has no forecast, so it must not offer the periods that
+               look into tomorrow. #}
             <select name="period" class="form-select">
-                {{option("Today", "vandaag", period)}}
-                {{option("Today with forecast", "today_with_forecast", period)}}
-                {{option("Tomorrow", "morgen", period)}}
-                {{option("Today and tomorrow", "vandaag en morgen", period)}}
-                {{option("Yesterday", "gisteren", period)}}
-                {{option("This week", "deze week", period)}}
-                {{option("Last week", "vorige week", period)}}
-                {{option("This month", "deze maand", period)}}
-                {{option("Last month", "vorige maand", period)}}
-                {{option("This year", "dit jaar", period)}}
-                {{option("Last year", "vorig jaar", period)}}
-                {{option("This contract year", "dit contractjaar", period)}}
-                {{option("365 days", "365 dagen", period)}}
+                {% for o in period_options %}
+                {{option(o.label, o.value, period)}}
+                {% endfor %}
             </select>
         </div>
         {% endif %}

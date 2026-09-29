@@ -249,7 +249,7 @@ def delete_file():
 
 @v2.route("/tasks")
 def tasks():
-    return render_template("v2/tasks.html")
+    return render_template("v2/tasks.html", tasks=task_page_entries())
 
 @v2.route("/task-cancel")
 def task_cancel():
@@ -269,7 +269,14 @@ def task_exec():
     if canonical is None:
         return "Invalid action", 400
 
-    values = {"days": request.form.get("days", "14")}
+    # Whatever the task declares, rather than just "days": the price fetch
+    # takes a date range, and a task added later gets picked up for free.
+    declared = task_registry.get(canonical).get("parameters", ())
+    values = {
+        parameter: request.form.get(parameter, "")
+        for parameter in declared
+        if request.form.get(parameter, "").strip()
+    }
 
     # Hand the work to the scheduler process instead of running it here.
     # This request is served by a gunicorn worker that gets recycled on
@@ -349,6 +356,109 @@ def task_state_page():
     ), headers
 
 
+#: How to render each parameter the task registry declares. The registry
+#: knows the parameter *names* because the command line needs them; what a
+#: field should look like is a UI concern and stays here.
+PARAMETER_FIELDS = {
+    "prijzen_start": {"label": "Van", "type": "date", "default": ""},
+    "prijzen_tot": {"label": "Tot", "type": "date", "default": ""},
+    "days": {"label": "Dagen", "type": "number", "default": "14"},
+}
+
+#: The tasks the page offers, in the order they appear. Keyed by the
+#: registry's canonical names.
+TASK_PAGE_ORDER = (
+    "calc_optimum_met_debug",
+    "calc_optimum",
+    "calc_baseloads",
+    "prices",
+    "meteo",
+    "tibber",
+    "consolidate",
+    "forecast_accuracy",
+    "train_ml_predictions",
+    "clean",
+    "fast_once",
+    "fast_control_simulate",
+)
+
+
+def task_page_entries() -> list[dict]:
+    """The task buttons and their parameter fields, from the registry.
+
+    The page used to hard-code a subset of buttons with no parameter inputs
+    at all, so five tasks were unreachable and the price fetch could not be
+    given a date range -- the one thing the v1 page could do that this one
+    could not.
+    """
+    entries = []
+    for key in TASK_PAGE_ORDER:
+        task = task_registry.get(key)
+        if task is None:  # pragma: no cover - guards a typo above
+            logging.error(f"Onbekende taak {key!r} in de takenlijst, overgeslagen")
+            continue
+        entries.append(
+            {
+                "key": key,
+                "name": task["name"],
+                "fields": [
+                    {"name": parameter, **PARAMETER_FIELDS[parameter]}
+                    for parameter in task.get("parameters", ())
+                    if parameter in PARAMETER_FIELDS
+                ],
+            }
+        )
+    return entries
+
+
+#: Every report period, in the order the dropdown shows them.
+PERIOD_OPTIONS = (
+    ("Today", "vandaag"),
+    ("Today with forecast", "today_with_forecast"),
+    ("Tomorrow", "morgen"),
+    ("Today and tomorrow", "vandaag en morgen"),
+    ("Yesterday", "gisteren"),
+    ("This week", "deze week"),
+    ("Last week", "vorige week"),
+    ("This month", "deze maand"),
+    ("Last month", "vorige maand"),
+    ("This year", "dit jaar"),
+    ("Last year", "vorig jaar"),
+    ("This contract year", "dit contractjaar"),
+    ("365 days", "365 dagen"),
+)
+
+#: Periods that reach into the future. Only a report with a forecast can
+#: offer these; CO2 has none, since there is no forecast of grid intensity.
+FORECAST_PERIODS = frozenset(
+    {"today_with_forecast", "morgen", "vandaag en morgen"}
+)
+
+
+def co2_available() -> bool:
+    """Whether a grid CO2 intensity sensor is configured.
+
+    Without one every CO2 figure is zero, so the report is not offered at
+    all rather than shown empty.
+    """
+    # _load_config rather than a cache: this is a user-initiated page
+    # render, not one of the polling endpoints, so a fresh read is fine and
+    # picks up a sensor that was just configured.
+    config = _load_config()
+    report_options = getattr(config, "report", None) if config else None
+    return bool(getattr(report_options, "co2_intensity_sensor", None))
+
+
+def period_options(subject: str) -> list[dict]:
+    """The periods *subject* can actually report on."""
+    allowed = PERIOD_OPTIONS
+    if subject == "co2":
+        allowed = tuple(
+            entry for entry in PERIOD_OPTIONS if entry[1] not in FORECAST_PERIODS
+        )
+    return [{"label": label, "value": value} for label, value in allowed]
+
+
 def reports_gen(subject: str, view: str, period: str, solar_item=None, date: datetime.datetime = None):
     report = Report(app_datapath + "/options.json")
     prognose = period in ["vandaag en morgen", "morgen", "today_with_forecast"]
@@ -378,13 +488,13 @@ def reports_gen(subject: str, view: str, period: str, solar_item=None, date: dat
         report_df = report.calc_balance_columns(
             report_df, interval, view
         )
-    # else:  # co2
-    #     report_df = report.calc_co2_emission(
-    #         period,
-    #         _tot=tot,
-    #         active_interval="uur",
-    #         active_view=view,
-    #     )
+    elif subject == "co2":
+        report_df = report.calc_co2_emission(
+            period,
+            _tot=tot,
+            active_interval=interval,
+            active_view=view,
+        )
     elif subject == "save_cons":
         report_df = report.calc_saving_consumption(
             active_period=period,
@@ -428,10 +538,10 @@ def reports_gen(subject: str, view: str, period: str, solar_item=None, date: dat
             report_data = report.make_graph(
                 report_df, period, report.balance_graph_options
             )
-        # else:  # co2
-        #     report_data = report.make_graph(
-        #         report_df, period, report.co2_graph_options
-        #     )
+        elif subject == "co2":
+            report_data = report.make_graph(
+                report_df, period, report.co2_graph_options
+            )
         elif subject == "save_cons":
             report_data = report.make_graph(
                 report_df, period, report.saving_cons_graph_options
@@ -458,6 +568,17 @@ def reports():
     subject = request.args.get("subject", default="grid")
     view = request.args.get("view", default="tabel")
     period = request.args.get("period", default="vandaag")
+    subjects = [
+        {"label": "Grid", "value": "grid"},
+        {"label": "Balance", "value": "balans"},
+    ]
+    if co2_available():
+        subjects.append({"label": "CO2", "value": "co2"})
+    # A bookmarked CO2 url must not blow up once the sensor is removed.
+    if subject not in {entry["value"] for entry in subjects}:
+        subject = subjects[0]["value"]
+    if subject == "co2" and period in FORECAST_PERIODS:
+        period = "vandaag"
     report_data = reports_gen(subject, view, period)
     return render_template(
         "v2/report.html",
@@ -466,8 +587,8 @@ def reports():
         subject=subject,
         view=view,
         report_data=report_data,
-        subject_options=[{"label": "Grid", "value": "grid"},
-                         {"label": "Balance", "value": "balans"}]
+        subject_options=subjects,
+        period_options=period_options(subject),
     )
 
 
@@ -476,6 +597,12 @@ def savings():
     subject = request.args.get("subject", default="save_cons")
     view = request.args.get("view", default="tabel")
     period = request.args.get("period", default="vandaag")
+    subjects = [
+        {"label": "Consumption", "value": "save_cons"},
+        {"label": "Cost", "value": "save_cost"},
+    ]
+    if subject not in {entry["value"] for entry in subjects}:
+        subject = subjects[0]["value"]
     report_data = reports_gen(subject, view, period)
     return render_template(
         "v2/report.html",
@@ -484,8 +611,8 @@ def savings():
         subject=subject,
         view=view,
         report_data=report_data,
-        subject_options=[{"label": "Consumption", "value": "save_cons"},
-                         {"label": "Cost", "value": "save_cost"}]
+        subject_options=subjects,
+        period_options=period_options(subject),
     )
 
 
@@ -519,6 +646,7 @@ def solar():
         hide_period=True,
         show_datepicker=True,
         date=date_str,
+        period_options=period_options(subject),
         subject_options=[
             {"label": key, "value": key}
             for key in solar_items.keys()
