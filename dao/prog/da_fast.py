@@ -27,6 +27,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Run directly from dao/prog without a PYTHONPATH: put the repository root on
 # the path so the "dao.prog.*" imports below resolve. The add-on itself sets
@@ -87,8 +88,13 @@ def cmd_once(args) -> int:
     return 0
 
 
-def _spec_from_config(config) -> BatterySpec:
-    """Build a simulation battery from the configured batteries."""
+def _spec_from_config(config, ha_getter) -> BatterySpec:
+    """Build a simulation battery from the configured batteries.
+
+    lower_limit/upper_limit are FlexInt: .value is the raw config token,
+    which is the entity id itself when the field is HA-entity-backed, not a
+    percentage. .resolve() is what actually returns a usable number.
+    """
     specs = []
     for battery in config.battery:
         charge_stages = [s.power for s in battery.charge_stages]
@@ -100,8 +106,8 @@ def _spec_from_config(config) -> BatterySpec:
                 max_charge_w=float(max(charge_stages)),
                 max_discharge_w=float(max(discharge_stages)),
                 minimum_power_w=float(battery.minimum_power or 0),
-                soc_min=float(battery.lower_limit.value),
-                soc_max=float(battery.upper_limit.value),
+                soc_min=float(battery.lower_limit.resolve(ha_getter, default=20)),
+                soc_max=float(battery.upper_limit.resolve(ha_getter, default=100)),
                 cycle_cost=float(battery.cycle_cost),
                 charge_efficiency=float(battery.dc_to_bat_efficiency),
                 discharge_efficiency=float(battery.bat_to_dc_efficiency),
@@ -127,12 +133,19 @@ def _entity_scales(sensor) -> list[tuple[str, float]]:
     return pairs
 
 
-def _limits_from_config(config) -> PolicyLimits:
+def _resolve_optional_float(flex, ha_getter) -> Optional[float]:
+    if flex is None:
+        return None
+    value = flex.resolve(ha_getter, default=None)
+    return None if value is None else float(value)
+
+
+def _limits_from_config(config, ha_getter) -> PolicyLimits:
     fast = config.fast_control
     return PolicyLimits(
-        storage_value_mode=str(fast.storage_value_mode.value),
+        storage_value_mode=str(fast.storage_value_mode.resolve(ha_getter, default="plan")),
         storage_value_fixed=(
-            float(fast.storage_value.value) if fast.storage_value is not None else None
+            _resolve_optional_float(fast.storage_value, ha_getter)
         ),
         round_trip_efficiency=fast.round_trip_efficiency,
         min_benefit=fast.min_benefit,
@@ -148,7 +161,7 @@ def _limits_from_config(config) -> PolicyLimits:
         max_grid_import=(
             float(fast.max_grid_import) if fast.max_grid_import is not None else None
         ),
-        allow_grid_charge=bool(fast.allow_grid_charge.value),
+        allow_grid_charge=bool(fast.allow_grid_charge.resolve(ha_getter, default=False)),
     )
 
 
@@ -157,7 +170,7 @@ def cmd_simulate(args) -> int:
 
     report = Report(args.options)
     config = report.config
-    spec = _spec_from_config(config)
+    spec = _spec_from_config(config, report.ha_getter)
     fast = config.fast_control
 
     grid_entities = _entity_scales(fast.grid_power)
@@ -187,7 +200,7 @@ def cmd_simulate(args) -> int:
     for warning in window.warnings:
         logging.warning(f"Backtest: {warning}")
 
-    limits = _limits_from_config(config)
+    limits = _limits_from_config(config, report.ha_getter)
     if args.energy_budget is not None:
         limits.energy_budget = args.energy_budget
     if args.min_benefit is not None:

@@ -28,7 +28,8 @@
   <p>Setpoint: <span id="fast-house-w">{{ last_decision.house_w if last_decision else '—' }}</span> W</p>
   <p>Benefit: <span id="fast-benefit">{{ '%.4f'|format(last_decision.benefit_eur_h) if last_decision else '—' }}</span> euro/uur</p>
   <p>PV: <span id="fast-pv-w">{{ last_decision.pv_w if last_decision else '—' }}</span> W</p>
-  <p>Bespaard vandaag: <span id="fast-saved">{{ '%.3f'|format(state.get('saved_today_eur', 0)) }}</span> euro</p>
+  <p>Bespaard vandaag: <span id="fast-saved">{{ '%.3f'|format(state.get('saved_today_eur', 0)) }}</span> euro
+    {%- if state.get('saved_today_is_estimate') %} <em>(schatting, modus was niet steeds 'active')</em>{% endif %}</p>
 </div>
 
 <h3>Budget</h3>
@@ -52,7 +53,7 @@
         document.getElementById('fast-house-w').textContent = (j.house_w !== null && j.house_w !== undefined) ? j.house_w : '—';
         document.getElementById('fast-benefit').textContent = (j.benefit_eur_h !== null && j.benefit_eur_h !== undefined) ? j.benefit_eur_h.toFixed(4) : '—';
         document.getElementById('fast-pv-w').textContent = (j.pv_w !== null && j.pv_w !== undefined) ? j.pv_w : '—';
-        document.getElementById('fast-saved').textContent = (j.saved_today_eur !== undefined) ? j.saved_today_eur.toFixed(3) : '0.000';
+        document.getElementById('fast-saved').textContent = (j.saved_today_eur !== undefined) ? j.saved_today_eur.toFixed(3) + (j.saved_today_is_estimate ? ' (schatting)' : '') : '0.000';
         var daily = (j.daily_extra_throughput_used !== undefined) ? j.daily_extra_throughput_used : 0;
         var energy = (j.energy_budget_used !== undefined) ? j.energy_budget_used : 0;
         document.getElementById('fast-daily').textContent = daily.toFixed(2);

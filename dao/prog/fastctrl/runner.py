@@ -522,12 +522,17 @@ class FastControlRunner:
             )
             self._warned_stale_plan = True
 
+        sensor_ok = grid_w is not None and grid_fresh
         measurement = Measurement(
             timestamp=now,
             grid_w=grid_w if grid_w is not None else 0.0,
             batteries=batteries,
             pv_w=pv_w,
-            grid_valid=grid_w is not None and grid_fresh and not plan_stale,
+            grid_valid=sensor_ok and not plan_stale,
+            # Distinguish "the grid sensor is unreadable" from "the plan is
+            # too old"; both used to be reported as sensor_stale, which is
+            # misleading when the sensor is fine and only the plan is old.
+            invalid_reason="sensor_stale" if not sensor_ok else "plan_stale",
         )
 
         # Capture the previous tick timestamp BEFORE policy.account() resets
@@ -563,6 +568,11 @@ class FastControlRunner:
             else 0.0
         )
         self.state.saved_today_eur += decision.benefit_eur_h * elapsed_h
+        if mode != MODE_ACTIVE:
+            # Nothing was actually written this tick, so this contribution
+            # (and therefore today's total) is a projection, not a measured
+            # saving.
+            self.state.saved_today_is_estimate = True
 
         self._actuate(decision, plan, mode)
         self._publish(decision, mode, measurement)
@@ -738,6 +748,7 @@ class FastControlRunner:
             round(measurement.pv_w) if measurement.pv_w is not None else None
         )
         attributes["saved_today_eur"] = round(self.state.saved_today_eur, 3)
+        attributes["saved_today_is_estimate"] = self.state.saved_today_is_estimate
         attributes["friendly_name"] = "DAO fast control"
         attributes["icon"] = "mdi:speedometer"
 

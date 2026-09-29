@@ -496,6 +496,7 @@ def fast_control_state_json():
         "benefit_eur_h": last_decision.get("benefit_eur_h"),
         "pv_w": last_decision.get("pv_w"),
         "saved_today_eur": state.get("saved_today_eur", 0),
+        "saved_today_is_estimate": state.get("saved_today_is_estimate", False),
         "daily_extra_throughput_used": state.get("daily_extra_throughput_used", 0),
         "energy_budget_used": state.get("energy_budget_used", 0),
         "ts": last_decision.get("ts"),

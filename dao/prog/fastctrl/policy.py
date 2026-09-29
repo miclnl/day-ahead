@@ -138,8 +138,12 @@ class Measurement:
     #: Optional, diagnostics only. The control law does not use it because PV
     #: is already contained in the grid measurement.
     pv_w: Optional[float] = None
-    #: False when the grid reading is missing or stale.
+    #: False when the grid reading is missing or stale, or the plan itself
+    #: is too old to be trusted.
     grid_valid: bool = True
+    #: Why grid_valid is False, surfaced as Decision.reason. The runner sets
+    #: this to "plan_stale" when the plan (not the sensor) is the reason.
+    invalid_reason: str = "sensor_stale"
 
     def battery(self, index: int) -> BatteryMeasurement:
         if 0 <= index < len(self.batteries):
@@ -198,6 +202,10 @@ class ControllerState:
     day_key: str = ""
     #: Estimated saving accumulated since midnight, in euro.
     saved_today_eur: float = 0.0
+    #: True once any part of today's saved_today_eur came from a tick where
+    #: the layer was not actually writing (shadow or off): the figure is
+    #: then a projection, not a measured saving, for at least part of today.
+    saved_today_is_estimate: bool = False
     last_tick_ts: float = 0.0
     #: Snapshot of the most recent :class:`Decision` attributes, or ``None``
     #: before the first tick. Used to surface the layer's last verdict to the
@@ -244,6 +252,7 @@ class ControllerState:
             "interval_start_ts": self.interval_start_ts,
             "day_key": self.day_key,
             "saved_today_eur": self.saved_today_eur,
+            "saved_today_is_estimate": self.saved_today_is_estimate,
             "last_tick_ts": self.last_tick_ts,
             "last_decision": self.last_decision,
             "events": list(self.events),
@@ -262,6 +271,7 @@ class ControllerState:
             interval_start_ts=int(data.get("interval_start_ts", 0)),
             day_key=str(data.get("day_key", "")),
             saved_today_eur=float(data.get("saved_today_eur", 0.0)),
+            saved_today_is_estimate=bool(data.get("saved_today_is_estimate", False)),
             last_tick_ts=float(data.get("last_tick_ts", 0.0)),
             last_decision=data.get("last_decision"),
             events=list(data.get("events", [])),
@@ -512,6 +522,7 @@ class FastControlPolicy:
         if state.day_key != day_key:
             state.day_key = day_key
             state.saved_today_eur = 0.0
+            state.saved_today_is_estimate = False
             for battery in state.batteries:
                 battery.daily_deviation_kwh = 0.0
 
@@ -692,7 +703,7 @@ class FastControlPolicy:
         )
 
         if not measurement.grid_valid:
-            return self._all_plan(plan, measurement, state, "sensor_stale", interval)
+            return self._all_plan(plan, measurement, state, measurement.invalid_reason, interval)
 
         # Batteries are decided one at a time. Each one sees the rest of the
         # site as its load: the house plus whatever the other batteries are

@@ -279,6 +279,41 @@ class TestTick:
         assert state.startswith("shadow:")
         assert attributes["deviation_w"] == pytest.approx(3000.0, abs=1.0)
 
+    def test_saved_today_is_flagged_as_an_estimate_in_shadow_mode(self, workspace):
+        """Shadow mode never writes anything, so any accumulated
+        saved_today_eur for the day is a projection, not a measured saving,
+        and must be labelled as such."""
+        make_plan(workspace["plan_path"])
+        hass = FakeHass(
+            {
+                "sensor.p1_power": "3500",
+                "sensor.battery_power": "0",
+                "sensor.soc": "60",
+            }
+        )
+        runner = FastControlRunner(
+            hass, make_config(mode="shadow", **{"max sensor age": 999999}), **workspace
+        )
+        runner.tick(T0 + 60)
+        assert runner.state.saved_today_is_estimate is True
+        _, attributes = hass.published["sensor.dao_fast_control"]
+        assert attributes["saved_today_is_estimate"] is True
+
+    def test_saved_today_is_not_an_estimate_in_active_mode(self, workspace):
+        make_plan(workspace["plan_path"], battery_w=0.0)
+        hass = FakeHass(
+            {
+                "sensor.p1_power": "3500",
+                "sensor.battery_power": "0",
+                "sensor.soc": "60",
+            }
+        )
+        runner = FastControlRunner(hass, make_config(mode="active"), **workspace)
+        runner.tick(T0 + 60)
+        assert runner.state.saved_today_is_estimate is False
+        _, attributes = hass.published["sensor.dao_fast_control"]
+        assert attributes["saved_today_is_estimate"] is False
+
     def test_off_mode_does_nothing(self, workspace):
         make_plan(workspace["plan_path"])
         hass = FakeHass({"sensor.p1_power": "3500", "sensor.soc": "60"})
@@ -386,7 +421,9 @@ class TestTick:
         runner = FastControlRunner(hass, make_config(), **workspace)
         decision = runner.tick(T0 + 60)
         assert decision is not None
-        assert decision.reason == "sensor_stale"
+        # Distinct from "sensor_stale": the grid sensor itself is fine here,
+        # only the plan is too old to be trusted.
+        assert decision.reason == "plan_stale"
         assert not decision.override
 
     def test_a_missing_grid_sensor_prevents_any_action(self, workspace):
