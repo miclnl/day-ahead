@@ -5,7 +5,6 @@ import datetime
 import requests
 from requests import get, post
 from nordpool.elspot import Prices
-import pytz
 import json
 import math
 import pprint as pp
@@ -58,10 +57,17 @@ class DaPrices:
         if not explicit_range:
             present = self.db_da.get_time_border_record("da")
             if not (present is None):
-                tz = pytz.timezone("CET")
-                present = tz.normalize(tz.localize(present))
+                # The same zone everything else uses, not a hard-coded "CET".
+                # present comes out of the DAO database, whose epoch columns
+                # are read against the configured zone, and end is derived
+                # from local wall-clock times -- so calling either of them
+                # CET was wrong for anyone outside CET. The day-ahead market
+                # publishing in CET is a separate matter, handled where those
+                # responses are parsed.
+                tz = self.db_da.tzinfo
+                present = present.replace(tzinfo=tz)
                 if end.tzinfo is None:
-                    end = tz.normalize(tz.localize(end))
+                    end = end.replace(tzinfo=tz)
                 if present >= (end - datetime.timedelta(hours=1)):
                     logging.info(f"Day ahead data already present")
                     return

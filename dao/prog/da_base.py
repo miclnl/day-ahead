@@ -5,7 +5,6 @@ import os
 import math
 import time
 import threading
-import pytz
 import warnings
 from dataclasses import dataclass
 import json
@@ -224,6 +223,15 @@ class DaBase:
                 f"Onverwacht antwoord van Home Assistant api/config: {resp_dict!r}"
             ) from ex
         self.time_zone = self.ha_context.time_zone
+        # One clock. The epoch columns are read and written against this
+        # zone, so the database layer has to agree with what Home Assistant
+        # reports rather than fall back to the container's own setting. An
+        # explicit time_zone in options.json still wins: it is there for the
+        # case where the database genuinely disagrees.
+        if not (self.config.time_zone or None):
+            for manager in (self.db_da, self.db_ha):
+                if manager is not None:
+                    manager.TARGET_TIMEZONE = self.time_zone
         self.meteo = Meteo(
             self.config,
             self.db_da,
@@ -595,16 +603,16 @@ class DaBase:
         """
         df = df.reset_index(drop=True)
         columns = df.columns.values.tolist()[1:]
-        tz = pytz.timezone(self.time_zone)
         # Melt (time, col1, col2, ...) into long-format (time, code, value)
         # rows via a plain list instead of df_db.loc[df_db.shape[0]] = row
         # per (index, column) pair: that copies the whole frame on every one
         # of the rows*columns appends.
         rows = []
         for index in range(min(len(tijd), len(df))):
-            dt = pd.to_datetime(tijd[index])
-            dt = tz.localize(dt)
-            utc = int(dt.timestamp())
+            # db_da.epoch rather than a local pytz.localize: one conversion
+            # against the configured zone for everything that reads or writes
+            # these epoch columns.
+            utc = self.db_da.epoch(pd.to_datetime(tijd[index]).to_pydatetime())
             for c in columns:
                 rows.append((str(utc), c, float(df.loc[index, c])))
         df_db = pd.DataFrame(rows, columns=["time", "code", "value"])

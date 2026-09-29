@@ -107,9 +107,11 @@ def test_monthly_aggregate_query_has_no_bare_column_under_group_by():
 
     # __new__, not DBmanagerObj(...): the constructor eagerly probes a real
     # connection to fail fast, and this test only needs the dialect-aware SQL
-    # helpers (month(), month_start(), ...), which only read self.db_dialect.
+    # helpers (month(), month_start(), ...), which read self.db_dialect and
+    # self.TARGET_TIMEZONE.
     db = DBmanagerObj.__new__(DBmanagerObj)
     db.db_dialect = "postgresql"
+    db.TARGET_TIMEZONE = "Europe/Amsterdam"
     # Build the same shape of query get_sensor_data builds for agg="maand",
     # against a throwaway in-memory metadata (no live connection needed to
     # compile and inspect the SQL text).

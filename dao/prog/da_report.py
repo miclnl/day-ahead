@@ -987,8 +987,11 @@ class Report(DaBase):
         v1 = statistics_meta.alias("v1")
 
         # Define parameters
-        start_ts_param1 = vanaf.strftime("%Y-%m-%d %H:%M:%S")  # '2024-01-01 00:00:00'
-        start_ts_param2 = tot.strftime("%Y-%m-%d %H:%M:%S")  # '2024-05-23 00:00:00'
+        # Epoch integers rather than formatted strings for SQL to parse
+        # back: the column holds epochs, and which zone the database read
+        # such a string in depended on the dialect and on server settings.
+        start_ts_param1 = self.db_ha.epoch(vanaf)
+        start_ts_param2 = self.db_ha.epoch(tot)
         if sensor_type == "quantity":
             t2 = statistics.alias("t2")
             if agg == "maand":
@@ -1047,11 +1050,11 @@ class Report(DaBase):
                     & (t2.c.state.isnot(None))
                     & (
                             t1.c.start_ts
-                            >= self.db_ha.unix_timestamp(start_ts_param1) - 3600
+                            >= start_ts_param1 - 3600
                     )
                     & (
                             t1.c.start_ts
-                            < self.db_ha.unix_timestamp(start_ts_param2) - 3600
+                            < start_ts_param2 - 3600
                     )
                 )
             )
@@ -1076,8 +1079,8 @@ class Report(DaBase):
                 .where(
                     (v1.c.statistic_id == sensor)
                     & (t1.c.mean.isnot(None))
-                    & (t1.c.start_ts >= self.db_ha.unix_timestamp(start_ts_param1))
-                    & (t1.c.start_ts < self.db_ha.unix_timestamp(start_ts_param2))
+                    & (t1.c.start_ts >= start_ts_param1)
+                    & (t1.c.start_ts < start_ts_param2)
                 )
             )
 
@@ -1774,11 +1777,9 @@ class Report(DaBase):
                         v1.c.code == key,
                         t1.c.variabel == v1.c.id,
                         t1.c.time
-                        >= self.db_da.unix_timestamp(
-                            vanaf.strftime("%Y-%m-%d %H:%M:%S")
-                        ),
+                        >= self.db_da.epoch(vanaf),
                         t1.c.time
-                        < self.db_da.unix_timestamp(tot.strftime("%Y-%m-%d %H:%M:%S")),
+                        < self.db_da.epoch(tot),
                     )
                 )
                 .group_by(groupby_str)
@@ -1904,11 +1905,9 @@ class Report(DaBase):
                         v1.c.code == key,
                         t1.c.variabel == v1.c.id,
                         t1.c.time
-                        >= self.db_da.unix_timestamp(
-                            vanaf.strftime("%Y-%m-%d %H:%M:%S")
-                        ),
+                        >= self.db_da.epoch(vanaf),
                         t1.c.time
-                        < self.db_da.unix_timestamp(tot.strftime("%Y-%m-%d %H:%M:%S")),
+                        < self.db_da.epoch(tot),
                     )
                 )
                 .group_by(groupby_str)
@@ -1925,13 +1924,9 @@ class Report(DaBase):
                             v1.c.code == key,
                             p1.c.variabel == v1.c.id,
                             p1.c.time
-                            >= self.db_da.unix_timestamp(
-                                last_moment.strftime("%Y-%m-%d %H:%M:%S")
-                            ),
+                            >= self.db_da.epoch(last_moment),
                             p1.c.time
-                            < self.db_da.unix_timestamp(
-                                tot.strftime("%Y-%m-%d %H:%M:%S")
-                            ),
+                            < self.db_da.epoch(tot),
                         )
                     )
                     .group_by("uur")
@@ -2017,9 +2012,9 @@ class Report(DaBase):
                     v1.c.code == key,
                     t1.c.variabel == v1.c.id,
                     t1.c.time
-                    >= self.db_da.unix_timestamp(vanaf.strftime("%Y-%m-%d %H:%M:%S")),
+                    >= self.db_da.epoch(vanaf),
                     t1.c.time
-                    < self.db_da.unix_timestamp(tot.strftime("%Y-%m-%d %H:%M:%S")),
+                    < self.db_da.epoch(tot),
                 )
             )
             .group_by(groupby_str)
@@ -2195,13 +2190,9 @@ class Report(DaBase):
                             t1.c.variabel == v1.c.id,
                             v1.c.code == cat,
                             t1.c.time
-                            >= self.db_da.unix_timestamp(
-                                vanaf.strftime("%Y-%m-%d %H:%M:%S")
-                            ),
+                            >= self.db_da.epoch(vanaf),
                             t1.c.time
-                            < self.db_da.unix_timestamp(
-                                tot.strftime("%Y-%m-%d %H:%M:%S")
-                            ),
+                            < self.db_da.epoch(tot),
                         )
                     )
                     .group_by(interval)
@@ -2254,11 +2245,9 @@ class Report(DaBase):
                         v1.c.code == "da",
                         t1.c.variabel == v1.c.id,
                         t1.c.time
-                        >= self.db_da.unix_timestamp(
-                            last_moment.strftime("%Y-%m-%d %H:%M:%S")
-                        ),
+                        >= self.db_da.epoch(last_moment),
                         t1.c.time
-                        < self.db_da.unix_timestamp(tot.strftime("%Y-%m-%d %H:%M:%S")),
+                        < self.db_da.epoch(tot),
                     )
                 )
                 .order_by(t1.c.time)
@@ -2339,13 +2328,9 @@ class Report(DaBase):
                             p2.c.variabel == v2.c.id,
                             v2.c.code == "prod",
                             p1.c.time
-                            >= self.db_da.unix_timestamp(
-                                last_moment.strftime("%Y-%m-%d %H:%M:%S")
-                            ),
+                            >= self.db_da.epoch(last_moment),
                             p1.c.time
-                            < self.db_da.unix_timestamp(
-                                tot.strftime("%Y-%m-%d %H:%M:%S")
-                            ),
+                            < self.db_da.epoch(tot),
                         )
                     )
 
@@ -2851,8 +2836,8 @@ class Report(DaBase):
         t2 = statistics.alias("t2")
 
         # Define parameters
-        start_ts_param1 = vanaf.strftime("%Y-%m-%d %H:%M:%S")  # '2024-01-01 00:00:00'
-        tot_ts_param1 = tot.strftime("%Y-%m-%d %H:%M:%S")
+        start_ts_param1 = self.db_ha.epoch(vanaf)
+        tot_ts_param1 = self.db_ha.epoch(tot)
 
         # Build the query to retrieve raw data
         query = (
@@ -2873,8 +2858,8 @@ class Report(DaBase):
                 (statistics_meta.c.statistic_id == sensor)
                 & (t1.c.state.isnot(None))
                 & (t2.c.state.isnot(None))
-                & (t1.c.start_ts >= self.db_ha.unix_timestamp(start_ts_param1) - 3600)
-                & (t1.c.start_ts < self.db_ha.unix_timestamp(tot_ts_param1) - 3600)
+                & (t1.c.start_ts >= start_ts_param1 - 3600)
+                & (t1.c.start_ts < tot_ts_param1 - 3600)
             )
         )
 

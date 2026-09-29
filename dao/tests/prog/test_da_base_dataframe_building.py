@@ -87,6 +87,10 @@ def make_da_base(db):
     base = DaBase.__new__(DaBase)
     base.db_da = db
     base.time_zone = "UTC"
+    # save_df converts through db_da.epoch, so the database layer has to
+    # carry the same zone. In production DaBase.__init__ pushes Home
+    # Assistant's zone into the managers for exactly this reason.
+    db.TARGET_TIMEZONE = "UTC"
     return base
 
 

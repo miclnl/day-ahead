@@ -18,9 +18,9 @@ import os
 import tempfile
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-import pytz
 from typing import Any, Callable, Iterable, Optional
 
 from dao.prog.config.models.fastcontrol import (
@@ -464,7 +464,7 @@ class FastControlRunner:
         """Local calendar day, used to roll over the daily budgets."""
         if self._tz_info is None and self._time_zone:
             try:
-                self._tz_info = pytz.timezone(self._time_zone)
+                self._tz_info = ZoneInfo(self._time_zone)
             except Exception:  # noqa: BLE001 - fall back to the system clock
                 self._time_zone = None
         return datetime.datetime.fromtimestamp(now, self._tz_info).strftime("%Y-%m-%d")

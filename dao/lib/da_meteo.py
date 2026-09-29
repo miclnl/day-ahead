@@ -5,7 +5,6 @@ import logging
 import time
 from typing import Optional
 import pandas as pd
-import pytz
 import ephem
 import requests
 from requests import get
@@ -163,7 +162,7 @@ class Meteo:
         n = dif.days
         d = math.radians(23.44 *  math.sin(math.radians(360*(284 + n) / 365))) # declinatie 
         in radialen
-        dtz = datetime.datetime.fromtimestamp(utc_time, tz=pytz.utc)
+        dtz = datetime.datetime.fromtimestamp(utc_time, tz=datetime.timezone.utc)
         t = dtz.hour
         u = t * math.radians(15) #uurhoek in radialen
         br = math.radians(self.latitude) # breedtegraad
@@ -177,7 +176,7 @@ class Meteo:
         observer = ephem.Observer()
         observer.lat = math.radians(self.latitude)  # breedtegraad
         observer.lon = math.radians(self.longitude)
-        dtz = datetime.datetime.fromtimestamp(utc_time, tz=pytz.utc)
+        dtz = datetime.datetime.fromtimestamp(utc_time, tz=datetime.timezone.utc)
         observer.date = dtz.strftime("%Y-%m-%d %H:%M:%S.%f")  # '2023-09-19 12:00:00'
         sun = ephem.Sun(observer)
         result = {"h": sun.alt * 1.0, "A": (sun.az + math.pi) % (2 * math.pi)}

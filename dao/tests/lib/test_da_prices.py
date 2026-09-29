@@ -24,6 +24,18 @@ class FakeDb:
         self.present = present
         self.saved = []
 
+    @property
+    def tzinfo(self):
+        """The one authoritative zone, as DBmanagerObj exposes it.
+
+        get_prices compares a timestamp from the database against the
+        requested range, and used to localize both as a hard-coded "CET" --
+        wrong for anyone outside it.
+        """
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo("Europe/Amsterdam")
+
     def get_time_border_record(self, code, latest=True, table_name="values"):
         return self.present
 

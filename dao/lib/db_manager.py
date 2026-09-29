@@ -22,6 +22,7 @@ from sqlalchemy.engine import URL
 import sqlalchemy_utils
 import os
 import logging
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
     BigInteger,
@@ -71,6 +72,21 @@ def lead_bucket(lead_hours: float) -> int:
     return chosen
 
 
+def _container_zone_name() -> str:
+    """The container's own timezone name.
+
+    Used only as a last resort. The Home Assistant supervisor sets TZ for
+    add-ons, which is why SQLite's "localtime" and MySQL's session zone have
+    been giving the right answers all along; this makes the same assumption
+    explicit instead of leaving the zone unset.
+    """
+    name = os.environ.get("TZ")
+    if name:
+        return name
+    local = datetime.datetime.now().astimezone().tzinfo
+    return getattr(local, "key", None) or str(local) or "UTC"
+
+
 class DBmanagerObj(object):
     """
     Database manager class.
@@ -107,7 +123,12 @@ class DBmanagerObj(object):
         self.password = db_password
         self.port = db_port
         self.db_path = db_path
-        self.TARGET_TIMEZONE = db_time_zone
+        # The optional database override from options.json, which is None
+        # unless the operator set it. DaBase overwrites this with the zone
+        # Home Assistant reports as soon as it knows it (see
+        # DaBase.__init__), so the order of authority is: explicit override,
+        # then Home Assistant, then the container's own zone.
+        self.TARGET_TIMEZONE = db_time_zone or _container_zone_name()
 
         self.engine = create_engine(
             self.db_url(
@@ -181,11 +202,55 @@ class DBmanagerObj(object):
         )
 
     # Custom function to handle from_unixtime
+    @property
+    def tzinfo(self) -> ZoneInfo:
+        """The configured Home Assistant timezone.
+
+        TARGET_TIMEZONE is config.time_zone (see db_connections.py). It used
+        to be stored and then never used: the one line that applied it,
+        ``SET timezone``, is commented out, so PostgreSQL rendered and parsed
+        everything in its own session zone -- usually UTC -- which is why
+        those installations saw every timestamp shifted by one or two hours.
+        """
+        try:
+            return ZoneInfo(self.TARGET_TIMEZONE)
+        except Exception:  # noqa: BLE001 - an unknown zone name from HA
+            logging.warning(
+                f"Onbekende tijdzone {self.TARGET_TIMEZONE!r}, UTC gebruikt"
+            )
+            return ZoneInfo("UTC")
+
+    def epoch(self, moment: datetime.datetime) -> int:
+        """Epoch seconds for *moment*, reading a naive value as local time.
+
+        Every caller used to hand SQL a formatted string
+        (``unix_timestamp(moment.strftime(...))``) and let the database parse
+        it back into an epoch. Which zone that string was taken to be in
+        depended on the dialect and on server settings, so the same query
+        selected a different range on SQLite, MySQL and PostgreSQL. The
+        column holds epoch integers, so the conversion belongs here, once,
+        against the configured zone.
+        """
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=self.tzinfo)
+        return int(moment.timestamp())
+
+    def _pg_local(self, column):
+        """PostgreSQL: the epoch column as a naive timestamp in the configured
+        zone.
+
+        ``to_timestamp`` yields a timestamptz, which ``to_char`` then renders
+        in the session's TimeZone -- UTC on a stock server, since nothing
+        sets it. ``timezone(zone, ...)`` pins it to the zone the operator
+        configured in Home Assistant, which is the whole point.
+        """
+        return func.timezone(self.TARGET_TIMEZONE, func.to_timestamp(column))
+
     def from_unixtime(self, column):
         if self.db_dialect == "sqlite":
             return func.datetime(column, "unixepoch", "localtime")
         elif self.db_dialect == "postgresql":
-            return func.to_char(func.to_timestamp(column), "YYYY-MM-DD HH24:MI:SS")
+            return func.to_char(self._pg_local(column), "YYYY-MM-DD HH24:MI:SS")
         else:  # mysql/mariadb
             return func.from_unixtime(column)
 
@@ -209,7 +274,7 @@ class DBmanagerObj(object):
                 "%Y-%m", func.datetime(column, "unixepoch", "localtime")
             )
         elif self.db_dialect == "postgresql":
-            return func.to_char(func.to_timestamp(column), "YYYY-MM")
+            return func.to_char(self._pg_local(column), "YYYY-MM")
         else:  # mysql/mariadb
             return func.concat(
                 func.year(func.from_unixtime(column)),
@@ -223,7 +288,7 @@ class DBmanagerObj(object):
                 "%Y-%m-01", func.datetime(column, "unixepoch", "localtime")
             )
         elif self.db_dialect == "postgresql":
-            return func.to_char(func.to_timestamp(column), "YYYY-MM-01")
+            return func.to_char(self._pg_local(column), "YYYY-MM-01")
         else:  # mysql/mariadb
             return func.concat(
                 func.year(func.from_unixtime(column)),
@@ -238,7 +303,7 @@ class DBmanagerObj(object):
                 "%Y-%m-%d", func.datetime(column, "unixepoch", "localtime")
             )
         elif self.db_dialect == "postgresql":
-            return func.to_char(func.to_timestamp(column), "YYYY-MM-DD")
+            return func.to_char(self._pg_local(column), "YYYY-MM-DD")
         else:  # mysql/mariadb
             return func.date(func.from_unixtime(column))
 
@@ -248,7 +313,7 @@ class DBmanagerObj(object):
                 "%Y-%m-%d", func.datetime(column, "unixepoch", "localtime")
             )
         elif self.db_dialect == "postgresql":
-            return func.to_char(func.to_timestamp(column), "YYYY-MM-DD")
+            return func.to_char(self._pg_local(column), "YYYY-MM-DD")
         else:  # mysql/mariadb
             return func.date(func.from_unixtime(column))
 
@@ -258,7 +323,7 @@ class DBmanagerObj(object):
                 "%H:00", func.datetime(column, "unixepoch", "localtime")
             )
         elif self.db_dialect == "postgresql":
-            return func.to_char(func.to_timestamp(column), "HH24:00")
+            return func.to_char(self._pg_local(column), "HH24:00")
         else:  # mysql/mariadb
             return func.time_format(func.time(func.from_unixtime(column)), "%H:00")
 
@@ -268,7 +333,7 @@ class DBmanagerObj(object):
                 "%Y-%m-%d %H:00", func.datetime(column, "unixepoch", "localtime")
             )
         elif self.db_dialect == "postgresql":
-            return func.to_char(func.to_timestamp(column), "YYYY-MM-DD HH24:00")
+            return func.to_char(self._pg_local(column), "YYYY-MM-DD HH24:00")
         else:  # mysql/mariadb
             return func.date_format(func.from_unixtime(column), "%Y-%m-%d %H:00")
 
@@ -405,7 +470,7 @@ class DBmanagerObj(object):
                 t1.c.variabel == v1.c.id,
                 v1.c.code == field,
                 t1.c.time
-                >= start,  # self.unix_timestamp(start.strftime('%Y-%m-%d %H:%M:%S'))
+                >= start,
             )
         )
         if end is not None:
@@ -421,10 +486,7 @@ class DBmanagerObj(object):
                 num_days = 2
             end_dt = start_dt + datetime.timedelta(days=num_days)
             end_dt = datetime.datetime(end_dt.year, end_dt.month, end_dt.day)
-            end_ts = end_dt.timestamp()
-            query = query.where(
-                t1.c.time < self.unix_timestamp(end_dt.strftime("%Y-%m-%d %H:%M:%S"))
-            )
+            query = query.where(t1.c.time < self.epoch(end_dt))
 
         query = query.order_by(t1.c.time)
 
@@ -462,7 +524,7 @@ class DBmanagerObj(object):
                     t0.c.variabel == v0.c.id,
                     v0.c.code == "temp",
                     t1.c.time
-                    >= start,  # self.unix_timestamp(start.strftime('%Y-%m-%d %H:%M:%S'))
+                    >= start,
                 )
             )
             if end is not None:
@@ -478,11 +540,7 @@ class DBmanagerObj(object):
                     num_days = 2
                 end_dt = start_dt + datetime.timedelta(days=num_days)
                 end_dt = datetime.datetime(end_dt.year, end_dt.month, end_dt.day)
-                end_ts = end_dt.timestamp()
-                query = query.where(
-                    t1.c.time
-                    < self.unix_timestamp(end_dt.strftime("%Y-%m-%d %H:%M:%S"))
-                )
+                query = query.where(t1.c.time < self.epoch(end_dt))
 
             query = query.order_by(t1.c.time)
 
@@ -538,9 +596,11 @@ class DBmanagerObj(object):
         """
         if start is None:
             start = datetime.datetime.now()
-        start = start.strftime("%Y-%m-%d %H:%M")
-        if end is not None:
-            end = end.strftime("%Y-%m-%d %H:%M")
+        # Converted here rather than handed to SQL as a formatted string:
+        # the column holds epoch integers and which zone the database read
+        # that string in depended on the dialect and on server settings.
+        start_ts = self.epoch(start)
+        end_ts = None if end is None else self.epoch(end)
         """
         #  old style sql query
         sqlQuery = (
@@ -580,7 +640,7 @@ class DBmanagerObj(object):
             and_(
                 variabel_table.c.code == column_name,
                 values_table.c.variabel == variabel_table.c.id,
-                values_table.c.time >= self.unix_timestamp(start),
+                values_table.c.time >= start_ts,
             )
         )
         """
@@ -588,7 +648,7 @@ class DBmanagerObj(object):
             query = query.group_by("uur", "time")
         """
         if end is not None:
-            query = query.where(values_table.c.time < self.unix_timestamp(end))
+            query = query.where(values_table.c.time < end_ts)
         query = query.order_by("time")
 
         with self.engine.connect() as connection:
@@ -640,8 +700,8 @@ class DBmanagerObj(object):
                 v1.c.code == "cons",
                 t2.c.variabel == v2.c.id,
                 v2.c.code == "prod",
-                t1.c.time >= self.unix_timestamp(start.strftime("%Y-%m-%d %H:%M:%S")),
-                t1.c.time < self.unix_timestamp(end.strftime("%Y-%m-%d %H:%M:%S")),
+                t1.c.time >= self.epoch(start),
+                t1.c.time < self.epoch(end),
             )
         )
 
