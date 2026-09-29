@@ -10,6 +10,7 @@ This guide will help developers set up their development environment, test chang
 - [Running the Application Locally](#running-the-application-locally)
 - [Testing](#testing)
 - [Making Contributions](#making-contributions)
+- [Releasing](#releasing)
 - [Code Style and Best Practices](#code-style-and-best-practices)
 
 ---
@@ -388,6 +389,52 @@ Before submitting your PR, ensure:
 - [ ] Commit messages are clear
 - [ ] No unnecessary files are included (check `.gitignore`)
 - [ ] Changes are based on the latest `main` branch
+
+---
+
+## Releasing
+
+### Version numbers
+
+Releases use calendar versioning: `YEAR.MONTH.DAY`, for example `2026.9.29`.
+When a release has to be redone on the same day, append a fourth component
+instead of a suffix:
+
+```
+2026.9.29  <  2026.9.29.1  <  2026.9.29.2  <  2026.9.30
+```
+
+**Never use a dash.** Home Assistant compares add-on versions with
+[awesomeversion](https://github.com/ludeeus/awesomeversion). A dash turns the
+number into a SemVer *prerelease*, and a prerelease sorts *before* the release
+it belongs to:
+
+```python
+>>> AwesomeVersion("2026.9.29-2") > AwesomeVersion("2026.9.29")
+False
+```
+
+So `2026.9.29-2` reads as older than `2026.9.29`. The image builds and lands in
+the registry, but Home Assistant never offers the update and users cannot
+install it. Do not paper over this by dropping the separator either:
+`2026.9.292` compares as micro version 292, which would rank it above the
+release of the next day (`2026.9.3`).
+
+The version in `release-testing/config.yaml` follows the same rule; a `.rcN`
+suffix is fine because it has no dash.
+
+### Cutting a release
+
+1. Bump `dao/config.yaml` and `dao/prog/version.py` to the same value.
+2. Rename the `# Unreleased` heading in `dao/CHANGELOG.md` to the new version.
+   Do not leave it open across releases; the add-on store shows this file and
+   users need to see what a version actually contains.
+3. Commit, then tag with exactly that version and publish a GitHub release.
+
+`.github/workflows/build_images.yaml` validates all of this before it builds:
+it rejects a dash in any version, rejects a mismatch between `config.yaml` and
+`version.py`, and fails when the release tag matches neither the stable nor the
+testing `config.yaml`.
 
 ---
 

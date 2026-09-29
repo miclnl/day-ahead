@@ -41,6 +41,7 @@ jobs:
         run: |
           DAO_VERSION=$(grep '^version:' dao/config.yaml | awk '{print $2}')
           TEST_VERSION=$(grep '^version:' release-testing/config.yaml | awk '{print $2}')
+          PROG_VERSION=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' dao/prog/version.py)
           RELEASE_TAG="${{ github.event.release.tag_name }}"
           if [[ -z "$RELEASE_TAG" ]]; then
             RELEASE_TAG="${{ inputs.release_tag }}"
@@ -49,6 +50,40 @@ jobs:
           echo "Release tag:     ${RELEASE_TAG}"
           echo "DAO version:     ${DAO_VERSION}"
           echo "Testing version: ${TEST_VERSION}"
+          echo "version.py:      ${PROG_VERSION}"
+
+          # Home Assistant vergelijkt add-on versies met awesomeversion. Een
+          # streepje maakt van het nummer een SemVer prerelease, en die sorteert
+          # voor de release zelf: 2026.9.29-2 geldt als ouder dan 2026.9.29,
+          # waardoor de update nooit wordt aangeboden. Een dagrelease die opnieuw
+          # moet, krijgt daarom een vierde component: 2026.9.29.1.
+          check_version() {
+            local file="$1" value="$2"
+
+            if [[ -z "${value}" ]]; then
+              echo "ERROR: geen versie gevonden in ${file}"
+              exit 1
+            fi
+
+            if [[ "${value}" == *-* ]]; then
+              echo "ERROR: ${file} heeft versie '${value}' met een streepje."
+              echo "  Home Assistant leest dat als een SemVer prerelease en ziet de"
+              echo "  release dan als ouder dan hetzelfde nummer zonder streepje,"
+              echo "  dus wordt de update niet aangeboden."
+              echo "  Gebruik JAAR.MAAND.DAG.PATCH, bijvoorbeeld ${value%%-*}.1"
+              exit 1
+            fi
+          }
+
+          check_version "dao/config.yaml" "${DAO_VERSION}"
+          check_version "release-testing/config.yaml" "${TEST_VERSION}"
+          check_version "dao/prog/version.py" "${PROG_VERSION}"
+
+          if [[ "${PROG_VERSION}" != "${DAO_VERSION}" ]]; then
+            echo "ERROR: dao/prog/version.py (${PROG_VERSION}) loopt niet gelijk met"
+            echo "  dao/config.yaml (${DAO_VERSION}). Bump ze samen."
+            exit 1
+          fi
 
           if [[ "${RELEASE_TAG}" == "${DAO_VERSION}" ]]; then
             echo "Detected stable release"

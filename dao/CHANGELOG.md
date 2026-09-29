@@ -1,6 +1,23 @@
 # Changelog DAO+
 # Day Ahead Optimizer
-# Unreleased
+# 2026.9.29.1
+
+## Versienummer met een punt in plaats van een streepje
+Deze release heette eerst `2026.9.29-2` en was niet te installeren. Home
+Assistant leest het streepje als een SemVer-prerelease en beschouwt zo'n
+nummer daardoor als *ouder* dan `2026.9.29`, dus werd de update nooit
+aangeboden. Hetzelfde gold eerder al voor `2026.9.1-2`.
+
+Vandaar `2026.9.29.1`: dezelfde inhoud, maar met een vierde component in
+plaats van een streepje, zodat de volgorde wel klopt (`2026.9.29` <
+`2026.9.29.1` < `2026.9.30`). De build controleert voortaan zelf dat er geen
+streepje in een versienummer staat en dat `config.yaml` en `version.py` gelijk
+lopen.
+
+Alles hieronder tot aan `2026.9.1` zat nog onder "Unreleased" en is nu pas
+onder een versie gezet. Wie van `2026.9.1` komt, krijgt het in één keer; wie
+tussendoor `2026.9.25` tot en met `2026.9.29` heeft gedraaid, heeft het
+grootste deel al.
 
 ## Alleen nog de nieuwe web-UI
 De oude interface is verwijderd; alles loopt nu via de v2-pagina's. Het
