@@ -1,0 +1,16 @@
+# Project-level lint settings so `ruff check` gives the same answer on every
+# machine instead of picking up whatever user configuration happens to exist.
+# Deliberately modest: the codebase logs on the root logger by design (DaBase
+# owns its configuration) and uses long f-strings in Dutch log messages.
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+ignore = ["E501", "B008", "UP007", "UP045"]
+
+[lint.per-file-ignores]
+"dao/tests/**" = ["E402"]
+
+[lint.isort]
+known-first-party = ["dao"]
