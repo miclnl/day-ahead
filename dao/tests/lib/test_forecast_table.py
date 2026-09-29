@@ -18,9 +18,11 @@ creates it on demand.
 import time
 
 import pytest
-from sqlalchemy import Column, Integer, String, Table, insert, inspect
+from sqlalchemy import Column, Integer, MetaData, String, Table, insert, inspect
+from sqlalchemy.dialects import mysql
+from sqlalchemy.schema import CreateTable
 
-from dao.lib.db_manager import DBmanagerObj
+from dao.lib.db_manager import DBmanagerObj, forecasts_table
 
 
 @pytest.fixture
@@ -84,6 +86,56 @@ class TestEnsureForecastsTable:
         assert db.ensure_forecasts_table() is False
         assert "forecasts" in caplog.text
         assert "overgeslagen" in caplog.text
+
+
+class TestForeignKeyTypeFollowsTheReferencedColumn:
+    """MySQL and MariaDB only accept a foreign key when both columns have
+    exactly the same type, signedness included. Installations from before
+    the schema moved into Python carry ``variabel.id`` as ``INT(10)
+    UNSIGNED``, so spelling ``Integer`` on the referencing column rendered a
+    signed ``INTEGER`` and the server refused the whole table:
+
+        (1005, "Can't create table `day_ahead`.`forecasts`
+                (errno: 150 \\"Foreign key constraint is incorrectly formed\\")")
+
+    Every optimiser run then logged that the archive was skipped. SQLite
+    ignores the type of a foreign key column entirely, which is why the
+    other tests in this file ran green throughout.
+    """
+
+    @staticmethod
+    def variabel_column_ddl(metadata):
+        ddl = str(
+            CreateTable(forecasts_table(metadata)).compile(dialect=mysql.dialect())
+        )
+        return next(
+            line.strip().rstrip(",")
+            for line in ddl.splitlines()
+            if line.strip().startswith("variabel ")
+        )
+
+    def test_it_follows_an_unsigned_id_on_an_upgraded_database(self):
+        metadata = MetaData()
+        Table(
+            "variabel",
+            metadata,
+            Column(
+                "id",
+                mysql.INTEGER(display_width=10, unsigned=True),
+                primary_key=True,
+            ),
+        )
+
+        assert (
+            self.variabel_column_ddl(metadata)
+            == "variabel INTEGER(10) UNSIGNED NOT NULL"
+        )
+
+    def test_it_follows_a_signed_id_on_a_fresh_database(self):
+        metadata = MetaData()
+        Table("variabel", metadata, Column("id", Integer, primary_key=True))
+
+        assert self.variabel_column_ddl(metadata) == "variabel INTEGER NOT NULL"
 
 
 class TestSaveForecastsRecovers:

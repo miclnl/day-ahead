@@ -1,5 +1,26 @@
 # Changelog DAO+
 # Day Ahead Optimizer
+# Unreleased
+
+## Prognose-archief werkt nu ook op een bijgewerkte database
+Bij het opstarten verscheen op bestaande installaties:
+
+    Tabel "forecasts" kon niet worden aangemaakt (... errno: 150 "Foreign
+    key constraint is incorrectly formed" ...); het prognose-archief wordt
+    overgeslagen.
+
+Databases die van voor de omzetting naar Python stammen hebben
+`variabel.id` als `INT(10) UNSIGNED`. MySQL en MariaDB accepteren een
+foreign key alleen als beide kolommen precies hetzelfde type hebben, dus
+ook hetzelfde teken. De nieuwe tabel vroeg om een gewone `INTEGER` en werd
+daarom geweigerd. De verwijzende kolom neemt haar type nu over van de
+kolom waar ze naar wijst, zodat het op het oude en het nieuwe schema werkt.
+
+Dit raakte alleen het archief waarmee de prognosefout wordt gemeten; de
+optimalisatie zelf liep gewoon door. Op een verse installatie was er niets
+aan de hand, en op SQLite ook niet, want dat controleert het type van een
+foreign key niet.
+
 # 2026.9.29.1
 
 ## Versienummer met een punt in plaats van een streepje

@@ -72,6 +72,44 @@ def lead_bucket(lead_hours: float) -> int:
     return chosen
 
 
+def forecasts_table(metadata: MetaData) -> Table:
+    """Define the forecast archive on *metadata*, which must hold "variabel".
+
+    Unlike "values" and "prognoses" this table keeps the lead time at which
+    a forecast was made, so forecast quality can be measured afterwards. The
+    unique key caps it at one row per (variable, target, lead bucket), which
+    bounds its size regardless of how often the optimizer runs.
+
+    The "variabel" column deliberately carries no type of its own.
+    MySQL and MariaDB accept a foreign key only when both columns have
+    exactly the same type, signedness included, and databases that predate
+    the schema moving into Python have "variabel.id" as INT(10) UNSIGNED.
+    Writing Integer here renders a signed INTEGER and the server refuses the
+    table with errno 150, "Foreign key constraint is incorrectly formed".
+    Leaving the type out makes SQLAlchemy copy it from the column the key
+    points at, so this works on both the old and the new schema. That only
+    holds when "variabel" in *metadata* was reflected from the database
+    rather than declared here; see :meth:`DBmanagerObj.ensure_forecasts_table`.
+    """
+    return Table(
+        "forecasts",
+        metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column(
+            "variabel",
+            ForeignKey("variabel.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        Column("target_time", BigInteger, nullable=False),
+        Column("lead_bucket", Integer, nullable=False),
+        Column("issued_time", BigInteger, nullable=False),
+        Column("value", Float),
+        UniqueConstraint("variabel", "target_time", "lead_bucket"),
+        sqlite_autoincrement=True,
+        extend_existing=True,
+    )
+
+
 def _container_zone_name() -> str:
     """The container's own timezone name.
 
@@ -760,44 +798,19 @@ class DBmanagerObj(object):
         nothing about what to do. :meth:`save_forecasts` now calls this and
         recovers on its own.
 
-        Unlike "values" and "prognoses" this table keeps the lead time at
-        which a forecast was made, so forecast quality can be measured
-        afterwards. The unique key caps it at one row per (variable, target,
-        lead bucket), which bounds its size regardless of how often the
-        optimiser runs.
-
         Returns whether the table exists afterwards.
         """
         if inspect(self.engine).has_table("forecasts"):
             return True
         try:
-            # Reflect the real "variabel" table first. Without this the
-            # foreign key is resolved against whatever column types happen to
-            # be defined locally in metadata, which can mismatch the actual
-            # ones in MySQL/MariaDB (INT UNSIGNED versus INT) and make it
-            # reject the CREATE TABLE with errno 150, "Foreign key constraint
-            # is incorrectly formed".
+            # Reflect the real "variabel" first, and drop any local
+            # declaration of it: :func:`forecasts_table` takes the type of
+            # its foreign key straight from "variabel.id", so that column
+            # has to be the one the database actually has.
             if "variabel" in self.metadata.tables:
                 self.metadata.remove(self.metadata.tables["variabel"])
             Table("variabel", self.metadata, autoload_with=self.engine)
-            forecasts = Table(
-                "forecasts",
-                self.metadata,
-                Column("id", Integer, primary_key=True, autoincrement=True),
-                Column(
-                    "variabel",
-                    Integer,
-                    ForeignKey("variabel.id", ondelete="CASCADE"),
-                    nullable=False,
-                ),
-                Column("target_time", BigInteger, nullable=False),
-                Column("lead_bucket", Integer, nullable=False),
-                Column("issued_time", BigInteger, nullable=False),
-                Column("value", Float),
-                UniqueConstraint("variabel", "target_time", "lead_bucket"),
-                sqlite_autoincrement=True,
-                extend_existing=True,
-            )
+            forecasts = forecasts_table(self.metadata)
             forecasts.create(self.engine, checkfirst=True)
             Index("ix_forecasts_target", forecasts.c.target_time).create(
                 bind=self.engine, checkfirst=True

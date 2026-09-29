@@ -13,6 +13,7 @@ pytest.importorskip("pandas")
 from dao.lib.db_manager import (  # noqa: E402
     LEAD_BUCKETS,
     DBmanagerObj,
+    forecasts_table,
     lead_bucket,
 )
 
@@ -59,17 +60,9 @@ def db(tmp_path):
             Column("value", Float),
             UniqueConstraint("variabel", "time"),
         )
-    forecasts = Table(
-        "forecasts",
-        metadata,
-        Column("id", Integer, primary_key=True),
-        Column("variabel", Integer, ForeignKey("variabel.id"), nullable=False),
-        Column("target_time", BigInteger, nullable=False),
-        Column("lead_bucket", Integer, nullable=False),
-        Column("issued_time", BigInteger, nullable=False),
-        Column("value", Float),
-        UniqueConstraint("variabel", "target_time", "lead_bucket"),
-    )
+    # The real definition rather than a copy, so this fixture cannot drift
+    # away from the schema that ships.
+    forecasts = forecasts_table(metadata)
     Index("ix_forecasts_target", forecasts.c.target_time)
     metadata.create_all(manager.engine)
 
