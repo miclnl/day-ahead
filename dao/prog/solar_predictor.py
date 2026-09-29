@@ -20,14 +20,12 @@ import math
 
 # ML imports
 from xgboost import XGBRegressor
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 from scipy import stats
 from dao.prog.da_base import DaBase
 from dao.prog.config.models.devices.solar import SolarConfig
 # import pvlib
-
-warnings.filterwarnings("ignore")
 
 
 class SolarPredictor(DaBase):
@@ -340,9 +338,15 @@ class SolarPredictor(DaBase):
         # Remove negative values
         solar_df = solar_df[solar_df["solar_kwh"] >= 0]
 
-        # Resample to hourly if needed
+        # Resample to hourly if needed. min_count=1 (not the default 0): an
+        # hour with no underlying samples at all (a recorder or inverter
+        # outage) must resample to NaN, not to a fabricated 0. The two
+        # dropna() calls a few lines down in train() then correctly exclude
+        # it, instead of teaching the model "no production" for an hour
+        # where nothing was actually measured. The default made every
+        # outage during daylight look like a hard physical zero.
         if len(solar_df) > 0:
-            solar_df = solar_df[["solar_kwh"]].resample("h").sum()
+            solar_df = solar_df[["solar_kwh"]].resample("h").sum(min_count=1)
 
         return solar_df
 
@@ -568,17 +572,33 @@ class SolarPredictor(DaBase):
             X_train_subset = X_train.iloc[:subset_size]
             y_train_subset = y_train.iloc[:subset_size]
 
+            # TimeSeriesSplit, not a plain cv=3 (KFold): with an integer cv,
+            # sklearn folds are contiguous but not time-ordered relative to
+            # each other, so a model can end up trained on later data and
+            # validated on earlier data. For weather/production series with
+            # strong day-to-day and seasonal autocorrelation that leaks
+            # future information into the score. TimeSeriesSplit only ever
+            # validates on data that comes after its training fold.
             grid_search = GridSearchCV(
                 estimator=XGBRegressor(
                     random_state=self.random_state, objective="reg:squarederror"
                 ),
                 param_grid=param_grid,
-                cv=3,
+                cv=TimeSeriesSplit(n_splits=3),
                 scoring="neg_mean_absolute_error",
                 n_jobs=-1,
             )
 
-            grid_search.fit(X_train_subset, y_train_subset)
+            # GridSearchCV fits hundreds of models here and sklearn/xgboost
+            # are chatty about things like convergence and near-constant
+            # folds; that used to be silenced process-wide via a
+            # module-level warnings.filterwarnings("ignore"), which also
+            # hid unrelated warnings everywhere else this module gets
+            # imported (the web server, the scheduler). Scope it to just
+            # this call instead.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                grid_search.fit(X_train_subset, y_train_subset)
             best_params = grid_search.best_params_
             logging.info(f"Best parameters: {best_params}")
         else:
