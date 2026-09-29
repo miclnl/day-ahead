@@ -317,6 +317,12 @@ class DAOConfigBaseModel(BaseModel):
         if not isinstance(data, dict):
             return data
 
+        # Never modify the caller's document. Pydantic hands the very dict that
+        # came out of json.load(); writing into it leaked {"value": ...,
+        # "enum_values": [...]} into options.json whenever that dict was saved
+        # again after validation.
+        data = dict(data)
+
         # Iterate through all fields in the model
         for field_name, field_info in cls.model_fields.items():
             # Check if this field is annotated as FlexEnum
@@ -341,11 +347,11 @@ class DAOConfigBaseModel(BaseModel):
                     enum_values = default.enum_values
 
             if enum_values:
-                # Inject enum_values into the data
+                # Inject enum_values into a copy of the value
                 if isinstance(value, str):
                     data[key] = {"value": value, "enum_values": enum_values}
                 elif isinstance(value, dict) and "enum_values" not in value:
-                    value["enum_values"] = enum_values
+                    data[key] = {**value, "enum_values": enum_values}
 
         return data
 

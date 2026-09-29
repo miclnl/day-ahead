@@ -2,6 +2,8 @@
 Configuration loader with support for versioning, migration, and unknown key preservation.
 """
 
+import copy
+import os
 import shutil
 import json
 import logging
@@ -10,6 +12,7 @@ from typing import Any, Optional, Type
 from pydantic import BaseModel, ValidationError
 import fcntl
 from .migrations.migrator import migrate_config
+from .models.base import FlexValue
 from .versions.v0 import ConfigurationV0
 
 # Uncomment when creating v1:
@@ -40,6 +43,98 @@ VERSION_MODELS: dict[int, Type[BaseModel]] = {
 
 # Derive current version from registry
 CURRENT_VERSION = max(VERSION_MODELS.keys())
+
+
+def validate_config_data(config_data: Any) -> BaseModel:
+    """Migrate (in memory) and validate a configuration without touching disk.
+
+    This is what every writer of options.json must call before saving: the
+    web editors, the fast-control mode switch and the tests. It follows the
+    same migration path as ConfigurationLoader, so a document with an older
+    or missing config_version is judged the way the loader would judge it.
+
+    Raises ConfigValidationError (a ValueError) with a readable message.
+    """
+    if not isinstance(config_data, dict):
+        raise ValueError("De configuratie moet een JSON-object zijn")
+    version = config_data.get("config_version")
+    if version is not None and (isinstance(version, bool) or not isinstance(version, int)):
+        raise ValueError(
+            f"config_version moet een geheel getal zijn, niet {version!r}"
+        )
+    if version is None or version < CURRENT_VERSION:
+        config_data = migrate_config(
+            copy.deepcopy(config_data), target_version=CURRENT_VERSION
+        )
+    version = config_data.get("config_version", CURRENT_VERSION)
+    if version not in VERSION_MODELS:
+        raise ValueError(
+            f"Onbekende config_version {version}; bekend zijn "
+            f"{sorted(VERSION_MODELS.keys())}"
+        )
+    try:
+        return VERSION_MODELS[version](**config_data)
+    except ValidationError as e:
+        raise ConfigValidationError(e) from e
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write a file so a reader never sees a half-written version.
+
+    The content goes to a temporary file in the same directory, is flushed to
+    disk and then renamed over the target. A crash in the middle leaves the
+    old file untouched instead of a truncated options.json.
+    """
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+FAST_CONTROL_MODES = ("off", "shadow", "active")
+
+
+def set_fast_control_mode(config_path: Path, new_mode: str) -> None:
+    """Change only the fast-control mode in options.json.
+
+    Edits the raw document instead of dumping the whole validated model, so
+    the user's key spelling, comments-as-extra-keys, explicit nulls and
+    omitted defaults survive. The result is validated before it is written.
+
+    Raises ValueError when the mode is invalid, when the mode is bound to a
+    Home Assistant entity (it must then be changed in HA), or when the
+    resulting configuration does not validate.
+    """
+    if new_mode not in FAST_CONTROL_MODES:
+        raise ValueError(f"Ongeldige modus {new_mode!r}")
+    config_path = Path(config_path)
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError("options.json moet een JSON-object zijn")
+    key = "fast control" if "fast control" in raw or "fast_control" not in raw else "fast_control"
+    section = raw.get(key)
+    if not isinstance(section, dict):
+        section = {}
+    current = section.get("mode")
+    if isinstance(current, dict):
+        current = current.get("value")
+    if FlexValue.is_entity_id(current):
+        raise ValueError(
+            f"De modus wordt gestuurd door Home Assistant entity {current}; "
+            f"wijzig die in Home Assistant"
+        )
+    section["mode"] = new_mode
+    raw[key] = section
+    validate_config_data(raw)
+    atomic_write_json(config_path, raw)
 
 
 class ConfigurationLoader:

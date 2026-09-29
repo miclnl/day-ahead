@@ -119,3 +119,26 @@ def test_unknown_keys_preserved(options_example_data):
     # Note: Pydantic may not preserve unknown keys at root level by default
     # This test documents current behavior
     print(f"✅ Unknown key handling test complete")
+
+
+def test_loader_loads_a_copy_of_the_example(tmp_path):
+    """End to end through ConfigurationLoader, migration included.
+
+    Instantiating ConfigurationV0 directly (as the tests above do) bypasses
+    the migration code that real installations go through.
+    """
+    import shutil
+    from dao.prog.config.loader import CURRENT_VERSION, ConfigurationLoader
+
+    example = Path(__file__).resolve().parents[2] / "data" / "options_example.json"
+    target = tmp_path / "options.json"
+    shutil.copy(example, target)
+
+    config = ConfigurationLoader(target).load_and_validate()
+
+    assert config.config_version == CURRENT_VERSION
+    assert config.scheduler.active is True
+    assert config.scheduler.schedule[0].action == "get_meteo_data"
+    # The loader wrote the migrated document back; it must load again unchanged.
+    again = ConfigurationLoader(target).load_and_validate()
+    assert again.scheduler.model_dump() == config.scheduler.model_dump()

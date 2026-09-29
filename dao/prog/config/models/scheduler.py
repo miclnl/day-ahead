@@ -26,8 +26,8 @@ class ScheduleEntry(BaseModel):
     time: str = Field(
         description="Time pattern in HHMM format",
         json_schema_extra={
-            "x-help": "Time pattern: specific time like '0435' or wildcard like 'xx00' (every hour at :00)",
-            "x-validation-hint": "Format: HHMM (24-hour, e.g., '0435', 'xx15')",
+            "x-help": "Time pattern: specific time like '0435', 'xx00' (every hour at :00) or '02xx' (every minute between 02:00 and 02:59)",
+            "x-validation-hint": "Format: HHMM (24-hour, e.g., '0435', 'xx15', '02xx')",
         },
     )
     action: SchedulerAction = Field(
@@ -40,16 +40,19 @@ class ScheduleEntry(BaseModel):
     @field_validator("time")
     @classmethod
     def validate_time_pattern(cls, v: str) -> str:
+        # The scheduler runtime (da_scheduler.py) matches three shapes: an
+        # exact HHMM, xxMM for every hour, and HHxx for every minute of one
+        # hour. The validator must accept exactly the same set.
         if not isinstance(v, str) or len(v) != 4:
             raise ValueError("Time pattern must be 4 characters (HHMM format)")
-        if not (v.isdigit() or (v[0:2] == "xx" and v[2:4].isdigit())):
-            raise ValueError("Time must be HHMM digits or 'xx' wildcard for hours")
-        if v[0:2] != "xx":
-            hour = int(v[0:2])
-            if hour > 23:
-                raise ValueError("Hour must be between 00 and 23")
-        minute = int(v[2:4])
-        if minute > 59:
+        hours, minutes = v[0:2], v[2:4]
+        if not ((hours == "xx" or hours.isdigit()) and (minutes == "xx" or minutes.isdigit())):
+            raise ValueError("Time must be HHMM digits or 'xx' wildcard for hours or minutes")
+        if hours == "xx" and minutes == "xx":
+            raise ValueError("Time pattern 'xxxx' would run every minute; fix at least the hours or the minutes")
+        if hours != "xx" and int(hours) > 23:
+            raise ValueError("Hour must be between 00 and 23")
+        if minutes != "xx" and int(minutes) > 59:
             raise ValueError("Minute must be between 00 and 59")
         return v
 

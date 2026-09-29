@@ -10,11 +10,16 @@ Changes:
 - Migrates 'entity stop victron' to 'entity stop inverter' in battery configs
 """
 
+import copy
 import logging
+import re
 from typing import Any
 from pydantic import TypeAdapter
 
 _bool_adapter = TypeAdapter(bool)
+
+# "HHMM", "xxMM" (every hour at MM) or "HHxx" (every minute of hour HH).
+_TIME_PATTERN_RE = re.compile(r"^(\d{2}|xx)(\d{2}|xx)$")
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +42,18 @@ def migrate_unversioned_to_v0(config: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Version 0 configuration
     """
-    # Create a copy to avoid modifying original
-    migrated = config.copy()
+    # Deep copy: the nested dicts are modified in place below and the caller
+    # keeps using its own document (the loader stores it as _raw_options).
+    migrated = copy.deepcopy(config)
 
     # Add version field
     migrated["config_version"] = 0
     logger.info("Added config_version=0 to unversioned configuration")
 
-    # Migrate scheduler format
+    # Migrate scheduler format. Only the legacy {"HHMM": action} shape needs
+    # converting; a document without config_version can already carry the
+    # new {"active": ..., "schedule": [...]} shape (the shipped example does),
+    # and treating that as legacy turned the "schedule" key into a bogus entry.
     if "scheduler" in migrated and isinstance(migrated["scheduler"], dict):
         old_scheduler = migrated["scheduler"]
 
@@ -61,21 +70,36 @@ def migrate_unversioned_to_v0(config: dict[str, Any]) -> dict[str, Any]:
                 )
                 active = True
 
-        # Build schedule array from time->action entries
-        schedule = []
-        for time_pattern, action in old_scheduler.items():
-            # Skip the 'active' field - it's not a schedule entry
-            if time_pattern == "active":
-                continue
+        if isinstance(old_scheduler.get("schedule"), list):
+            migrated["scheduler"] = {
+                **old_scheduler,
+                "active": active,
+                "schedule": old_scheduler["schedule"],
+            }
+            logger.debug("Scheduler already uses the schedule-list format")
+        else:
+            # Build schedule array from time->action entries
+            schedule = []
+            dropped = []
+            for time_pattern, action in old_scheduler.items():
+                # Skip the 'active' field - it's not a schedule entry
+                if time_pattern == "active":
+                    continue
+                if not _TIME_PATTERN_RE.match(str(time_pattern)):
+                    dropped.append(time_pattern)
+                    continue
+                schedule.append({"time": time_pattern, "action": action})
+            if dropped:
+                logger.warning(
+                    f"Scheduler: ignoring keys that are not a time pattern: {dropped}"
+                )
 
-            schedule.append({"time": time_pattern, "action": action})
+            # Create new scheduler structure
+            migrated["scheduler"] = {"active": active, "schedule": schedule}
 
-        # Create new scheduler structure
-        migrated["scheduler"] = {"active": active, "schedule": schedule}
-
-        logger.info(
-            f"Migrated scheduler: active={active}, {len(schedule)} schedule entries"
-        )
+            logger.info(
+                f"Migrated scheduler: active={active}, {len(schedule)} schedule entries"
+            )
 
     _prices_renames = {
         "cost supplier delivery": "cost supplier consumption",

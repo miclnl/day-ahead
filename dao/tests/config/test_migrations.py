@@ -103,6 +103,48 @@ def test_migrate_unversioned_to_v0_scheduler():
     assert scheduler.schedule[0].action == "get_day_ahead_prices"
 
 
+def test_migrate_unversioned_to_v0_keeps_new_style_scheduler():
+    """A document without config_version can already use the schedule list.
+
+    The shipped options_example.json is such a document. Treating every dict
+    as the legacy {"HHMM": action} shape turned the "schedule" key into a
+    bogus entry and made the example unloadable.
+    """
+    old_config = {
+        "scheduler": {
+            "active": True,
+            "schedule": [
+                {"time": "0544", "action": "get_meteo_data"},
+                {"time": "xx15", "action": "calc_optimum"},
+            ],
+        }
+    }
+
+    new_config = migrate_unversioned_to_v0(old_config)
+
+    assert new_config["scheduler"] == old_config["scheduler"]
+    scheduler = SchedulerConfig(**new_config["scheduler"])
+    assert [e.time for e in scheduler.schedule] == ["0544", "xx15"]
+    # The input document is left untouched.
+    assert "config_version" not in old_config
+
+
+def test_migrate_unversioned_to_v0_scheduler_drops_non_time_keys():
+    old_config = {
+        "scheduler": {
+            "active": True,
+            "//comment": "runs at night",
+            "0435": "get_day_ahead_prices",
+            "02xx": "calc_optimum",
+        }
+    }
+
+    new_config = migrate_unversioned_to_v0(old_config)
+
+    assert [e["time"] for e in new_config["scheduler"]["schedule"]] == ["0435", "02xx"]
+    SchedulerConfig(**new_config["scheduler"])
+
+
 def test_migrate_config_with_target_version():
     """Test migrate_config with explicit target version."""
     config = {
