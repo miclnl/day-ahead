@@ -47,7 +47,13 @@ fi
 
 export PYTHONPATH="/root:/root/dao:/root/dao/lib:/root/dao/prog"
 cd /root/dao/prog
-python3 check_db.py || bashio::log.info "check_db.py failed"
+# A failure here is not fatal -- the add-on still starts and the optimiser
+# still runs -- but it does mean a schema migration or an index/table
+# creation did not happen, which then shows up much later as a confusing
+# error during a task. Log it as a warning so it is visible in the add-on
+# log instead of blending into the info lines.
+python3 check_db.py || bashio::log.warning \
+  "check_db.py is mislukt; database-migraties zijn mogelijk niet uitgevoerd"
 
 if [ -d /config/miplib/lib ]; then
   bashio::log.info "Copying saved miplib-binaries"

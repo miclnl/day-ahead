@@ -23,7 +23,19 @@ import sqlalchemy_utils
 import os
 import logging
 
-from sqlalchemy import bindparam, delete
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    UniqueConstraint,
+    bindparam,
+    delete,
+    inspect,
+)
+from sqlalchemy.exc import NoSuchTableError
 
 from dao.prog.utils import interpolate
 
@@ -676,6 +688,70 @@ class DBmanagerObj(object):
                     self._variabel_cache[code] = ident
         return {c: self._variabel_cache[c] for c in codes if c in self._variabel_cache}
 
+    def ensure_forecasts_table(self) -> bool:
+        """Create the forecast archive table if it is not there yet.
+
+        Lives here rather than only in check_db.py because this is where the
+        table is used. check_db.py runs once at start-up and run.sh swallows
+        its failure with a single log line, so anything going wrong earlier
+        in that script left the table uncreated and every optimiser run
+        warning "Prognose-archief niet bijgewerkt: forecasts" -- a
+        NoSuchTableError whose str() is just the table name, which says
+        nothing about what to do. :meth:`save_forecasts` now calls this and
+        recovers on its own.
+
+        Unlike "values" and "prognoses" this table keeps the lead time at
+        which a forecast was made, so forecast quality can be measured
+        afterwards. The unique key caps it at one row per (variable, target,
+        lead bucket), which bounds its size regardless of how often the
+        optimiser runs.
+
+        Returns whether the table exists afterwards.
+        """
+        if inspect(self.engine).has_table("forecasts"):
+            return True
+        try:
+            # Reflect the real "variabel" table first. Without this the
+            # foreign key is resolved against whatever column types happen to
+            # be defined locally in metadata, which can mismatch the actual
+            # ones in MySQL/MariaDB (INT UNSIGNED versus INT) and make it
+            # reject the CREATE TABLE with errno 150, "Foreign key constraint
+            # is incorrectly formed".
+            if "variabel" in self.metadata.tables:
+                self.metadata.remove(self.metadata.tables["variabel"])
+            Table("variabel", self.metadata, autoload_with=self.engine)
+            forecasts = Table(
+                "forecasts",
+                self.metadata,
+                Column("id", Integer, primary_key=True, autoincrement=True),
+                Column(
+                    "variabel",
+                    Integer,
+                    ForeignKey("variabel.id", ondelete="CASCADE"),
+                    nullable=False,
+                ),
+                Column("target_time", BigInteger, nullable=False),
+                Column("lead_bucket", Integer, nullable=False),
+                Column("issued_time", BigInteger, nullable=False),
+                Column("value", Float),
+                UniqueConstraint("variabel", "target_time", "lead_bucket"),
+                sqlite_autoincrement=True,
+                extend_existing=True,
+            )
+            forecasts.create(self.engine, checkfirst=True)
+            Index("ix_forecasts_target", forecasts.c.target_time).create(
+                bind=self.engine, checkfirst=True
+            )
+        except Exception as exception:  # noqa: BLE001 - the archive is optional
+            logging.warning(
+                f"Tabel \"forecasts\" kon niet worden aangemaakt ({exception}); "
+                f"het prognose-archief wordt overgeslagen. De rest van de "
+                f"berekening is hierdoor niet be\u00efnvloed."
+            )
+            return False
+        logging.info('Tabel "forecasts" aangemaakt voor het prognose-archief.')
+        return True
+
     def save_forecasts(
         self,
         rows,
@@ -734,7 +810,21 @@ class DBmanagerObj(object):
         if not records:
             return 0
 
-        table = Table(tablename, self.metadata, autoload_with=self.engine)
+        try:
+            table = Table(tablename, self.metadata, autoload_with=self.engine)
+        except NoSuchTableError:
+            # check_db.py creates this at start-up, but run.sh swallows its
+            # failure, so a database that never got the table would warn on
+            # every single optimiser run with nothing but the table name to
+            # go on. Create it here and carry on; give up quietly (one clear
+            # line from ensure_forecasts_table) if that is not possible
+            # either, because the archive is a diagnostic, not part of the
+            # plan.
+            if not (
+                tablename == "forecasts" and self.ensure_forecasts_table()
+            ):
+                return 0
+            table = Table(tablename, self.metadata, autoload_with=self.engine)
         remove = delete(table).where(
             and_(
                 table.c.variabel == bindparam("b_variabel"),

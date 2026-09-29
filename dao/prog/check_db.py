@@ -441,48 +441,12 @@ class CheckDB:
     def ensure_forecast_table(self) -> None:
         """Create the forecast archive if it is not there yet.
 
-        Unlike "values" and "prognoses" this table keeps the lead time at which
-        a forecast was made, so forecast quality can be measured afterwards.
-        The unique key caps it at one row per (variable, target, lead bucket),
-        which bounds its size regardless of how often the optimizer runs.
+        The table definition lives on DBmanagerObj, next to the code that
+        writes to it: save_forecasts creates it on demand as well, so a
+        database that missed this step at start-up recovers by itself
+        instead of warning on every optimiser run.
         """
-        inspector = inspect(self.engine)
-        if "forecasts" in inspector.get_table_names():
-            return
-        metadata = self.db_da.metadata
-        # Replace the locally-defined "variabel" table in metadata with the
-        # actual schema loaded from the database. Without this, the FK on
-        # forecasts.variabel is resolved against the local Integer columns
-        # defined earlier in update_db_da, which can mismatch the real
-        # column types in MySQL/MariaDB (e.g. INT UNSIGNED vs INT) and
-        # cause errno 150 ("Foreign key constraint is incorrectly formed")
-        # when MySQL rejects the CREATE TABLE.
-        if "variabel" in metadata.tables:
-            metadata.remove(metadata.tables["variabel"])
-        Table("variabel", metadata, autoload_with=self.engine)
-        forecasts = Table(
-            "forecasts",
-            metadata,
-            Column("id", Integer, primary_key=True, autoincrement=True),
-            Column(
-                "variabel",
-                Integer,
-                ForeignKey("variabel.id", ondelete="CASCADE"),
-                nullable=False,
-            ),
-            Column("target_time", BigInteger, nullable=False),
-            Column("lead_bucket", Integer, nullable=False),
-            Column("issued_time", BigInteger, nullable=False),
-            Column("value", Float),
-            UniqueConstraint("variabel", "target_time", "lead_bucket"),
-            sqlite_autoincrement=True,
-            extend_existing=True,
-        )
-        forecasts.create(self.engine, checkfirst=True)
-        Index("ix_forecasts_target", forecasts.c.target_time).create(
-            bind=self.engine, checkfirst=True
-        )
-        print('Table "forecasts" gecreeerd.')
+        self.db_da.ensure_forecasts_table()
 
     def ensure_time_indexes(self) -> None:
         indexes = (
