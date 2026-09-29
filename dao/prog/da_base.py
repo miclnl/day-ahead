@@ -31,6 +31,7 @@ from dao.prog.version import __version__
 from pathlib import Path
 from dao.prog.config.loader import ConfigurationLoader
 from dao.prog.config.models.base import UNUSABLE_STATES
+from dao.prog import tasks as task_registry
 from dao.lib.db_connections import make_db_da, make_db_ha
 from dao.lib.da_meteo import Meteo
 from dao.lib.da_prices import DaPrices
@@ -456,77 +457,14 @@ class DaBase:
 
     @staticmethod
     def generate_tasks():
-        tasks = {
-            "calc_optimum_met_debug": {
-                "name": "Optimaliseringsberekening met debug",
-                "cmd": ["python3", "../prog/day_ahead.py", "debug", "calc"],
-                "object": "DaCalc",
-                "function": "calc_optimum_met_debug",
-                "file_name": "calc_debug",
-            },
-            "calc_optimum": {
-                "name": "Optimaliseringsberekening zonder debug",
-                "cmd": ["python3", "../prog/day_ahead.py", "calc"],
-                "object": "DaBase",
-                "function": "calc_optimum",
-                "file_name": "calc",
-            },
-            "tibber": {
-                "name": "Verbruiksgegevens bij Tibber ophalen",
-                "cmd": ["python3", "../prog/day_ahead.py", "tibber"],
-                "function": "get_tibber_data",
-                "file_name": "tibber",
-            },
-            "meteo": {
-                "name": "Meteoprognoses ophalen",
-                "cmd": ["python3", "../prog/day_ahead.py", "meteo"],
-                "function": "get_meteo_data",
-                "file_name": "meteo",
-            },
-            "prices": {
-                "name": "Day ahead prijzen ophalen",
-                "cmd": ["python3", "../prog/day_ahead.py", "prices"],
-                "function": "get_day_ahead_prices",
-                "file_name": "prices",
-            },
-            "calc_baseloads": {
-                "name": "Bereken de baseloads",
-                "cmd": ["python3", "../prog/day_ahead.py", "calc_baseloads"],
-                "function": "calc_baseloads",
-                "file_name": "baseloads",
-            },
-            "clean": {
-                "name": "Bestanden opschonen",
-                "cmd": ["python3", "../prog/day_ahead.py", "clean_data"],
-                "function": "clean_data",
-                "file_name": "clean",
-            },
-            "train_ml_predictions": {
-                "name": "ML modellen trainen",
-                "cmd": ["python3", "../prog/day_ahead.py", "train"],
-                "function": "train_ml_predictions",
-                "file_name": "train",
-            },
-            "consolidate": {
-                "name": "Verbruik/productie consolideren",
-                "cmd": ["python3", "../prog/day_ahead.py", "consolidate"],
-                "function": "consolidate_data",
-                "file_name": "consolidate",
-            },
-            "forecast_accuracy": {
-                "name": "Prognosefout rapporteren",
-                "cmd": ["python3", "../prog/day_ahead.py", "accuracy"],
-                "function": "forecast_accuracy",
-                "file_name": "accuracy",
-            },
-            "fast_control_simulate": {
-                "name": "Snelle regellaag: terugrekenen op historie",
-                "cmd": ["python3", "../prog/da_fast.py", "simulate"],
-                "function": "fast_control_simulate",
-                "file_name": "fast_simulate",
-            },
-        }
-        return tasks
+        """The task registry, kept in dao.prog.tasks.
+
+        This used to be the definition itself, one of four separate task
+        lists that had drifted apart (see the module docstring of
+        dao.prog.tasks). It stays as a method because the scheduler and the
+        v2 API already call DaBase.generate_tasks().
+        """
+        return dict(task_registry.TASKS)
 
     def start_logging(self):
         logging.debug(f"python pad:{sys.path}")

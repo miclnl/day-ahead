@@ -12,7 +12,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 _ALLOW_EXTRA = ConfigDict(extra="allow")
 
 
-# Valid scheduler actions
+# Valid scheduler actions.
+#
+# Spelled out as a Literal rather than derived from dao.prog.tasks so the
+# generated JSON schema carries an enum the settings UI can render as a
+# dropdown. That makes it a second list which can drift from the registry --
+# and it had: consolidate_data was a complete registry entry (function,
+# command, log file) that configuration validation rejected, so
+# consolidation could only ever be run by hand from the command line.
+# dao/tests/prog/test_tasks_registry.py asserts this literal and
+# tasks.schedulable_functions() stay identical.
 SchedulerAction = Literal[
     "get_meteo_data",
     "get_tibber_data",
@@ -21,6 +30,7 @@ SchedulerAction = Literal[
     "calc_optimum_met_debug",
     "clean_data",
     "calc_baseloads",
+    "consolidate_data",
     "train_ml_predictions",
     "forecast_accuracy",
 ]

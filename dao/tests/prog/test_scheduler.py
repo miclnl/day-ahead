@@ -14,7 +14,7 @@ import pytest
 
 pytest.importorskip("apscheduler")
 
-from dao.prog import da_scheduler  # noqa: E402
+from dao.prog import da_scheduler, task_state  # noqa: E402
 from dao.prog.da_scheduler import DaScheduler, cron_trigger  # noqa: E402
 
 TZ = ZoneInfo("Europe/Amsterdam")
@@ -127,5 +127,52 @@ def test_a_failing_task_does_not_propagate(monkeypatch, caplog):
     monkeypatch.setattr(instance, "run_task_process", boom)
     instance._run_exclusive("calc_optimum")
     assert "kaboom" in caplog.text
-    # The lock is released again after the failure.
-    assert not instance._task_locks["calc_optimum"].locked()
+    # The claim is released again after the failure, and the outcome is
+    # recorded so the dashboard can show that the run failed.
+    assert task_state.is_running("calc_optimum") is False
+    assert task_state.last_result("calc_optimum")["status"] == "error"
+
+
+def test_the_scheduler_claim_is_visible_outside_this_process(monkeypatch):
+    """The point of moving exclusion into task_state: the dashboard now sees
+    a scheduled run. With the old in-process threading.Lock, cron starting
+    calc_optimum at 05:44 and a user pressing the button at 05:44 produced
+    two optimisation runs writing the same tables."""
+    instance = _bare_scheduler(monkeypatch, [])
+    running = threading.Event()
+    release = threading.Event()
+
+    def slow_task(key_task):
+        running.set()
+        release.wait(5)
+        return True
+
+    monkeypatch.setattr(instance, "run_task_process", slow_task)
+
+    worker = threading.Thread(target=instance._run_exclusive, args=["calc_optimum"])
+    worker.start()
+    try:
+        assert running.wait(5)
+        # This is what a dashboard request does before starting a task.
+        assert task_state.claim("calc_optimum", "dashboard") is False
+        assert task_state.running_tasks()["calc_optimum"]["source"] == "scheduler"
+    finally:
+        release.set()
+        worker.join(5)
+
+    assert task_state.claim("calc_optimum", "dashboard") is True
+
+
+def test_a_task_started_elsewhere_makes_the_scheduler_skip(monkeypatch, caplog):
+    """The other direction: a task the user started from the dashboard must
+    not be started a second time when its cron time comes around."""
+    instance = _bare_scheduler(monkeypatch, [])
+    runs = []
+    monkeypatch.setattr(instance, "run_task_process", lambda key: runs.append(key))
+
+    task_state.claim("calc_optimum", "dashboard")
+    instance._run_exclusive("calc_optimum")
+
+    assert runs == []
+    assert "overgeslagen" in caplog.text
+    assert "dashboard" in caplog.text

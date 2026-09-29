@@ -19,7 +19,7 @@ import logging
 import os
 import signal
 import sys
-import threading
+import time
 from subprocess import Popen
 from zoneinfo import ZoneInfo
 
@@ -28,6 +28,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from da_base import DaBase
+from dao.prog import task_state
 from dao.prog.fastctrl.runner import start_if_enabled
 
 #: How late a job may still be started when the scheduler was busy or the
@@ -38,6 +39,12 @@ MISFIRE_GRACE_S = 300
 #: optimisation does not have to wait for ML training); the same task never
 #: overlaps itself, see _run_exclusive.
 MAX_PARALLEL_TASKS = 4
+
+#: How often a running task refreshes its claim. Well under
+#: task_state.STALE_AFTER_S so a task is never mistaken for dead, and long
+#: enough that a multi-hour ML training does not rewrite the state file
+#: thousands of times.
+HEARTBEAT_S = 30
 
 
 def cron_trigger(pattern: str, timezone) -> CronTrigger:
@@ -66,8 +73,7 @@ class DaScheduler(DaBase):
         self.schedule = list(self.config.scheduler.schedule)
         self.fast_control = None
         self.scheduler: BlockingScheduler | None = None
-        self._task_locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
+
 
     # -- running one task ---------------------------------------------------
 
@@ -87,7 +93,13 @@ class DaScheduler(DaBase):
         logging.info(f"Taak {key_task} gestart")
         started = datetime.datetime.now()
         proc = Popen(run_task["cmd"], cwd=self.PROG_DIR)
-        proc.wait()
+        # Keep the claim fresh while the task runs, so a long one (ML
+        # training) is not mistaken for a dead claim and started a second
+        # time by the dashboard. Polling instead of proc.wait() is what
+        # makes that possible.
+        while proc.poll() is None:
+            task_state.heartbeat(key_task)
+            time.sleep(HEARTBEAT_S)
         duration = (datetime.datetime.now() - started).total_seconds()
         if proc.returncode != 0:
             logging.error(
@@ -99,20 +111,30 @@ class DaScheduler(DaBase):
         return True
 
     def _run_exclusive(self, key_task: str) -> None:
-        """Run a task unless the previous run of the same task is still busy."""
-        with self._locks_guard:
-            lock = self._task_locks.setdefault(key_task, threading.Lock())
-        if not lock.acquire(blocking=False):
+        """Run a task unless the same task is already running.
+
+        The claim is taken through dao.prog.task_state, the same file-locked
+        registry the dashboards use, rather than an in-process
+        threading.Lock. A lock held only in this process was invisible to
+        the web server, so cron starting calc_optimum at 05:44 and a user
+        pressing the button at 05:44 produced two optimisation runs writing
+        the same tables and pushing conflicting setpoints to Home Assistant.
+        """
+        granted = task_state.claim(key_task, source="scheduler")
+        if not granted:
+            holder = task_state.running_tasks().get(key_task, {})
             logging.warning(
-                f"Taak {key_task} overgeslagen: de vorige run loopt nog"
+                f"Taak {key_task} overgeslagen: draait al "
+                f"(gestart door {holder.get('source', 'onbekend')})"
             )
             return
         try:
-            self.run_task_process(key_task)
+            ok = self.run_task_process(key_task)
         except Exception:  # noqa: BLE001 - the scheduler must keep running
             logging.exception(f"Taak {key_task} is mislukt")
-        finally:
-            lock.release()
+            task_state.release(key_task, "error")
+        else:
+            task_state.release(key_task, "done" if ok else "error")
 
     # -- fast control -------------------------------------------------------
 
