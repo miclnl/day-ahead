@@ -1047,64 +1047,114 @@ class DaBase:
         solar_predictor.run_train()
 
     def run_task_function(self, task, logfile: bool = True):
-        # klass = globals()["class_name"]
-        # instance = klass()
+        """Run *task* in this process, logging it to its own file.
 
-        # oude task
+        Every handler this adds to the root logger is removed again in the
+        finally, which is what the old version got wrong in three ways:
+
+        * the cleanup sat *after* a ``try`` that re-raised, so a task that
+          failed -- exactly when you want the log -- never reached it;
+        * ``removeHandler`` was never called for any of the three, only
+          ``close()``, and only for two of them. A closed FileHandler that
+          is still attached is worse than one that is left open: its
+          ``emit`` reopens the file on the next record, so the task's log
+          file was quietly reopened and appended to after the task had
+          finished (``main()`` logs the pool status after this returns);
+        * the NotificationHandler was added outside the ``if logfile:``
+          block and removed nowhere at all, so a second call in one process
+          left two attached and pushed every warning to Home Assistant
+          twice.
+        """
         if task not in self.tasks:
+            logging.error(f"Onbekende taak: {task}")
             return
         run_task = self.tasks[task]
-        file_handler = None
-        stream_handler = None
+        function_name = run_task.get("function")
+        if not function_name:
+            # fast_once and friends exist only as a subprocess; there is no
+            # method to call here.
+            logging.error(
+                f"Taak {task} kan niet in dit proces draaien, "
+                f"gebruik het commando: {' '.join(run_task['cmd'])}"
+            )
+            return
+
         logger = logging.getLogger()
         formatter = logging.Formatter(
             "%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
         )
-        if logfile:
-            # old_stdout = sys.stdout
-            for handler in logger.handlers[:]:  # make a copy of the list
-                logger.removeHandler(handler)
-            file_name = (
-                "../data/log/"
-                + run_task["file_name"]
-                + "_"
-                + datetime.datetime.now().strftime("%Y-%m-%d__%H:%M:%S")
-                + ".log"
-            )
-
-            file_handler = logging.FileHandler(file_name)
-            file_handler.setLevel(self.log_level)
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
-            stream_handler = logging.StreamHandler(sys.stdout)
-            stream_handler.setFormatter(formatter)
-            stream_handler.setLevel(self.log_level)
-            logger.addHandler(stream_handler)
-        if self.notification_entity is not None:
-            notification_handler = NotificationHandler(
-                _hass=self, _entity=self.notification_entity
-            )
-            notification_handler.setFormatter(formatter)
-            logger.addHandler(notification_handler)
-        self.start_logging()
+        added: list[Handler] = []
+        replaced: list[Handler] = []
+        file_handler = None
+        # The handlers below are given self.log_level, which only has any
+        # effect if the logger itself passes those records on. __init__ sets
+        # the root level, but relying on that made this method silently
+        # depend on how it was reached; set it here too and restore it after.
+        previous_level = logger.level
         try:
+            logger.setLevel(self.log_level)
+            if logfile:
+                # The task's output belongs in its own file, so whatever was
+                # configured before (the basicConfig handler from __init__)
+                # is set aside for the duration and restored in the finally.
+                replaced = logger.handlers[:]
+                for handler in replaced:
+                    logger.removeHandler(handler)
+                file_name = (
+                    "../data/log/"
+                    + run_task["file_name"]
+                    + "_"
+                    + datetime.datetime.now().strftime("%Y-%m-%d__%H:%M:%S")
+                    + ".log"
+                )
+                file_handler = logging.FileHandler(file_name)
+                file_handler.setLevel(self.log_level)
+                file_handler.setFormatter(formatter)
+                logger.addHandler(file_handler)
+                added.append(file_handler)
+                # Also to stdout, which is what Home Assistant's supervisor
+                # captures as the add-on log.
+                stream_handler = logging.StreamHandler(sys.stdout)
+                stream_handler.setFormatter(formatter)
+                stream_handler.setLevel(self.log_level)
+                logger.addHandler(stream_handler)
+                added.append(stream_handler)
+            if self.notification_entity is not None:
+                notification_handler = NotificationHandler(
+                    _hass=self, _entity=self.notification_entity
+                )
+                notification_handler.setFormatter(formatter)
+                logger.addHandler(notification_handler)
+                added.append(notification_handler)
+
+            self.start_logging()
             logging.info(
                 f"Day Ahead Optimalisatie gestart: "
                 f"{datetime.datetime.now().strftime('%d-%m-%Y %H:%M:%S')} "
-                f"taak: {run_task['function']}"
+                f"taak: {function_name}"
             )
             self.db_da.log_pool_status()
-            getattr(self, run_task["function"])()
+            getattr(self, function_name)()
             self.set_last_activity()
             self.db_da.log_pool_status()
         except Exception:
             logging.exception("Er is een fout opgetreden, zie de fout-tracering")
             raise
-
-        if logfile:
-            file_handler.flush()
-            file_handler.close()
-            stream_handler.close()
+        finally:
+            # Detach first, then close: a handler that is closed while still
+            # attached gets used again by the next log record.
+            for handler in added:
+                logger.removeHandler(handler)
+            if file_handler is not None:
+                file_handler.flush()
+            for handler in added:
+                try:
+                    handler.close()
+                except Exception:  # noqa: BLE001 - closing must not mask the task's own error
+                    pass
+            for handler in replaced:
+                logger.addHandler(handler)
+            logger.setLevel(previous_level)
 
     def run_task_cmd(self, task):
         if task not in self.tasks:

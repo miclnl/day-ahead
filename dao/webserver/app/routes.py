@@ -20,7 +20,6 @@ import os
 import threading
 from subprocess import Popen, PIPE, run, STDOUT, TimeoutExpired
 import logging
-from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from dao.prog.config.loader import (
     ConfigurationLoader,
@@ -71,7 +70,6 @@ def validate_settings_document(setting: str, text: str) -> None:
         raise ValueError("secrets.json moet een JSON-object met sleutel/waarde zijn")
 
 
-logname = "dashboard.log"
 
 browse = {}
 
@@ -232,20 +230,6 @@ def check_web_menu_items():
 
 
 check_web_menu_items()
-
-_save_days = config.history.save_days if config is not None else 7
-handler = TimedRotatingFileHandler(
-    "../data/log/" + logname,
-    when="midnight",
-    backupCount=_save_days,
-)
-handler.suffix = "%Y%m%d"
-handler.setLevel(logging.INFO)
-logging.basicConfig(
-    level=logging.DEBUG,
-    handlers=[handler],
-    format=f"%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s",
-)
 
 if config is not None:
     sensor_co2_intensity = (

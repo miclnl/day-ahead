@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 from pathlib import Path
 
 from flask import Flask, abort, request, send_from_directory
@@ -26,6 +27,51 @@ SUPERVISOR_NETWORK = ipaddress.ip_network("172.30.32.2/32")
 ALLOW_DIRECT = os.environ.get("DAO_ALLOW_DIRECT") == "1"
 
 _IMAGE_NAME = re.compile(r"^[\w.\-]+\.png$")
+
+
+def _configure_logging() -> None:
+    """Send the dashboard's log to stdout, once per worker process.
+
+    This used to happen at import time in app/routes.py, which created a
+    TimedRotatingFileHandler on ../data/log/dashboard.log and passed it to
+    basicConfig as the *only* handler. Two problems with that:
+
+    * gunicorn runs two worker processes (see gunicorn_config.py), so two
+      processes held a rotating handler on the same file. At midnight both
+      try to rename it; one wins and the other keeps writing to a file that
+      has been renamed out from under it.
+    * replacing the default handler meant nothing the dashboard logged ever
+      reached stdout, so none of it showed up in the Home Assistant add-on
+      log -- while the scheduler and the task subprocesses, which do log to
+      stdout, did. The add-on's log was quietly missing half the system.
+
+    Supervisor captures the container's stdout, so stdout is the whole
+    mechanism; there is nothing to rotate and nothing to coordinate between
+    workers. Task output is a separate matter: each task still writes its
+    own file under ../data/log, which is what the dashboard's log viewer
+    reads.
+
+    Living here rather than in app/routes.py also means it no longer depends
+    on the v1 dashboard being imported: v2 and the API had no logging setup
+    of their own and silently relied on v1's, so removing v1 would have left
+    the web server with no logging configuration at all.
+    """
+    root = logging.getLogger()
+    if any(getattr(h, "_dao_dashboard", False) for h in root.handlers):
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    handler._dao_dashboard = True
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+
+_configure_logging()
 
 
 class IngressMiddleware:
