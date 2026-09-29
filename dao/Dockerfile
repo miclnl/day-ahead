@@ -9,8 +9,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update -y && \
     apt-get install -y pkgconf file \
-      libmariadb-dev postgresql-client libjpeg-dev libffi-dev \
-      libnauty-dev coinor-libcgl-dev gcc g++ libmariadb3 mariadb-client \
+      postgresql-client libjpeg-dev libffi-dev \
+      libnauty-dev coinor-libcgl-dev gcc g++ \
       python3 python3-venv python3-pip npm
 
 WORKDIR /root/dao
@@ -19,7 +19,6 @@ RUN python3 -m venv $VIRTUAL_ENV
 
 COPY requirements.txt /root/dao/requirements.txt
 
-RUN if [ "x${BUILD_ARCH}" = "xaarch64" ]; then ln -s `which mariadb_config` /usr/local/bin/mariadb_config; fi
 RUN source $VIRTUAL_ENV/bin/activate \
     && pip3 install uv \
     && uv pip install  -r /root/dao/requirements.txt \
@@ -44,10 +43,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   apt-get update -y && \
   apt-get upgrade -y && \
   apt-get install -y file mariadb-client inotify-tools procps \
-    gunicorn libmariadb3 postgresql-client sqlite3 wget nano git\
-    libmariadb-dev libjpeg-dev libffi-dev \
+    postgresql-client sqlite3 wget nano git \
+    libjpeg-dev libffi-dev \
     libnauty-dev coinor-libcgl-dev gcc g++ \
-    python3 python3-venv python3-pip npm 
+    python3 python3-venv python3-pip
 
 # Copy software for add-on
 RUN mkdir /root/dao
