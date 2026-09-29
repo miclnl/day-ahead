@@ -26,6 +26,9 @@ database): the web server imports this to render its task list and must not
 pay for the whole optimiser to do so.
 """
 
+import logging
+import os
+import signal
 from typing import Any, Iterable, Optional
 
 _PY = "python3"
@@ -250,6 +253,25 @@ def api_timeout_s(key: str) -> int:
     if task is None:
         return API_RUN_TIMEOUT_S
     return min(int(task.get("timeout_s", API_RUN_TIMEOUT_S)), API_RUN_TIMEOUT_S)
+
+
+def kill_process_group(proc) -> None:
+    """Kill a task subprocess and everything it spawned.
+
+    Tasks are started with ``start_new_session=True``, which gives them
+    their own process group. A bare ``proc.kill()`` only reaches that one
+    process; if the script it runs forks or execs a helper of its own, that
+    helper would be left running as an orphan after a cancel.
+
+    Lives here rather than in either dashboard because both of them cancel
+    tasks and the two copies had already started to differ.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # already exited
+    except OSError as exception:
+        logging.warning(f"Kon procesgroep van pid {proc.pid} niet stoppen: {exception}")
 
 
 def menu_entries(keys: Optional[Iterable[str]] = None) -> dict[str, dict[str, Any]]:

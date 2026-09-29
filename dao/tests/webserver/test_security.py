@@ -16,22 +16,13 @@ linked) and imports the app from there.
 """
 
 import json
-import re
 
 import pytest
 
 pytest.importorskip("flask")
 pytest.importorskip("flask_wtf")
 
-from .conftest import INGRESS, SUPERVISOR  # noqa: E402
-
-
-def _csrf_token(client, path):
-    response = client.get(path, headers=INGRESS, environ_base=SUPERVISOR)
-    assert response.status_code == 200
-    match = re.search(rb'name="csrf_token" value="([^"]+)"', response.data)
-    assert match, "page has no csrf token"
-    return match.group(1).decode()
+from .conftest import INGRESS, SUPERVISOR, csrf_token as _csrf_token  # noqa: E402
 
 
 def test_direct_requests_are_refused(client):

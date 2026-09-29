@@ -56,3 +56,19 @@ def client(site, tmp_path_factory):
     finally:
         os.chdir(previous)
         sys.path.remove(str(site / "webserver"))
+
+
+def csrf_token(client, path: str) -> str:
+    """A valid CSRF token, scraped from a rendered page.
+
+    Every POST route is CSRF-protected (Flask-WTF, see app/__init__.py), so
+    a test that posts has to carry a real token; without one the response is
+    a 400 and the test would be asserting on the wrong thing.
+    """
+    import re
+
+    response = client.get(path, headers=INGRESS, environ_base=SUPERVISOR)
+    assert response.status_code == 200
+    match = re.search(rb'name="csrf_token" value="([^"]+)"', response.data)
+    assert match, f"page {path} has no csrf token"
+    return match.group(1).decode()

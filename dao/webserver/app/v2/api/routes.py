@@ -1,8 +1,9 @@
 from flask import Blueprint, abort, render_template, request, redirect, url_for
 from markupsafe import escape
 from dao.prog.da_report import Report
-from subprocess import run as subprocess_run
-from dao.prog.da_base import DaBase
+from subprocess import TimeoutExpired, run as subprocess_run
+from dao.prog import task_state
+from dao.prog import tasks as task_registry
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, available_timezones
 
@@ -68,16 +69,51 @@ def data():
 
 @api.route("/run/<string:task>")
 def run(task: str):
-    tasks = DaBase.generate_tasks()
-    if task in tasks.keys():
-        proc = subprocess_run(tasks[task]["cmd"], capture_output=True, text=True)
-        data = proc.stdout
-        err = proc.stderr
-        log_content = data + err
-
-        return log_content, {"Content-Type": "text/plain"}
-    else:
+    definition = task_registry.get(task)
+    if definition is None:
         return f"Unknown task: {escape(task)}", 404
+    canonical = task_registry.resolve(task)
+
+    # This endpoint runs the task inside the request, so it needs the same
+    # claim as every other starter (otherwise it happily runs a second
+    # optimisation alongside the one cron just started) and a cap below
+    # gunicorn's own per-request timeout. It had neither: without a timeout
+    # gunicorn killed the worker at 120 s and the child was orphaned, with
+    # no output returned at all.
+    if not task_state.claim(canonical, source="api"):
+        holder = task_state.running_tasks().get(canonical, {})
+        return (
+            f"Task already running (started by "
+            f"{holder.get('source', 'unknown')}): {canonical}",
+            409,
+            {"Content-Type": "text/plain"},
+        )
+
+    timeout_s = task_registry.api_timeout_s(canonical)
+    status = "error"
+    returncode = None
+    try:
+        proc = subprocess_run(
+            definition["cmd"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        log_content = proc.stdout + proc.stderr
+        returncode = proc.returncode
+        status = "done" if returncode == 0 else "error"
+    except TimeoutExpired as exception:
+        log_content = (
+            f"Task {canonical} aborted after {timeout_s}s timeout.\n"
+            f"Use the task page for tasks that take longer: those run in "
+            f"the background without this limit.\n"
+            f"stdout so far:\n{exception.stdout or ''}\n"
+            f"stderr so far:\n{exception.stderr or ''}\n"
+        )
+    finally:
+        task_state.release(canonical, status, returncode=returncode)
+
+    return log_content, {"Content-Type": "text/plain"}
 
 
 @api.route("/data-sql-ha/")

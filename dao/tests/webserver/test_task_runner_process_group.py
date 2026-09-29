@@ -1,16 +1,27 @@
-"""run_and_log() spawns the requested script as its own session leader and,
-on cancellation, kills the whole process group rather than just the direct
-child. Without start_new_session=True a script that forks or execs a helper
-of its own could leave that helper running as an orphan after "cancel"."""
+"""run_and_log spawns a task as its own session leader and, on cancel,
+kills the whole process group rather than just the direct child.
+
+Without start_new_session=True a task that forks or execs a helper of its
+own could leave that helper running as an orphan after a cancel. The kill
+itself lives in dao.prog.tasks because both dashboards cancel tasks and the
+two copies had started to differ.
+
+These tests drive the v2 runner, which is the one with a cancel path.
+"""
 
 import os
 import signal
 
+import pytest
+
+from dao.prog import task_state
+from dao.prog import tasks as task_registry
+
 
 class FakeProc:
-    """Stands in for subprocess.Popen: exits immediately unless kill()'d."""
+    """Stands in for subprocess.Popen: runs for one poll, then exits."""
 
-    def __init__(self, cmd, **kwargs):
+    def __init__(self, cmd=None, **kwargs):
         self.cmd = cmd
         self.kwargs = kwargs
         self.pid = 4242
@@ -19,8 +30,6 @@ class FakeProc:
         self._polls = 0
 
     def poll(self):
-        # First poll: still running, so run_and_log takes the cancellation
-        # branch. After that: finished.
         self._polls += 1
         if self._killed:
             return 0
@@ -33,11 +42,14 @@ class FakeProc:
         self._killed = True
 
 
-def test_run_and_log_starts_a_new_session(client, monkeypatch):
+@pytest.fixture
+def v2_routes(client):
     import importlib
 
-    v2_routes = importlib.import_module("app.v2.routes")
+    return importlib.import_module("app.v2.routes")
 
+
+def test_run_and_log_starts_a_new_session(v2_routes, monkeypatch):
     captured = {}
 
     def fake_popen(cmd, **kwargs):
@@ -45,56 +57,75 @@ def test_run_and_log_starts_a_new_session(client, monkeypatch):
         return FakeProc(cmd, **kwargs)
 
     monkeypatch.setattr(v2_routes, "Popen", fake_popen)
-    monkeypatch.setattr(
-        v2_routes, "get_task_state", lambda: {"status": "idle", "logfile": None}
-    )
-    monkeypatch.setattr(v2_routes, "save_task_state", lambda state: None)
     monkeypatch.setattr(v2_routes.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(v2_routes, "get_file_list_with_ts", lambda path, pattern: [])
 
-    v2_routes.run_and_log(
-        ["python3", "noop.py"], {"logfile": None, "status": "running"}
-    )
+    task_state.claim("meteo", "dashboard")
+    v2_routes.run_and_log(["python3", "noop.py"], "meteo")
 
     assert captured.get("start_new_session") is True
 
 
-def test_cancel_kills_the_whole_process_group(client, monkeypatch, tmp_path):
-    import importlib
+def test_the_claim_is_released_when_the_task_finishes(v2_routes, monkeypatch):
+    monkeypatch.setattr(v2_routes, "Popen", lambda cmd, **kw: FakeProc(cmd, **kw))
+    monkeypatch.setattr(v2_routes.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(v2_routes, "get_file_list_with_ts", lambda path, pattern: [])
 
-    v2_routes = importlib.import_module("app.v2.routes")
+    task_state.claim("meteo", "dashboard")
+    v2_routes.run_and_log(["python3", "noop.py"], "meteo")
 
+    assert task_state.is_running("meteo") is False
+    assert task_state.last_result("meteo")["status"] == "done"
+
+
+def test_the_claim_is_released_when_the_task_crashes(v2_routes, monkeypatch):
+    """Without this a crashed run would keep its claim until the staleness
+    window expired, blocking the task for ten minutes."""
+
+    def boom(cmd, **kwargs):
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr(v2_routes, "Popen", boom)
+    monkeypatch.setattr(v2_routes, "get_file_list_with_ts", lambda path, pattern: [])
+
+    task_state.claim("meteo", "dashboard")
+    with pytest.raises(OSError):
+        v2_routes.run_and_log(["python3", "noop.py"], "meteo")
+
+    assert task_state.is_running("meteo") is False
+    assert task_state.last_result("meteo")["status"] == "error"
+
+
+def test_cancel_kills_the_whole_process_group(v2_routes, monkeypatch, tmp_path):
     fake_proc = FakeProc(["python3", "noop.py"], start_new_session=True)
     monkeypatch.setattr(v2_routes, "Popen", lambda cmd, **kw: fake_proc)
-    monkeypatch.setattr(
-        v2_routes,
-        "get_task_state",
-        lambda: {"status": "cancelled", "logfile": str(logfile)},
-    )
-    monkeypatch.setattr(v2_routes, "save_task_state", lambda state: None)
-
-    killed = {}
-
-    def fake_killpg(pgid, sig):
-        killed["pgid"] = pgid
-        killed["sig"] = sig
-
-    monkeypatch.setattr(os, "killpg", fake_killpg)
-    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(v2_routes.time, "sleep", lambda seconds: None)
 
     logfile = tmp_path / "run.log"
     logfile.write_text("partial output")
+    log_dir = str(tmp_path)
+    monkeypatch.setattr(v2_routes, "app_datapath", str(tmp_path.parent))
+    monkeypatch.setattr(
+        v2_routes,
+        "get_file_list_with_ts",
+        lambda path, pattern: [{"name": logfile.name}],
+    )
 
-    v2_routes.run_and_log(["python3", "noop.py"], {"logfile": str(logfile)})
+    killed = {}
+    monkeypatch.setattr(
+        os, "killpg", lambda pgid, sig: killed.update(pgid=pgid, sig=sig)
+    )
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+
+    task_state.claim("meteo", "dashboard")
+    task_state.request_cancel("meteo")
+    v2_routes.run_and_log(["python3", "noop.py"], "meteo")
 
     assert killed == {"pgid": fake_proc.pid, "sig": signal.SIGKILL}
-    assert not logfile.exists()  # cancelled tasks drop their partial log
+    assert task_state.last_result("meteo")["status"] == "cancelled"
 
 
-def test_kill_process_group_swallows_already_exited_process(client, monkeypatch):
-    import importlib
-
-    v2_routes = importlib.import_module("app.v2.routes")
-
+def test_kill_process_group_swallows_already_exited_process(monkeypatch):
     class DeadProc:
         pid = 99999
 
@@ -104,4 +135,18 @@ def test_kill_process_group_swallows_already_exited_process(client, monkeypatch)
     monkeypatch.setattr(os, "getpgid", raise_lookup)
 
     # Must not raise even though the process is already gone.
-    v2_routes._kill_process_group(DeadProc())
+    task_registry.kill_process_group(DeadProc())
+
+
+def test_kill_process_group_logs_other_os_errors(monkeypatch, caplog):
+    class Proc:
+        pid = 1
+
+    def raise_perm(pid):
+        raise PermissionError("not allowed")
+
+    monkeypatch.setattr(os, "getpgid", raise_perm)
+
+    task_registry.kill_process_group(Proc())
+
+    assert "procesgroep" in caplog.text

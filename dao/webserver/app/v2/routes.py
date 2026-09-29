@@ -1,10 +1,12 @@
-import time, os, fnmatch, re, datetime, time, threading, json, signal
+import time, os, fnmatch, re, datetime, threading, json, logging
 from flask import Blueprint, abort, render_template, request, redirect, url_for
 
 from dao.prog.version import __version__
 from subprocess import Popen, PIPE, run, STDOUT, DEVNULL
 from pathlib import Path
 from dao.prog.da_report import Report
+from dao.prog import task_state
+from dao.prog import tasks as task_registry
 from dao.prog.config.loader import (
     ConfigurationLoader,
     atomic_write_text,
@@ -95,135 +97,98 @@ def get_closest_index_from_list(flist: list, ts: float) -> int:
     )
 
 
-STATEFILE = "../data/task_state.json"
-STALE_AFTER = 600
-
-def save_task_state(state):
-    # Write to tmp file and replace (atomic)
-    # This prevents race condition between read and write
-    state = {
-        **state,
-        "last_update": time.time(),
-    }
-
-    temp_file = STATEFILE + ".tmp"
-
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-        f.flush()
-        os.fsync(f.fileno())
-
-    os.replace(temp_file, STATEFILE)
+#: How often a running task refreshes its claim and checks for a cancel.
+#: Well under task_state.STALE_AFTER_S.
+HEARTBEAT_S = 1
 
 
 def get_task_state() -> dict:
-    no_state = {
-        "status": "idle",
-        "task": None,
-        "logfile": None,
-        "started": None,
-    }
+    """The task this dashboard's task page reports on.
 
-    try:
-        with open(STATEFILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-    except FileNotFoundError:
-        return no_state
-    except (json.JSONDecodeError, OSError):
-        return no_state
-
-    last_update = state.get("last_update", 0)
-
-    if (
-        state.get("status") == "running"
-        and time.time() - last_update > STALE_AFTER
-    ):
-        return no_state
-
-    return state
-
-def _kill_process_group(proc):
-    """Kill the task subprocess and anything it spawned.
-
-    The task is started with start_new_session=True, giving it its own
-    process group. A bare proc.kill() only reaches that one process; if
-    the script it runs forks or execs a helper of its own, that helper
-    would otherwise be left running as an orphan after "cancel".
+    Claims are per task (see dao/prog/task_state.py) but this page shows one
+    task at a time: the running one, or the most recently finished when
+    nothing runs. Returns the flat shape the template and the poll endpoint
+    already expected.
     """
+    state = task_state.read()
+    running = state["running"]
+    if running:
+        key = max(running, key=lambda k: running[k].get("started") or 0)
+        entry = running[key]
+        return {
+            "status": "cancelled" if entry.get("cancel") else "running",
+            "task": key,
+            "logfile": entry.get("logfile"),
+            "started": entry.get("started"),
+            "returncode": None,
+        }
+    finished = state["last"]
+    if finished:
+        key = max(finished, key=lambda k: finished[k].get("finished") or 0)
+        entry = finished[key]
+        return {
+            "status": entry.get("status", "idle"),
+            "task": key,
+            "logfile": entry.get("logfile"),
+            "started": entry.get("started"),
+            "returncode": entry.get("returncode"),
+        }
+    return {"status": "idle", "task": None, "logfile": None, "started": None}
+
+
+def run_and_log(cmd, task_key):
+    """Run a claimed task and keep its claim fresh until it finishes.
+
+    The caller must already hold the claim on *task_key* (see task_exec);
+    releasing it is this function's job, on every path, so a crashed run
+    does not block the next one for the full staleness window.
+
+    The task writes its own log file, so the name is discovered by watching
+    the log directory for a file that appeared after the start. This used to
+    be tangled up with ownership detection -- comparing its own log file
+    against the one in the shared single-slot state and killing itself when
+    they differed -- which is no longer needed now that a claim is per task
+    and belongs unambiguously to this run.
+    """
+    log_dir = os.path.join(app_datapath, "log")
+    existing = get_file_list_with_ts(log_dir, "*.log")
+    newest_before = existing[-1]["name"] if existing else None
+
+    logfile = None
+    status = "error"
+    returncode = None
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError:
-        pass  # already exited
-
-
-def run_and_log(cmd, state):
-    flist = get_file_list_with_ts(os.path.join(app_datapath, "log"),"*.log",)
-
-    last_log_file = None
-    if len(flist) > 0:
-        last_log_file = app_datapath + "log/" + flist[-1]["name"]
-
-    print(cmd)
-    proc = Popen(
-        cmd,
-        stdout=DEVNULL,
-        stderr=DEVNULL,
-        text=True,
-        start_new_session=True,
-    )
-
-    while proc.poll() is None:
-        updated_state = get_task_state()
-
-        if updated_state.get("status") == "cancelled":
-            if state["logfile"] and os.path.exists(state["logfile"]):
-                os.remove(state["logfile"])
-
-            _kill_process_group(proc)
-            break
-
-        if state["logfile"] is None:
-            flist = get_file_list_with_ts(
-                os.path.join(app_datapath, "log"),
-                "*.log",
-            )
-
-            if flist:
-                logfile = os.path.join(
-                    app_datapath,
-                    "log",
-                    flist[-1]["name"],
-                )
-
-                if logfile != last_log_file:
-                    state["logfile"] = logfile
-                    save_task_state(state)
-
-        elif state["logfile"] != updated_state.get("logfile"):
-            if os.path.exists(state["logfile"]):
-                os.remove(state["logfile"])
-
-            _kill_process_group(proc)
-            break
-
-        # Neem de actuele status over voordat de heartbeat geschreven wordt.
-        state["status"] = updated_state.get("status", state["status"])
-
-        if state["status"] == "running":
-            save_task_state(state)
-
-        time.sleep(1)
-
-    proc.wait()
-
-    updated_state = get_task_state()
-
-    if updated_state["logfile"] == state["logfile"]:
-        print("Task completed")
-        print(proc.returncode)
-        state["status"] = "done" if proc.returncode == 0 else "error"
-        state["returncode"] = proc.returncode
-        save_task_state(state)
+        proc = Popen(
+            cmd,
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        cancelled = False
+        while proc.poll() is None:
+            entry = task_state.heartbeat(task_key, logfile=logfile)
+            if entry.get("cancel"):
+                cancelled = True
+                task_registry.kill_process_group(proc)
+                break
+            if logfile is None:
+                flist = get_file_list_with_ts(log_dir, "*.log")
+                if flist and flist[-1]["name"] != newest_before:
+                    logfile = os.path.join(log_dir, flist[-1]["name"])
+            time.sleep(HEARTBEAT_S)
+        proc.wait()
+        returncode = proc.returncode
+        if cancelled:
+            status = "cancelled"
+            # A cancelled run's partial log is not worth keeping around.
+            if logfile and os.path.exists(logfile):
+                os.remove(logfile)
+            logfile = None
+        else:
+            status = "done" if returncode == 0 else "error"
+    finally:
+        task_state.release(task_key, status, returncode=returncode, logfile=logfile)
 
 
 def log_chart(datapath: str, pattern: str):
@@ -345,73 +310,53 @@ def tasks():
 @v2.route("/task-cancel")
 def task_cancel():
     try:
-        state = get_task_state()
-        state["status"] = "cancelled"
-        save_task_state(state)
+        for key in task_state.running_tasks():
+            task_state.request_cancel(key)
         return render_template("v2/tasks.html")
     except Exception:
+        logging.exception("Afbreken van de taak is mislukt")
         return "Error cancelling task", 500
 
 
 @v2.route("/task-exec", methods=["POST"])
 def task_exec():
-    current_state = get_task_state()
+    requested = request.form.to_dict().get("task", "")
+    canonical = task_registry.resolve(requested)
+    if canonical is None:
+        return "Invalid action", 400
 
-    if current_state["status"] == "running":
-        return "Process already running: " + current_state["task"], 500
+    values = {"days": request.form.get("days", "14")}
+    cmd = task_registry.build_cmd(canonical, values)
 
-    task = request.form.to_dict()["task"]
-
-    extra = [request.form.get("days", "14")]
-
-    argv = None
-    script = None
-    match task:
-        case "optimize_debug":
-            argv, script = ["debug", "calc"], "day_ahead.py"
-        case "optimize_regular":
-            argv, script = ["calc"], "day_ahead.py"
-        case "calc_baseloads":
-            argv, script = ["calc_baseloads"], "day_ahead.py"
-        case "update_tibber":
-            argv, script = ["tibber"], "day_ahead.py"
-        case "update_meteo":
-            argv, script = ["meteo"], "day_ahead.py"
-        case "update_prices":
-            argv, script = ["prices"], "day_ahead.py"
-        case "train_ml":
-            argv, script = ["train"], "day_ahead.py"
-        case "fast_once":
-            argv, script = ["once"], "da_fast.py"
-        case "fast_simulate":
-            argv, script = ["simulate", "--days", *extra], "da_fast.py"
-
-    if argv is None or script is None:
-        return "Invalid action", 500
-
-    # Save the state synchronous to prevent race condition
-    state = {
-        "status": "running",
-        "started": time.time(),
-        "task": task,
-        "returncode": None,
-        "logfile": None,
-    }
-    save_task_state(state)
-
-    cmd = ["python3", f"../prog/{script}", *argv]
+    # Claim before starting the thread. The check and the write happen
+    # together under a lock, so two near-simultaneous posts cannot both get
+    # past it, and a run started by cron for the same task blocks this one
+    # (and the other way around) -- the scheduler takes its claims from the
+    # same registry.
+    logfile = None
+    if not task_state.claim(canonical, source="dashboard", logfile=logfile):
+        holder = task_state.running_tasks().get(canonical, {})
+        return (
+            f"Taak draait al (gestart door {holder.get('source', 'onbekend')}): "
+            f"{task_registry.get(canonical)['name']}",
+            409,
+        )
 
     threading.Thread(
         target=run_and_log,
-        args=(cmd, state),
-        daemon=True
+        args=(cmd, canonical),
+        daemon=True,
     ).start()
 
     return redirect(url_for('v2.task_state'))
 
 
-@v2.route("/task-state", methods=["GET"])
-def task_state():
+# endpoint="task_state" keeps url_for('v2.task_state') and the two
+# templates using it working; the function itself is renamed because
+# task_state is also the module holding the shared claims (imported above)
+# and a route function of that name would shadow it for the whole module.
+@v2.route("/task-state", methods=["GET"], endpoint="task_state")
+def task_state_page():
     current_state = get_task_state()
 
     content = "No logfile available"

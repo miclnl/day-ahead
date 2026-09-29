@@ -30,6 +30,8 @@ from dao.prog.config.loader import (
 )
 from dao.prog.da_report import Report
 from dao.prog.version import __version__
+from dao.prog import task_state
+from dao.prog import tasks as task_registry
 import json
 
 # globals
@@ -265,65 +267,55 @@ else:
     web_menu["savings"]["submenu"]["co2"]["periods"]["list"].remove("vandaag en morgen")
     web_menu["savings"]["submenu"]["co2"]["periods"]["list"].remove("morgen")
 
-bewerkingen = {
-    "calc_met_debug": {
-        "name": "Optimaliseringsberekening met debug",
-        "cmd": ["python3", "../prog/day_ahead.py", "debug", "calc"],
-        "task": "calc_optimum",
-        "file_name": "calc_debug",
-    },
-    "calc_zonder_debug": {
-        "name": "Optimaliseringsberekening zonder debug",
-        "cmd": ["python3", "../prog/day_ahead.py", "calc"],
-        "task": "calc_optimum",
-        "file_name": "calc",
-    },
-    "get_tibber": {
-        "name": "Verbruiksgegevens bij Tibber ophalen",
-        "cmd": ["python3", "../prog/day_ahead.py", "tibber"],
-        "task": "get_tibber_data",
-        "file_name": "tibber",
-    },
-    "get_meteo": {
-        "name": "Meteoprognoses ophalen",
-        "cmd": ["python3", "../prog/day_ahead.py", "meteo"],
-        "task": "get_meteo_data",
-        "file_name": "meteo",
-    },
-    "get_prices": {
-        "name": "Day ahead prijzen ophalen",
-        "cmd": ["python3", "../prog/day_ahead.py", "prices"],
-        "task": "get_day_ahead_prices",
-        "parameters": ["prijzen_start", "prijzen_tot"],
-        "file_name": "prices",
-    },
-    "calc_baseloads": {
-        "name": "Bereken de baseloads",
-        "cmd": ["python3", "../prog/day_ahead.py", "calc_baseloads"],
-        "task": "calc_baseloads",
-        "file_name": "baseloads",
-    },
-    "train_ml_predictions": {
-        "name": "ML modellen trainen",
-        "cmd": ["python3", "../prog/day_ahead.py", "train"],
-        "function": "train_ml_predictions",
-        "file_name": "train",
-    },
-    "fast_once": {
-        "name": "Fast control: run once",
-        "cmd": ["python3", "../prog/da_fast.py", "once"],
-        "task": "fast_once",
-        "file_name": "fast_once",
-    },
-    "fast_simulate": {
-        "name": "Fast control: backtest",
-        "cmd": ["python3", "../prog/da_fast.py", "simulate", "--days"],
-        "task": "fast_simulate",
-        "parameters": ["days"],
-        "file_name": "fast_simulate",
-        "timeout_s": 600,
-    },
-}
+# The tasks this dashboard offers, derived from the one registry in
+# dao/prog/tasks.py. Keyed by the historical v1 keys (which are aliases in
+# the registry) so existing form values, bookmarks and /api/run/<key> URLs
+# keep working. clean, consolidate and forecast_accuracy are new here: they
+# had a complete registry entry all along but were listed in neither
+# dashboard, so they could only be run from the command line.
+_V1_TASK_KEYS = (
+    "calc_met_debug",
+    "calc_zonder_debug",
+    "get_prices",
+    "get_meteo",
+    "get_tibber",
+    "calc_baseloads",
+    "consolidate",
+    "forecast_accuracy",
+    "train_ml_predictions",
+    "clean",
+    "fast_once",
+    "fast_simulate",
+)
+
+
+def _build_bewerkingen() -> dict:
+    """Registry entries under their v1 keys, with the fields run.html reads.
+
+    run.html iterates value["parameters"] and renders value["wait"] into a
+    setTimeout call. Jinja renders a missing key as an empty string, so the
+    entries that had no "wait" (all of them) produced
+    ``setTimeout(callback, )`` -- a JavaScript syntax error, which is why
+    the "bewerking wordt uitgevoerd" page never resubmitted itself. Both
+    keys are always present now.
+    """
+    entries = {}
+    for key in _V1_TASK_KEYS:
+        task = task_registry.get(key)
+        if task is None:  # pragma: no cover - guards a typo in _V1_TASK_KEYS
+            logging.error(f"Onbekende taak {key!r} in de v1-takenlijst, overgeslagen")
+            continue
+        entries[key] = {
+            "name": task["name"],
+            "cmd": list(task["cmd"]),
+            "file_name": task["file_name"],
+            "parameters": list(task.get("parameters", ())),
+            "wait": 1000,
+        }
+    return entries
+
+
+bewerkingen = _build_bewerkingen()
 
 
 def get_file_list(path: str, pattern: str) -> list:
@@ -690,63 +682,77 @@ task_state = {
 """
 lock = threading.Lock()
 
-STATEFILE = "../data/task_state.json"
-STALE_AFTER = 600
+#: How often a running task refreshes its claim, and how often it checks
+#: whether a cancel was requested. Well under task_state.STALE_AFTER_S.
+HEARTBEAT_S = 5
 
 
-def save_state(task_state):
-    task_state["last_update"] = time.time()
-    with open(STATEFILE, "w") as f:
-        json.dump(task_state, f)
+def _tracked_task() -> tuple:
+    """The task this dashboard's status and log polling should report on.
+
+    Claims are per task now (see dao/prog/task_state.py), but this UI shows
+    one task at a time: the running one, or the most recently finished when
+    nothing runs. Returns (task_key, flat_record) where the record has the
+    shape the /status and /log routes already expected.
+    """
+    state = task_state.read()
+    running = state["running"]
+    if running:
+        key = max(running, key=lambda k: running[k].get("started") or 0)
+        return key, {"status": "running", **running[key]}
+    finished = state["last"]
+    if finished:
+        key = max(finished, key=lambda k: finished[k].get("finished") or 0)
+        return key, finished[key]
+    return None, {"status": "idle", "logfile": None}
 
 
-def load_state():
-    if not os.path.exists(STATEFILE):
-        return {"status": "idle", "task": None, "logfile": None}
+def run_and_log(cmd, task_key, logfile):
+    """Run a claimed task, streaming its output into *logfile*.
+
+    The caller must already hold the claim on *task_key* (see run_process);
+    taking it here would reopen the check-then-act race this is meant to
+    close. Releasing it is this function's job, including when the task
+    fails, so a crashed run does not block the next one for the full
+    staleness window.
+    """
+    status = "error"
+    returncode = None
     try:
-        with open(STATEFILE) as f:
-            state = json.load(f)
-
-        # 🔥 check op "stale" state
-        last = state.get("last_update", 0)
-        if state.get("status") == "running":
-            if time.time() - last > STALE_AFTER:
-                # taak is waarschijnlijk dood
-                return {"status": "idle", "task": None, "logfile": None}
-        return state
+        with open(logfile, "w") as handle:
+            # start_new_session=True: the task gets its own process group, so
+            # a cancel reaches everything it spawned and a signal aimed at
+            # the web server does not kill it halfway through.
+            proc = Popen(
+                cmd, stdout=PIPE, stderr=STDOUT, text=True, start_new_session=True
+            )
+            task_state.heartbeat(task_key, logfile=logfile)
+            cancelled = False
+            last_beat = time.time()
+            for line in proc.stdout:
+                handle.write(line)
+                handle.flush()
+                now = time.time()
+                if now - last_beat >= HEARTBEAT_S:
+                    last_beat = now
+                    entry = task_state.heartbeat(task_key)
+                    if entry.get("cancel"):
+                        cancelled = True
+                        handle.write("\nOpdracht afgebroken op verzoek.\n")
+                        handle.flush()
+                        task_registry.kill_process_group(proc)
+                        break
+            proc.wait()
+            returncode = proc.returncode
+            if cancelled:
+                status = "cancelled"
+            else:
+                status = "done" if returncode == 0 else "error"
     except Exception:
-        return {"status": "idle", "task": None}
-
-
-def run_and_log(cmd, task, logfile):
-    # logfile = f"../data/log/run_{int(time.time())}.log"
-    save_state(
-        {"status": "running", "task": task, "returncode": None, "logfile": logfile}
-    )
-    with open(logfile, "w") as f:
-        # start_new_session=True: isolate the task from the web server's own
-        # process group so a signal sent to the foreground group (e.g. a
-        # terminal Ctrl+C during interactive debugging) doesn't also kill
-        # the task mid-run and leave the log file and state file out of
-        # sync with what actually happened.
-        proc = Popen(
-            cmd, stdout=PIPE, stderr=STDOUT, text=True, start_new_session=True
-        )
-
-        for line in proc.stdout:
-            f.write(line)
-            f.flush()
-
-        proc.wait()
-
-    save_state(
-        {
-            "status": "done" if proc.returncode == 0 else "error",
-            "task": task,
-            "returncode": proc.returncode,
-            "logfile": logfile,
-        }
-    )
+        logging.exception(f"Taak {task_key} is mislukt")
+        raise
+    finally:
+        task_state.release(task_key, status, returncode=returncode, logfile=logfile)
 
 
 @app.route("/run", methods=["POST", "GET"])
@@ -757,22 +763,23 @@ def run_process():
     parameters = {}
 
     if request.method in ["POST", "GET"]:
-        task_state = load_state()
-        if task_state.get("status") == "running":
+        if task_state.running_tasks():
             log_content = "Er draait al een opdracht."
             state = "running"
         else:
             dct = request.form.to_dict(flat=False)
             if "current_bewerking" in dct:
                 current_bewerking = dct["current_bewerking"][0]
-                run_bewerking = bewerkingen[current_bewerking]
-                extra_parameters = []
-                if "parameters" in run_bewerking:
-                    for j in range(len(run_bewerking["parameters"])):
-                        if run_bewerking["parameters"][j] in dct:
-                            param_value = dct[run_bewerking["parameters"][j]][0]
-                            if len(param_value) > 0:
-                                extra_parameters.append(param_value)
+                run_bewerking = bewerkingen.get(current_bewerking)
+                if run_bewerking is None:
+                    abort(404)
+                canonical = task_registry.resolve(current_bewerking)
+                values = {
+                    parameter: dct[parameter][0]
+                    for parameter in run_bewerking["parameters"]
+                    if parameter in dct
+                }
+                cmd = task_registry.build_cmd(canonical, values)
                 logfile = (
                     "../data/log/"
                     + run_bewerking["file_name"]
@@ -780,15 +787,25 @@ def run_process():
                     + datetime.datetime.now().strftime("%Y-%m-%d__%H:%M:%S")
                     + ".log"
                 )
-
-                cmd = run_bewerking["cmd"] + extra_parameters
-                bewerking = ""
-                task = current_bewerking
-                threading.Thread(
-                    target=run_and_log, args=(cmd, task, logfile), daemon=True
-                ).start()
-                log_content = "Opdracht is gestart"
-                state = "running"
+                # Claim before starting the thread, not inside it. The old
+                # code read the state here and only wrote "running" once the
+                # worker thread got scheduled, so two near-simultaneous
+                # requests both passed the check above and started the task
+                # twice. claim() does the check and the write atomically.
+                if not task_state.claim(
+                    canonical, source="dashboard", logfile=logfile
+                ):
+                    log_content = "Er draait al een opdracht."
+                    state = "running"
+                else:
+                    bewerking = ""
+                    threading.Thread(
+                        target=run_and_log,
+                        args=(cmd, canonical, logfile),
+                        daemon=True,
+                    ).start()
+                    log_content = "Opdracht is gestart"
+                    state = "running"
             else:
                 for i in range(len(dct.keys())):
                     bew = list(dct.keys())[i]
@@ -822,21 +839,18 @@ def run_process():
 
 @app.route("/status")
 def status():
-    task_state = load_state()
-    task = task_state.get("task")
-    if task in bewerkingen:
-        task_name = bewerkingen[task]["name"]
-    else:
-        task_name = task
-    state = task_state.get("status")
-    msg = task_state.get("msg")
-    task_state["msg"] = ""
+    task, record = _tracked_task()
+    definition = task_registry.get(task) if task else None
+    task_name = definition["name"] if definition else task
+    state = record.get("status")
     if state == "running":
         msg = f"Opdracht '{task_name}' wordt uitgevoerd"
     elif state == "done":
         msg = f"✅ Opdracht '{task_name}' succesvol afgerond"
     elif state == "error":
         msg = f"❌ Opdracht '{task_name}' geëindigd met fout"
+    elif state == "cancelled":
+        msg = f"Opdracht '{task_name}' is afgebroken"
     else:
         msg = f"Opdracht '{task}' : {state}"
     return jsonify({"status": state, "msg": msg})
@@ -844,14 +858,13 @@ def status():
 
 @app.route("/log")
 def show_log():
-    task_state = load_state()
-    logfile = task_state.get("logfile", None)
+    _task, record = _tracked_task()
+    logfile = record.get("logfile")
     if logfile is None or not os.path.exists(logfile):
         return "Nog geen log beschikbaar"
     with open(logfile, "r") as f:
         lines = f.readlines()
-    state = task_state["status"]
-    if state == "running":
+    if record.get("status") == "running":
         text = "".join(lines[-20:])  # laatste 20 regels
     else:
         text = "".join(lines)
@@ -1170,45 +1183,70 @@ def api_report(fld: str, periode: str):
 @app.route("/api/run/<string:bewerking>", methods=["GET", "POST"])
 @csrf.exempt
 def run_api(bewerking: str):
-    if bewerking in bewerkingen.keys():
-        # Run synchronously but cap the wall-clock time so a long-running
-        # task (especially fast_simulate, which can take minutes) cannot
-        # block this Flask worker forever and starve other requests.
-        # 5 minutes matches the gunicorn per-request timeout with a safety
-        # margin; tasks that legitimately need more should be reworked
-        # into a background-task pattern.
-        timeout_s = bewerkingen[bewerking].get("timeout_s", 300)
-        try:
-            proc = run(
-                bewerkingen[bewerking]["cmd"],
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-            )
-            data = proc.stdout
-            err = proc.stderr
-            log_content = data + err
-        except TimeoutExpired as exception:
-            log_content = (
-                f"Taak {bewerking} afgebroken na {timeout_s}s timeout.\n"
-                f"stdout tot timeout:\n{exception.stdout or ''}\n"
-                f"stderr tot timeout:\n{exception.stderr or ''}\n"
-            )
-        filename = (
-            "../data/log/"
-            + bewerkingen[bewerking]["file_name"]
-            + "_"
-            + datetime.datetime.now().strftime("%Y-%m-%d__%H:%M:%S")
-            + ".log"
+    task = task_registry.get(bewerking)
+    if task is None:
+        # Never echo the path segment back: it is attacker controlled and
+        # the response is HTML.
+        abort(404)
+    canonical = task_registry.resolve(bewerking)
+
+    # This endpoint runs the task inside the request. Claim it like any
+    # other starter so it cannot run alongside the same task started by
+    # cron or from the task page.
+    if not task_state.claim(canonical, source="api"):
+        return (
+            render_template(
+                "api_run.html",
+                log_content=f"Taak {task['name']} draait al.",
+                version=__version__,
+                active_menu_list=web_menu_items,
+            ),
+            409,
         )
+
+    # The cap has to stay under gunicorn's own per-request timeout (120 s,
+    # see gunicorn_config.py). It used to be 300 s with a comment claiming
+    # that matched gunicorn; it did not, so the worker was killed at 120 s
+    # and the run ended as a dead worker plus an orphaned child instead of
+    # a timeout message with the output collected so far.
+    timeout_s = task_registry.api_timeout_s(canonical)
+    status = "error"
+    returncode = None
+    try:
+        proc = run(
+            task["cmd"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        log_content = proc.stdout + proc.stderr
+        returncode = proc.returncode
+        status = "done" if returncode == 0 else "error"
+    except TimeoutExpired as exception:
+        log_content = (
+            f"Taak {bewerking} afgebroken na {timeout_s}s timeout.\n"
+            f"Gebruik de takenpagina voor taken die langer duren: die "
+            f"draaien in de achtergrond zonder deze limiet.\n"
+            f"stdout tot timeout:\n{exception.stdout or ''}\n"
+            f"stderr tot timeout:\n{exception.stderr or ''}\n"
+        )
+    filename = (
+        "../data/log/"
+        + task["file_name"]
+        + "_"
+        + datetime.datetime.now().strftime("%Y-%m-%d__%H:%M:%S")
+        + ".log"
+    )
+    try:
         with open(filename, "w") as f:
             f.write(log_content)
-        return render_template(
-            "api_run.html",
-            log_content=log_content,
-            version=__version__,
-            active_menu_list=web_menu_items,
+    finally:
+        task_state.release(
+            canonical, status, returncode=returncode, logfile=filename
         )
-    # Never echo the path segment back: it is attacker controlled and the
-    # response is HTML.
-    abort(404)
+    return render_template(
+        "api_run.html",
+        log_content=log_content,
+        version=__version__,
+        active_menu_list=web_menu_items,
+    )
