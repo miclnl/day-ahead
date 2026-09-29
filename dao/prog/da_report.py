@@ -1603,7 +1603,10 @@ class Report(DaBase):
             get_interval: str | None = None,
             column: str | None = None,
     ) -> pd.DataFrame:
-        result = pd.DataFrame(columns=[rep_interval, "tijd", "tot", "datasoort"])
+        # Building the frame with one .loc[shape[0]] append per row is O(n^2)
+        # (a full copy on every append) and materialises to 8760 rows for an
+        # hourly "dit jaar" report. Rows are collected as plain tuples and
+        # handed to pd.DataFrame(...) once instead.
         moment = vanaf
         now = datetime.datetime.now()
         now = datetime.datetime(now.year, now.month, now.day, now.hour)
@@ -1611,6 +1614,7 @@ class Report(DaBase):
             step_interval = rep_interval
         else:
             step_interval = get_interval
+        rows = []
         while moment < tot:
             if get_interval == "maand":
                 old_moment = datetime.datetime(moment.year, moment.month, day=1)
@@ -1630,7 +1634,8 @@ class Report(DaBase):
             else:  # "maand":
                 moment = old_moment + relativedelta(months=1)
             datasoort = "recorded" if moment <= now else "expected"
-            result.loc[result.shape[0]] = [tijd_str, old_moment, moment, datasoort]
+            rows.append((tijd_str, old_moment, moment, datasoort))
+        result = pd.DataFrame(rows, columns=[rep_interval, "tijd", "tot", "datasoort"])
         result.index = pd.to_datetime(result["tijd"])
         if column is not None:
             result[column] = 0.0

@@ -768,7 +768,11 @@ class SolarPredictor(DaBase):
         Q         : Globale straling (in J/cm2) -> gr -
         """
         df = df.rename(columns={"    T": "temp", "    Q": "gr", "   FH": "winds"})
-        save_df = pd.DataFrame(columns=["time", "code", "value"])
+        # Three rows appended per source row with .loc[shape[0]] is O(n^2)
+        # (a full copy on every append); a plain list of tuples handed to
+        # pd.DataFrame(...) once is O(n). Three years of hourly KNMI data is
+        # ~26000 source rows here, so ~78000 appends avoided.
+        records = []
         for row in df.itertuples():
             year = int(str(row.YYYYMMDD)[0:4])
             month = int(str(row.YYYYMMDD)[4:6])
@@ -776,9 +780,10 @@ class SolarPredictor(DaBase):
             hour = row.HH - 1
             dati = dt.datetime(year, month, day, hour, tzinfo=dt.timezone.utc)
             utc = int(dati.timestamp())
-            save_df.loc[save_df.shape[0]] = [utc, "temp", row.temp / 10]
-            save_df.loc[save_df.shape[0]] = [utc, "gr", row.gr]
-            save_df.loc[save_df.shape[0]] = [utc, "winds", row.winds / 10]
+            records.append((utc, "temp", row.temp / 10))
+            records.append((utc, "gr", row.gr))
+            records.append((utc, "winds", row.winds / 10))
+        save_df = pd.DataFrame(records, columns=["time", "code", "value"])
         self.db_da.savedata(save_df, tablename="values")
         os.remove(filename)
         return
@@ -817,15 +822,21 @@ class SolarPredictor(DaBase):
         knmi_df["utc"] = pd.to_datetime(
             knmi_df["utc"], utc=True
         )  # , format='%Y-%m-%d %H:%M:%S')
-        save_df = pd.DataFrame(columns=["time", "code", "value"])
+        # See import_weatherdata for why this collects into a plain list
+        # instead of appending to the DataFrame row by row.
+        has_temp = "temp" in knmi_df.columns
+        has_gr = "gr" in knmi_df.columns
+        has_winds = "winds" in knmi_df.columns
+        records = []
         for row in knmi_df.itertuples():
             utc = int(row.utc.timestamp())
-            if "temp" in knmi_df.columns:
-                save_df.loc[save_df.shape[0]] = [utc, "temp", row.temp / 10]
-            if "gr" in knmi_df.columns:
-                save_df.loc[save_df.shape[0]] = [utc, "gr", row.gr]
-            if "winds" in knmi_df.columns:
-                save_df.loc[save_df.shape[0]] = [utc, "winds", row.winds / 10]
+            if has_temp:
+                records.append((utc, "temp", row.temp / 10))
+            if has_gr:
+                records.append((utc, "gr", row.gr))
+            if has_winds:
+                records.append((utc, "winds", row.winds / 10))
+        save_df = pd.DataFrame(records, columns=["time", "code", "value"])
         self.db_da.savedata(save_df, tablename="values")
         return None
 
