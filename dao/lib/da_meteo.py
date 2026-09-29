@@ -474,29 +474,18 @@ class Meteo:
             logging.error(f"No {self.meteoserver_model}-data recieved from meteoserver")
         else:
             df1 = df1.reset_index()  # make sure indexes pair with number of rows
+            # Melt (tijd, gr, temp, winds, neersl) into long-format (time,
+            # code, value) rows via a plain list instead of four
+            # df_db.loc[df_db.shape[0]] = row appends per source row, which
+            # copies the whole frame on every one of the up to 384 appends.
+            rows = []
             for row in df1.itertuples():
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "gr",
-                    float(row.gr),
-                ]
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "temp",
-                    float(row.temp),
-                ]
-                # winds
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "winds",
-                    float(row.winds),
-                ]
-                # neersl
-                df_db.loc[df_db.shape[0]] = [
-                    str(int(row.tijd)),
-                    "neersl",
-                    float(row.neersl),
-                ]
+                time_str = str(int(row.tijd))
+                rows.append((time_str, "gr", float(row.gr)))
+                rows.append((time_str, "temp", float(row.temp)))
+                rows.append((time_str, "winds", float(row.winds)))
+                rows.append((time_str, "neersl", float(row.neersl)))
+            df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
 
         """
         df2 = pd.DataFrame()

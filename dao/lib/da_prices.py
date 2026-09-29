@@ -84,7 +84,6 @@ class DaPrices:
                 logging.error(ex)
                 logging.error(f"Geen data van Entsoe: tussen {start} en {end}")
             if len(da_prices.index) > 0:
-                df_db = pd.DataFrame(columns=["time", "code", "value"])
                 da_prices = (
                     da_prices.reset_index()
                 )  # make sure indexes pair with number of rows
@@ -92,9 +91,11 @@ class DaPrices:
                     f"Day ahead prijzen van Entsoe: \n{da_prices.to_string(index=False)}"
                 )
                 last_time = start
+                rows = []
                 for row in da_prices.itertuples():
                     last_time = int(datetime.datetime.timestamp(row[1]))
-                    df_db.loc[df_db.shape[0]] = [str(last_time), "da", row[2] / 1000]
+                    rows.append((str(last_time), "da", row[2] / 1000))
+                df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
                 logging.debug(
                     f"Day ahead prijzen (source: entsoe, db-records): \n"
                     f"{df_db.to_string(index=False)}"
@@ -187,13 +188,14 @@ class DaPrices:
                 f"Day ahead prijzen van Easyenergy:\n {df.to_string(index=False)}"
             )
             # datetime.datetime.strptime('Tue Jun 22 12:10:20 2010 EST', '%a %b %d %H:%M:%S %Y %Z')
-            df_db = pd.DataFrame(columns=["time", "code", "value"])
             df = df.reset_index()  # make sure indexes pair with number of rows
+            rows = []
             for row in df.itertuples():
                 dtime = str(
                     int(datetime.datetime.fromisoformat(row.Timestamp).timestamp())
                 )
-                df_db.loc[df_db.shape[0]] = [dtime, "da", row.TariffReturn]
+                rows.append((dtime, "da", row.TariffReturn))
+            df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
 
             logging.debug(
                 f"Day ahead prijzen (source: easy energy, db-records): \n "
@@ -282,7 +284,7 @@ class DaPrices:
                     f"{str(tibber_dict)[:200]}"
                 )
                 return
-            df_db = pd.DataFrame(columns=["time", "code", "value"])
+            rows = []
             for lst in [today_nodes, tomorrow_nodes, range_nodes]:
                 for node in lst:
                     dt = datetime.datetime.strptime(
@@ -291,7 +293,8 @@ class DaPrices:
                     time_stamp = int(dt.timestamp())
                     value = float(node["energy"])
                     logging.info(f"{node} {dt} {time_stamp} {value}")
-                    df_db.loc[df_db.shape[0]] = [time_stamp, "da", value]
+                    rows.append((time_stamp, "da", value))
+            df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
             logging.debug(
                 f"Day ahead prijzen (source: tibber, db-records): \n "
                 f"{df_db.to_string(index=False)}"
