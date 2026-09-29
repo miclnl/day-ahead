@@ -74,3 +74,30 @@ def test_the_v1_module_no_longer_configures_logging(client):
 
     assert not hasattr(routes, "logname")
     assert not hasattr(routes, "handler")
+
+
+def test_a_report_in_a_request_does_not_change_the_dashboard_level(client):
+    """DaBase configured the root logger unconditionally in __init__, and ~8
+    routes construct a Report (a DaBase subclass) to render a page. So
+    opening one report page reset the dashboard's log level to whatever
+    logging_level the DAO configuration carried -- with debug that meant
+    every later request logged SQLAlchemy, urllib3 and matplotlib output
+    into the add-on log, as a side effect of rendering a page.
+
+    Driven through the dashboard's real setup so the two stay consistent if
+    either side changes.
+    """
+    from dao.prog.da_base import DaBase
+
+    root = logging.getLogger()
+    level_before = root.level
+    handlers_before = root.handlers[:]
+
+    instance = DaBase.__new__(DaBase)
+    instance.log_level = logging.DEBUG
+
+    owns = instance._configure_root_logging()
+
+    assert owns is False, "DaBase took over the dashboard's root logger"
+    assert root.level == level_before
+    assert root.handlers == handlers_before

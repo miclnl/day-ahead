@@ -127,12 +127,7 @@ class DaBase:
         # user what was wrong with the configuration.
         self.config = None
         self.loader = None
-        logging.basicConfig(
-            level=self.log_level,
-            format="%(asctime)s %(levelname)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        logging.getLogger().setLevel(self.log_level)
+        self._owns_root_logger = self._configure_root_logging()
         # Load config exactly once, even when multiple threads construct a
         # DaBase subclass concurrently (e.g. gunicorn workers sharing a process).
         # DB singletons are managed separately in db_connections.py.
@@ -172,7 +167,8 @@ class DaBase:
         logging.addLevelName(logging.WARNING, "waarschuwing")
         logging.addLevelName(logging.ERROR, "fout")
         logging.addLevelName(logging.CRITICAL, "kritiek")
-        logging.getLogger().setLevel(self.log_level)
+        if self._owns_root_logger:
+            logging.getLogger().setLevel(self.log_level)
         ha = self.config.homeassistant
         self.protocol_api = ha.protocol_api
         self.ip_address = ha.ip_address
@@ -454,6 +450,44 @@ class DaBase:
                 f"nog {state!r}"
             )
         return result
+
+    def _configure_root_logging(self, logger: logging.Logger = None) -> bool:
+        """Configure *logger* (the root logger by default), unless a host
+        application already owns it.
+
+        Returns whether this instance is the one that configured it, which
+        gates the second ``setLevel`` later in ``__init__`` (the level is
+        only known once the configuration has been read).
+
+        In the command line processes (day_ahead.py, da_scheduler.py,
+        da_fast.py) nothing has configured logging when a DaBase is built,
+        so it configures the root logger as before. Inside the web server
+        app/__init__.py owns it, and a Report() constructed to render a
+        report page used to reset the root level to whatever
+        ``logging_level`` the DAO configuration carries. Opening one report
+        page could therefore switch the entire dashboard to debug and flood
+        the add-on log with output from every library, as a side effect of
+        rendering a page.
+
+        Spelled out rather than left to ``logging.basicConfig``, whose
+        "do nothing when handlers exist" rule is the same decision made
+        invisibly: here the condition is the thing being returned, and a
+        logger can be passed in so the behaviour is testable without
+        fighting whatever else has configured the real root logger.
+        """
+        logger = logging.getLogger() if logger is None else logger
+        if logger.handlers:
+            return False
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(handler)
+        logger.setLevel(self.log_level)
+        return True
 
     @staticmethod
     def generate_tasks():
