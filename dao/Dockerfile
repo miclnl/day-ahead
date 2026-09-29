@@ -54,6 +54,7 @@ COPY --from=builder /root/dao/webserver/app/static/build /root/dao/webserver/app
 COPY --from=builder /root/dao/venv /root/dao/venv
 COPY __init__.py /root/dao
 COPY lib /root/dao/lib/
+COPY forecast /root/dao/forecast/
 COPY prog /root/dao/prog/
 COPY webserver /root/dao/webserver/
 COPY data /tmp/daodata/

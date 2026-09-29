@@ -61,7 +61,9 @@ def test_power_sensor_uses_mean_and_logs_once(ha_db, reader, caplog):
             ["sensor.test_pv_power"], local(T0), local(T0 + 2 * HOUR)
         )
     assert list(series.round(3)) == [1.2, 0.6]
-    assert sum("vermogenssensor" in r.message for r in caplog.records) == 1
+    hits = [r for r in caplog.records if "vermogenssensor" in r.message]
+    assert len(hits) == 1 and hits[0].levelname == "WARNING"
+    assert "energiesensor" in hits[0].message
 
 
 def test_unsupported_unit_raises_with_sensor_name(ha_db, reader):
@@ -178,3 +180,34 @@ def test_baseload_formula():
     frame = pd.DataFrame({c: [1.0] for c in COMPONENT_COLUMNS}, index=index)
     frame["bat_in"] = 2.0
     assert baseload_from_components(frame).iloc[0] == pytest.approx(-4.0)
+
+
+def test_component_caps_unwraps_flex_values_and_skips_entities():
+    import types
+
+    from dao.forecast.history import component_caps
+    from dao.prog.config.models.base import FlexFloat
+
+    config = types.SimpleNamespace(
+        solar=[types.SimpleNamespace(total_capacity=3.6)],
+        battery=[
+            types.SimpleNamespace(
+                dc_to_bat_max_power=FlexFloat(value=2200.0),
+                bat_to_dc_max_power=FlexFloat(value="sensor.test_max_power"),
+            )
+        ],
+        grid=types.SimpleNamespace(max_power=17.0),
+    )
+    caps = component_caps(config)
+    assert caps["pv_ac"] == pytest.approx(4.32)
+    assert caps["bat_in"] == pytest.approx(2.2)
+    assert caps["grid_in"] == 17.0
+
+
+def test_small_negative_power_mean_is_measurement_noise_not_a_gap(ha_db, reader):
+    _, helper = ha_db
+    helper.add_power("sensor.test_pv_power", "W", {T0: -0.4, T0 + HOUR: -80.0, T0 + 2 * HOUR: 300.0})
+    series = reader.read_energy(["sensor.test_pv_power"], local(T0), local(T0 + 3 * HOUR))
+    assert series.iloc[0] == 0.0
+    assert np.isnan(series.iloc[1])
+    assert series.iloc[2] == pytest.approx(0.3)

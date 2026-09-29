@@ -3117,7 +3117,9 @@ class Report(DaBase):
         if frame is None:
             frame = self.calc_baseload_frame()
         options = self.baseload_options()
-        reference = datetime.datetime.now()
+        from zoneinfo import ZoneInfo
+
+        reference = datetime.datetime.now(tz=ZoneInfo(self.time_zone))
         if frame is None or len(frame) == 0:
             return BaseloadProfile()
 

@@ -52,6 +52,9 @@ _UNIT_FACTORS: dict[str, tuple[str, float]] = {
     "kW": ("power", 1.0),
 }
 
+#: Negative values with a magnitude below this (10 Wh) are rounded to zero.
+NOISE_FLOOR_KWH = 0.01
+
 _REPORT_ATTRIBUTES = {
     "grid_in": "entities_grid_consumption",
     "grid_out": "entities_grid_production",
@@ -201,13 +204,20 @@ class HistoryReader:
             values = (following - totals).where(gap == pd.Timedelta(hours=1))
         else:
             values = pd.Series(frame["mean"].astype("float64").values, index=moments)
-            logging.info(
+            # The hourly mean of a power sensor is a fallback, not a meter:
+            # on a real installation it came out 30 percent below the energy
+            # counter of the same inverter. Say so every run.
+            logging.warning(
                 f"{meta.statistic_id} is een vermogenssensor; het uurgemiddelde "
-                f"wordt als energie gebruikt"
+                f"wordt als energie gebruikt. Gebruik bij voorkeur de cumulatieve "
+                f"energiesensor van hetzelfde apparaat, die is nauwkeuriger."
             )
         values = values * meta.factor_to_kwh
         values.index = values.index.tz_convert(self.tz)
         values = values.reindex(index)
+        # A power meter idles at a few watts below zero (inverter self
+        # consumption); that is noise, not a missing hour.
+        values = values.mask(values.between(-NOISE_FLOOR_KWH, 0.0), 0.0)
         out_of_range = values < 0
         if cap_kwh is not None:
             out_of_range |= values > cap_kwh
@@ -275,6 +285,21 @@ def component_groups(report) -> dict[str, list[str]]:
     }
 
 
+def _literal_number(value) -> float | None:
+    """A configured number, or None when it is absent or a Home Assistant entity.
+
+    Several battery settings are FlexFloat: either a literal or an entity id
+    that is resolved at run time. Without a Home Assistant client only the
+    literal can be used; an entity means "no bound" here.
+    """
+    if value is None:
+        return None
+    inner = getattr(value, "value", value)
+    if isinstance(inner, bool) or not isinstance(inner, (int, float)):
+        return None
+    return float(inner)
+
+
 def component_caps(config) -> dict[str, float | None]:
     """Physical upper bound in kWh per hour per group, or None for no bound."""
     pv_capacity = sum(
@@ -284,12 +309,12 @@ def component_caps(config) -> dict[str, float | None]:
     for battery in config.battery or []:
         battery_kw += (
             max(
-                float(getattr(battery, "dc_to_bat_max_power", 0.0) or 0.0),
-                float(getattr(battery, "bat_to_dc_max_power", 0.0) or 0.0),
+                _literal_number(getattr(battery, "dc_to_bat_max_power", None)) or 0.0,
+                _literal_number(getattr(battery, "bat_to_dc_max_power", None)) or 0.0,
             )
             / 1000.0
         )
-    grid_kw = getattr(config.grid, "max_power", None)
+    grid_kw = _literal_number(getattr(config.grid, "max_power", None))
     return {
         "grid_in": grid_kw,
         "grid_out": grid_kw,
