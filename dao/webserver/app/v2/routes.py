@@ -441,10 +441,7 @@ def co2_available() -> bool:
     Without one every CO2 figure is zero, so the report is not offered at
     all rather than shown empty.
     """
-    # _load_config rather than a cache: this is a user-initiated page
-    # render, not one of the polling endpoints, so a fresh read is fine and
-    # picks up a sensor that was just configured.
-    config = _load_config()
+    config = _cached_config()
     report_options = getattr(config, "report", None) if config else None
     return bool(getattr(report_options, "co2_intensity_sensor", None))
 
@@ -695,6 +692,9 @@ def config():
             # the scheduler in a restart loop.
             validate_config_data(json.loads(newconfig))
             atomic_write_text(Path(path), newconfig)
+            # This process just wrote the file, so the cached copy the
+            # display paths use is stale.
+            _invalidate_cached_config()
             success = "Config updated successfully"
         except (ValueError, OSError) as err:
             error = "Error: " + str(err)
@@ -748,7 +748,19 @@ def _load_fast_state():
         return {}
 
 
+#: Filled on first use and reused for page renders. See _cached_config.
+_config_cache = None
+_config_cache_loaded = False
+
+
 def _load_config():
+    """Parse and validate options.json from scratch.
+
+    Note that this can *write* the file: load_and_validate runs the
+    migration path, which stamps config_version and saves a backup. Use
+    :func:`_cached_config` for anything that only displays, and call this
+    directly only right after this process itself wrote the file.
+    """
     from dao.prog.config.loader import ConfigurationLoader
     from pathlib import Path
     loader = ConfigurationLoader(Path(app_datapath + "options.json"))
@@ -756,6 +768,31 @@ def _load_config():
         return loader.load_and_validate()
     except Exception:
         return None
+
+
+def _cached_config():
+    """The configuration for read-only display paths.
+
+    _load_config re-parses and re-validates on every call, takes the same
+    fcntl.flock the migration path uses, and can rewrite options.json from
+    what looks like a plain GET. Rendering a page should not do any of
+    that. The watchdog restarts this worker whenever options.json changes
+    (see watchdog.sh), so a value cached for the life of the process cannot
+    go stale; a POST handler that just wrote the file calls _load_config
+    directly instead.
+    """
+    global _config_cache, _config_cache_loaded
+    if not _config_cache_loaded:
+        _config_cache = _load_config()
+        _config_cache_loaded = True
+    return _config_cache
+
+
+def _invalidate_cached_config():
+    """Drop the cache after this process wrote options.json."""
+    global _config_cache, _config_cache_loaded
+    _config_cache = None
+    _config_cache_loaded = False
 
 
 def _resolved_mode(config):
@@ -777,7 +814,7 @@ def _resolved_mode(config):
 @v2.route("/fast-control")
 def fast_control():
     state = _load_fast_state()
-    config = _load_config()
+    config = _cached_config()
     mode, mode_is_entity = _resolved_mode(config)
     last_decision = state.get("last_decision")
     events = state.get("events", [])
@@ -809,6 +846,7 @@ def fast_control_mode():
         # Edits only the mode key in the raw document; dumping the whole model
         # would rewrite the user's file with every default pinned.
         set_fast_control_mode(Path(app_datapath + "options.json"), new_mode)
+        _invalidate_cached_config()
     except (ValueError, OSError) as ex:
         return str(ex), 400
     return redirect(url_for("v2.fast_control"))

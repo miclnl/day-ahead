@@ -19,6 +19,8 @@ on v1 being imported; it is in app/__init__.py now.
 import logging
 from logging.handlers import TimedRotatingFileHandler
 
+import pytest
+
 
 def test_the_dashboard_installs_a_stdout_handler(client):
     import sys
@@ -64,16 +66,18 @@ def test_configuring_twice_does_not_duplicate_the_handler(client):
     assert len(marked_after) == len(marked_before) == 1
 
 
-def test_the_v1_module_no_longer_configures_logging(client):
-    """v2 and the API had no logging setup of their own and relied on v1's
-    import side effect, so retiring the v1 UI would have left the web server
-    with no logging configuration at all."""
+def test_logging_does_not_depend_on_the_retired_v1_module(client):
+    """v2 and the API had no logging setup of their own and relied on the v1
+    module configuring the root logger as an import side effect. That module
+    is gone now, so the setup in app/__init__.py is the only thing keeping
+    the dashboard's log alive -- and the stdout handler asserted above is
+    the proof that it does."""
     import importlib
+    import sys
 
-    routes = importlib.import_module("app.routes")
-
-    assert not hasattr(routes, "logname")
-    assert not hasattr(routes, "handler")
+    assert "app.routes" not in sys.modules
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("app.routes")
 
 
 def test_a_report_in_a_request_does_not_change_the_dashboard_level(client):

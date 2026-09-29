@@ -7,7 +7,7 @@ import secrets
 import sys
 from pathlib import Path
 
-from flask import Flask, abort, request, send_from_directory
+from flask import Flask, abort, redirect, request, send_from_directory, url_for
 from flask_wtf.csrf import CSRFProtect
 
 # The add-on data directory. The web server runs with dao/webserver as its
@@ -175,10 +175,28 @@ def _human_ts(value):
     return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
-from . import routes  # noqa: E402
 from .v2.routes import v2  # noqa: E402
 from .v2.api.routes import api  # noqa: E402
+from .public_api import public_api  # noqa: E402
 
 app.register_blueprint(v2, name="v2", url_prefix="/v2")
 app.register_blueprint(api, name="api", url_prefix="/v2/api")
+# The documented /api/run and /api/report endpoints, kept at their own
+# paths because DOCS.md wires them into people's Home Assistant
+# configurations. Both are hit by rest_command and REST sensors, which
+# carry no CSRF token.
+app.register_blueprint(public_api, name="public_api")
 csrf.exempt(api)
+csrf.exempt(public_api)
+
+
+@app.route("/")
+def root():
+    """Send the bare ingress path to the dashboard.
+
+    The v1 interface used to own "/", so removing it would have left the
+    address Home Assistant's ingress actually opens on a 404. Everything
+    lives under /v2 now; this keeps the entry point working without
+    duplicating the blueprint at two prefixes.
+    """
+    return redirect(url_for("v2.chart"))

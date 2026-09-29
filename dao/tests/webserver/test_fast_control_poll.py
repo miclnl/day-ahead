@@ -1,61 +1,91 @@
-"""The v1 fast-control status poll must not re-parse options.json.
+"""The fast control status widget polls; polling must stay cheap.
 
-/fast_control/state.json is polled every 5 seconds by the page's own JS.
-It used to call ConfigurationLoader(...).load_and_validate() on every poll,
-which takes an exclusive fcntl.flock() and can write options.json back (the
-migration branch) from what looks like a read-only GET.
+The page refreshes its status every second or so. The v1 equivalent of this
+endpoint called ConfigurationLoader.load_and_validate() on every tick,
+which re-parsed and re-validated options.json, took the same fcntl.flock
+the migration path uses, and could even *write* the file from what looks
+like a read-only GET.
+
+v2's endpoint reads only fast_state.json, so it never had that problem.
+This keeps it that way: it would be an easy thing to reintroduce by
+reaching for the config to render one more field.
 """
+
+import importlib
 
 import pytest
 
 from .conftest import INGRESS, SUPERVISOR
 
 
-def test_polling_the_state_endpoint_does_not_reparse_options_json(client, monkeypatch):
-    import app.routes as routes
-
-    calls = []
-    original = routes.ConfigurationLoader.load_and_validate
-
-    def counting(self):
-        calls.append(1)
-        return original(self)
-
-    monkeypatch.setattr(routes.ConfigurationLoader, "load_and_validate", counting)
-
-    for _ in range(3):
-        response = client.get(
-            "/fast_control/state.json", headers=INGRESS, environ_base=SUPERVISOR
-        )
-        assert response.status_code == 200
-
-    assert calls == [], (
-        "the polling endpoint parsed/validated options.json; it should use "
-        "the config already cached at import time"
-    )
+@pytest.fixture
+def v2_routes(client):
+    return importlib.import_module("app.v2.routes")
 
 
-def test_the_full_page_render_also_uses_the_cached_config(client, monkeypatch):
-    import app.routes as routes
-
-    calls = []
+def test_polling_the_state_endpoint_does_not_read_the_configuration(
+    client, v2_routes, monkeypatch
+):
+    loads = []
     monkeypatch.setattr(
-        routes.ConfigurationLoader,
-        "load_and_validate",
-        lambda self: calls.append(1),
+        v2_routes, "_load_config", lambda: loads.append(1) or None
     )
 
-    response = client.get("/fast_control", headers=INGRESS, environ_base=SUPERVISOR)
-
-    assert response.status_code == 200
-    assert calls == []
-
-
-def test_the_mode_still_comes_from_the_cached_config(client):
-    """Sanity check that using the cache did not break the feature: the
-    example config's fast-control mode must still show up on the page."""
     response = client.get(
-        "/fast_control/state.json", headers=INGRESS, environ_base=SUPERVISOR
+        "/v2/fast-control/state", headers=INGRESS, environ_base=SUPERVISOR
     )
+
     assert response.status_code == 200
-    assert response.json["mode"] in ("off", "shadow", "active")
+    assert loads == [], "the polling endpoint parsed options.json"
+
+
+def test_polling_the_state_endpoint_does_not_construct_a_loader(
+    client, monkeypatch
+):
+    """Belt and braces: catch a direct ConfigurationLoader too, not just the
+    module's own helper."""
+    from dao.prog.config import loader as loader_module
+
+    built = []
+
+    class Tripwire(loader_module.ConfigurationLoader):
+        def __init__(self, *args, **kwargs):
+            built.append(args)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(loader_module, "ConfigurationLoader", Tripwire)
+
+    client.get(
+        "/v2/fast-control/state", headers=INGRESS, environ_base=SUPERVISOR
+    )
+
+    assert built == []
+
+
+def test_the_state_endpoint_renders_what_the_runner_wrote(
+    client, v2_routes, monkeypatch
+):
+    monkeypatch.setattr(
+        v2_routes,
+        "_load_fast_state",
+        lambda: {
+            "last_decision": {
+                "state": "follow_plan",
+                "mode": "shadow",
+                "reason": "follow_plan",
+                "house_w": 1200.0,
+                "pv_w": 800.0,
+                "benefit_eur_h": 0.02,
+                "saved_today_eur": 0.15,
+                "saved_today_is_estimate": True,
+                "override": False,
+            }
+        },
+    )
+
+    response = client.get(
+        "/v2/fast-control/state", headers=INGRESS, environ_base=SUPERVISOR
+    )
+
+    assert response.status_code == 200
+    assert b"follow_plan" in response.data

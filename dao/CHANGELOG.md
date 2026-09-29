@@ -2,6 +2,38 @@
 # Day Ahead Optimizer
 # Unreleased
 
+## Alleen nog de nieuwe web-UI
+De oude interface is verwijderd; alles loopt nu via de v2-pagina's. Het
+kale adres (`/`) stuurt door naar het dashboard, dus de link uit Home
+Assistant blijft werken. De "legacy UI"-link in de voettekst is weg.
+
+Eerst zijn de twee dingen toegevoegd die de oude interface nog wel kon:
+
+- **CO2-rapport.** Dat zat er in de nieuwe interface nog niet in. Het
+  verschijnt alleen als je een sensor voor de CO2-intensiteit van het net
+  hebt ingesteld, want zonder die sensor is elk getal nul. CO2 biedt geen
+  perioden die vooruitkijken; er is geen prognose van netintensiteit.
+- **Datumbereik bij het ophalen van prijzen**, en het aantal dagen bij de
+  terugrekening van de snelle regellaag. De takenpagina wordt nu opgebouwd
+  uit de takenlijst zelf, waardoor ook vijf taken erbij komen die eerder
+  alleen via de commandoregel te starten waren: opschonen, consolideren,
+  prognosefout rapporteren, één regelcyclus en de terugrekening.
+
+**De api verandert niet van adres.** `<url>/api/run/<commando>` en
+`<url>/api/report/<variabele>/<periode>` blijven waar ze waren, inclusief
+de oude commandonamen, want die staan in de documentatie en in
+automatiseringen van gebruikers. Twee dingen zijn er wel anders aan
+`/api/run`:
+
+- De aanroep zet de taak in de wachtrij en antwoordt direct met `202`
+  in plaats van te wachten tot de taak klaar is. Een lange berekening
+  werd voorheen afgebroken door de tijdslimiet van de webserver; nu
+  loopt hij door. Draait de taak al, dan volgt `409`.
+- Het antwoord is platte tekst in plaats van een HTML-pagina. Het
+  resultaat staat in het logbestand van de taak, te zien op de
+  takenpagina.
+
+
 ## Codereview: beveiliging, betrouwbaarheid en snelheid
 Een volledige review van de Python-code heeft 18 kritieke bugs en alle acht
 verbeterpunten opgeleverd; die zijn nu doorgevoerd. De testsuite is meegegroeid

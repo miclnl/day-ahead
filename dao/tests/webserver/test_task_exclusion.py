@@ -139,7 +139,11 @@ class TestV2Api:
         assert response.status_code == 404
 
 
-class TestV1Api:
+class TestDocumentedApi:
+    """/api/run and /api/report are documented in DOCS.md with worked Home
+    Assistant examples, so they kept their paths when the v1 interface was
+    removed. They live in app/public_api.py now."""
+
     def test_it_refuses_a_task_that_is_already_running(self, client):
         task_state.claim("calc_optimum", source="scheduler")
 
@@ -148,34 +152,41 @@ class TestV1Api:
         )
 
         assert response.status_code == 409
+        assert b"scheduler" in response.data
 
-    def test_a_historical_alias_still_resolves(self, client, monkeypatch):
-        """/api/run/<key> URLs are the kind of thing people bookmark or wire
-        into an automation, so every old key has to keep working."""
-        import importlib
-
-        routes = importlib.import_module("app.routes")
-        calls = []
-
-        class Result:
-            stdout = "ok"
-            stderr = ""
-            returncode = 0
-
-        def fake_run(cmd, **kwargs):
-            calls.append(cmd)
-            return Result()
-
-        monkeypatch.setattr(routes, "run", fake_run)
-
+    def test_a_historical_alias_still_resolves(self, client):
+        """These urls are the kind of thing people wire into an automation,
+        so every old key has to keep working."""
         response = client.get(
             "/api/run/get_meteo", headers=INGRESS, environ_base=SUPERVISOR
         )
 
-        assert response.status_code == 200
-        assert calls == [task_registry.get("meteo")["cmd"]]
-        # Claim released afterwards, so the next call is not blocked.
-        assert task_state.is_running("meteo") is False
+        assert response.status_code == 202
+        # The canonical key is what gets claimed, whichever alias was used.
+        assert task_state.pending_requests().keys() == {"meteo"}
+
+    def test_it_hands_the_work_to_the_scheduler(self, client):
+        """It used to run the task inside the request, which meant it had to
+        finish inside gunicorn's per-request timeout or the worker was killed
+        and the child orphaned. An optimisation takes minutes, so it never
+        could."""
+        response = client.get(
+            "/api/run/calc_zonder_debug", headers=INGRESS, environ_base=SUPERVISOR
+        )
+
+        assert response.status_code == 202
+        entry = task_state.running_tasks()["calc_optimum"]
+        assert entry["state"] == "pending"
+        assert entry["source"] == "api"
+
+    def test_the_response_is_plain_text(self, client):
+        """It used to render an HTML page. The documented use is a
+        fire-and-forget rest_command that does not read the body."""
+        response = client.get(
+            "/api/run/get_meteo", headers=INGRESS, environ_base=SUPERVISOR
+        )
+
+        assert response.headers["Content-Type"].startswith("text/plain")
 
     def test_an_unknown_task_is_a_404(self, client):
         response = client.get(
@@ -184,29 +195,19 @@ class TestV1Api:
 
         assert response.status_code == 404
 
-
-class TestApiTimeoutStaysUnderGunicorn:
-    def test_the_cap_is_applied_and_reported(self, client, monkeypatch):
-        """Gunicorn kills a worker that does not answer within 120 s. The old
-        code capped at 300 s, so the worker died first and the run ended as a
-        dead worker plus an orphaned child with no output at all."""
-        import importlib
-        from subprocess import TimeoutExpired
-
-        routes = importlib.import_module("app.routes")
-        seen = {}
-
-        def fake_run(cmd, **kwargs):
-            seen["timeout"] = kwargs.get("timeout")
-            raise TimeoutExpired(cmd, kwargs.get("timeout"), output="partial")
-
-        monkeypatch.setattr(routes, "run", fake_run)
-
+    def test_it_does_not_echo_the_path_back(self, client):
+        """The segment is attacker controlled."""
         response = client.get(
-            "/api/run/get_meteo", headers=INGRESS, environ_base=SUPERVISOR
+            "/api/run/<script>alert(1)</script>",
+            headers=INGRESS,
+            environ_base=SUPERVISOR,
         )
 
-        assert response.status_code == 200
-        assert seen["timeout"] == task_registry.API_RUN_TIMEOUT_S
-        assert seen["timeout"] < 120
-        assert task_state.is_running("meteo") is False
+        assert response.status_code == 404
+        assert b"script" not in response.data
+
+    def test_it_is_still_refused_without_ingress(self, client):
+        """Reachable only with allow_direct_access, exactly as before and as
+        DOCS.md says."""
+        assert client.get("/api/run/get_meteo").status_code == 401
+        assert client.get("/api/report/da/vandaag").status_code == 401

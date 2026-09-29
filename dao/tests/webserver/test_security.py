@@ -32,8 +32,15 @@ def test_direct_requests_are_refused(client):
 
 
 def test_ingress_requests_are_served(client):
+    """The bare ingress path redirects to the dashboard.
+
+    The old interface owned "/", so it now needs a redirect of its own --
+    without one, the address Home Assistant's ingress actually opens would
+    be a 404.
+    """
     response = client.get("/", headers=INGRESS, environ_base=SUPERVISOR)
-    assert response.status_code == 200
+    assert response.status_code == 302
+    assert "/v2" in response.headers["Location"]
 
 
 def test_data_directory_is_not_served_as_static(client):
@@ -53,31 +60,49 @@ def test_image_route_serves_only_png_names(client):
         assert response.status_code == 404, name
 
 
-def test_settings_editor_refuses_other_files(client, site):
-    token = _csrf_token(client, "/settings/options")
+def test_no_route_takes_a_settings_filename(client):
+    """The traversal this used to guard against is now structurally
+    impossible.
+
+    The old editor took the file to edit from the url
+    (/settings/<filename>), which is what allowed "../evil". The current
+    pages are /v2/config and /v2/secrets, each pinned to one fixed path, so
+    there is no filename to smuggle anything through.
+    """
+    from app import app
+
+    for rule in app.url_map.iter_rules():
+        assert "settings" not in str(rule), rule
+
+
+def test_the_config_editor_writes_only_its_own_file(client, site):
+    token = _csrf_token(client, "/v2/config")
     response = client.post(
-        "/settings/options",
-        data={"cur_setting": "../evil", "codeinput": "{}", "action": "update",
-              "csrf_token": token},
+        "/v2/config",
+        data={"config": '{"nonsense": true}', "csrf_token": token},
         headers=INGRESS,
         environ_base=SUPERVISOR,
     )
-    assert response.status_code == 400
-    assert not (site / "evil.json").exists()
 
-
-def test_settings_editor_rejects_invalid_config(client, site):
-    before = (site / "data" / "options.json").read_text(encoding="utf-8")
-    token = _csrf_token(client, "/settings/options")
-    response = client.post(
-        "/settings/options",
-        data={"cur_setting": "options", "codeinput": '{"battery": "nope"}',
-              "action": "update", "csrf_token": token},
-        headers=INGRESS,
-        environ_base=SUPERVISOR,
-    )
     assert response.status_code == 200
-    assert b"Error:" in response.data
+    assert not (site / "evil.json").exists()
+    assert not (site / "data" / "evil.json").exists()
+
+
+def test_the_config_editor_rejects_invalid_config(client, site):
+    """A typo in the editor must not be able to leave an options.json the
+    scheduler cannot load, which would put it in a restart loop."""
+    token = _csrf_token(client, "/v2/config")
+    before = (site / "data" / "options.json").read_text(encoding="utf-8")
+
+    response = client.post(
+        "/v2/config",
+        data={"config": '{"battery": "nope"}', "csrf_token": token},
+        headers=INGRESS,
+        environ_base=SUPERVISOR,
+    )
+
+    assert response.status_code == 200
     assert (site / "data" / "options.json").read_text(encoding="utf-8") == before
 
 
@@ -99,9 +124,13 @@ def test_post_without_csrf_token_is_refused(client):
 
 def test_mode_switch_edits_only_the_mode_key(client, site):
     options = site / "data" / "options.json"
+    # Fetch the token first, then read the baseline. Rendering the page loads
+    # the configuration, and loading an unversioned options.json migrates it
+    # and stamps config_version -- a legitimate one-off write that would
+    # otherwise show up here as a difference the mode switch did not cause.
+    token = _csrf_token(client, "/v2/fast-control")
     before = json.loads(options.read_text(encoding="utf-8"))
     key = "fast control" if "fast control" in before else "fast_control"
-    token = _csrf_token(client, "/v2/fast-control")
 
     response = client.post(
         "/v2/fast-control/mode", data={"mode": "active", "csrf_token": token},
@@ -125,13 +154,21 @@ def test_mode_switch_rejects_unknown_mode(client, site):
     assert response.status_code == 400
 
 
-def test_v1_mode_switch_uses_the_same_writer(client, site):
+def test_switching_the_mode_off_is_written_through(client, site):
+    """There used to be two mode switches, one per interface, and the test
+    above only covered one of them. There is one now."""
     options = site / "data" / "options.json"
-    key = "fast control" if "fast control" in json.loads(options.read_text()) else "fast_control"
-    token = _csrf_token(client, "/fast_control")
+    token = _csrf_token(client, "/v2/fast-control")
+    key = (
+        "fast control"
+        if "fast control" in json.loads(options.read_text())
+        else "fast_control"
+    )
+
     response = client.post(
-        "/fast_control", data={"mode": "off", "csrf_token": token},
+        "/v2/fast-control/mode", data={"mode": "off", "csrf_token": token},
         headers=INGRESS, environ_base=SUPERVISOR,
     )
-    assert response.status_code == 200
+
+    assert response.status_code == 302
     assert json.loads(options.read_text(encoding="utf-8"))[key]["mode"] == "off"

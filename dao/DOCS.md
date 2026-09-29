@@ -1929,13 +1929,21 @@ De terugrekening is ook bereikbaar via de api:
 
 ### Web UI
 
-De web UI heeft een pagina op `/v2/fast-control` (v2) of `/fast_control`
-(v1) waar de huidige modus, de laatste beslissing en het lopende
-budget zichtbaar zijn. De pagina bevat knoppen om de modus te
-wijzigen en om een eenmalige beslissing (`Run once`) of een backtest
-(`Backtest`) te draaien. Triggers worden bewaard in een ringbuffer
-van 200 events in `data/fast_state.json`; in v2 verschijnen ze ook
-als scatter-grafiek.
+De web UI heeft een pagina op `/v2/fast-control` waar de huidige modus,
+de laatste beslissing en het lopende budget zichtbaar zijn. De pagina
+bevat knoppen om de modus te wijzigen en om een eenmalige beslissing
+(`Run once`) of een backtest (`Backtest`) te draaien. Triggers worden
+bewaard in een ringbuffer van 200 events in `data/fast_state.json` en
+verschijnen ook als scatter-grafiek.
+
+Staat de snelle laag ingeschakeld maar doet hij niets, dan zegt het
+add-on-log waarom. Twee veelvoorkomende oorzaken: er is geen `grid
+power`-sensor of geen batterij geconfigureerd (dan start de laag niet,
+met een regel bij het opstarten), of het plan dekt het huidige moment
+niet meer (`plan_expired`). In dat laatste geval staan alle batterijen
+op 0 W en herhaalt het log elk half uur hoe oud het plan is; zoek dan
+op `Plan voor de snelle regellaag` om te zien waarom de
+optimalisering geen nieuw plan wegschrijft.
 
 
 ---
@@ -2157,8 +2165,16 @@ add-on configuratie **allow_direct_access** hebt aangezet en in het netwerk-gede
 een poort hebt toegewezen. Zonder die optie antwoordt de add-on met `401 Unauthorized`.<br/>
 
 ## \<url>/api/run/\<commando><br />
-Met dit onderdeel van de api kun je via het dashboard alle berekeningen en bewerkingen
+Met dit onderdeel van de api kun je alle berekeningen en bewerkingen
 van het programma starten. Dit kan met **curl** maar ook kun je hiermee vanuit Home Assistant een bewerking of berekening uitvoeren. <br/>
+
+De aanroep zet de taak in de wachtrij en antwoordt direct met
+`202 Accepted`; de planner pikt hem binnen enkele seconden op en voert
+hem uit. Draait die taak al, dan is het antwoord `409 Conflict`. Het
+resultaat komt in het logbestand van de taak, te zien op de
+takenpagina van het dashboard.<br/>
+Voorheen draaide de taak in het verzoek zelf, waardoor een lange
+berekening werd afgebroken door de tijdslimiet van de webserver.<br/>
 Bij ```<commando>``` vul je een van de volgende commando's in:<br />
 * ```calc_zonder_debug```: een optimaliseringsberekening wordt uitgevoerd. 
 De resultaten worden doorgezet naar Home Assistant.<br />  
