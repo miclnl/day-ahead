@@ -1013,17 +1013,23 @@ class Report(DaBase):
                     v1.c.unit_of_measurement.label("dim"),
                 ]
             else:
+                # func.min/func.max, not the bare columns: PostgreSQL and
+                # MySQL 8 (ONLY_FULL_GROUP_BY, the default there) reject a
+                # non-aggregated column in a SELECT with GROUP BY. SQLite
+                # and MariaDB are lenient about it, which is the only reason
+                # this ever worked. unit_of_measurement is constant for one
+                # sensor, so max() does not change its value.
                 columns = [
                     column,
                     column2,
                     func.max(self.db_ha.from_unixtime(t2.c.start_ts)).label("tot"),
-                    t2.c.start_ts.label("utc"),
+                    func.min(t2.c.start_ts).label("utc"),
                     func.sum(
                         case(
                             (t2.c.state > t1.c.state, t2.c.state - t1.c.state), else_=0
                         )
                     ).label(col_name),
-                    v1.c.unit_of_measurement.label("dim"),
+                    func.max(v1.c.unit_of_measurement).label("dim"),
                 ]
 
             # Build the query to retrieve raw data
@@ -3503,7 +3509,19 @@ class Report(DaBase):
             return result
 
         df["time"] = pd.to_datetime(df["time"])
-        df["time_ts"] = df["time"].dt.tz_localize(self.time_zone)
+        # Every bucket here is one row per hour label (from an SQL GROUP BY
+        # on the hour string), not one row per actual wall-clock hour, so on
+        # the autumn DST day there is no repeated 02:00 in this series for
+        # pandas to infer the right occurrence from -- ambiguous="infer"
+        # still raises. ambiguous=False (the bucket is standard/winter time)
+        # is a fixed, deterministic choice that never depends on such a
+        # pattern. nonexistent="shift_forward" covers the spring day, whose
+        # 02:00-03:00 bucket does not exist at all. Without either, any
+        # report covering one of those two days a year crashed this
+        # endpoint outright.
+        df["time_ts"] = df["time"].dt.tz_localize(
+            self.time_zone, ambiguous=False, nonexistent="shift_forward"
+        )
         df["time"] = df["time"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M"))
         df.rename(columns={"datasoort": "datatype"}, inplace=True)
         cols = df.columns.tolist()
