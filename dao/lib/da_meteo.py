@@ -3,6 +3,7 @@ import json
 import math
 import logging
 import time
+from typing import Optional
 import pandas as pd
 import pytz
 import ephem
@@ -37,6 +38,9 @@ class Meteo:
         self.solar = config.solar
         self.bat = config.battery
         self.graphics_style = config.graphics.style
+        # Used to evaluate the sun's position at the middle of the interval
+        # a radiation value stands for, whatever that interval's length is.
+        self.interval_s = 3600 if config.interval == "1hour" else 900
 
     @staticmethod
     def makerefmoment(moment):
@@ -180,8 +184,10 @@ class Meteo:
         return result
 
     def get_dif_rad_factor(self, utc_time):
-        # een half uur verder voor berekenen van gem zonpositie in dat uur.
-        cor_utc_time = float(utc_time) + 1800
+        # naar het midden van het interval voor de gemiddelde zonpositie
+        # daarin; 1800s (half uur) alleen juist bij uur-intervallen, vandaar
+        # self.interval_s / 2 in plaats van een hard-coded 1800.
+        cor_utc_time = float(utc_time) + self.interval_s / 2
         # 52 graden noorderbreedte, 5 graden oosterlengte
         sunpos = self.sun_position(cor_utc_time)
         sun_h = sunpos["h"]  # hoogte boven horizon in rad
@@ -281,7 +287,12 @@ class Meteo:
         elif radiation <= 5:
             q_tot = radiation
         else:
-            sun_pos = self.sun_position(utc_time)
+            # Same instant get_dif_rad_factor() (called just below) evaluates
+            # the sun at. Using utc_time itself (the start of the interval)
+            # here made the direct component 0 in the first daylight interval
+            # of the day: the sun could still be below the horizon at the
+            # exact start while already up for most of the interval.
+            sun_pos = self.sun_position(float(utc_time) + self.interval_s / 2)
             dir_rad_factor = min(
                 2.0,
                 self.direct_radiation_factor(h_col, a_col, sun_pos["h"], sun_pos["A"]),
@@ -623,12 +634,13 @@ class Meteo:
         self.db_da.savedata(df_db)
         """
 
-    def get_avg_temperature(self, date: datetime.datetime = None) -> float:
+    def get_avg_temperature(self, date: datetime.datetime = None) -> Optional[float]:
         """
         Berekent gewogen met temperatuur grens van 16 oC
         :param date: de datum waarvoor de berekening wordt gevraagd
         als None: vandaag
-        :return: berekende gewogen graaddagen
+        :return: berekende gewogen graaddagen, of None als er geen
+            temperatuurprognoses voor die dag beschikbaar zijn
         """
         if date is None:
             date = datetime.datetime.combine(
@@ -656,6 +668,9 @@ class Meteo:
                     variabel_table.c.code == "temp",
                     values_table.c.variabel == variabel_table.c.id,
                     values_table.c.time >= date_utc,
+                    # Without this, a day with no data at all would silently
+                    # average whatever forecast exists for a *later* day.
+                    values_table.c.time < date_utc + 86400,
                 )
             )
             .order_by(values_table.c.time.asc())
@@ -670,6 +685,11 @@ class Meteo:
         with self.db_da.engine.connect() as connection:
             result = connection.execute(outer_query)
             avg_temp = result.scalar()
+        if avg_temp is None:
+            logging.warning(
+                f"Geen temperatuurprognose beschikbaar voor {date:%Y-%m-%d}"
+            )
+            return None
         """
         sql_avg_temp = (
             "SELECT AVG(t1.`value`) avg_temp FROM "
@@ -705,6 +725,15 @@ class Meteo:
             )
         if avg_temp is None:
             avg_temp = self.get_avg_temperature(date)
+        if avg_temp is None:
+            # No temperature forecast for this day at all: 0 degree days is
+            # the safe fallback (day_ahead.py already treats heat_needed<=0
+            # as "skip the heat pump this run" rather than crashing on it).
+            logging.warning(
+                f"Graaddagen voor {date:%Y-%m-%d} niet te berekenen (geen "
+                f"temperatuurprognose); 0 graaddagen aangenomen"
+            )
+            return 0.0
         weight_factor = 1
         if weighted:
             mon = date.month
