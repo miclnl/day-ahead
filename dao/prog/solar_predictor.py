@@ -7,7 +7,7 @@ hourly solar production based on weather data and historical solar output.
 
 import pandas as pd
 import numpy as np
-import joblib
+import json
 import os
 import sys
 import warnings
@@ -19,6 +19,7 @@ import copy
 import math
 
 # ML imports
+import xgboost
 from xgboost import XGBRegressor
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
@@ -26,6 +27,13 @@ from scipy import stats
 from dao.prog.da_base import DaBase
 from dao.prog.config.models.devices.solar import SolarConfig
 # import pvlib
+
+
+def _metadata_path(model_path: str) -> str:
+    """Sidecar file next to a saved model holding the feature list it was
+    trained with, so a mismatch with the current code shows up as a clear
+    error rather than a silently misaligned prediction."""
+    return model_path + ".meta.json"
 
 
 class SolarPredictor(DaBase):
@@ -649,14 +657,31 @@ class SolarPredictor(DaBase):
             "best_params": best_params if tune_hyperparameters else "default",
         }
 
-        # Save model
+        # Save model. xgboost's own save_model()/load_model() (a "model
+        # file", not a pickle of the Python wrapper) survives an xgboost
+        # version bump; joblib.dump() pickles the whole estimator object,
+        # including private attributes whose layout has broken across major
+        # xgboost releases before. The feature list travels alongside it in
+        # a small sidecar so a mismatch between the model and the current
+        # code's feature_columns is caught with a clear error instead of a
+        # silently misaligned prediction.
         os.makedirs(
             os.path.dirname(model_save_path)
             if os.path.dirname(model_save_path)
             else ".",
             exist_ok=True,
         )
-        joblib.dump(self.model, model_save_path)
+        self.model.save_model(model_save_path)
+        with open(_metadata_path(model_save_path), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "feature_columns": self.feature_columns,
+                    "trained_at": dt.datetime.now().isoformat(),
+                    "xgboost_version": xgboost.__version__,
+                },
+                f,
+                indent=2,
+            )
         self.is_trained = True
 
         logging.info(f"Model training van {self.solar_name} complete")
@@ -739,12 +764,32 @@ class SolarPredictor(DaBase):
 
         Returns:
             None # SolarPredictor instance with loaded model
+
+        Raises:
+            FileNotFoundError: no model at model_path.
+            ValueError: the model's sidecar metadata lists a different set
+                of feature columns than the current code uses. Loading it
+                anyway would silently feed the wrong values into the wrong
+                slots instead of failing.
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
-        # predictor = cls()
-        self.model = joblib.load(model_path)
+        metadata_path = _metadata_path(model_path)
+        if os.path.exists(metadata_path):
+            with open(metadata_path, encoding="utf-8") as f:
+                metadata = json.load(f)
+            trained_columns = metadata.get("feature_columns")
+            if trained_columns is not None and trained_columns != self.feature_columns:
+                raise ValueError(
+                    f"Model {model_path} was trained with feature columns "
+                    f"{trained_columns}, but the current code uses "
+                    f"{self.feature_columns}. Retrain before using this model."
+                )
+
+        model = XGBRegressor()
+        model.load_model(model_path)
+        self.model = model
         self.is_trained = True
 
         return None
@@ -1040,7 +1085,7 @@ class SolarPredictor(DaBase):
         self.train(
             weather_data,
             solar_data,
-            "../data/prediction/models/" + self.solar_name + ".pkl",
+            "../data/prediction/models/" + self.solar_name + ".json",
             tune_hyperparameters=True,
         )
 
@@ -1088,7 +1133,7 @@ class SolarPredictor(DaBase):
         self.tilt = solar_option.effective_tilt
         self.azimut = solar_option.effective_orientation + 180
         self.solar_capacity = solar_option.total_capacity
-        file_name = "../data/prediction/models/" + self.solar_name + ".pkl"
+        file_name = "../data/prediction/models/" + self.solar_name + ".json"
         if os.path.isfile(file_name):
             self.load_model(file_name)
         else:

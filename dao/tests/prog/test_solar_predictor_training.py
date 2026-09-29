@@ -102,13 +102,13 @@ class TestTrainUsesTimeSeriesSplit:
         stats = predictor.train(
             weather_data=weather,
             solar_data=solar,
-            model_save_path=str(tmp_path / "model.joblib"),
+            model_save_path=str(tmp_path / "model.json"),
             remove_outliers=False,
             tune_hyperparameters=True,
         )
 
         assert isinstance(captured["cv"], TimeSeriesSplit)
-        assert (tmp_path / "model.joblib").exists()
+        assert (tmp_path / "model.json").exists()
         assert "best_params" in stats
 
 

@@ -588,17 +588,21 @@ class DaBase(hass.Hass):
             zodat de prognosefout achteraf te meten is
         :return: None
         """
-        df_db = pd.DataFrame(columns=["time", "code", "value"])
         df = df.reset_index(drop=True)
         columns = df.columns.values.tolist()[1:]
         tz = pytz.timezone(self.time_zone)
+        # Melt (time, col1, col2, ...) into long-format (time, code, value)
+        # rows via a plain list instead of df_db.loc[df_db.shape[0]] = row
+        # per (index, column) pair: that copies the whole frame on every one
+        # of the rows*columns appends.
+        rows = []
         for index in range(min(len(tijd), len(df))):
             dt = pd.to_datetime(tijd[index])
             dt = tz.localize(dt)
             utc = int(dt.timestamp())
             for c in columns:
-                db_row = [str(utc), c, float(df.loc[index, c])]
-                df_db.loc[df_db.shape[0]] = db_row
+                rows.append((str(utc), c, float(df.loc[index, c])))
+        df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
         logging.debug("Save calculated data:\n{}".format(df_db.to_string()))
         self.db_da.savedata(df_db, tablename=tablename)
         if vintage:
@@ -1043,7 +1047,6 @@ class DaBase(hass.Hass):
             ):
                 solar_prog = solar_prog.iloc[1:]
         else:
-            solar_prog = pd.DataFrame(columns=["tijd", "prediction"])
             start_ts = datetime.datetime(
                 year=vanaf.year, month=vanaf.month, day=vanaf.day, hour=vanaf.hour
             ).timestamp()
@@ -1053,14 +1056,15 @@ class DaBase(hass.Hass):
             prog_data.index = pd.to_datetime(prog_data["tijd"])
             while len(prog_data) > 0 and prog_data.iloc[0]["tijd"] < vanaf:
                 prog_data = prog_data.iloc[1:]
-            index = 0
+            rows = []
             for row in prog_data.itertuples():
                 h_frac = interval_s / 3600
                 prod = self.calc_prod_solar(
                     solar_option, row.time, row.glob_rad, h_frac
                 )
                 prod = round(prod, 3)
-                solar_prog.loc[solar_prog.shape[0]] = [row.tijd, prod]
+                rows.append((row.tijd, prod))
+            solar_prog = pd.DataFrame(rows, columns=["tijd", "prediction"])
         solar_prog.reset_index(drop=True, inplace=True)
         return solar_prog
 
