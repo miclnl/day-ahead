@@ -1447,20 +1447,22 @@ class Report(DaBase):
                     return "expected"
             return "recorded"
 
-        fi_df = pd.DataFrame(
-            columns=[
-                interval,
-                "vanaf",
-                "tot",
-                "consumption",
-                "production",
-                "cost",
-                "profit",
-                "datasoort",
-            ]
-        )
+        columns = [
+            interval,
+            "vanaf",
+            "tot",
+            "consumption",
+            "production",
+            "cost",
+            "profit",
+            "datasoort",
+        ]
         if len(org_data_df.index) == 0:
-            return fi_df
+            return pd.DataFrame(columns=columns)
+        # One list of tuples built up front, then a single DataFrame(), not
+        # fi_df.loc[fi_df.shape[0]] = row per source row: that copies the
+        # whole (growing) frame on every append.
+        rows = []
         for row in org_data_df.itertuples():
             if pd.isnull(row.tijd):
                 continue
@@ -1483,17 +1485,20 @@ class Report(DaBase):
             else:
                 col_4 = 0
             col_5 = row.datasoort
-            fi_df.loc[fi_df.shape[0]] = [
-                tijd_str,
-                row.tijd,
-                row.tijd + datetime.timedelta(hours=1),
-                col_1,
-                col_2,
-                col_3,
-                col_4,
-                col_5,
-            ]
+            rows.append(
+                (
+                    tijd_str,
+                    row.tijd,
+                    row.tijd + datetime.timedelta(hours=1),
+                    col_1,
+                    col_2,
+                    col_3,
+                    col_4,
+                    col_5,
+                )
+            )
 
+        fi_df = pd.DataFrame(rows, columns=columns)
         fi_df = fi_df.groupby([interval], as_index=False).agg(
             {
                 "vanaf": "min",
@@ -1515,7 +1520,7 @@ class Report(DaBase):
         datasoort_values = df.pop("datasoort")
         df.insert(2, "datasoort", datasoort_values)
         columns = [interval] + df.columns.tolist()
-        result = pd.DataFrame(columns=columns)
+        rows = []
         for row in df.itertuples():
             if interval == "uur":
                 tijd_str = str(row.vanaf)[10:16]
@@ -1523,21 +1528,24 @@ class Report(DaBase):
                 tijd_str = str(row.vanaf)[0:10]
             else:
                 tijd_str = str(row.vanaf)[0:7]  # jaar maand
-            result.loc[result.shape[0]] = [
-                tijd_str,
-                row.vanaf,
-                row.vanaf + datetime.timedelta(hours=1),
-                row.datasoort,
-                row.cons,
-                row.prod,
-                row.bat_out,
-                row.bat_in,
-                row.pv_ac,
-                row.ev,
-                row.wp,
-                row.boil,
-                row.base,
-            ]
+            rows.append(
+                (
+                    tijd_str,
+                    row.vanaf,
+                    row.vanaf + datetime.timedelta(hours=1),
+                    row.datasoort,
+                    row.cons,
+                    row.prod,
+                    row.bat_out,
+                    row.bat_in,
+                    row.pv_ac,
+                    row.ev,
+                    row.wp,
+                    row.boil,
+                    row.base,
+                )
+            )
+        result = pd.DataFrame(rows, columns=columns)
 
         if interval != "uur":
             agg_dict = {"vanaf": "min"}
@@ -2647,9 +2655,9 @@ class Report(DaBase):
             "Netto kosten",
         ]
         # columns.extend(ext_columns)
-        fi_df = pd.DataFrame(columns=columns)
         if len(report_df.index) == 0:
-            return fi_df
+            return pd.DataFrame(columns=columns)
+        rows = []
         for row in report_df.itertuples():
             if pd.isnull(row.vanaf):
                 continue
@@ -2665,15 +2673,8 @@ class Report(DaBase):
             col_4 = row.cost
             col_5 = row.profit
             col_6 = col_4 - col_5
-            fi_df.loc[fi_df.shape[0]] = [
-                tijd_str,
-                col_1,
-                col_2,
-                col_3,
-                col_4,
-                col_5,
-                col_6,
-            ]
+            rows.append((tijd_str, col_1, col_2, col_3, col_4, col_5, col_6))
+        fi_df = pd.DataFrame(rows, columns=columns)
 
         # , "Tarief verbr.", "Tarief prod."
         # , "Tarief verbr.":'mean', "Tarief prod.":"mean"
@@ -3225,8 +3226,8 @@ class Report(DaBase):
         multiplier_l = 1
         multiplier_t = 1
         columns = ["time", "da_ex", "da_cons", "da_prod", "datasoort"]
-        df = pd.DataFrame(columns=columns)
         salderen = self.prices_options.tax_refund if self.prices_options else True
+        rows = []
         for row in df_da.itertuples():
             if pd.isnull(row.time):
                 continue
@@ -3248,26 +3249,29 @@ class Report(DaBase):
                 )
             else:
                 da_prod = (row.value + ol_t) * (1 + btw_t / 100)
-            df.loc[df.shape[0]] = [
-                datetime.datetime.strptime(row.time, "%Y-%m-%d %H:%M"),
-                row.value,
-                da_cons,
-                da_prod,
-                "expected",
-            ]
-        return df
+            rows.append(
+                (
+                    datetime.datetime.strptime(row.time, "%Y-%m-%d %H:%M"),
+                    row.value,
+                    da_cons,
+                    da_prod,
+                    "expected",
+                )
+            )
+        return pd.DataFrame(rows, columns=columns)
 
     def calc_solar_data(self, device, day: datetime.date, active_view: str):
-        result = pd.DataFrame(columns=["uur", "tijd"])
         start = datetime.datetime(day.year, day.month, day.day)
         end = start + datetime.timedelta(days=1)
         begin = dati = datetime.datetime(start.year, start.month, start.day, hour=0)
         hour_int = 0
+        rows = []
         while dati < end:
             hour_int += 1
             hour_str = dati.strftime("%H:%M")
-            result.loc[result.shape[0]] = [hour_str, dati]
+            rows.append((hour_str, dati))
             dati = begin + datetime.timedelta(hours=hour_int)
+        result = pd.DataFrame(rows, columns=["uur", "tijd"])
         result.index = pd.to_datetime(result["tijd"])
 
         # prognose straling
