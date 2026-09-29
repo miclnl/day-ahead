@@ -10,17 +10,29 @@ not delayed by several seconds of pointless backoff.
 
 import time
 
-import hassapi as hass
 import pytest
-import requests
-from hassapi.exceptions import NotFound, ServiceUnavailable, Unauthorised
+from homeassistant_api.errors import (
+    EndpointNotFoundError,
+    InternalServerError,
+    UnauthorizedError,
+)
+from niquests.exceptions import ConnectionError as HAConnectionError
+from niquests.exceptions import Timeout as HATimeout
 
 from dao.prog.da_base import DaBase
 
 
+class FakeHAClient:
+    """Stand-in for the homeassistant_api.Client instance DaBase composes
+    as self._ha_client. Each method below is monkeypatched per test to the
+    exact failure/success sequence that test wants to exercise."""
+
+
 @pytest.fixture
 def instance():
-    return DaBase.__new__(DaBase)
+    obj = DaBase.__new__(DaBase)
+    obj._ha_client = FakeHAClient()
+    return obj
 
 
 @pytest.fixture(autouse=True)
@@ -34,105 +46,114 @@ def _no_real_backoff(monkeypatch):
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
 
-@pytest.fixture
-def restore_hass_methods():
-    saved = {
-        "get_state": hass.Hass.get_state,
-        "call_service": hass.Hass.call_service,
-        "set_state": hass.Hass.set_state,
-    }
-    yield
-    for name, method in saved.items():
-        setattr(hass.Hass, name, method)
-
-
-def test_get_state_retries_a_transient_connection_error(instance, restore_hass_methods, monkeypatch):
+def test_get_state_retries_a_transient_connection_error(instance):
     calls = {"n": 0}
 
-    def flaky(self, entity_id):
+    def flaky(*, entity_id):
         calls["n"] += 1
         if calls["n"] < 3:
-            raise requests.exceptions.ConnectionError("boom")
+            raise HAConnectionError("boom")
         return "42"
 
-    monkeypatch.setattr(hass.Hass, "get_state", flaky)
+    instance._ha_client.get_state = flaky
 
     assert instance.get_state("sensor.x") == "42"
     assert calls["n"] == 3
 
 
-def test_get_state_does_not_retry_a_permanent_error(instance, restore_hass_methods, monkeypatch):
+def test_get_state_does_not_retry_a_permanent_error(instance):
     calls = {"n": 0}
 
-    def not_found(self, entity_id):
+    def not_found(*, entity_id):
         calls["n"] += 1
-        raise NotFound("no such entity")
+        raise EndpointNotFoundError("no such entity")
 
-    monkeypatch.setattr(hass.Hass, "get_state", not_found)
+    instance._ha_client.get_state = not_found
 
-    with pytest.raises(NotFound):
+    with pytest.raises(EndpointNotFoundError):
         instance.get_state("sensor.y")
     assert calls["n"] == 1
 
 
-def test_get_state_gives_up_after_three_attempts(instance, restore_hass_methods, monkeypatch):
+def test_get_state_gives_up_after_three_attempts(instance):
     calls = {"n": 0}
 
-    def always_fails(self, entity_id):
+    def always_fails(*, entity_id):
         calls["n"] += 1
-        raise requests.exceptions.Timeout("slow")
+        raise HATimeout("slow")
 
-    monkeypatch.setattr(hass.Hass, "get_state", always_fails)
+    instance._ha_client.get_state = always_fails
 
-    with pytest.raises(requests.exceptions.Timeout):
+    with pytest.raises(HATimeout):
         instance.get_state("sensor.z")
     assert calls["n"] == 3
 
 
-def test_call_service_retry_also_covers_turn_on_and_set_value(
-    instance, restore_hass_methods, monkeypatch
-):
+def test_call_service_retry_also_covers_turn_on_and_set_value(instance):
     """turn_on/turn_off/select_option/set_value are thin wrappers around
-    call_service in hassapi; overriding call_service alone must cover all of
-    them through normal method dispatch."""
+    call_service; overriding call_service alone must cover all of them
+    through normal method dispatch."""
     calls = {"n": 0}
 
-    def flaky(self, service, entity_id, **kwargs):
+    def flaky(domain, service, **kwargs):
         calls["n"] += 1
         if calls["n"] < 2:
-            raise ServiceUnavailable("busy")
+            raise InternalServerError(503, "busy")
         return "ok"
 
-    monkeypatch.setattr(hass.Hass, "call_service", flaky)
+    instance._ha_client.trigger_service = flaky
 
     assert instance.turn_on("switch.x") == "ok"
     assert calls["n"] == 2
 
 
-def test_call_service_does_not_retry_unauthorised(instance, restore_hass_methods, monkeypatch):
+def test_call_service_does_not_retry_unauthorised(instance):
     calls = {"n": 0}
 
-    def unauthorised(self, service, entity_id, **kwargs):
+    def unauthorised(domain, service, **kwargs):
         calls["n"] += 1
-        raise Unauthorised("bad token")
+        raise UnauthorizedError("bad token")
 
-    monkeypatch.setattr(hass.Hass, "call_service", unauthorised)
+    instance._ha_client.trigger_service = unauthorised
 
-    with pytest.raises(Unauthorised):
+    with pytest.raises(UnauthorizedError):
         instance.turn_off("switch.x")
     assert calls["n"] == 1
 
 
-def test_set_state_also_retries(instance, restore_hass_methods, monkeypatch):
+def test_set_state_also_retries(instance):
     calls = {"n": 0}
 
-    def flaky(self, entity_id, state, attributes=None):
+    def flaky(state):
         calls["n"] += 1
         if calls["n"] < 2:
-            raise requests.exceptions.ConnectionError("boom")
+            raise HAConnectionError("boom")
         return "ok"
 
-    monkeypatch.setattr(hass.Hass, "set_state", flaky)
+    instance._ha_client.set_state = flaky
 
     assert instance.set_state("sensor.status", "on") == "ok"
     assert calls["n"] == 2
+
+
+def test_call_service_derives_the_domain_from_entity_id(instance):
+    """trigger_service() wants the domain as its own argument;
+    call_service() must derive it from entity_id rather than require every
+    caller to pass it separately (matching the old hassapi call shape)."""
+    captured = {}
+
+    def capture(domain, service, **kwargs):
+        captured["domain"] = domain
+        captured["service"] = service
+        captured["kwargs"] = kwargs
+        return "ok"
+
+    instance._ha_client.trigger_service = capture
+
+    instance.select_option("select.mode", "eco")
+
+    assert captured == {
+        "domain": "select",
+        "service": "select_option",
+        "kwargs": {"entity_id": "select.mode", "option": "eco"},
+    }

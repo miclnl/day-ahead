@@ -221,10 +221,9 @@ def _call_key(args: tuple, kwargs: dict) -> str:
 
 
 class _FakeState:
-    """Minimal stand-in for whatever hassapi's ``get_state()`` normally
-    returns. Every call site in day_ahead.py/da_base.py only ever reads
-    ``.state`` off the result (verified by grep) so nothing else is
-    implemented."""
+    """Minimal stand-in for whatever DaBase.get_state() normally returns.
+    Every call site in day_ahead.py/da_base.py only ever reads ``.state``
+    off the result (verified by grep) so nothing else is implemented."""
 
     __slots__ = ("state",)
 
@@ -233,31 +232,26 @@ class _FakeState:
         self.state = state
 
 
-class _FakeHttpResponse:
-    """Stand-in for a ``requests.Response``. Serves two distinct real call
-    sites during replay: the raw ``get(hassurl + "api/config")`` in
-    ``DaBase.__init__`` (reads only ``.text``), and — discovered by actually
-    running a hermetic construction against the real ``hassapi`` package,
-    not just reading it — ``hass.Hass.__init__`` itself, via
-    ``BaseClient._assert_api_running()``, which does its own independent
-    ``requests.get("<hassurl>/")`` health check and reads ``.ok``/``.json()``
-    on the result. Supporting all three keeps both call sites served by one
-    small stand-in."""
+class _FakeHAClient:
+    """Stand-in for the ``homeassistant_api.Client`` instance
+    ``DaBase.__init__`` constructs as ``self._ha_client``. Only
+    ``get_config()`` needs to actually work here: it is the one call
+    ``__init__`` itself makes (to resolve latitude/longitude/time_zone), and
+    it happens before ``DaBase.get_state``/``call_service``/``set_state`` —
+    which reach ``self._ha_client`` for real — get replaced by the read/
+    write patches installed below. Any other method reaching here would mean
+    some other part of __init__ started using the client directly and needs
+    its own patch added, so it deliberately isn't stubbed out."""
 
-    __slots__ = ("_payload", "text", "ok", "status_code")
+    __slots__ = ("_config",)
 
-    # Bouwt een minimale requests.Response-imitatie met .text/.ok/.status_code, 
-    # nodig om zowel da_base.py's eigen HA-aanroep als hassapi's interne verzoek te kunnen bedienen.
-    def __init__(self, payload: dict):
-        self._payload = payload
-        self.text = json.dumps(payload)
-        self.ok = True
-        self.status_code = 200
+    # Onthoudt alleen de config-payload die get_config() straks teruggeeft.
+    def __init__(self, config: dict):
+        self._config = config
 
-    # Geeft de payload terug zoals requests.Response.json() dat zou doen, 
-    # want hassapi's interne verwerking roept dit aan.
-    def json(self):
-        return self._payload
+    # Levert de vastgelegde HA-config terug, precies zoals DaBase.__init__ die verwacht.
+    def get_config(self):
+        return self._config
 
 
 class _FakeDbManager:
@@ -313,10 +307,10 @@ class _FakeLoader:
 class _PatchList:
     """Tracks class/module attribute overrides so they can be reverted
     exactly, including the case where the attribute didn't exist directly on
-    the target before (e.g. ``DaBase.get_state`` is inherited from
-    ``hass.Hass``, not defined on ``DaBase`` itself) — restoring must
-    ``delattr`` in that case, not set back a value that was never really
-    there, or the shadow would survive patch removal."""
+    the target before (e.g. it was inherited from a base class rather than
+    defined on the target itself) — restoring must ``delattr`` in that case,
+    not set back a value that was never really there, or the shadow would
+    survive patch removal."""
 
     # Start met een lege lijst van toegepaste patches.
     def __init__(self):
@@ -1110,25 +1104,13 @@ class ReplayIO:
             "time_zone": "UTC",
             "country": "NL",
         }
+        # DaBase.__init__ constructs self._ha_client = HAClient(...) and
+        # immediately calls its get_config() to resolve latitude/longitude/
+        # time_zone; patching the HAClient name in da_base's own module
+        # namespace intercepts that construction with no real network
+        # access at all, one seam for the one call site.
         self._patches.set(
-            da_base_module, "get", lambda *a, **k: _FakeHttpResponse(ha_context)
-        )
-
-        # hass.Hass.__init__ (from the hassapi package DaBase subclasses)
-        # does its own independent reachability check via a bare
-        # `requests.get(...)` inside hassapi.client.base — a call site
-        # da_base.py has no seam for at all, distinct from the explicit
-        # `get(hassurl + "api/config")` above. Patching the `requests`
-        # module's own `get` attribute reaches it, since hassapi does
-        # `import requests` (a shared module reference) rather than
-        # `from requests import get` (a copied one, which is why da_base.py
-        # needed its own separate patch just above).
-        import requests
-
-        self._patches.set(
-            requests,
-            "get",
-            lambda *a, **k: _FakeHttpResponse({"message": "API running."}),
+            da_base_module, "HAClient", lambda *a, **k: _FakeHAClient(ha_context)
         )
 
         label = f"ReplayIO ({self._source})"
@@ -3206,11 +3188,11 @@ def _contains_negative_zero(obj) -> bool:
     return False
 
 
-# Interne zelftest voor precies het scenario dat DaBase.get_state raakt: een geërfde, niet-eigen methode moet na restore weer via de klasse-hiërarchie lopen.
+# Interne zelftest: een geërfde, niet-eigen methode moet na restore weer via de klasse-hiërarchie lopen.
 def _patch_list_restore_check() -> None:
     """The scenario that matters most: an attribute inherited via MRO
-    (never owned by the class itself, like DaBase.get_state on hass.Hass)
-    must be un-shadowed by delattr, not overwritten with a stale value."""
+    (never owned by the class itself) must be un-shadowed by delattr, not
+    overwritten with a stale value."""
 
     class Base:
         # Triviale testmethode zonder eigen betekenis, alleen om patch en restore op te kunnen testen.

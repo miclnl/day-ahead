@@ -30,7 +30,7 @@ T0 = 1_700_000_000
 
 
 class FakeHass:
-    """Minimal stand-in for the hassapi surface DaBase exposes."""
+    """Minimal stand-in for the HA client surface DaBase exposes."""
 
     def __init__(self, states=None, fail_template=False):
         self.states = dict(states or {})

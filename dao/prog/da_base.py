@@ -8,16 +8,11 @@ import threading
 import pytz
 import warnings
 from dataclasses import dataclass
-import requests
-from requests import get
 import json
-import hassapi as hass
-from hassapi.exceptions import (
-    BadGateway,
-    InternalServerError,
-    ServiceUnavailable,
-    TooManyRequests,
-)
+from homeassistant_api import Client as HAClient
+from homeassistant_api.models import State as HAState
+from homeassistant_api.errors import InternalServerError, RequestTimeoutError
+from niquests.exceptions import RequestException as HARequestException
 import pandas as pd
 from subprocess import PIPE, run
 import logging
@@ -43,7 +38,6 @@ from dao.prog.utils import interpolate
 
 # from db_manager import DBmanagerObj
 from typing import Optional, Union
-from hassapi.models import StateList
 
 
 @dataclass
@@ -63,30 +57,32 @@ class HAContext:
 
 #: A network hiccup or a momentarily overloaded Home Assistant must not
 #: itself take down calc_optimum (~40 HA reads per run); three attempts with
-#: a short backoff absorb a single blip. hassapi's own exceptions carry the
-#: HTTP status code in their type: only the transient ones (429/500/502/503)
-#: are retried here, a 401/403/404 is a configuration error retrying cannot
-#: fix and would only delay the FlexValue default-fallback (see
-#: models/base.py) by several seconds for nothing.
+#: a short backoff absorb a single blip. homeassistant_api only wraps a
+#: timeout (RequestTimeoutError) and a >=500 response (InternalServerError)
+#: in its own exception types; anything below that in the transport itself
+#: (connection refused, DNS failure) surfaces as a raw niquests
+#: RequestException instead. A 401/403/404/429 is not retried: those come
+#: back as their own homeassistant_api.errors classes (UnauthorizedError,
+#: EndpointNotFoundError, ...), none of which are in this tuple, so
+#: retry_if_exception_type leaves them alone — a config error retrying
+#: cannot fix would otherwise just delay the FlexValue default-fallback
+#: (see models/base.py) by several seconds for nothing.
 _retry_ha_call = retry(
     reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
     retry=retry_if_exception_type(
         (
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-            TooManyRequests,
+            HARequestException,
+            RequestTimeoutError,
             InternalServerError,
-            BadGateway,
-            ServiceUnavailable,
         )
     ),
 )
 
 
 class NotificationHandler(Handler):
-    def __init__(self, _hass: hass.Hass, _entity=None):
+    def __init__(self, _hass: "DaBase", _entity=None):
         """
         Initialize the handler.
         """
@@ -101,10 +97,13 @@ class NotificationHandler(Handler):
                 self.count += 1
             msg = self.format(record)
             msg = msg.partition("\n")[0]
-            self.hass.set_value(self.entity, msg)
+            # Bypasses DaBase.set_value's own retry/read-back/logging: a
+            # warning raised while reporting a warning through this same
+            # handler would recurse.
+            self.hass._raw_set_value(self.entity, msg)
 
 
-class DaBase(hass.Hass):
+class DaBase:
     _config = None
     _loader = None
     _init_lock = threading.Lock()
@@ -194,18 +193,26 @@ class DaBase(hass.Hass):
         else:
             self.hasstoken = _tok.resolve(self.loader.secrets)
 
-        super().__init__(hassurl=self.hassurl, token=self.hasstoken, timeout=10)
-        headers = {
-            "Authorization": "Bearer " + self.hasstoken,
-            "content-type": "application/json",
-        }
+        # A single persistent Session (niquests, via homeassistant_api) is
+        # reused for every HA call this instance makes, instead of hassapi's
+        # bare requests.get()/post() opening a new TCP+TLS connection per
+        # call — real overhead at ~40 HA reads per calc_optimum run.
+        self._ha_client = HAClient(
+            api_url=self.hassurl + "api",
+            token=self.hasstoken,
+            global_request_kwargs={"timeout": 10},
+        )
         try:
-            resp = get(self.hassurl + "api/config", headers=headers, timeout=(5, 30))
-            resp.raise_for_status()
-            resp_dict = resp.json()
-        except requests.RequestException as ex:
+            resp_dict = self._ha_client.get_config()
+        except Exception as ex:
+            # Deliberately broad: a construction-time reachability failure
+            # can surface as a homeassistant_api.errors.* exception (a non-2xx
+            # response) or as a raw niquests exception (connection refused,
+            # DNS failure) — homeassistant_api only wraps a timeout, nothing
+            # below that in the transport. Either way the instance is
+            # unusable and the caller needs the same clear message.
             raise RuntimeError(
-                f"Home Assistant API niet bereikbaar op {self.hassurl}api/config: {ex}"
+                f"Home Assistant API niet bereikbaar op {self.hassurl}api: {ex}"
             ) from ex
         logging.debug(f"hass/api/config: {resp_dict}")
         try:
@@ -293,19 +300,45 @@ class DaBase(hass.Hass):
         warnings.simplefilter("ignore", ResourceWarning)
 
     @_retry_ha_call
-    def get_state(self, entity_id: str, *args, **kwargs):
-        return super().get_state(entity_id, *args, **kwargs)
+    def get_state(self, entity_id: str) -> HAState:
+        return self._ha_client.get_state(entity_id=entity_id)
 
     @_retry_ha_call
-    def call_service(self, service: str, *args, **kwargs):
-        # turn_on/turn_off/select_option/open_cover/... are all thin
-        # wrappers around call_service (see hassapi.client.services), so
-        # this one override also covers every one of them.
-        return super().call_service(service, *args, **kwargs)
+    def call_service(self, service: str, entity_id: str, **kwargs) -> tuple:
+        # turn_on/turn_off/select_option/set_value below are all thin
+        # wrappers around call_service, so this one override also covers
+        # every one of them. homeassistant_api's trigger_service() wants the
+        # domain as its own argument rather than deriving it from entity_id
+        # itself (hassapi's behaviour, kept here so every call site that
+        # passes entity_id, positionally or as a keyword, is unaffected).
+        domain = entity_id.split(".")[0]
+        return self._ha_client.trigger_service(
+            domain, service, entity_id=entity_id, **kwargs
+        )
 
     @_retry_ha_call
-    def set_state(self, entity_id: str, *args, **kwargs):
-        return super().set_state(entity_id, *args, **kwargs)
+    def set_state(self, entity_id: str, state, attributes: Optional[dict] = None) -> HAState:
+        return self._ha_client.set_state(
+            HAState(entity_id=entity_id, state=str(state), attributes=attributes or {})
+        )
+
+    def turn_on(self, entity_id: str) -> tuple:
+        return self.call_service("turn_on", entity_id)
+
+    def turn_off(self, entity_id: str) -> tuple:
+        return self.call_service("turn_off", entity_id)
+
+    def select_option(self, entity_id: str, option: str) -> tuple:
+        return self.call_service("select_option", entity_id, option=option)
+
+    def _raw_set_value(self, entity_id: str, value) -> tuple:
+        """Call the set_value service directly against the HA client,
+        bypassing set_value()'s own retry/read-back/logging wrapper. Used
+        only by NotificationHandler.emit (see its comment for why)."""
+        domain = entity_id.split(".")[0]
+        return self._ha_client.trigger_service(
+            domain, "set_value", entity_id=entity_id, value=value
+        )
 
     # Callable passed to FlexValue.resolve() — returns HA state as a plain string.
     def ha_getter(self, eid):
@@ -388,7 +421,7 @@ class DaBase(hass.Hass):
         logging.warning(f"{what or entity_id}: standaardwaarde {default} gebruikt")
         return default
 
-    def set_value(self, entity_id: str, value: Union[int, float, str]) -> StateList:
+    def set_value(self, entity_id: str, value: Union[int, float, str]) -> tuple:
         """Write *value* through the set_value service and check the result.
 
         A failing service call is an error and is raised. A read-back that does
@@ -399,7 +432,7 @@ class DaBase(hass.Hass):
         power written but its operating mode not.
         """
         try:
-            result = super().set_value(entity_id, value)
+            result = self.call_service("set_value", entity_id, value=value)
         except Exception:
             logging.error(f"Fout bij schrijven naar {entity_id}, waarde {value}")
             raise
@@ -742,7 +775,7 @@ class DaBase(hass.Hass):
     # TODO: _get_option and the set_entity_*/get_entity_state helpers below are
     #   generic HA interaction utilities that don't belong on DaBase. Consider
     #   extracting them into a dedicated HAEntityHelper class (or mixin) that
-    #   wraps the hass.Hass API, so DaBase stays focused on config/orchestration.
+    #   wraps the HA client, so DaBase stays focused on config/orchestration.
 
     @staticmethod
     def _get_option(key: str, options, default=None):
@@ -1111,7 +1144,7 @@ class DaBase(hass.Hass):
             logger.addHandler(stream_handler)
         if self.notification_entity is not None:
             notification_handler = NotificationHandler(
-                _hass=super(), _entity=self.notification_entity
+                _hass=self, _entity=self.notification_entity
             )
             notification_handler.setFormatter(formatter)
             logger.addHandler(notification_handler)
