@@ -1,15 +1,12 @@
 import datetime
-import json
 import math
 import logging
-import time
 from typing import Optional
 import pandas as pd
 import ephem
-import requests
-from requests import get
 import matplotlib.pyplot as plt
 import knmi
+from dao.forecast.weather.meteoserver import fetch_meteoserver
 from dao.lib.da_graph import GraphBuilder
 from dao.lib.db_manager import DBmanagerObj
 from sqlalchemy import Table, select, func, and_
@@ -407,63 +404,39 @@ class Meteo:
         """
 
     def get_from_meteoserver(self, model: str) -> pd.DataFrame:
-        if not self.meteoserver_key:
-            logging.error("Geen meteoserver key geconfigureerd, geen meteodata opgehaald")
-            return pd.DataFrame()
-        params = {
-            "lat": str(self.latitude),
-            "long": str(self.longitude),
-            "key": self.meteoserver_key,
-        }
-        data = None
-        if model == "harmonie":
-            url = "https://data.meteoserver.nl/api/uurverwachting.php"
-        else:
-            url = "https://data.meteoserver.nl/api/uurverwachting_gfs.php"
-        # attempts is the number of retries on top of the first request, so the
-        # loop runs attempts + 1 times. A hung socket must never block the
-        # scheduler, hence the explicit timeout; a short pause between attempts
-        # keeps a meteoserver outage from turning into a request storm.
-        max_attempts = max(1, int(self.meteoserver_attempts or 0) + 1)
-        for attempt in range(1, max_attempts + 1):
-            try:
-                resp = get(url, params=params, timeout=(5, 30))
-                resp.raise_for_status()
-                json_object = resp.json()
-            except (requests.RequestException, ValueError) as ex:
-                logging.warning(
-                    f"Meteoserver poging {attempt} van {max_attempts} mislukt: {ex}"
-                )
-                json_object = {}
-            if isinstance(json_object, dict) and json_object.get("data"):
-                data = json_object["data"]
-                break
-            if attempt < max_attempts:
-                time.sleep(min(30, 2**attempt))
-
-        if data is None:
-            logging.error(
-                f"Geen meteodata ontvangen van meteoserver na {max_attempts} pogingen"
-            )
-            return pd.DataFrame()
-
-        df = pd.DataFrame.from_records(data)
-        missing = [
-            c for c in ["tijd", "tijd_nl", "gr", "temp", "winds", "neersl"]
-            if c not in df.columns
-        ]
-        if missing:
-            logging.error(f"Meteoserver antwoord mist kolommen {missing}")
-            return pd.DataFrame()
-        df1 = df[["tijd", "tijd_nl", "gr", "temp", "winds", "neersl"]]
-        df1 = df1[:96]
-        logging.info(f"Meteodata model {model}")
-        logging.info(
-            f"Aantal uitgevoerde ophaalpogingen: {attempt} van maximaal: {max_attempts}"
+        """Delegates to :func:`fetch_meteoserver`, reshaped back into the
+        columns this class's own callers still expect (``tijd``/``tijd_nl``
+        rather than the weather frame's ``time``). A thin compatibility
+        layer until those callers move to :mod:`dao.forecast.weather`
+        themselves.
+        """
+        frame = fetch_meteoserver(
+            self.meteoserver_key,
+            model,
+            self.meteoserver_attempts,
+            self.latitude,
+            self.longitude,
         )
-        logging.info(f"Aantal records: {len(df1)}")
-        logging.info(f"Data {model}: \n{df1.to_string(index=True)}")
-        return df1
+        if frame.empty:
+            return pd.DataFrame()
+        result = pd.DataFrame(
+            {
+                "tijd": frame["time"],
+                "tijd_nl": frame["time"].apply(
+                    lambda t: datetime.datetime.fromtimestamp(t).strftime(
+                        "%d-%m-%Y %H:%M"
+                    )
+                ),
+                "gr": frame["gr"],
+                "temp": frame["temp"],
+                "winds": frame["winds"],
+                "neersl": frame["neersl"],
+            }
+        )
+        logging.info(f"Meteodata model {model}")
+        logging.info(f"Aantal records: {len(result)}")
+        logging.info(f"Data {model}: \n{result.to_string(index=True)}")
+        return result
 
     def get_meteo_data(self, show_graph=False):
         df1 = self.get_from_meteoserver(self.meteoserver_model)
