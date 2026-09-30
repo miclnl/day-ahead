@@ -3,6 +3,91 @@
 from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
+from dao.prog.config.models.base import EntityId
+
+
+class AbsenceConfig(BaseModel):
+    """When the household is away, detected from consumption or told directly."""
+
+    detect: bool = Field(
+        default=True,
+        description="Label past away days from consumption history",
+        json_schema_extra={
+            "x-help": "Without any extra sensors, a day counts as away when its active "
+            "energy (the day's total minus standby) falls well below what recent "
+            "days led the estimator to expect. Past away days feed a separate "
+            "away profile, so absences are forecast rather than papered over "
+            "with the ordinary weekday pattern.",
+            "x-ui-section": "Baseload",
+            "x-order": 120,
+        },
+    )
+    threshold: float = Field(
+        default=0.4,
+        ge=0.1,
+        le=0.9,
+        description="Fraction of expected consumption below which a day counts as away",
+        json_schema_extra={
+            "x-help": "Once at least ten days have both a consumption label and an "
+            "`entities presence` reading, this is recalibrated automatically "
+            "against reality; the configured value only applies until then.",
+            "x-ui-section": "Baseload",
+            "x-order": 121,
+        },
+    )
+    entities_presence: list[EntityId] = Field(
+        default_factory=list,
+        alias="entities presence",
+        description="Person-tracker entities, used both to detect the regime and to "
+        "calibrate the threshold",
+        json_schema_extra={"x-ui-section": "Baseload", "x-order": 122},
+    )
+    entity_away: Optional[EntityId] = Field(
+        default=None,
+        alias="entity away",
+        description="An entity whose state alone decides the household is away",
+        json_schema_extra={
+            "x-help": "Takes priority over every other signal. For "
+            "`alarm_control_panel`, `away state: armed_away` is the usual choice.",
+            "x-ui-section": "Baseload",
+            "x-order": 123,
+        },
+    )
+    away_state: str = Field(
+        default="on",
+        alias="away state",
+        description="The state of `entity away` that means the household is away",
+        json_schema_extra={"x-ui-section": "Baseload", "x-order": 124},
+    )
+    entity_calendar: Optional[EntityId] = Field(
+        default=None,
+        alias="entity calendar",
+        description="A calendar entity whose events mark away periods",
+        json_schema_extra={"x-ui-section": "Baseload", "x-order": 125},
+    )
+    calendar_keywords: list[str] = Field(
+        default_factory=lambda: ["vakantie", "weg", "afwezig", "holiday"],
+        alias="calendar keywords",
+        description="Case-insensitive words in an event's title that mark it as away",
+        json_schema_extra={"x-ui-section": "Baseload", "x-order": 126},
+    )
+    away_after_hours: int = Field(
+        default=3,
+        ge=1,
+        alias="away after hours",
+        description="Consecutive hours with nobody present marks the rest of today away",
+        json_schema_extra={"x-ui-section": "Baseload", "x-order": 127},
+    )
+    assume_next_day_after_hours: int = Field(
+        default=24,
+        ge=1,
+        alias="assume next day after hours",
+        description="Consecutive hours with nobody present marks tomorrow away too",
+        json_schema_extra={"x-ui-section": "Baseload", "x-order": 128},
+    )
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
 
 class BaseloadOptionsConfig(BaseModel):
     """How the daily baseload profile is estimated from history."""
@@ -113,6 +198,11 @@ class BaseloadOptionsConfig(BaseModel):
             "x-ui-section": "Baseload",
             "x-order": 117,
         },
+    )
+    absence: AbsenceConfig = Field(
+        default_factory=AbsenceConfig,
+        description="Away-day detection and anticipation",
+        json_schema_extra={"x-ui-section": "Baseload", "x-order": 118},
     )
 
     model_config = ConfigDict(

@@ -301,6 +301,10 @@ class DaCalc(DaBase):
                 f"{U}), de berekening wordt afgebroken"
             )
             return None
+        try:
+            self.baseload_service().record_presence()
+        except Exception as ex:
+            logging.warning(f"Aanwezigheid registreren mislukt: {ex}")
 
         # 0.015 kWh/J/cm² productie van mijn panelen per J/cm²
         solar_prod = []

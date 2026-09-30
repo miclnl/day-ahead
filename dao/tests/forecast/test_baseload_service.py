@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import types
 from zoneinfo import ZoneInfo
@@ -27,7 +28,16 @@ def flat_profile(value: float, samples: int = 8) -> BaseloadProfile:
     )
 
 
-def make_config(*, baseload=None, calc_periode=56, aggregate="mean"):
+def make_config(
+    *,
+    baseload=None,
+    calc_periode=56,
+    aggregate="mean",
+    absence_detect=True,
+    entities_presence=None,
+    entity_away=None,
+    entity_calendar=None,
+):
     return types.SimpleNamespace(
         report=types.SimpleNamespace(
             entities_grid_consumption=["sensor.test_grid_in"],
@@ -53,6 +63,17 @@ def make_config(*, baseload=None, calc_periode=56, aggregate="mean"):
             holidays="sunday",
             clip_negative=True,
             min_samples=3,
+            absence=types.SimpleNamespace(
+                detect=absence_detect,
+                threshold=0.4,
+                entities_presence=entities_presence or [],
+                entity_away=entity_away,
+                away_state="on",
+                entity_calendar=entity_calendar,
+                calendar_keywords=["vakantie", "weg", "afwezig", "holiday"],
+                away_after_hours=3,
+                assume_next_day_after_hours=24,
+            ),
         ),
         baseload=baseload,
     )
@@ -130,6 +151,79 @@ def service_with_history(ha_db, tmp_path):
         config, db_da=None, db_ha=manager, data_dir=data_dir, tz=TZ, now=lambda: now
     )
     return service, data_dir
+
+
+def _synthetic_history_with_gap(ha_db, da_db, tmp_path, *, gap_days: int):
+    """60 days of day/night history with a low-consumption gap of
+    ``gap_days`` days, twenty days in -- long enough to have history before
+    it. Day/night variation matters here: :func:`standby_kwh` reads it off
+    the night hours, so a flat day would make "active energy" collapse to
+    noise around zero."""
+    manager, helper = ha_db
+    now = dt.datetime(2026, 3, 4, 6, 0, tzinfo=ZONE)
+    period_days = 60
+    tot = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    vanaf = tot - dt.timedelta(days=period_days)
+    n_hours = period_days * 24
+    gap_start = vanaf + dt.timedelta(days=20)
+    gap_end = gap_start + dt.timedelta(days=gap_days)
+
+    grid_in: dict[int, float] = {}
+    total = 0.0
+    for i in range(n_hours + 1):
+        moment = vanaf + dt.timedelta(hours=i)
+        grid_in[int(moment.timestamp())] = total
+        if i < n_hours:
+            if gap_start <= moment < gap_end:
+                step = 0.05
+            else:
+                step = 0.3 if 7 <= moment.hour < 23 else 0.1
+            total += step
+
+    helper.add_energy("sensor.test_grid_in", "kWh", grid_in)
+    helper.add_energy("sensor.test_grid_out", "kWh", {ts: 0.0 for ts in grid_in})
+    helper.add_power("sensor.test_pv", "W", {ts: 0.0 for ts in list(grid_in)[:-1]})
+
+    config = make_config(baseload=None, calc_periode=period_days)
+    data_dir = tmp_path / "forecast" / "baseload"
+    service = BaseloadService(
+        config, db_da=da_db, db_ha=manager, data_dir=data_dir, tz=TZ, now=lambda: now
+    )
+    return service, gap_start.date(), gap_end.date()
+
+
+@pytest.fixture
+def service_with_history_and_vacation(ha_db, da_db, tmp_path):
+    """A six day dip in consumption, long enough for the "labels" source."""
+    return _synthetic_history_with_gap(ha_db, da_db, tmp_path, gap_days=6)
+
+
+@pytest.fixture
+def service_with_history_short_vacation(ha_db, da_db, tmp_path):
+    """A two day dip, too short for the "labels" source: standby instead."""
+    service, _, _ = _synthetic_history_with_gap(ha_db, da_db, tmp_path, gap_days=2)
+    return service
+
+
+@pytest.fixture
+def fake_ha():
+    """A stub HA client: configurable entity states, no calendar events."""
+
+    class FakeState:
+        def __init__(self, state):
+            self.state = state
+
+    class FakeHA:
+        def __init__(self):
+            self.states: dict[str, str] = {}
+
+        def get_state(self, entity_id):
+            return FakeState(self.states.get(entity_id, "unknown"))
+
+        def get_calendar_events(self, entity_id, start, end):
+            return []
+
+    return FakeHA()
 
 
 def test_forecast_uses_effective_weekday_for_holiday(service_with_profiles):
@@ -234,3 +328,79 @@ def test_profile_set_migrates_legacy_directory(service_without_profiles, tmp_pat
     assert profile_set is not None
     assert len(profile_set.home) == 7
     assert (service_without_profiles.data_dir / "profile.json").exists()
+
+
+def test_fit_labels_vacation_and_builds_away_profile(service_with_history_and_vacation):
+    service, vacation_start, vacation_end = service_with_history_and_vacation
+
+    profile_set = service.fit()
+
+    assert profile_set.away is not None
+    assert profile_set.away_source == "labels"
+    assert sum(profile_set.away.values) < 0.6 * sum(profile_set.home[1].values)
+
+    frame = service.db_da.get_column_data(
+        "values",
+        "away",
+        start=dt.datetime.combine(vacation_start, dt.time.min, tzinfo=ZONE),
+        end=dt.datetime.combine(vacation_end, dt.time.min, tzinfo=ZONE),
+    )
+    assert len(frame) == (vacation_end - vacation_start).days
+    assert list(frame["value"]) == [1.0] * len(frame)
+
+
+def test_fit_with_two_away_days_uses_standby(service_with_history_short_vacation):
+    profile_set = service_with_history_short_vacation.fit()
+
+    assert profile_set.away is not None
+    assert profile_set.away_source == "standby"
+
+
+def test_forecast_picks_regime_from_entity(service_with_profiles, fake_ha):
+    fake_ha.states["input_boolean.away"] = "on"
+    service_with_profiles.ha = fake_ha
+    service_with_profiles.config.baseload_options.absence.entity_away = (
+        "input_boolean.away"
+    )
+
+    start = dt.datetime(2026, 3, 2, 0, 0, tzinfo=ZONE)  # Monday, home 0.3, away 0.1
+    series = service_with_profiles.forecast(start, 3)
+
+    assert list(series.values) == pytest.approx([0.1, 0.1, 0.1])
+
+    status = json.loads(
+        (service_with_profiles.data_dir / "status.json").read_text()
+    )
+    assert status["regime"] == "away"
+    assert status["reason"] == "entity"
+
+
+def test_record_presence_writes_fraction(da_db, fake_ha, tmp_path):
+    fake_ha.states["person.a"] = "home"
+    fake_ha.states["person.b"] = "not_home"
+    config = make_config(entities_presence=["person.a", "person.b"])
+    now = dt.datetime(2026, 3, 4, 12, 0, tzinfo=ZONE)
+    data_dir = tmp_path / "forecast" / "baseload"
+    service = BaseloadService(
+        config,
+        db_da=da_db,
+        db_ha=None,
+        data_dir=data_dir,
+        tz=TZ,
+        now=lambda: now,
+        ha=fake_ha,
+    )
+
+    service.record_presence()
+
+    frame = da_db.get_column_data(
+        "values",
+        "presence",
+        start=now - dt.timedelta(hours=1),
+        end=now + dt.timedelta(hours=1),
+    )
+    assert list(frame["value"]) == [0.5]
+
+
+def test_record_presence_noop_without_entities(service_with_profiles):
+    service_with_profiles.record_presence()  # no entities configured; must not raise

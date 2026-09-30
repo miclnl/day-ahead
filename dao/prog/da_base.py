@@ -80,6 +80,22 @@ _retry_ha_call = retry(
 )
 
 
+def _parse_calendar_datetime(value, tz) -> datetime.datetime:
+    """A calendar event edge as a tz-aware datetime.
+
+    Home Assistant returns a timed event's edge as an ISO string directly
+    and an all-day event's as ``{"date": "YYYY-MM-DD"}``; both are handled
+    here rather than assuming the shape of the entity that happens to be
+    configured.
+    """
+    if isinstance(value, dict):
+        value = value.get("dateTime") or value.get("date")
+    moment = datetime.datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=tz)
+    return moment
+
+
 class NotificationHandler(Handler):
     def __init__(self, _hass: "DaBase", _entity=None):
         """
@@ -306,6 +322,38 @@ class DaBase:
     @_retry_ha_call
     def get_state(self, entity_id: str) -> HAState:
         return self._ha_client.get_state(entity_id=entity_id)
+
+    @_retry_ha_call
+    def get_calendar_events(
+        self, entity_id: str, start: datetime.datetime, end: datetime.datetime
+    ) -> list:
+        """Events on ``entity_id`` in ``[start, end]``, via the raw calendar API.
+
+        ``homeassistant_api`` has no calendar support of its own; the
+        underlying client's generic ``request()`` reaches the same
+        ``GET /api/calendars/<entity_id>`` endpoint the frontend uses.
+        """
+        from dao.forecast.baseload.absence import CalendarEvent
+
+        payload = self._ha_client.request(
+            f"calendars/{entity_id}",
+            params={"start": start.isoformat(), "end": end.isoformat()},
+        )
+        events = []
+        for item in payload or []:
+            try:
+                events.append(
+                    CalendarEvent(
+                        start=_parse_calendar_datetime(item.get("start"), start.tzinfo),
+                        end=_parse_calendar_datetime(item.get("end"), start.tzinfo),
+                        summary=item.get("summary") or "",
+                    )
+                )
+            except (TypeError, ValueError) as ex:
+                logging.warning(
+                    f"Kalenderevent van {entity_id} overgeslagen: {ex}"
+                )
+        return events
 
     @_retry_ha_call
     def call_service(self, service: str, entity_id: str, **kwargs) -> tuple:
@@ -814,6 +862,7 @@ class DaBase:
             self.db_ha,
             Path("../data/forecast/baseload"),
             self.time_zone,
+            ha=self,
         )
 
     def calc_baseloads(self):

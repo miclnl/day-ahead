@@ -407,6 +407,16 @@ class CheckDB:
         ):
             self.upsert_variabel(variabel_tabel, record)
 
+        # Variabelen voor het forecast-pakket: stralingscomponenten voor het
+        # pvlib-model en de afwezigheidsdetectie. Idempotent, zoals hierboven.
+        for record in (
+            [28, "dni", "Directe straling", "J/cm2", "avg"],
+            [29, "dhi", "Diffuse straling", "J/cm2", "avg"],
+            [30, "away", "Afwezig", "-", "avg"],
+            [31, "presence", "Aanwezigheid", "-", "avg"],
+        ):
+            self.upsert_variabel(variabel_tabel, record)
+
         # Voeg indexen toe op kolom `time` in de values en prognoses tabel, indien niet bestaand
         self.ensure_time_indexes()
         self.ensure_forecast_table()

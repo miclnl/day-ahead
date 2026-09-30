@@ -449,6 +449,23 @@ class DBmanagerObj(object):
             index_elements=["variabel", "time"], set_={"value": statement.excluded.value}
         )
 
+    def save_daily_value(self, code: str, day: datetime.date, value: float) -> None:
+        """Upsert one value at the local midnight epoch of ``day``.
+
+        For once-a-day labels (``away``) that belong to a calendar date
+        rather than a measured hour.
+        """
+        midnight = datetime.datetime.combine(day, datetime.time.min, tzinfo=self.tzinfo)
+        self.savedata(
+            pd.DataFrame([{"code": code, "time": self.epoch(midnight), "value": value}])
+        )
+
+    def save_hourly_value(self, code: str, moment: datetime.datetime, value: float) -> None:
+        """Upsert one value at the epoch of ``moment``."""
+        self.savedata(
+            pd.DataFrame([{"code": code, "time": self.epoch(moment), "value": value}])
+        )
+
     def get_time_border_record(
         self, code: str, latest: bool = True, table_name: str = "values"
     ) -> datetime.datetime:
