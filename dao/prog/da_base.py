@@ -1072,14 +1072,11 @@ class DaBase:
         return solar_prog
 
     def train_ml_predictions(self):
-        from dao.prog.solar_predictor import SolarPredictor
-
-        # Calibrates the physical model for every installation first: the
-        # ML model's own features include that model's (now current)
-        # output, and its physical fallback should not be stale either.
+        # Calibrates the physical model for every installation and, for
+        # those configured for ml/auto, trains the ML model too -- in that
+        # order, since the ML model's own features include the physical
+        # model's (now current) output.
         self.pv_service().run_training()
-        solar_predictor = SolarPredictor()
-        solar_predictor.run_train()
 
     def run_task_function(self, task, logfile: bool = True):
         """Run *task* in this process, logging it to its own file.

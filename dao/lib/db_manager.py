@@ -637,6 +637,45 @@ class DBmanagerObj(object):
             result_df["time"] = result_df["time"].astype("int64")
             return result_df[columns]
 
+    def forecast_rows(
+        self, codes, lead_buckets, start_ts: int, end_ts: int
+    ) -> pd.DataFrame:
+        """Archived forecasts for ``codes``/``lead_buckets`` in ``[start_ts, end_ts)``.
+
+        Columns: ``target_time``, ``code``, ``lead_bucket``, ``value``,
+        ``source``. Used to train the PV ML model on what a forecast at a
+        given lead time actually looked like, rather than on measurements
+        it will never be fed again at prediction time.
+        """
+        from sqlalchemy import Table, and_, select
+        from sqlalchemy.exc import NoSuchTableError
+
+        columns = ["target_time", "code", "lead_bucket", "value", "source"]
+        try:
+            forecasts = Table("forecasts", self.metadata, autoload_with=self.engine)
+            variabel = Table("variabel", self.metadata, autoload_with=self.engine)
+        except NoSuchTableError:
+            return pd.DataFrame(columns=columns)
+
+        query = select(
+            forecasts.c.target_time,
+            variabel.c.code,
+            forecasts.c.lead_bucket,
+            forecasts.c.value,
+            forecasts.c.source,
+        ).where(
+            and_(
+                forecasts.c.variabel == variabel.c.id,
+                variabel.c.code.in_(list(codes)),
+                forecasts.c.lead_bucket.in_(list(lead_buckets)),
+                forecasts.c.target_time >= int(start_ts),
+                forecasts.c.target_time < int(end_ts),
+            )
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(query).fetchall()
+        return pd.DataFrame(rows, columns=columns)
+
     def get_prognose_fields(
         self, codes, start, end=None, interval: str = "1hour"
     ) -> pd.DataFrame:

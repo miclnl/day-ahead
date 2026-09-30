@@ -241,8 +241,15 @@ class PVService:
         return result
 
     def run_training(self) -> None:
-        """Calibrate every installation and log the outcome."""
-        for installation in self.installations():
+        """Calibrate every installation, then train the ML model for those
+        configured for it.
+
+        Calibration always runs first: an installation's ml/auto model
+        trains on features that include the physical model's own output,
+        so that output should be current before training starts.
+        """
+        installations = self.installations()
+        for installation in installations:
             result = self.calibrate_installation(installation)
             if result is not None:
                 logging.info(
@@ -254,3 +261,23 @@ class PVService:
                 logging.info(
                     f"PV-kalibratie {installation.name}: geen nieuwe kalibratie"
                 )
+
+        ml_installations = [
+            installation
+            for installation in installations
+            if installation.effective_model in ("ml", "auto")
+            and installation.entities_sensors
+        ]
+        if not ml_installations:
+            return
+
+        from dao.prog.solar_predictor import SolarPredictor
+
+        solar_predictor = SolarPredictor()
+        start = (self._now() - datetime.timedelta(days=3 * 365)).replace(tzinfo=None)
+        for installation in ml_installations:
+            try:
+                solar_predictor.train_solar_option(installation, start)
+            except Exception as ex:  # noqa: BLE001 - one bad model must not
+                # abort every other installation's training in the same run.
+                logging.warning(f"ML-training van {installation.name} mislukt: {ex}")
