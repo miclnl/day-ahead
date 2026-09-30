@@ -14,7 +14,6 @@ import warnings
 from typing import Optional, Union, Dict, Any
 import datetime as dt
 import logging
-import knmi
 import copy
 import math
 
@@ -856,108 +855,32 @@ class SolarPredictor(DaBase):
     def get_and_save_knmi_data(
         self, start: dt.datetime, end: dt.datetime, variables: list = ["FH", "T", "Q"]
     ):
-        """
-        haalt data op en bewaart ze in dao-db
-        :param start: datetime
-        :param end: datetime
-        :return: None
-        """
-        knmi_df = knmi.get_hour_data_dataframe(
-            [self.knmi_station],
-            start=start - dt.timedelta(days=1),
-            end=end,
-            variables=variables,
-        )
-        if len(knmi_df) == 0:
-            logging.info(
-                f"Er zijn geen aanvullende knmi-data beschikbaar vanaf {start}-{end}"
-            )
-            return
+        """Delegates to the unified observation fetcher.
 
-        knmi_df["utc"] = knmi_df.index
-        knmi_eerste = pd.to_datetime(knmi_df["utc"].iloc[0]).tz_localize(self.time_zone)
-        knmi_laatste = pd.to_datetime(knmi_df["utc"].iloc[-1]).tz_localize(
-            self.time_zone
+        Kept for compatibility with existing call sites until Task 24; the
+        bespoke gap arithmetic this used to do is superseded by
+        ``update_observations`` always refreshing a trailing window, which
+        is idempotent (``savedata`` upserts) so there is no gap to track by
+        hand. ``variables`` is accepted but no longer selective: the KNMI
+        fetch behind this always retrieves gr/temp/winds together.
+        """
+        from dao.forecast.weather.observations import update_observations
+
+        days = max(1, (end.date() - start.date()).days + 1)
+        update_observations(
+            self.db_da,
+            self.latitude,
+            self.longitude,
+            self.ha_context.country,
+            "auto",
+            days=days,
+            now=end,
         )
-        logging.info(
-            f"Er zijn data van het KNMI binnengekomen vanaf {knmi_eerste} tot en met "
-            f"{knmi_laatste}"
-        )
-        knmi_df = knmi_df.rename(columns={"T": "temp", "Q": "gr", "FH": "winds"})
-        knmi_df["utc"] = pd.to_datetime(
-            knmi_df["utc"], utc=True
-        )  # , format='%Y-%m-%d %H:%M:%S')
-        # See import_weatherdata for why this collects into a plain list
-        # instead of appending to the DataFrame row by row.
-        has_temp = "temp" in knmi_df.columns
-        has_gr = "gr" in knmi_df.columns
-        has_winds = "winds" in knmi_df.columns
-        records = []
-        for row in knmi_df.itertuples():
-            utc = int(row.utc.timestamp())
-            if has_temp:
-                records.append((utc, "temp", row.temp / 10))
-            if has_gr:
-                records.append((utc, "gr", row.gr))
-            if has_winds:
-                records.append((utc, "winds", row.winds / 10))
-        save_df = pd.DataFrame(records, columns=["time", "code", "value"])
-        self.db_da.savedata(save_df, tablename="values")
-        return None
 
     def import_knmi_df(self, start: dt.datetime, end: dt.datetime):
-        """
-        haalt data op bij knmi en slaat deze op in dao-database
-        :param start: begin-datum waarvan data aanwezig moeten zijn
-        :param end: datum tot data aanwezig meten zijn
-        :return:
-        """
-        """
-        # import and delete meteo-files
-        meteo_files = []
-        map = "../data/prediction/meteo/"
-        for f in os.listdir(map):
-            if not f ==".keep" and os.path.isfile(map+f):
-                meteo_files.append(map+f)
-        for meteo_file in meteo_files:
-            self.import_weatherdata(meteo_file)
-        """
-        # get dataframe with knmi-py
-        # datetime of latest data-reord
-        logging.info(
-            f"KNMI-weerstation: {self.knmi_station} {knmi.stations[int(self.knmi_station)].name}"
-        )
-
-        latest_wind_dt = self.db_da.get_time_border_record("winds", latest=True)
-        latest_dt = self.db_da.get_time_border_record("gr", latest=True)
-        if latest_wind_dt is None and latest_dt is not None:
-            logging.info("Er zijn nog geen winddata van knmi aanwezig")
-            self.get_and_save_knmi_data(start, latest_dt, ["FH"])
-        else:
-            if (
-                latest_dt is not None
-                and latest_wind_dt is not None
-                and latest_wind_dt < latest_dt
-            ):
-                self.get_and_save_knmi_data(latest_wind_dt, latest_dt, ["FH"])
-
-        first_dt = self.db_da.get_time_border_record("gr", latest=False)
-        latest_dt = self.db_da.get_time_border_record("gr", latest=True)
-        if latest_dt is None:  # er zijn nog geen data
-            logging.info(f"Er zijn nog geen knmi-data aanwezig")
-            self.get_and_save_knmi_data(start, end)
-            first_dt = self.db_da.get_time_border_record("gr", latest=False)
-            latest_dt = self.db_da.get_time_border_record("gr", latest=True)
-        else:
-            logging.info(f"Er zijn knmi-data aanwezig vanaf {first_dt} tot {latest_dt}")
-        if first_dt <= start and latest_dt >= end:
-            logging.info(f"Er worden geen knmi-data opgehaald")
-            return None
-        if first_dt > start:
-            self.get_and_save_knmi_data(start, first_dt)
-        if latest_dt < end:
-            self.get_and_save_knmi_data(latest_dt, end)
-        return None
+        """Delegates to the unified observation fetcher; see
+        ``get_and_save_knmi_data`` for why the old gap-detection is gone."""
+        self.get_and_save_knmi_data(start, end)
 
     def get_weatherdata(
         self,

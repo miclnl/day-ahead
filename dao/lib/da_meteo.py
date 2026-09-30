@@ -5,7 +5,6 @@ from typing import Optional
 import pandas as pd
 import ephem
 import matplotlib.pyplot as plt
-import knmi
 from dao.forecast.weather.meteoserver import fetch_meteoserver
 from dao.lib.da_graph import GraphBuilder
 from dao.lib.db_manager import DBmanagerObj
@@ -200,52 +199,9 @@ class Meteo:
         station :code van een knmi station
         :return: boolean
         """
-        """ 
-        start = datetime.date.today() - datetime.timedelta(days=4)
-        knmi_df = knmi.get_hour_data_dataframe(
-            [station],
-            start=start,
-            end=start,
-            variables=["Q", "T"],
-        )
-        result = len(knmi_df) > 0 and not knmi_df.isnull().values.any()
-        """
-        # onderstaande lijst is gegenereerd met prof/tst.py/generate_list_knmi-aws.py
-        # beter bij iedere nieuwe versie autoamtisch checken en vernieuwen op github
-        list_aws = [
-            215,
-            235,
-            240,
-            249,
-            251,
-            257,
-            260,
-            267,
-            269,
-            270,
-            273,
-            275,
-            277,
-            278,
-            279,
-            280,
-            283,
-            286,
-            290,
-            310,
-            319,
-            323,
-            330,
-            344,
-            348,
-            350,
-            356,
-            370,
-            375,
-            377,
-            380,
-        ]
-        return station in list_aws
+        from dao.forecast.weather.observations import KNMI_AWS_STATIONS
+
+        return int(station) in KNMI_AWS_STATIONS
 
     def which_station(self) -> str:
         """
@@ -254,19 +210,9 @@ class Meteo:
         :param longitude:
         :return: code weerstation
         """
-        stations = knmi.stations
-        distance = None
-        result = None
-        for key in stations:
-            if self.is_aws(key):
-                station = stations[key]
-                afstand = (self.latitude - station.latitude) ** 2 + (
-                    self.longitude - station.longitude
-                ) ** 2
-                if result is None or afstand < distance:
-                    distance = afstand
-                    result = key
-        return str(result)
+        from dao.forecast.weather.observations import nearest_knmi_station
+
+        return str(nearest_knmi_station(self.latitude, self.longitude))
 
     def solar_rad(
         self, utc_time: float, radiation: float, h_col: float, a_col: float
