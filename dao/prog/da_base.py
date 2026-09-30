@@ -253,6 +253,7 @@ class DaBase:
             latitude=self.ha_context.latitude,
             longitude=self.ha_context.longitude,
             secrets=self.loader.secrets,
+            country=self.ha_context.country,
         )
         if (self.ha_context.country == "NL") or (self.ha_context.country == "BE"):
             self.knmi_station = self.meteo.which_station()

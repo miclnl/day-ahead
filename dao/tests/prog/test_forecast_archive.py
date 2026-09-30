@@ -288,3 +288,63 @@ class TestVariabelIds:
 
     def test_unknown_codes_are_absent_from_the_result(self, db):
         assert db.variabel_ids(["nope"]) == {}
+
+
+class TestForecastsSourceColumn:
+    def test_source_column_is_added_to_an_existing_table(self, tmp_path):
+        from sqlalchemy import (
+            BigInteger,
+            Column,
+            Float,
+            ForeignKey,
+            Integer,
+            String,
+            Table,
+            UniqueConstraint,
+            inspect,
+            insert,
+        )
+
+        manager = DBmanagerObj(
+            db_dialect="sqlite", db_name="day_ahead.db", db_path=str(tmp_path)
+        )
+        metadata = manager.metadata
+        variabel = Table(
+            "variabel",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("code", String(10), unique=True, nullable=False),
+            Column("name", String(50), unique=True, nullable=False),
+            Column("dim", String(10), nullable=False),
+            Column("aggregate", String(3), nullable=False, default="avg"),
+        )
+        # The pre-source shape: everything forecasts_table has today except
+        # the "source" column, i.e. what a database migrated before this
+        # column existed still has on disk.
+        Table(
+            "forecasts",
+            metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("variabel", ForeignKey("variabel.id"), nullable=False),
+            Column("target_time", BigInteger, nullable=False),
+            Column("lead_bucket", Integer, nullable=False),
+            Column("issued_time", BigInteger, nullable=False),
+            Column("value", Float),
+            UniqueConstraint("variabel", "target_time", "lead_bucket"),
+        )
+        metadata.create_all(manager.engine)
+        with manager.engine.begin() as connection:
+            connection.execute(
+                insert(variabel),
+                [{"id": 27, "code": "hload", "name": "Geplande huisvraag", "dim": "kWh"}],
+            )
+
+        columns_before = {c["name"] for c in inspect(manager.engine).get_columns("forecasts")}
+        assert "source" not in columns_before
+
+        assert manager.ensure_forecasts_source_column() is True
+        columns_after = {c["name"] for c in inspect(manager.engine).get_columns("forecasts")}
+        assert "source" in columns_after
+
+        # Idempotent: calling it again on an already-migrated table is a no-op.
+        assert manager.ensure_forecasts_source_column() is True

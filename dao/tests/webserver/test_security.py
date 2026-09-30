@@ -76,17 +76,28 @@ def test_no_route_takes_a_settings_filename(client):
 
 
 def test_the_config_editor_writes_only_its_own_file(client, site):
+    # "site" is module-scoped: its options.json is shared with every other
+    # test in this file. "{"nonsense": true}" now validates on its own
+    # (every top-level field has a default), so the POST really does
+    # overwrite it -- restore the previous content after checking the
+    # traversal property this test actually cares about, or every test
+    # after this one loads a config with nothing in it.
+    options = site / "data" / "options.json"
+    before = options.read_text(encoding="utf-8")
     token = _csrf_token(client, "/v2/config")
-    response = client.post(
-        "/v2/config",
-        data={"config": '{"nonsense": true}', "csrf_token": token},
-        headers=INGRESS,
-        environ_base=SUPERVISOR,
-    )
+    try:
+        response = client.post(
+            "/v2/config",
+            data={"config": '{"nonsense": true}', "csrf_token": token},
+            headers=INGRESS,
+            environ_base=SUPERVISOR,
+        )
 
-    assert response.status_code == 200
-    assert not (site / "evil.json").exists()
-    assert not (site / "data" / "evil.json").exists()
+        assert response.status_code == 200
+        assert not (site / "evil.json").exists()
+        assert not (site / "data" / "evil.json").exists()
+    finally:
+        options.write_text(before, encoding="utf-8")
 
 
 def test_the_config_editor_rejects_invalid_config(client, site):

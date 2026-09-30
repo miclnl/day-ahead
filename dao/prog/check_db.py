@@ -420,6 +420,7 @@ class CheckDB:
         # Voeg indexen toe op kolom `time` in de values en prognoses tabel, indien niet bestaand
         self.ensure_time_indexes()
         self.ensure_forecast_table()
+        self.db_da.ensure_forecasts_source_column()
 
         # timezone in postgresql could be wrong, check and report
         if self.db_da.db_dialect == "postgresql":

@@ -20,16 +20,18 @@ class Meteo:
         latitude: float,
         longitude: float,
         secrets: dict = None,
+        country: str = "NL",
     ):
         self.config = config
         self.db_da = db_da
-        _secrets = secrets or {}
+        self.secrets = secrets or {}
         mk = config.meteoserver_key
-        self.meteoserver_key = mk.resolve(_secrets) if mk is not None else None
+        self.meteoserver_key = mk.resolve(self.secrets) if mk is not None else None
         self.meteoserver_model = config.meteoserver_model
         self.meteoserver_attempts = config.meteoserver_attempts
         self.latitude = latitude
         self.longitude = longitude
+        self.country = country
         self.solar = config.solar
         self.bat = config.battery
         self.graphics_style = config.graphics.style
@@ -301,7 +303,12 @@ class Meteo:
     """
 
     def make_graph_meteo(self, df, file=None, show=False):
-        df["uur"] = df.tijd_nl.apply(lambda x: x[11:13])
+        if "tijd_nl" in df.columns:
+            df["uur"] = df.tijd_nl.apply(lambda x: x[11:13])
+        else:
+            df["uur"] = pd.to_datetime(df["time"], unit="s", utc=True).apply(
+                lambda moment: moment.strftime("%H")
+            )
         meteo_options = {
             "title": f"Opgehaalde meteodata vanaf {df.iloc[0, 2]}",
             "style": self.graphics_style,
@@ -385,161 +392,32 @@ class Meteo:
         return result
 
     def get_meteo_data(self, show_graph=False):
-        df1 = self.get_from_meteoserver(self.meteoserver_model)
-        df_db = pd.DataFrame(columns=["time", "code", "value"])
-        count = len(df1)
-        if count == 0:
-            logging.error(f"No {self.meteoserver_model}-data recieved from meteoserver")
-        else:
-            df1 = df1.reset_index()  # make sure indexes pair with number of rows
-            # Melt (tijd, gr, temp, winds, neersl) into long-format (time,
-            # code, value) rows via a plain list instead of four
-            # df_db.loc[df_db.shape[0]] = row appends per source row, which
-            # copies the whole frame on every one of the up to 384 appends.
-            rows = []
-            for row in df1.itertuples():
-                time_str = str(int(row.tijd))
-                rows.append((time_str, "gr", float(row.gr)))
-                rows.append((time_str, "temp", float(row.temp)))
-                rows.append((time_str, "winds", float(row.winds)))
-                rows.append((time_str, "neersl", float(row.neersl)))
-            df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
+        from pathlib import Path
 
-        """
-        df2 = pd.DataFrame()
-        if count < 96:
-            df2 = self.get_from_meteoserver("gfs")
-            len_df2 = len(df2)
-            if len_df2 == 0:
-                logging.error("No gfs-data recieved from meteoserver")
-            else:
-                for row in df2[count:].itertuples():
-                    df_db.loc[df_db.shape[0]] = [
-                        str(int(row.tijd)),
-                        "gr",
-                        float(row.gr),
-                    ]
-                    df_db.loc[df_db.shape[0]] = [
-                        str(int(row.tijd)),
-                        "temp",
-                        float(row.temp),
-                    ]
-                    df_db.loc[df_db.shape[0]] = [
-                        str(int(row.tijd)),
-                        "solar_rad",
-                        float(row.solar_rad),
-                    ]
-                    count += 1
-                    if count >= 96:
-                        break
-        """
-        df_tostring = df_db
-        df_tostring["tijd"] = df_tostring["time"].apply(
-            lambda x: datetime.datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M")
+        from dao.forecast.weather.service import WeatherService
+
+        service = WeatherService(
+            self.config,
+            self.db_da,
+            self.latitude,
+            self.longitude,
+            self.secrets,
+            Path("../data/forecast/weather"),
+            self.country,
         )
-        logging.debug(f"Meteo data records \n{df_tostring.to_string(index=False)}")
-        self.db_da.savedata(df_db, tablename="prognoses")
-        # Archiveer met de vooruitblik erbij. "prognoses" wordt overschreven,
-        # dus zonder dit is achteraf niet meer te zien hoe goed de verwachting
-        # van gisteren voor vanavond eigenlijk was.
-        try:
-            self.db_da.save_forecasts(
-                (
-                    (int(row.time), row.code, row.value)
-                    for row in df_db.itertuples()
-                ),
-                issued_ts=int(datetime.datetime.now().timestamp()),
-            )
-        except Exception as ex:
-            logging.warning(f"Prognose-archief niet bijgewerkt: {ex}")
-        """
-        if len(df1) > 0:
-            if len(df2) > len(df1):
-                df_gr = pd.concat([df1, df2[len(df1):96]])
-            else:
-                df_gr = df1
-        else:
-            df_gr = df2[:96]
-        """
-        df_gr = df1
-        if len(df_gr) > 0:
+        status = service.update()
+        df = status.frame
+        if len(df) > 0:
             style = self.graphics_style
             plt.style.use(style)
             self.make_graph_meteo(
-                df_gr,
+                df,
                 file="../data/images/meteo_"
                 + datetime.datetime.now().strftime("%Y-%m-%d__%H-%M")
                 + ".png",
                 show=show_graph,
             )
-
-        """
-        url = "https://api.forecast.solar/estimate/watthours/"+str(self.latitude)+"/"
-                +str(self.longitude)+"/45/5/5.5"
-        resp = get(url)
-        
-        print (resp.text)
-        json_object = json.loads(resp.text)
-        data = json_object["result"]
-        df_db = pd.DataFrame(columns = ['time', 'time_str', 'code', 'value'])
-        last_hour = -1
-        last_value = 0
-        last_day = -1
-        last_datetime_obj = None
-        for time_str, pv_w in data.items():
-            datetime_obj = dt.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-            hour = datetime_obj.hour
-            if hour == last_hour:
-                hour = hour + 1
-            day = datetime_obj.day
-            if (day != last_day): # or (last_hour < hour-1):
-                if last_day == -1:
-                    for h in range(last_hour+1, hour):
-                        time_h = dt.datetime(datetime_obj.year, datetime_obj.month, 
-                        datetime_obj.day, h,0,0 )
-                        time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
-                        time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
-                else:
-                    for h in range(last_hour + 1, 24):
-                        time_h = dt.datetime(last_datetime_obj.year,last_datetime_obj.month,
-                        last_datetime_obj.day,h,0,0)
-                        time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
-                        time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
-                    for h in range(0, hour):
-                        time_h = dt.datetime(datetime_obj.year, datetime_obj.month, 
-                        datetime_obj.day, h, 0, 0)
-                        time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
-                        time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
-                    last_value = 0
-            time_h = dt.datetime(datetime_obj.year, datetime_obj.month, d
-            atetime_obj.day, hour, 0, 0)
-            time_utc = dt.datetime.timestamp(time_h) -3600
-            df_db.loc[df_db.shape[0]] = [str(int(time_utc)), time_h.strftime("%Y-%m-%d %H:%M"), 
-            'pv', pv_w - last_value]
-            last_hour = hour
-            last_value = pv_w
-            last_day = day
-            last_datetime_obj = datetime_obj
-        for h in range(last_hour + 1, 24):
-            time_h = dt.datetime(last_datetime_obj.year, last_datetime_obj.month, 
-            last_datetime_obj.day, h, 0, 0)
-            time_utc = dt.datetime.timestamp(time_h) - 3600
-            df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
-            time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
-
-        print(df_db)
-
-        graphs.make_graph_meteo(df_db, file = "../data/images/meteo" + 
-                                              datetime.datetime.now().strftime("%H%M") + 
-                                             ".png", show=show_graph)
-                               
-        del df_db["time_str"]
-        print(df_db)
-        self.db_da.savedata(df_db)
-        """
+        return status
 
     def get_avg_temperature(self, date: datetime.datetime = None) -> Optional[float]:
         """
