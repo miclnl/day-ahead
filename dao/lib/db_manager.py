@@ -55,10 +55,12 @@ LEAD_BUCKETS = (0, 1, 4, 12, 24)
 #: Which forecasts are worth archiving.
 #:
 #: Deliberately short. These are the series whose error actually moves the
-#: plan: the net house demand, the PV production, and the two weather inputs
-#: they are derived from. Archiving every optimizer output would multiply the
-#: table for no analytical gain.
-ARCHIVED_FORECAST_CODES = frozenset({"hload", "pv_ac", "gr", "temp"})
+#: plan: the net house demand, the PV production (AC and DC), the baseload,
+#: and the weather inputs they are derived from. Archiving every optimizer
+#: output would multiply the table for no analytical gain.
+ARCHIVED_FORECAST_CODES = frozenset(
+    {"hload", "pv_ac", "pv_dc", "base", "gr", "dni", "dhi", "temp"}
+)
 
 
 def lead_bucket(lead_hours: float) -> int:

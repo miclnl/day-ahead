@@ -7,7 +7,6 @@ import time
 import threading
 import warnings
 from dataclasses import dataclass
-import json
 from homeassistant_api import Client as HAClient
 from homeassistant_api.models import State as HAState
 from homeassistant_api.errors import InternalServerError, RequestTimeoutError
@@ -636,33 +635,6 @@ class DaBase:
                 logging.warning(f"Prognose-archief niet bijgewerkt: {ex}")
         return
 
-    @staticmethod
-    def get_calculated_baseload(weekday: int) -> list:
-        """
-        Haalt de berekende baseload op voor de weekdag.
-
-        Leest zowel het oude formaat (een kale lijst van 24 getallen) als het
-        nieuwe (een dict met daarin het profiel en het aantal metingen per
-        uur). Waarschuwt als het profiel oud is: een verouderd profiel is
-        lastig te herkennen aan de uitkomst, maar kost wel geld.
-
-        :param weekday: : 0 = maandag, 6 zondag
-        :return: een lijst van 24 waarden voor de betreffende dag
-        """
-        from dao.forecast.baseload.profile import profile_age_days, profile_from_file
-
-        in_file = "../data/baseload/baseload_" + str(weekday) + ".json"
-        with open(in_file, "r") as f:
-            payload = json.load(f)
-        result = profile_from_file(payload)
-        age = profile_age_days(payload)
-        if age is not None and age > 14:
-            logging.warning(
-                f"Het baseload-profiel is {age:.0f} dagen oud. Plan de taak "
-                f"'calc_baseloads' in zodat het profiel je huidige verbruik volgt."
-            )
-        return result
-
     def calc_prod_solar(
         self, solar_opt: dict, act_time: int, act_gr: float, hour_fraction: float
     ):
@@ -833,12 +805,22 @@ class DaBase:
         dacalc.debug = False
         dacalc.calc_optimum()
 
-    @staticmethod
-    def calc_baseloads():
+    def baseload_service(self):
+        from dao.forecast.baseload.service import BaseloadService
+
+        return BaseloadService(
+            self.config,
+            self.db_da,
+            self.db_ha,
+            Path("../data/forecast/baseload"),
+            self.time_zone,
+        )
+
+    def calc_baseloads(self):
         from da_report import Report
 
-        report = Report()
-        report.calc_save_baseloads()
+        Report(self.file_name).check_baseload_sensors()
+        self.baseload_service().fit()
 
     #: Which forecast is compared against which realised series.
     #: (forecast code, realised table, realised code, unit, label)

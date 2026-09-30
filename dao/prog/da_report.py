@@ -11,19 +11,10 @@ from pandas.core.dtypes.inference import is_number
 
 from dao.lib.da_graph import GraphBuilder
 from dao.prog.da_base import DaBase
-from dao.forecast.baseload.profile import (
-    BaseloadOptions,
-    BaseloadProfile,
-    build_profile,
-    iter_samples,
-    profile_to_dict,
-)
 from dao.prog.utils import get_value_from_dict
 import math
-import json
 import itertools
 import logging
-import os
 from sqlalchemy import (
     Table,
     select,
@@ -3087,81 +3078,6 @@ class Report(DaBase):
         )
         logging.debug(f"Baseload berekening per uur:\n {result.to_string()}\n")
         return result
-
-    def baseload_options(self) -> BaseloadOptions:
-        """Translate the configuration into the pure estimator's options."""
-        options = self.config.baseload_options
-        return BaseloadOptions(
-            aggregate=options.aggregate,
-            trim_fraction=options.trim_fraction,
-            remove_outliers=options.remove_outliers,
-            outlier_factor=options.outlier_factor,
-            half_life_days=options.half_life_days,
-            holidays=options.holidays,
-            clip_negative=options.clip_negative,
-            min_samples=options.min_samples,
-        )
-
-    def calc_weekday_baseload(self, wd: int, frame: pd.DataFrame = None) -> list:
-        """
-        :param wd : weekdag 0= maandag, 6 = zondag
-        :param frame: het resultaat van calc_baseload_frame, wordt anders opgehaald
-        :return: de berekende basislast voor die dag
-        """
-        return self.calc_weekday_profile(wd, frame).values
-
-    def calc_weekday_profile(
-        self, wd: int, frame: pd.DataFrame = None
-    ) -> BaseloadProfile:
-        """Robust 24 hour profile for one weekday, with its sample counts."""
-        if frame is None:
-            frame = self.calc_baseload_frame()
-        options = self.baseload_options()
-        from zoneinfo import ZoneInfo
-
-        reference = datetime.datetime.now(tz=ZoneInfo(self.time_zone))
-        if frame is None or len(frame) == 0:
-            return BaseloadProfile()
-
-        rows = list(zip(frame["tijd"], frame["baseload"]))
-        grouped = iter_samples(rows, reference, options.holidays)
-        pooled: dict = {}
-        for cells in grouped.values():
-            for hour, samples in cells.items():
-                pooled.setdefault(hour, []).extend(samples)
-        return build_profile(grouped.get(wd, {}), pooled, options)
-
-    def calc_save_baseloads(self):
-        """Recompute and store the seven weekday profiles."""
-        self.check_baseload_sensors()
-        frame = self.calc_baseload_frame()
-        if frame is None or len(frame) == 0:
-            logging.error(
-                "Baseload: geen meetdata gevonden; de profielen zijn niet bijgewerkt"
-            )
-            return
-        options = self.baseload_options()
-        period = self.config.baseload_calc_periode
-        os.makedirs("../data/baseload", exist_ok=True)
-        for weekday in range(7):
-            profile = self.calc_weekday_profile(weekday, frame)
-            thin = [h for h in range(24) if profile.pooled[h]]
-            logging.info(
-                f"baseload weekdag {weekday}: totaal {profile.total:.2f} kWh, "
-                f"mediaan aantal metingen per uur "
-                f"{sorted(profile.samples)[12]}"
-                + (f", {len(thin)} uur uit de gepoolde schatting" if thin else "")
-            )
-            logging.info(" ".join(str(x) for x in profile.values))
-            out_file = "../data/baseload/baseload_" + str(weekday) + ".json"
-            with open(out_file, "w") as f:
-                print(
-                    json.dumps(
-                        profile_to_dict(profile, weekday, period, options), indent=2
-                    ),
-                    file=f,
-                )
-        return
 
     # ------------------------------------------------
     def get_field_data(self, field: str, periode: str, tot=None, dict=None):
