@@ -649,7 +649,7 @@ class DaBase:
         :param weekday: : 0 = maandag, 6 zondag
         :return: een lijst van 24 waarden voor de betreffende dag
         """
-        from dao.prog.baseload import profile_age_days, profile_from_file
+        from dao.forecast.baseload.profile import profile_age_days, profile_from_file
 
         in_file = "../data/baseload/baseload_" + str(weekday) + ".json"
         with open(in_file, "r") as f:

@@ -5,10 +5,11 @@ these tests are mostly about what happens when one of those eight is wrong.
 """
 
 import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from dao.prog.baseload import (
+from dao.forecast.baseload.profile import (
     BaseloadOptions,
     Sample,
     build_profile,
@@ -23,6 +24,7 @@ from dao.prog.baseload import (
     profile_to_dict,
     quantile,
     recency_weights,
+    standby_profile,
     trimmed,
     weighted_mean,
     weighted_median,
@@ -31,7 +33,7 @@ from dao.prog.baseload import (
 
 def cell(*values, ages=None):
     ages = ages if ages is not None else [0.0] * len(values)
-    return [Sample(age_days=a, value=v) for a, v in zip(ages, values)]
+    return [Sample(age_days=a, value=v) for a, v in zip(ages, values, strict=True)]
 
 
 class TestQuantile:
@@ -105,8 +107,12 @@ class TestWeights:
         assert kept == [1.0, 2.0]
 
 
+def test_default_aggregate_is_mean():
+    assert BaseloadOptions().aggregate == "mean"
+
+
 class TestEstimateCell:
-    OPTIONS = BaseloadOptions(half_life_days=None)
+    OPTIONS = BaseloadOptions(half_life_days=None, aggregate="median")
 
     def test_median_is_unmoved_by_one_bad_day(self):
         """The whole point of the change.
@@ -138,10 +144,16 @@ class TestEstimateCell:
         old = cell(1.0, 1.0, 1.0, 1.0, ages=[56, 49, 42, 35])
         new = cell(0.5, 0.5, 0.5, 0.5, ages=[21, 14, 7, 0])
         weighted, _ = estimate_cell(
-            old + new, BaseloadOptions(remove_outliers=False, half_life_days=14.0)
+            old + new,
+            BaseloadOptions(
+                remove_outliers=False, half_life_days=14.0, aggregate="median"
+            ),
         )
         flat, _ = estimate_cell(
-            old + new, BaseloadOptions(remove_outliers=False, half_life_days=None)
+            old + new,
+            BaseloadOptions(
+                remove_outliers=False, half_life_days=None, aggregate="median"
+            ),
         )
         assert weighted == 0.5
         assert flat in (0.5, 1.0)
@@ -202,6 +214,23 @@ class TestBuildProfile:
         profile = build_profile({}, None, BaseloadOptions())
         assert profile.values == [0.0] * 24
         assert profile.total == 0.0
+
+    def test_build_profile_fills_spread(self):
+        cells = {0: [Sample(1, 0.2), Sample(2, 0.4), Sample(3, 0.6)]}
+        profile = build_profile(cells, options=BaseloadOptions(half_life_days=None))
+        assert profile.spread[0] == pytest.approx(0.163, abs=0.005)
+        assert profile.spread[1] == 0.0
+
+
+class TestStandbyProfile:
+    def test_standby_profile_is_p10_per_hour(self):
+        cells_all = {
+            h: [Sample(1, v) for v in (0.2, 0.25, 0.3, 0.9, 1.5)] for h in range(24)
+        }
+        profile = standby_profile(cells_all)
+        assert profile.values[3] == pytest.approx(0.22, abs=0.001)
+        assert profile.samples[3] == 5
+        assert profile.pooled[3] is False
 
 
 class TestHolidays:
@@ -282,6 +311,15 @@ class TestIterSamples:
         rows = [(datetime.datetime(2026, 12, 25, 9, 0), 5.0)]
         grouped = iter_samples(rows, reference, "sunday")
         assert 6 in grouped and 4 not in grouped
+
+    def test_iter_samples_keeps_both_dst_hours(self):
+        tz = ZoneInfo("Europe/Amsterdam")
+        reference = datetime.datetime(2026, 10, 26, tzinfo=tz)
+        first = datetime.datetime(2026, 10, 25, 2, 0, tzinfo=tz, fold=0)
+        second = datetime.datetime(2026, 10, 25, 2, 0, tzinfo=tz, fold=1)
+        rows = [(first, 1.0), (second, 2.0)]
+        grouped = iter_samples(rows, reference)
+        assert [s.value for s in grouped[6][2]] == [1.0, 2.0]
 
 
 class TestFileFormat:

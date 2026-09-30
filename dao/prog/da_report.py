@@ -11,7 +11,7 @@ from pandas.core.dtypes.inference import is_number
 
 from dao.lib.da_graph import GraphBuilder
 from dao.prog.da_base import DaBase
-from dao.prog.baseload import (
+from dao.forecast.baseload.profile import (
     BaseloadOptions,
     BaseloadProfile,
     build_profile,
