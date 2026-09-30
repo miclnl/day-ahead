@@ -12,13 +12,13 @@ import datetime
 import logging
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from dao.forecast.baseload.absence import Regime  # noqa: F401 (re-exported)
 from dao.forecast.baseload.profile import (
     BaseloadOptions,
     BaseloadProfile,
@@ -45,19 +45,6 @@ from dao.prog.utils import interpolate
 #: Beyond this many days a saved profile set is still used, but flagged: the
 #: household may have changed since the last fit.
 MAX_PROFILE_AGE_DAYS = 14.0
-
-
-@dataclass
-class Regime:
-    """Whether the target day is expected to be a normal or an away day.
-
-    Extended in a later task with the signals (entity, calendar, presence,
-    consumption) that decide it; here it is just the outcome.
-    """
-
-    away: bool = False
-    reason: str = "none"
-    switch_hour: Optional[int] = None
 
 
 class BaseloadUnavailable(RuntimeError):

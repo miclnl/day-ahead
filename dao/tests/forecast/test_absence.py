@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -10,12 +10,23 @@ import pandas as pd
 import pytest
 
 from dao.forecast.baseload.absence import (
+    CalendarEvent,
+    Regime,
+    RegimeSignals,
     calibrate_threshold,
+    determine_regime,
     label_days,
     standby_kwh,
 )
 
 TZ = ZoneInfo("Europe/Amsterdam")
+
+
+def presence_series(now: datetime, trailing_values: list[float]) -> pd.Series:
+    """Hourly presence fraction for the ``len(trailing_values)`` hours up
+    to and including ``now``, oldest first."""
+    index = pd.date_range(end=now, periods=len(trailing_values), freq="h", tz=TZ)
+    return pd.Series(trailing_values, index=index)
 
 
 def synthetic_year(away_ranges: list[tuple[str, str]]) -> pd.Series:
@@ -92,3 +103,129 @@ def test_calibrate_threshold_needs_ten_days():
     presence_daily = pd.Series([0.8] * 9, index=dates)
 
     assert calibrate_threshold(active_fraction, presence_daily) is None
+
+
+def test_entity_away_wins_over_everything():
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=TZ)
+    signals = RegimeSignals(
+        now=now,
+        entity_state="on",
+        presence=presence_series(now, [1.0] * 10),  # everyone home
+    )
+    regime = determine_regime(now.date(), signals)
+    assert regime == Regime(away=True, reason="entity")
+
+
+def test_entity_home_state_gives_home_even_with_calendar():
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=TZ)
+    event = CalendarEvent(
+        start=datetime(2026, 3, 9, tzinfo=TZ),
+        end=datetime(2026, 3, 15, tzinfo=TZ),
+        summary="Vakantie Zeeland",
+    )
+    signals = RegimeSignals(now=now, entity_state="off", calendar_events=[event])
+    regime = determine_regime(now.date(), signals)
+    assert regime == Regime(away=False, reason="entity")
+
+
+def test_calendar_keyword_marks_tomorrow():
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=TZ)
+    tomorrow = now.date() + timedelta(days=1)
+    event = CalendarEvent(
+        start=datetime(2026, 3, 9, 0, 0, tzinfo=TZ),
+        end=datetime(2026, 3, 20, 0, 0, tzinfo=TZ),
+        summary="Vakantie Zeeland",
+    )
+    signals = RegimeSignals(now=now, calendar_events=[event])
+    regime = determine_regime(tomorrow, signals)
+    assert regime.away is True
+    assert regime.reason == "calendar"
+    assert regime.switch_hour is None
+
+
+def test_calendar_partial_day_gives_switch_hour():
+    now = datetime(2026, 3, 10, 8, 0, tzinfo=TZ)
+    event = CalendarEvent(
+        start=datetime(2026, 3, 5, 0, 0, tzinfo=TZ),
+        end=datetime(2026, 3, 10, 14, 0, tzinfo=TZ),
+        summary="Vakantie Zeeland",
+    )
+    signals = RegimeSignals(now=now, calendar_events=[event])
+    regime = determine_regime(now.date(), signals)
+    assert regime.away is True
+    assert regime.reason == "calendar"
+    assert regime.switch_hour == 14
+
+
+def test_presence_three_hours_gone_marks_rest_of_today():
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=TZ)
+    presence = presence_series(now, [1.0, 1.0, 0.0, 0.0, 0.0])  # last 3 hours zero
+    signals = RegimeSignals(now=now, presence=presence)
+    regime = determine_regime(now.date(), signals)
+    assert regime.away is True
+    assert regime.reason == "presence"
+    assert regime.switch_hour == now.hour
+
+
+def test_presence_two_hours_not_enough():
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=TZ)
+    presence = presence_series(now, [1.0, 1.0, 1.0, 0.0, 0.0])  # last 2 hours zero
+    signals = RegimeSignals(now=now, presence=presence)
+    regime = determine_regime(now.date(), signals)
+    assert regime == Regime()
+
+
+def test_presence_24_hours_marks_tomorrow():
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=TZ)
+    presence = presence_series(now, [0.0] * 24)
+    signals = RegimeSignals(now=now, presence=presence)
+    tomorrow = now.date() + timedelta(days=1)
+    regime = determine_regime(tomorrow, signals)
+    assert regime.away is True
+    assert regime.reason == "presence"
+    assert regime.switch_hour is None
+
+
+def test_someone_home_breaks_the_run():
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=TZ)
+    presence = presence_series(now, [0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    signals = RegimeSignals(now=now, presence=presence)
+    regime = determine_regime(now.date(), signals)
+    assert regime.away is True
+    assert regime.reason == "presence"
+    assert regime.switch_hour == now.hour
+
+
+def test_consumption_rule_switches_after_six():
+    now = datetime(2026, 3, 10, 9, 0, tzinfo=TZ)
+    signals = RegimeSignals(
+        now=now,
+        consumption_today=[0.2] * 9,  # roughly standby all morning
+        home_profile_today=[0.5] * 24,  # normal use expected
+        standby=0.2,
+        threshold=0.4,
+    )
+    regime = determine_regime(now.date(), signals)
+    assert regime.away is True
+    assert regime.reason == "consumption"
+    assert regime.switch_hour == 9
+
+
+def test_consumption_rule_not_before_six():
+    now = datetime(2026, 3, 10, 5, 0, tzinfo=TZ)
+    signals = RegimeSignals(
+        now=now,
+        consumption_today=[0.2] * 5,
+        home_profile_today=[0.5] * 24,
+        standby=0.2,
+        threshold=0.4,
+    )
+    regime = determine_regime(now.date(), signals)
+    assert regime == Regime()
+
+
+def test_no_signal_is_home():
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=TZ)
+    signals = RegimeSignals(now=now)
+    regime = determine_regime(now.date(), signals)
+    assert regime == Regime()
