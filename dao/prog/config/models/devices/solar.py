@@ -2,7 +2,7 @@
 Solar configuration models.
 """
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from pydantic import (
     BaseModel,
     Field,
@@ -60,12 +60,13 @@ class SolarString(BaseModel):
             "x-ui-section": "Panel Orientation",
         },
     )
-    yield_factor: float = Field(
+    yield_factor: Optional[float] = Field(
+        default=None,
         alias="yield",
         gt=0,
         description="Yield factor for production calculation",
         json_schema_extra={
-            "x-help": "Efficiency factor for this string. Typically 0.8-0.9. Accounts for inverter losses, cable losses, shading, and dirt on panels.",
+            "x-help": "Efficiency factor for this string. Typically 0.8-0.9. Accounts for inverter losses, cable losses, shading, and dirt on panels. Not used by the pvlib model, which works from capacity directly; kept for reporting and the legacy estimator.",
             "x-unit": "ratio",
             "x-ui-section": "Panel Orientation",
             "x-validation-hint": "Must be greater than 0, typically 0.8-0.9",
@@ -200,6 +201,28 @@ class SolarConfig(BaseModel):
         },
     )
 
+    model: Optional[Literal["physical", "ml", "auto"]] = Field(
+        default=None,
+        description="Which forecasting model to use for this installation",
+        json_schema_extra={
+            "x-help": "physical uses the pvlib model; ml the trained XGBoost model (falls "
+            "back to physical, with a warning, until one has been trained); auto "
+            "backtests both on every training run and keeps whichever had the "
+            "lower error. Leave empty to use ml_prediction's old on/off choice.",
+            "x-ui-section": "ML Prediction",
+        },
+    )
+    calibration: Literal["off", "scale", "planes"] = Field(
+        default="scale",
+        description="How the physical model is calibrated against measured production",
+        json_schema_extra={
+            "x-help": "scale fits one overall factor against measured production; planes "
+            "fits one per plane (needs enough history to separate them); off uses "
+            "the nameplate capacity as configured, uncalibrated.",
+            "x-ui-section": "ML Prediction",
+        },
+    )
+
     model_config = ConfigDict(
         extra="allow",
         populate_by_name=True,
@@ -247,21 +270,24 @@ For panels facing different directions, use the 'strings' configuration:
 
     @model_validator(mode="after")
     def validate_config_completeness(self) -> "SolarConfig":
-        """Ensure either flat config or strings are provided."""
-        has_flat = all(
-            [
-                self.tilt is not None,
-                self.orientation is not None,
-                self.capacity is not None,
-                self.yield_factor is not None,
-            ]
+        """Ensure either flat config or strings are provided.
+
+        A flat installation needs tilt and orientation plus either capacity
+        or yield -- the pvlib model works from capacity directly (falling
+        back to yield * 360 W/kWp when capacity is absent), so yield alone
+        is no longer required alongside it.
+        """
+        has_flat = (
+            self.tilt is not None
+            and self.orientation is not None
+            and (self.capacity is not None or self.yield_factor is not None)
         )
         has_strings = bool(self.strings)
 
         if not has_flat and not has_strings:
             raise ValueError(
-                "Solar configuration must provide either all flat fields "
-                "(tilt, orientation, capacity, yield) or strings list"
+                "Solar configuration must provide either the flat fields "
+                "(tilt, orientation, and capacity or yield) or a strings list"
             )
 
         if has_flat and has_strings:
@@ -301,3 +327,11 @@ For panels facing different directions, use the 'strings' configuration:
             if total > 0:
                 return sum(s.orientation * s.capacity for s in self.strings) / total
         return self.orientation if self.orientation is not None else 0.0
+
+    @property
+    def effective_model(self) -> str:
+        """Which model forecasts this installation: the explicit choice, or
+        the old ml_prediction toggle when none was made."""
+        if self.model is not None:
+            return self.model
+        return "ml" if self.ml_prediction else "physical"

@@ -28,6 +28,7 @@ cbcbox==2.929
 mip==1.17.6
 scikit-learn~=1.9.1
 xgboost~=3.4.1
+pvlib~=0.16
 scipy~=1.18.1
 joblib~=1.6.0
 knmi-py~=0.2.0
