@@ -3235,21 +3235,34 @@ class Report(DaBase):
         self.add_col_df(df_solar, result, "gemeten", "gemeten_prod")
 
         # voorspelling DAO
-        pred_dao = []
-        for row in result.itertuples():
-            if pd.notna(row.tijd):
-                straling = row.gemeten_straling
-                if pd.isna(straling):
-                    straling = row.prognose_straling
-                if pd.notna(straling):
-                    prod = self.calc_prod_solar(
-                        device, row.tijd.timestamp(), straling, 1
-                    )
-                else:
-                    prod = pd.NA
-            else:
-                prod = pd.NA
-            pred_dao.append(prod)
+        from dao.forecast.weather.schema import jcm2h_to_wm2
+
+        straling = result["gemeten_straling"].fillna(result["prognose_straling"])
+        temp_real = self.get_da_data("temp", start, end, "uur", "uur", "values")
+        winds_real = self.get_da_data("winds", start, end, "uur", "uur", "values")
+        temp = (
+            pd.to_numeric(temp_real["temp"], errors="coerce").reindex(result.index)
+            if "temp" in temp_real.columns
+            else pd.Series(float("nan"), index=result.index)
+        ).fillna(15.0)
+        wind = (
+            pd.to_numeric(winds_real["winds"], errors="coerce").reindex(result.index)
+            if "winds" in winds_real.columns
+            else pd.Series(float("nan"), index=result.index)
+        ).fillna(3.0)
+
+        weather = pd.DataFrame(index=result.index.tz_localize(self.time_zone))
+        weather["ghi"] = jcm2h_to_wm2(pd.to_numeric(straling, errors="coerce").to_numpy())
+        weather["dni"] = float("nan")
+        weather["dhi"] = float("nan")
+        weather["temp"] = temp.to_numpy()
+        weather["wind"] = wind.to_numpy()
+
+        pred_dao = pd.Series(pd.NA, index=result.index, dtype="object")
+        if len(weather) > 0:
+            predictions = self.pv_service().forecast_from_weather(device, weather)
+            valid = straling.notna()
+            pred_dao.loc[valid] = predictions.to_numpy()[valid.to_numpy()]
         result["prognose_dao"] = pred_dao
 
         # voorspelling ML

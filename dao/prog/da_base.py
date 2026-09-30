@@ -684,42 +684,6 @@ class DaBase:
                 logging.warning(f"Prognose-archief niet bijgewerkt: {ex}")
         return
 
-    def calc_prod_solar(
-        self, solar_opt: dict, act_time: int, act_gr: float, hour_fraction: float
-    ):
-        """
-        berekent de productie van een string
-        :param solar_opt: dict met alle instellingen van de string
-        :param act_time: timestamp in utc seconden van het moment
-        :param act_gr: de globale straling
-        :param hour_fraction: de uurfractie
-        :return: de productie in kWh
-        """
-        if solar_opt.strings:
-            prod = 0
-            str_num = len(solar_opt.strings)
-            for str_s in range(str_num):
-                prod_str = (
-                    self.meteo.calc_solar_rad(
-                        solar_opt.strings[str_s],
-                        act_time,
-                        act_gr,
-                    )
-                    * solar_opt.strings[str_s].yield_factor
-                    * hour_fraction
-                )
-                prod += prod_str
-        else:
-            prod = (
-                self.meteo.calc_solar_rad(solar_opt, act_time, act_gr)
-                * solar_opt.yield_factor
-                * hour_fraction
-            )
-        max_power = solar_opt.max_power
-        if max_power is not None:
-            prod = min(prod, max_power)
-        return prod
-
     def calc_da_avg(self) -> float:
         """
         calculates the average of the last '24' hour values of the day ahead prices
@@ -864,6 +828,20 @@ class DaBase:
             Path("../data/forecast/baseload"),
             self.time_zone,
             ha=self,
+        )
+
+    def pv_service(self):
+        from dao.forecast.pv.service import PVService
+
+        return PVService(
+            self.config,
+            self.db_da,
+            self.db_ha,
+            self.ha_context.latitude,
+            self.ha_context.longitude,
+            Path("../data/forecast/pv"),
+            self.time_zone,
+            self.interval,
         )
 
     def calc_baseloads(self):
@@ -1038,9 +1016,6 @@ class DaBase:
             ml_prediction = _ml_prediction
         if interval is None:
             interval = self.interval
-            interval_s = self.interval_s
-        else:
-            interval_s = 900 if interval == "15min" else 3600
         solar_name = solar_option.name.replace(" ", "_").replace("-", "_")
         if ml_prediction:
             solar_predictor = SolarPredictor()
@@ -1092,31 +1067,17 @@ class DaBase:
             ):
                 solar_prog = solar_prog.iloc[1:]
         else:
-            start_ts = datetime.datetime(
-                year=vanaf.year, month=vanaf.month, day=vanaf.day, hour=vanaf.hour
-            ).timestamp()
-            prog_data = self.db_da.get_prognose_data(
-                start=start_ts, end=tot.timestamp(), interval=interval
-            )
-            prog_data.index = pd.to_datetime(prog_data["tijd"])
-            while len(prog_data) > 0 and prog_data.iloc[0]["tijd"] < vanaf:
-                prog_data = prog_data.iloc[1:]
-            rows = []
-            for row in prog_data.itertuples():
-                h_frac = interval_s / 3600
-                prod = self.calc_prod_solar(
-                    solar_option, row.time, row.glob_rad, h_frac
-                )
-                prod = round(prod, 3)
-                rows.append((row.tijd, prod))
-            solar_prog = pd.DataFrame(rows, columns=["tijd", "prediction"])
+            return self.pv_service().forecast(solar_option, vanaf, tot, interval)
         solar_prog.reset_index(drop=True, inplace=True)
         return solar_prog
 
-    @staticmethod
-    def train_ml_predictions():
+    def train_ml_predictions(self):
         from dao.prog.solar_predictor import SolarPredictor
 
+        # Calibrates the physical model for every installation first: the
+        # ML model's own features include that model's (now current)
+        # output, and its physical fallback should not be stale either.
+        self.pv_service().run_training()
         solar_predictor = SolarPredictor()
         solar_predictor.run_train()
 

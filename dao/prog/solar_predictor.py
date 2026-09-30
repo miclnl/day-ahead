@@ -959,34 +959,26 @@ class SolarPredictor(DaBase):
 
     def get_solar_data(self, start: dt.datetime, entities: list) -> pd.DataFrame:
         """
-        haalt solardata op uit HA database
+        haalt gemeten pv-productie op via de centrale HistoryReader, met
+        dezelfde uurresolutie en kolommen (datetime, solar_kwh) als voorheen
         :param start: begindatum
         :param entities: list van sensoren van ha
         :return:
         """
-        from dao.prog.da_report import Report
+        from zoneinfo import ZoneInfo
 
-        report = Report()
-        tot = dt.datetime.now()
-        count = 0
-        df_solar = pd.DataFrame()
-        for sensor in entities:
-            df_sensor = report.get_sensor_data(
-                sensor, col_name="solar_kwh", vanaf=start, tot=tot, agg="uur"
-            )
-            if count == 0:
-                df_solar = df_sensor
-            else:
-                df_sensor["overlap"] = df_sensor["tijd"].isin(df_solar["tijd"])
-                df_sensor_overlap = df_sensor[df_sensor["overlap"] == True]
-                report.add_col_df(df_sensor_overlap, df_solar, "solar_kwh")
-                df_sensor_new = df_sensor[df_sensor["overlap"] == False]
-                df_solar = pd.concat([df_solar, df_sensor_new])
-            count += 1
-        df_solar["utc"] = pd.to_datetime(df_solar["utc"], unit="s", utc=True)
-        df_solar = df_solar.set_index(df_solar["utc"])
-        df_solar = df_solar.rename(columns={"utc": "datetime"})
-        return df_solar
+        from dao.forecast.history import HistoryReader
+
+        tz = ZoneInfo(self.time_zone)
+        now = dt.datetime.now(tz=tz)
+        start_aware = start if start.tzinfo is not None else start.replace(tzinfo=tz)
+        cap = 1.2 * self.solar_capacity if self.solar_capacity else None
+
+        reader = HistoryReader(self.db_ha, self.time_zone)
+        series = reader.read_energy(list(entities), start_aware, now, cap_kwh=cap)
+        frame = series.to_frame(name="solar_kwh")
+        frame.index.name = "datetime"
+        return frame.reset_index()
 
     def train_solar_option(
         self, weather_data: pd.DataFrame, solar_option: SolarConfig, start: dt.datetime
