@@ -18,6 +18,7 @@ from .versions.v0 import ConfigurationV0
 # Uncomment when creating v1:
 from .versions.v1 import ConfigurationV1
 from .versions.v2 import ConfigurationV2
+from .versions.v3 import ConfigurationV3
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ VERSION_MODELS: dict[int, Type[BaseModel]] = {
     1: ConfigurationV1,
     # Uncomment when creating v2:
     2: ConfigurationV2,
+    3: ConfigurationV3,
 }
 
 # Derive current version from registry

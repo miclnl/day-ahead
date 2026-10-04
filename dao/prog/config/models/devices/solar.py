@@ -164,14 +164,6 @@ class SolarConfig(BaseModel):
     )
 
     # ML prediction
-    ml_prediction: bool = Field(
-        default=False,
-        description="Use ML model to predict solar production for this installation",
-        json_schema_extra={
-            "x-help": "Enable machine-learning-based solar production forecasting for this installation. Requires the predictor add-on to be set up and trained.",
-            "x-ui-section": "ML Prediction",
-        },
-    )
     ml_training_start_date: Optional[PastDate] = Field(
         default=date(2000, 1, 1),
         description="If configured the ml-traning of the solar model will be trained with the data since the start date",
@@ -201,14 +193,14 @@ class SolarConfig(BaseModel):
         },
     )
 
-    model: Optional[Literal["physical", "ml", "auto"]] = Field(
-        default=None,
+    model: Literal["physical", "ml", "auto"] = Field(
+        default="physical",
         description="Which forecasting model to use for this installation",
         json_schema_extra={
             "x-help": "physical uses the pvlib model; ml the trained XGBoost model (falls "
             "back to physical, with a warning, until one has been trained); auto "
             "backtests both on every training run and keeps whichever had the "
-            "lower error. Leave empty to use ml_prediction's old on/off choice.",
+            "lower error.",
             "x-ui-section": "ML Prediction",
         },
     )
@@ -327,11 +319,3 @@ For panels facing different directions, use the 'strings' configuration:
             if total > 0:
                 return sum(s.orientation * s.capacity for s in self.strings) / total
         return self.orientation if self.orientation is not None else 0.0
-
-    @property
-    def effective_model(self) -> str:
-        """Which model forecasts this installation: the explicit choice, or
-        the old ml_prediction toggle when none was made."""
-        if self.model is not None:
-            return self.model
-        return "ml" if self.ml_prediction else "physical"

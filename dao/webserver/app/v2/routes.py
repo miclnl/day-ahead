@@ -194,7 +194,7 @@ def get_solar_items_with_ml():
     return {
         solar_option.name or "default": solar_option
         for solar_option in solar_options
-        if solar_option.ml_prediction
+        if solar_option.model in ("ml", "auto")
     }
 
 

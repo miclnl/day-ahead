@@ -977,13 +977,13 @@ class SolarPredictor(DaBase):
             start = dt.datetime(year=now.year - 3, month=now.month, day=now.day)
         solar_options = self.config.solar
         for solar_option in solar_options:
-            if solar_option.effective_model in ("ml", "auto") and solar_option.entities_sensors:
+            if solar_option.model in ("ml", "auto") and solar_option.entities_sensors:
                 self.train_solar_option(solar_option, start)
         batteries = self.config.battery
         for battery in batteries:
             for solar_option in battery.solar:
                 if (
-                    solar_option.effective_model in ("ml", "auto")
+                    solar_option.model in ("ml", "auto")
                     and solar_option.entities_sensors
                 ):
                     self.train_solar_option(solar_option, start)
@@ -1033,12 +1033,12 @@ class SolarPredictor(DaBase):
     def test_solar_predictor(self, start, end):
         solar_options = self.config.solar
         for solar_option in solar_options:
-            if solar_option.ml_prediction:
+            if solar_option.model in ("ml", "auto"):
                 self.predict_solar_device(solar_option, start, end)
         batteries = self.config.battery
         for battery in batteries:
             for solar_option in battery.solar:
-                if solar_option.ml_prediction:
+                if solar_option.model in ("ml", "auto"):
                     self.predict_solar_device(solar_option, start, end)
 
 

@@ -44,6 +44,7 @@
 - [HASS](#hass)
   - [🏠 HomeAssistantConfig](#homeassistantconfig)
 - [Other](#other)
+  - [AbsenceConfig](#absenceconfig)
   - [BatteryStage](#batterystage)
   - [EVChargeScheduler](#evchargescheduler)
   - [EVChargeStage](#evchargestage)
@@ -61,6 +62,7 @@
   - [SecretStr](#secretstr)
   - [SocPowerLimit](#socpowerlimit)
   - [SolarString](#solarstring)
+  - [WeatherConfig](#weatherconfig)
   - [XGBoostConfig](#xgboostconfig)
 
 ---
@@ -321,10 +323,11 @@ For panels facing different directions, use the 'strings' configuration:
 | `capacity` | number (optional) | No | `null` | Installed capacity (for single installation) (Unit: `kWp`) _Greater than 0, leave empty when using strings_ |
 | `yield` | number (optional) | No | `null` | Yield factor (for single installation) (Unit: `ratio`) _Greater than 0, typically 0.8-0.9, leave empty when using strings_ |
 | `strings` | list[[SolarString](#solarstring)] | No | `null` | Multiple panel strings with different configurations |
-| `ml_prediction` | boolean | No | `false` | Use ML model to predict solar production for this installation |
 | `ml_training_start_date` | string (optional) | No | `"2000-01-01"` | If configured the ml-traning of the solar model will be trained with the data since the start date |
 | `entities sensors` | list[[EntityId](#entityid)] | No | `null` | HA sensor entities for measuring actual solar production |
 | `max power` | number (optional) | No | `null` | Maximum output power cap in kW (MPPT limit) (Unit: `kW`) |
+| `model` | string | No | `"physical"` | Which forecasting model to use for this installation. Options: `physical`, `ml`, `auto` |
+| `calibration` | string | No | `"scale"` | How the physical model is calibrated against measured production. Options: `off`, `scale`, `planes` |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
@@ -357,10 +360,6 @@ Yield factor for simple configuration. Use this OR 'strings', not both. Leave em
 
 Advanced: Configure multiple strings for panels with different orientations or tilts. Use this OR flat config (tilt/orientation/capacity/yield), not both.
 
-**`ml_prediction`**
-
-Enable machine-learning-based solar production forecasting for this installation. Requires the predictor add-on to be set up and trained.
-
 **`ml_training_start_date`**
 
 The ml-training will be restricted to the data since the start date with a maximum of three year
@@ -372,6 +371,14 @@ Optional: Home Assistant sensor entity (or list of entities) measuring actual so
 **`max power`**
 
 Optional. Limit the installation output to this value in kW. Use when your inverter/MPPT maximum power is less than the total panel capacity.
+
+**`model`**
+
+physical uses the pvlib model; ml the trained XGBoost model (falls back to physical, with a warning, until one has been trained); auto backtests both on every training run and keeps whichever had the lower error.
+
+**`calibration`**
+
+scale fits one overall factor against measured production; planes fits one per plane (needs enough history to separate them); off uses the nameplate capacity as configured, uncalibrated.
 
 </details>
 
@@ -1700,7 +1707,7 @@ Control how long optimization history is retained in the database.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `save days` | integer | No | `7` | Number of days to retain historical data (Unit: `days`) _Must be >= 1, typical 7-30 days_ |
-| `forecast days` | integer | No | `60` | Number of days of forecast history kept for accuracy reporting (Unit: `days`) _Must be >= 7, typical 30-90 days_ |
+| `forecast days` | integer | No | `400` | Number of days of forecast history kept for accuracy reporting (Unit: `days`) _Must be >= 7, typical 400 days_ |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
@@ -1711,7 +1718,7 @@ Number of days to retain optimization history in database. Older data is automat
 
 **`forecast days`**
 
-The forecast archive records what was predicted and how far ahead, so the forecast error can be measured afterwards. It holds one row per variable, moment and lead time bucket, which keeps it bounded no matter how often the optimizer runs: roughly 10 MB at the default of 60 days. Reduce it on a machine with limited storage, such as a Home Assistant Yellow on eMMC.
+The forecast archive records what was predicted and how far ahead, so the forecast error can be measured afterwards, and it is what the ML models train on: they then learn from the same imperfect forecasts they will later be given, rather than from measurements they will never see again. It holds one row per variable, moment and lead time bucket, which keeps it bounded no matter how often the optimizer runs: roughly 70 MB at the default of 400 days, which also covers a full year for season-to-season comparison. Reduce it on a machine with limited storage, such as a Home Assistant Yellow on eMMC.
 
 </details>
 
@@ -1973,7 +1980,10 @@ correction can repair afterwards.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `aggregate` | string | No | `"median"` | Statistic used to combine the observations of one hour. Options: `median`, `mean`, `trimmed` |
+| `model` | string | No | `"profile"` | Which model forecasts the baseload. Options: `profile`, `ml`, `auto` |
+| `ml min days` | integer | No | `120` | History needed before 'auto' will consider the ML model (Unit: `days`) |
+| `backtest days` | integer | No | `28` | Window 'auto' compares the two models over (Unit: `days`) |
+| `aggregate` | string | No | `"mean"` | Statistic used to combine the observations of one hour. Options: `median`, `mean`, `trimmed` |
 | `trim fraction` | number | No | `0.2` | Fraction dropped from each tail when aggregate is 'trimmed' |
 | `remove outliers` | boolean | No | `true` | Reject implausible observations before aggregating |
 | `outlier factor` | number | No | `2.0` | Interquartile range multiplier for outlier rejection |
@@ -1981,19 +1991,36 @@ correction can repair afterwards.
 | `holidays` | string | No | `"sunday"` | Which profile public holidays are folded into. Options: `sunday`, `saturday`, `ignore` |
 | `clip negative` | boolean | No | `true` | Never let an estimated hour go below zero |
 | `min samples` | integer | No | `3` | Observations needed before an hour is trusted on its own |
+| `absence` | [AbsenceConfig](#absenceconfig) | No | _See nested fields_ | Away-day detection and anticipation |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`model`**
+
+**profile** - the twenty-four values per weekday estimated from history. Predictable, needs little data, cannot react to the weather.
+
+**ml** - an XGBoost model on hour, weekday, season, temperature, sun elevation and the away flag. Needs roughly four months of history before it beats the profile.
+
+**auto** - backtests both on every `calc_baseloads` run over the last `backtest days` days and keeps whichever had the lower error. Below `ml min days` of history this is the same as `profile`.
+
+**`ml min days`**
+
+An XGBoost model on a few weeks of history mostly memorises those weeks. Four months is roughly where it starts to beat the profile on a backtest instead of only on its own training data.
+
+**`backtest days`**
+
+Both models forecast each day in this window using only data from before that day, and the one with the lower mean absolute error wins. Longer is a more reliable comparison but a slower `calc_baseloads` run.
 
 **`aggregate`**
 
 The profile rests on roughly eight observations per weekday and hour, so the choice matters.
 
-**median** - robust, a single odd day cannot move it. Recommended.
+**mean** - recommended. The optimizer plans an energy balance, and only the mean adds up to the energy actually used over the day; the median of each hour separately does not, and systematically under-plans a household with occasional heavy hours.
 
-**trimmed** - drops the extremes and averages the rest, a middle ground.
+**median** - the robust alternative. A single odd day cannot move an hour, at the cost of a profile whose daily total is too low.
 
-**mean** - the old behaviour. One party or one recorder gap shifts the hour by an eighth of the excursion, for two months.
+**trimmed** - drops the extremes and averages the rest, a middle ground between the two.
 
 **`trim fraction`**
 
@@ -2124,6 +2151,40 @@ Protocol for Home Assistant API. 'http' for local access, 'https' for SSL/TLS. U
 ## Other
 
 <a id="other"></a>
+
+### AbsenceConfig
+
+_When the household is away, detected from consumption or told directly._
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `detect` | boolean | No | `true` | Label past away days from consumption history |
+| `threshold` | number | No | `0.4` | Fraction of expected consumption below which a day counts as away |
+| `entities presence` | list[[EntityId](#entityid)] | No | `null` | Person-tracker entities, used both to detect the regime and to calibrate the threshold |
+| `entity away` | [EntityId](#entityid) (optional) | No | `null` | An entity whose state alone decides the household is away |
+| `away state` | string | No | `"on"` | The state of `entity away` that means the household is away |
+| `entity calendar` | [EntityId](#entityid) (optional) | No | `null` | A calendar entity whose events mark away periods |
+| `calendar keywords` | list[string] | No | `null` | Case-insensitive words in an event's title that mark it as away |
+| `away after hours` | integer | No | `3` | Consecutive hours with nobody present marks the rest of today away |
+| `assume next day after hours` | integer | No | `24` | Consecutive hours with nobody present marks tomorrow away too |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`detect`**
+
+Without any extra sensors, a day counts as away when its active energy (the day's total minus standby) falls well below what recent days led the estimator to expect. Past away days feed a separate away profile, so absences are forecast rather than papered over with the ordinary weekday pattern.
+
+**`threshold`**
+
+Once at least ten days have both a consumption label and an `entities presence` reading, this is recalibrated automatically against reality; the configured value only applies until then.
+
+**`entity away`**
+
+Takes priority over every other signal. For `alarm_control_panel`, `away state: armed_away` is the usual choice.
+
+</details>
+
 
 ### BatteryStage
 
@@ -2471,7 +2532,7 @@ Configuration for a single string of solar panels with the same tilt and orienta
 | `orientation` | number | Yes | — | Panel orientation in degrees (0=south, 90=west, -90=east) (Unit: `degrees`) _Must be between -180 and 180 degrees_ |
 | `capacity` | number | Yes | — | Installed capacity in kWp (Unit: `kWp`) _Must be greater than 0_ |
 | `max power` | number (optional) | No | `null` | Maximum output power cap in kW (MPPT limit) (Unit: `kW`) |
-| `yield` | number | Yes | — | Yield factor for production calculation (Unit: `ratio`) _Must be greater than 0, typically 0.8-0.9_ |
+| `yield` | number (optional) | No | `null` | Yield factor for production calculation (Unit: `ratio`) _Must be greater than 0, typically 0.8-0.9_ |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
@@ -2494,7 +2555,35 @@ Optional. Limit the string output to this value in kW. Use when your MPPT maximu
 
 **`yield`**
 
-Efficiency factor for this string. Typically 0.8-0.9. Accounts for inverter losses, cable losses, shading, and dirt on panels.
+Efficiency factor for this string. Typically 0.8-0.9. Accounts for inverter losses, cable losses, shading, and dirt on panels. Not used by the pvlib model, which works from capacity directly; kept for reporting and the legacy estimator.
+
+</details>
+
+
+### WeatherConfig
+
+_How the forecast and its fallback, and the observation source, are chosen._
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `fallback` | string (optional) | No | `"openmeteo"` | Weather source used to fill gaps in the primary forecast |
+| `openmeteo model` | string | No | `"knmi_seamless"` | Open-Meteo forecast model |
+| `observations` | string | No | `"auto"` | Source used to backfill measured weather (gr/temp/winds). Options: `auto`, `knmi`, `openmeteo`, `off` |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`fallback`**
+
+Meteoserver is the primary forecast source when a key is configured. When it is unreachable, or its horizon ends before the optimizer's, Open-Meteo fills the remaining hours. Leave empty to never fall back -- a gap then stays a gap.
+
+**`openmeteo model`**
+
+knmi_seamless blends KNMI's short-range model with a global one for the days beyond it. See open-meteo.com/en/docs for the full model list.
+
+**`observations`**
+
+auto uses KNMI in the Netherlands and Belgium and Open-Meteo's archive elsewhere. Measured weather is what the accuracy report and the PV calibration compare a forecast against.
 
 </details>
 

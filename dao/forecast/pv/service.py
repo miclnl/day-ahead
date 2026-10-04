@@ -111,7 +111,7 @@ class PVService:
                 decided_at=_parse_iso(payload.get("decided_at"), self._now()),
                 reason=payload.get("reason", ""),
             )
-        return select_pv_model(installation.effective_model, None)
+        return select_pv_model(installation.model, None)
 
     def _forecast_ml(self, installation, start, end, interval) -> Optional[pd.DataFrame]:
         """The ML model's forecast, or ``None`` to fall back to physical."""
@@ -337,7 +337,7 @@ class PVService:
         ml_installations = [
             installation
             for installation in installations
-            if installation.effective_model in ("ml", "auto")
+            if installation.model in ("ml", "auto")
             and installation.entities_sensors
         ]
 
@@ -360,7 +360,7 @@ class PVService:
 
     def _select_and_store(self, installation) -> None:
         """Backtest when configured for ``auto``, then record the choice."""
-        configured = installation.effective_model
+        configured = installation.model
         result = None
         if configured == "auto":
             try:

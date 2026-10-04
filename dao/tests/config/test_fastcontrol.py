@@ -266,9 +266,11 @@ class TestBaseloadOptions:
 
 
 class TestForecastRetention:
-    def test_the_default_keeps_two_months(self):
+    def test_the_default_keeps_more_than_a_year(self):
+        """400 days, not 60: the ML models train on this archive, and a
+        year-plus is what makes season-to-season comparison possible."""
         config = ConfigurationV0.model_validate({"meteoserver-key": "x"})
-        assert config.history.forecast_days == 60
+        assert config.history.forecast_days == 400
 
     def test_it_can_be_shortened_for_small_storage(self):
         config = ConfigurationV0.model_validate(

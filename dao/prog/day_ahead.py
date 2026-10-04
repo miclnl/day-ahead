@@ -311,7 +311,6 @@ class DaCalc(DaBase):
         entity_pv_ac_switch = []
         max_solar_power = []
         pv_ac_varcode = []
-        solar_ml_prediction = []
         solar_num = len(self.solar)
         for s in range(solar_num):
             if s <= 9:
@@ -322,8 +321,6 @@ class DaCalc(DaBase):
                 entity = None
             entity_pv_ac_switch.append(entity)
             max_solar_power.append(self.solar[s].max_power)
-            prediction = self.solar[s].ml_prediction
-            solar_ml_prediction.append(prediction)
         uur = []  # hulparray met uren
         tijd = []
         ts = []

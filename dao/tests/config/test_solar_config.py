@@ -31,26 +31,19 @@ def test_string_without_yield_is_accepted():
     assert config.strings[0].yield_factor is None
 
 
-def test_effective_model_defaults_from_ml_prediction():
-    without_ml = SolarConfig(name="Roof", tilt=35, orientation=0, capacity=3.6)
-    assert without_ml.effective_model == "physical"
-
-    with_ml = SolarConfig(
-        name="Roof", tilt=35, orientation=0, capacity=3.6, ml_prediction=True
-    )
-    assert with_ml.effective_model == "ml"
+def test_model_defaults_to_physical():
+    """v3 replaced the ml_prediction boolean with an explicit model name;
+    an installation that says nothing gets the physical model."""
+    installation = SolarConfig(name="Roof", tilt=35, orientation=0, capacity=3.6)
+    assert installation.model == "physical"
 
 
-def test_effective_model_explicit_choice_wins():
-    config = SolarConfig(
-        name="Roof",
-        tilt=35,
-        orientation=0,
-        capacity=3.6,
-        ml_prediction=True,
-        model="auto",
-    )
-    assert config.effective_model == "auto"
+def test_model_accepts_every_choice():
+    for choice in ("physical", "ml", "auto"):
+        installation = SolarConfig(
+            name="Roof", tilt=35, orientation=0, capacity=3.6, model=choice
+        )
+        assert installation.model == choice
 
 
 def test_calibration_defaults_to_scale():
