@@ -92,17 +92,66 @@ class AbsenceConfig(BaseModel):
 class BaseloadOptionsConfig(BaseModel):
     """How the daily baseload profile is estimated from history."""
 
+    model: Literal["profile", "ml", "auto"] = Field(
+        default="profile",
+        description="Which model forecasts the baseload",
+        json_schema_extra={
+            "x-help": "**profile** - the twenty-four values per weekday estimated from "
+            "history. Predictable, needs little data, cannot react to the "
+            "weather.\n\n"
+            "**ml** - an XGBoost model on hour, weekday, season, temperature, sun "
+            "elevation and the away flag. Needs roughly four months of history "
+            "before it beats the profile.\n\n"
+            "**auto** - backtests both on every `calc_baseloads` run over the last "
+            "`backtest days` days and keeps whichever had the lower error. Below "
+            "`ml min days` of history this is the same as `profile`.",
+            "x-ui-section": "Baseload",
+            "x-order": 105,
+        },
+    )
+    ml_min_days: int = Field(
+        default=120,
+        ge=30,
+        alias="ml min days",
+        description="History needed before 'auto' will consider the ML model",
+        json_schema_extra={
+            "x-help": "An XGBoost model on a few weeks of history mostly memorises those "
+            "weeks. Four months is roughly where it starts to beat the profile on "
+            "a backtest instead of only on its own training data.",
+            "x-unit": "days",
+            "x-ui-section": "Baseload",
+            "x-order": 106,
+        },
+    )
+    backtest_days: int = Field(
+        default=28,
+        ge=7,
+        alias="backtest days",
+        description="Window 'auto' compares the two models over",
+        json_schema_extra={
+            "x-help": "Both models forecast each day in this window using only data from "
+            "before that day, and the one with the lower mean absolute error "
+            "wins. Longer is a more reliable comparison but a slower "
+            "`calc_baseloads` run.",
+            "x-unit": "days",
+            "x-ui-section": "Baseload",
+            "x-order": 107,
+        },
+    )
     aggregate: Literal["median", "mean", "trimmed"] = Field(
-        default="median",
+        default="mean",
         description="Statistic used to combine the observations of one hour",
         json_schema_extra={
             "x-help": "The profile rests on roughly eight observations per weekday and "
             "hour, so the choice matters.\n\n"
-            "**median** - robust, a single odd day cannot move it. Recommended.\n\n"
+            "**mean** - recommended. The optimizer plans an energy balance, and "
+            "only the mean adds up to the energy actually used over the day; the "
+            "median of each hour separately does not, and systematically "
+            "under-plans a household with occasional heavy hours.\n\n"
+            "**median** - the robust alternative. A single odd day cannot move an "
+            "hour, at the cost of a profile whose daily total is too low.\n\n"
             "**trimmed** - drops the extremes and averages the rest, a middle "
-            "ground.\n\n"
-            "**mean** - the old behaviour. One party or one recorder gap shifts "
-            "the hour by an eighth of the excursion, for two months.",
+            "ground between the two.",
             "x-ui-section": "Baseload",
             "x-order": 110,
         },

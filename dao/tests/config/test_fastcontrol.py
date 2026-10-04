@@ -190,7 +190,10 @@ class TestBaseloadOptions:
         from dao.prog.config.models.baseload import BaseloadOptionsConfig
 
         config = BaseloadOptionsConfig()
-        assert config.aggregate == "median"
+        # "mean", not "median": the optimizer plans an energy balance, and
+        # only the mean of each hour adds up to the day's actual energy.
+        assert config.aggregate == "mean"
+        assert config.model == "profile"
         assert config.remove_outliers is True
         assert config.half_life_days == 28.0
         assert config.holidays == "sunday"
@@ -259,7 +262,7 @@ class TestBaseloadOptions:
 
     def test_the_root_default_needs_no_configuration(self):
         config = ConfigurationV0.model_validate({"meteoserver-key": "x"})
-        assert config.baseload_options.aggregate == "median"
+        assert config.baseload_options.aggregate == "mean"
 
 
 class TestForecastRetention:

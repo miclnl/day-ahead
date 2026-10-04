@@ -70,6 +70,29 @@ class BacktestResult:
         }
 
 
+@dataclass
+class Selection:
+    """Which model a selector picked, and what it based that on.
+
+    Shared by the baseload and PV selectors so both write the same
+    ``selection.json`` shape, and the dashboard can render either without
+    knowing which component it came from.
+    """
+
+    model: str
+    scores: dict
+    decided_at: datetime.datetime
+    reason: str
+
+    def to_dict(self) -> dict:
+        return {
+            "model": self.model,
+            "scores": self.scores,
+            "decided_at": self.decided_at.isoformat(),
+            "reason": self.reason,
+        }
+
+
 def metrics(forecast: np.ndarray, actual: np.ndarray) -> Score:
     """MAE, RMSE and bias (forecast - actual, so positive means over-forecast)."""
     forecast = np.asarray(forecast, dtype=float)

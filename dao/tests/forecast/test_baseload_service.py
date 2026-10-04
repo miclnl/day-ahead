@@ -37,6 +37,9 @@ def make_config(
     entities_presence=None,
     entity_away=None,
     entity_calendar=None,
+    model="profile",
+    ml_min_days=120,
+    backtest_days=28,
 ):
     return types.SimpleNamespace(
         report=types.SimpleNamespace(
@@ -63,6 +66,9 @@ def make_config(
             holidays="sunday",
             clip_negative=True,
             min_samples=3,
+            model=model,
+            ml_min_days=ml_min_days,
+            backtest_days=backtest_days,
             absence=types.SimpleNamespace(
                 detect=absence_detect,
                 threshold=0.4,
@@ -404,3 +410,75 @@ def test_record_presence_writes_fraction(da_db, fake_ha, tmp_path):
 
 def test_record_presence_noop_without_entities(service_with_profiles):
     service_with_profiles.record_presence()  # no entities configured; must not raise
+
+
+@pytest.fixture
+def service_with_long_history(ha_db, tmp_path):
+    """150 days of hourly history with a real day/night shape, so "auto"
+    has both enough days for the ML model and a pattern to learn."""
+    manager, helper = ha_db
+    now = dt.datetime(2026, 6, 1, 6, 0, tzinfo=ZONE)
+    period_days = 150
+    tot = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    vanaf = tot - dt.timedelta(days=period_days)
+    n_hours = period_days * 24
+
+    grid_in: dict[int, float] = {}
+    total = 0.0
+    for i in range(n_hours + 1):
+        moment = vanaf + dt.timedelta(hours=i)
+        grid_in[int(moment.timestamp())] = total
+        if i < n_hours:
+            hour = moment.hour
+            total += 0.8 if 17 <= hour < 21 else (0.3 if 7 <= hour < 23 else 0.1)
+
+    helper.add_energy("sensor.test_grid_in", "kWh", grid_in)
+    helper.add_energy("sensor.test_grid_out", "kWh", {ts: 0.0 for ts in grid_in})
+    helper.add_power("sensor.test_pv", "W", {ts: 0.0 for ts in list(grid_in)[:-1]})
+
+    config = make_config(
+        baseload=None,
+        calc_periode=period_days,
+        model="auto",
+        ml_min_days=120,
+        backtest_days=7,
+    )
+    data_dir = tmp_path / "forecast" / "baseload"
+    service = BaseloadService(
+        config, db_da=None, db_ha=manager, data_dir=data_dir, tz=TZ, now=lambda: now
+    )
+    return service, data_dir
+
+
+def test_fit_auto_writes_selection_json(service_with_long_history):
+    service, data_dir = service_with_long_history
+
+    service.fit()
+
+    selection = json.loads((data_dir / "selection.json").read_text())
+    assert selection["model"] in ("profile", "ml")
+    assert "backtest" in selection["reason"]
+    assert set(selection["scores"]) == {"profile", "ml"}
+    assert selection["scores"]["ml"]["n"] > 0
+
+
+def test_forecast_falls_back_to_profile_when_model_missing(tmp_path, caplog):
+    """selection.json says ml, but no model was ever saved: the profile
+    must answer anyway, with a warning rather than an exception."""
+    home = {wd: flat_profile(0.3) for wd in range(7)}
+    service = build_service(tmp_path, home, config=make_config(model="ml"))
+    write_json(
+        service.data_dir / "selection.json",
+        {
+            "model": "ml",
+            "scores": {},
+            "decided_at": dt.datetime(2026, 3, 4, tzinfo=ZONE).isoformat(),
+            "reason": "geconfigureerd",
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        series = service.forecast(dt.datetime(2026, 3, 2, 0, 0, tzinfo=ZONE), 3)
+
+    assert list(series.values) == pytest.approx([0.3, 0.3, 0.3])
+    assert any("ML-model" in message for message in caplog.messages)

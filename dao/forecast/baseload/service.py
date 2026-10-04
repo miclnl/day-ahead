@@ -40,6 +40,7 @@ from dao.forecast.baseload.profile import (
     standby_profile,
 )
 from dao.forecast.baseload.store import (
+    SELECTION_FILE,
     STATUS_FILE,
     ProfileSet,
     load_profile_set,
@@ -104,8 +105,8 @@ def _localize(moment: datetime.datetime, tz: ZoneInfo) -> datetime.datetime:
     return moment.replace(tzinfo=tz)
 
 
-def _presence_series_from_frame(frame, tz: ZoneInfo) -> Optional[pd.Series]:
-    """``get_column_data("values", "presence", ...)``'s frame as a tz-aware series."""
+def _series_from_frame(frame, tz: ZoneInfo) -> Optional[pd.Series]:
+    """A ``get_column_data`` frame as a tz-aware series, for any code."""
     if frame is None or len(frame) == 0:
         return None
     index = pd.to_datetime(frame["utc"], unit="s", utc=True).dt.tz_convert(tz)
@@ -124,6 +125,8 @@ class BaseloadService:
         tz: str,
         now: Optional[Callable[[], datetime.datetime]] = None,
         ha=None,
+        latitude: float = 52.1,
+        longitude: float = 5.2,
     ) -> None:
         self.config = config
         self.db_da = db_da
@@ -131,6 +134,10 @@ class BaseloadService:
         self.data_dir = Path(data_dir)
         self.tz = tz
         self.ha = ha
+        # Only the ML model uses these, for sun elevation as a feature; the
+        # defaults keep every existing caller working unchanged.
+        self.latitude = latitude
+        self.longitude = longitude
         self._zone = ZoneInfo(tz)
         self._now = now or (lambda: datetime.datetime.now(tz=self._zone))
 
@@ -165,7 +172,7 @@ class BaseloadService:
         except Exception as ex:  # noqa: BLE001 - calibration is best-effort
             logging.debug(f"Afwezigheid: kon presence-historie niet lezen: {ex}")
             return None
-        presence = _presence_series_from_frame(frame, self._zone)
+        presence = _series_from_frame(frame, self._zone)
         if presence is None:
             return None
         presence_daily = presence.groupby(presence.index.date).mean()
@@ -233,6 +240,9 @@ class BaseloadService:
         away_profile = None
         away_source = None
         standby_value = None
+        # Also handed to the ML model as its "away" feature, so an absent
+        # household is a thing it can learn rather than noise it averages in.
+        labels_for_ml = pd.Series(dtype=bool)
 
         absence_config = self.config.baseload_options.absence
         if absence_config.detect:
@@ -240,6 +250,7 @@ class BaseloadService:
             threshold = status.get("threshold", absence_config.threshold)
 
             labels = label_days(base, threshold)
+            labels_for_ml = labels
             away_dates = {day for day, is_away in labels.items() if is_away}
 
             if self.db_da is not None:
@@ -286,7 +297,193 @@ class BaseloadService:
             standby_kwh=standby_value,
         )
         save_profile_set(profile_set, self.data_dir)
+
+        self._train_and_select(base, labels_for_ml, options, now)
         return profile_set
+
+    # ------------------------------------------------------------ model choice
+    def _fill_temp_gaps(self, series: pd.Series, reference: pd.Series) -> pd.Series:
+        """Fill NaN temperatures from ``reference``'s own monthly means.
+
+        A household with no temperature history at all still has to be
+        forecastable; the ML model's features cannot contain NaN, so every
+        gap gets the month's climatological value rather than dropping the
+        row (which, with no history, would drop all of them).
+        """
+        if not series.isna().any():
+            return series
+        from dao.forecast.baseload.ml import climatological_temp
+
+        filled = series.copy()
+        for month in sorted({moment.month for moment in series.index}):
+            gaps = pd.Series(
+                [moment.month == month for moment in series.index], index=series.index
+            ) & filled.isna()
+            if gaps.any():
+                filled.loc[gaps] = climatological_temp(reference, month)
+        return filled
+
+    def _raw_temperature(self, index, table: str) -> pd.Series:
+        if self.db_da is None or len(index) == 0:
+            return pd.Series(float("nan"), index=index)
+        try:
+            frame = self.db_da.get_column_data(
+                table,
+                "temp",
+                start=index[0].to_pydatetime(),
+                end=index[-1].to_pydatetime() + datetime.timedelta(hours=1),
+            )
+        except Exception as ex:  # noqa: BLE001 - a feature, not the calculation
+            logging.debug(f"Baseload ML: temperatuur uit {table} niet leesbaar: {ex}")
+            return pd.Series(float("nan"), index=index)
+        series = _series_from_frame(frame, self._zone)
+        if series is None:
+            return pd.Series(float("nan"), index=index)
+        return series.reindex(index)
+
+    def _temperature_history(self, index) -> pd.Series:
+        """Measured temperature over ``index``, gaps filled, for training."""
+        raw = self._raw_temperature(index, "values")
+        return self._fill_temp_gaps(raw, raw)
+
+    def _train_and_select(self, base, away_labels, options, now) -> None:
+        """Train the ML model when configured, then record the choice.
+
+        Every step here is best-effort: a failed training or backtest
+        leaves the profile in place and is logged, rather than taking the
+        whole ``calc_baseloads`` run down with it.
+        """
+        from dao.forecast.baseload.ml import BaseloadMLModel
+        from dao.forecast.baseload.select import (
+            MLCandidate,
+            ProfileCandidate,
+            select_model,
+        )
+        from dao.forecast.evaluate import backtest
+
+        configured = getattr(self.config.baseload_options, "model", "profile")
+        history_days = int(pd.Series(base.index.date).nunique()) if len(base) else 0
+
+        if configured == "profile":
+            self._write_selection(
+                select_model(configured, history_days, 0, None)
+            )
+            return
+
+        ml_min_days = getattr(self.config.baseload_options, "ml_min_days", 120)
+        backtest_days = getattr(self.config.baseload_options, "backtest_days", 28)
+        temp = self._temperature_history(base.index)
+
+        def model_factory():
+            return BaseloadMLModel(
+                self.latitude, self.longitude, options.holidays
+            )
+
+        if configured == "auto" and history_days < ml_min_days:
+            self._write_selection(
+                select_model(configured, history_days, ml_min_days, None)
+            )
+            return
+
+        try:
+            model = model_factory()
+            model.train(base, temp, away_labels)
+            model.save(self.data_dir)
+            logging.info(
+                f"Baseload ML: getraind op {model.rows} uren, "
+                f"{model.away_days} afwezige dagen"
+            )
+        except Exception as ex:  # noqa: BLE001 - the profile is always there
+            logging.warning(f"Baseload ML-training mislukt: {ex}")
+            self._write_selection(
+                select_model("profile", history_days, ml_min_days, None)
+            )
+            return
+
+        result = None
+        if configured == "auto":
+            try:
+                result = backtest(
+                    "baseload",
+                    [ProfileCandidate(options), MLCandidate(model_factory, temp, away_labels)],
+                    base,
+                    backtest_days,
+                    end=now.date(),
+                    context_for_day=lambda day: {"temp": temp},
+                )
+                logging.info(
+                    f"Baseload backtest over {backtest_days} dagen: "
+                    + ", ".join(
+                        f"{name} MAE {score.mae:.3f} kWh"
+                        for name, score in result.scores.items()
+                    )
+                )
+            except Exception as ex:  # noqa: BLE001 - fall back to the profile
+                logging.warning(f"Baseload backtest mislukt: {ex}")
+                result = None
+
+        selection = select_model(configured, history_days, ml_min_days, result)
+        logging.info(
+            f"Baseload model: {selection.model} ({selection.reason})"
+        )
+        self._write_selection(selection)
+
+    def _write_selection(self, selection) -> None:
+        write_json(self.data_dir / SELECTION_FILE, selection.to_dict())
+
+    def _selected_model(self) -> str:
+        payload = read_json(self.data_dir / SELECTION_FILE) or {}
+        return payload.get("model", "profile")
+
+    def _horizon_temperature(self, index) -> pd.Series:
+        """Forecast temperature over ``index``, gaps filled per-month from
+        the measured history, so one missing hour cannot blank a whole day."""
+        forecast = self._raw_temperature(index, "prognoses")
+        if not forecast.isna().any():
+            return forecast
+        history = self._raw_temperature(
+            pd.date_range(index[0] - datetime.timedelta(days=365), index[0], freq="h"),
+            "values",
+        )
+        return self._fill_temp_gaps(forecast, history)
+
+    def _forecast_ml(self, index, regime_for, options) -> Optional[pd.Series]:
+        """The ML model's forecast over ``index``, or ``None`` to use the profile.
+
+        Returns ``None`` -- never raises -- whenever the model is missing,
+        stale, has too little away history for an away day, or fails
+        outright: the profile is always there, and a plan is worth more
+        than an exception.
+        """
+        from dao.forecast.baseload.ml import MIN_AWAY_DAYS_FOR_ML, BaseloadMLModel
+
+        model = BaseloadMLModel.load(
+            self.data_dir, self.latitude, self.longitude, options.holidays
+        )
+        if model is None:
+            logging.warning(
+                "Baseload: ML-model gekozen maar niet beschikbaar, "
+                "profiel gebruikt"
+            )
+            return None
+
+        try:
+            temp = self._horizon_temperature(index)
+            pieces = []
+            for day in sorted({timestamp.date() for timestamp in index}):
+                day_index = index[[timestamp.date() == day for timestamp in index]]
+                away = regime_for(day).away
+                if away and model.away_days < MIN_AWAY_DAYS_FOR_ML:
+                    logging.info(
+                        f"Baseload: {model.away_days} afwezige dagen in het "
+                        f"ML-model is te weinig, profiel gebruikt voor {day}"
+                    )
+                    return None
+                pieces.append(model.predict(day_index, temp.loc[day_index], away))
+            return pd.concat(pieces).reindex(index).rename("baseload")
+        except Exception as ex:  # noqa: BLE001 - the profile is the fallback
+            logging.warning(f"Baseload ML-voorspelling mislukt ({ex}), profiel gebruikt")
+            return None
 
     def forecast(
         self,
@@ -316,6 +513,12 @@ class BaseloadService:
             return regime_cache[day]
 
         profile_set = self.profile_set()
+
+        if self._selected_model() == "ml":
+            predicted = self._forecast_ml(index, regime_for, options)
+            if predicted is not None:
+                return predicted
+
         if profile_set is not None:
             age = profile_age_days(profile_set, self._now())
             if age > MAX_PROFILE_AGE_DAYS:
@@ -416,7 +619,7 @@ class BaseloadService:
                     start=now - datetime.timedelta(hours=48),
                     end=now,
                 )
-                presence = _presence_series_from_frame(frame, self._zone)
+                presence = _series_from_frame(frame, self._zone)
             except Exception as ex:  # noqa: BLE001 - a signal, not the calculation
                 logging.warning(f"Kon presence-historie niet lezen: {ex}")
 
