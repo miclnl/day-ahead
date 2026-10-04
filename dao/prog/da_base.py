@@ -828,6 +828,8 @@ class DaBase:
             Path("../data/forecast/baseload"),
             self.time_zone,
             ha=self,
+            latitude=self.ha_context.latitude,
+            longitude=self.ha_context.longitude,
         )
 
     def pv_service(self):
