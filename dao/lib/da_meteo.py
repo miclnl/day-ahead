@@ -3,7 +3,6 @@ import logging
 from typing import Optional
 import pandas as pd
 import matplotlib.pyplot as plt
-from dao.forecast.weather.meteoserver import fetch_meteoserver
 from dao.lib.da_graph import GraphBuilder
 from dao.lib.db_manager import DBmanagerObj
 from sqlalchemy import Table, select, func, and_
@@ -36,27 +35,6 @@ class Meteo:
         # Used to evaluate the sun's position at the middle of the interval
         # a radiation value stands for, whatever that interval's length is.
         self.interval_s = 3600 if config.interval == "1hour" else 900
-
-    @staticmethod
-    def is_aws(station: int):
-        """
-        station :code van een knmi station
-        :return: boolean
-        """
-        from dao.forecast.weather.observations import KNMI_AWS_STATIONS
-
-        return int(station) in KNMI_AWS_STATIONS
-
-    def which_station(self) -> str:
-        """
-        berekent welk weerstation het dichtst bij is
-        :param latitude:
-        :param longitude:
-        :return: code weerstation
-        """
-        from dao.forecast.weather.observations import nearest_knmi_station
-
-        return str(nearest_knmi_station(self.latitude, self.longitude))
 
     def make_graph_meteo(self, df, file=None, show=False):
         if "tijd_nl" in df.columns:
@@ -111,41 +89,6 @@ class Meteo:
         plt.close("all")
         return
         """
-
-    def get_from_meteoserver(self, model: str) -> pd.DataFrame:
-        """Delegates to :func:`fetch_meteoserver`, reshaped back into the
-        columns this class's own callers still expect (``tijd``/``tijd_nl``
-        rather than the weather frame's ``time``). A thin compatibility
-        layer until those callers move to :mod:`dao.forecast.weather`
-        themselves.
-        """
-        frame = fetch_meteoserver(
-            self.meteoserver_key,
-            model,
-            self.meteoserver_attempts,
-            self.latitude,
-            self.longitude,
-        )
-        if frame.empty:
-            return pd.DataFrame()
-        result = pd.DataFrame(
-            {
-                "tijd": frame["time"],
-                "tijd_nl": frame["time"].apply(
-                    lambda t: datetime.datetime.fromtimestamp(t).strftime(
-                        "%d-%m-%Y %H:%M"
-                    )
-                ),
-                "gr": frame["gr"],
-                "temp": frame["temp"],
-                "winds": frame["winds"],
-                "neersl": frame["neersl"],
-            }
-        )
-        logging.info(f"Meteodata model {model}")
-        logging.info(f"Aantal records: {len(result)}")
-        logging.info(f"Data {model}: \n{result.to_string(index=True)}")
-        return result
 
     def get_meteo_data(self, show_graph=False):
         from pathlib import Path
@@ -287,15 +230,3 @@ class Meteo:
         else:
             result = weight_factor * (16 - avg_temp)
         return result
-
-
-"""
-def main():
-    from dao.prog.da_base import DaBase
-    dbase = DaBase("../data/options.json")
-    meteo = Meteo(dbase.config, dbase.db_da)
-    station = meteo.which_station()
-
-if __name__ == "__main__":
-    main()
-"""

@@ -351,11 +351,11 @@ def _import_targets():
     from dao.prog.da_base import DaBase
     from dao.prog.da_report import Report
     from dao.lib.db_manager import DBmanagerObj
-    from dao.prog.solar_predictor import SolarPredictor
+    from dao.forecast.pv.service import PVService
     from dao.forecast.baseload.service import BaseloadService
     import dao.prog.da_base as da_base_module
 
-    return DaBase, Report, DBmanagerObj, SolarPredictor, BaseloadService, da_base_module
+    return DaBase, Report, DBmanagerObj, PVService, BaseloadService, da_base_module
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +564,7 @@ class RecordingIO:
 
     # Zet alle class- en module-patches voor deze opnamesessie neer; dekt samen alle kanalen uit sectie 1 van het ontwerp.
     def _install_patches(self) -> None:
-        DaBase, Report, DBmanagerObj, SolarPredictor, BaseloadService, _da_base_module = (
+        DaBase, Report, DBmanagerObj, PVService, BaseloadService, _da_base_module = (
             _import_targets()
         )
 
@@ -664,34 +664,34 @@ class RecordingIO:
         self._patches.set(DBmanagerObj, "get_prognose_data", _wrapped_get_prognose_data)
 
         # A channel this module doesn't patch anywhere else: found by
-        # actually running a real config with a solar device configured for
-        # ML prediction. calc_optimum() -> DaBase.calc_solar_predictions()
-        # -> SolarPredictor.predict_solar_device() does its own DB reads
-        # (get_time_border_record, get_column_data) that DBmanagerObj's
-        # patch above never sees, because those calls only happen inside
-        # this method — patched wholesale, same principle as
-        # Report.get_price_data, rather than trying to fake the two
-        # DB primitives generically.
-        original_predict_solar_device = SolarPredictor.predict_solar_device
+        # actually running a real config with a solar device. calc_optimum()
+        # -> DaBase.calc_solar_predictions() -> PVService.forecast() does its
+        # own DB reads (get_prognose_fields) and, on the ML path, loads a
+        # model file -- none of which DBmanagerObj's patch above sees.
+        # Patched wholesale, same principle as Report.get_price_data, rather
+        # than trying to fake the primitives underneath it generically.
+        original_pv_forecast = PVService.forecast
 
-        # Roept de echte ML-zonnevoorspelling aan en bewaart het resultaat per paneelnaam, niet per tijdvenster, want dat laatste kan meer drift geven dan bedoeld.
-        def _wrapped_predict_solar_device(instance, solar_option, start, end):
-            result = original_predict_solar_device(instance, solar_option, start, end)
+        # Roept de echte zonnevoorspelling aan en bewaart het resultaat per paneelnaam, niet per tijdvenster, want dat laatste kan meer drift geven dan bedoeld.
+        def _wrapped_pv_forecast(instance, installation, start, end, interval, model=None):
+            result = original_pv_forecast(
+                instance, installation, start, end, interval, model
+            )
             # Keyed by device name only, not (start, end): those two are
             # themselves derived from calc_optimum()'s own internal
             # dt.datetime.now() call, which fires strictly later than (and
             # therefore can drift from) RecordingIO's own captured_at
-            # timestamp — a live run's DB/HA setup alone can take long
+            # timestamp -- a live run's DB/HA setup alone can take long
             # enough to cross an interval boundary between the two. There
             # is only ever one legitimate (start, end) window per device
             # per snapshot anyway, so the name alone is both sufficient
             # and immune to that drift. Found by an actual capture/replay
             # round trip against a live config, not by reasoning about it.
-            key = _call_key((getattr(solar_option, "name", None),), {})
+            key = _call_key((getattr(installation, "name", None),), {})
             self._solar_predictions[key] = result
             return result
 
-        self._patches.set(SolarPredictor, "predict_solar_device", _wrapped_predict_solar_device)
+        self._patches.set(PVService, "forecast", _wrapped_pv_forecast)
 
         # Re-anchor _captured_at to the moment calc_optimum() is actually
         # invoked, not construction time. The __init__ default (set before
@@ -998,7 +998,7 @@ class ReplayIO:
 
     # Zet alle class- en module-patches voor deze replaysessie neer: config, reads, writes en de klok.
     def _install_patches(self) -> None:
-        DaBase, Report, DBmanagerObj, SolarPredictor, BaseloadService, da_base_module = (
+        DaBase, Report, DBmanagerObj, PVService, BaseloadService, da_base_module = (
             _import_targets()
         )
 
@@ -1094,19 +1094,19 @@ class ReplayIO:
         self._patches.set(Report, "get_heatpump_run_hours", _replay_hp_hours)
 
         # Levert de opgeslagen zonnevoorspelling terug op paneelnaam, ongevoelig voor een afwijkend tijdvenster.
-        def _replay_predict_solar_device(instance, solar_option, start, end):
-            # Keyed by device name only — see the matching comment on the
+        def _replay_pv_forecast(instance, installation, start, end, interval, model=None):
+            # Keyed by device name only -- see the matching comment on the
             # RecordingIO side for why (start, end) is deliberately excluded.
-            key = _call_key((getattr(solar_option, "name", None),), {})
+            key = _call_key((getattr(installation, "name", None),), {})
             if key not in self._solar_predictions:
                 raise SnapshotMiss(
-                    f"ReplayIO ({self._source}): predict_solar_device for "
-                    f"{getattr(solar_option, 'name', '?')!r} is not present "
+                    f"ReplayIO ({self._source}): PV forecast for "
+                    f"{getattr(installation, 'name', '?')!r} is not present "
                     f"in the snapshot (looked up as key {key})."
                 )
             return self._solar_predictions[key].copy()
 
-        self._patches.set(SolarPredictor, "predict_solar_device", _replay_predict_solar_device)
+        self._patches.set(PVService, "forecast", _replay_pv_forecast)
 
         fake_db = _FakeDbManager(self._prog_data, self._source)
         self._patches.set(da_base_module, "make_db_da", lambda *a, **k: fake_db)

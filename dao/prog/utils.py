@@ -23,7 +23,7 @@ def make_data_path():
 
 def is_laagtarief(dtime, switch_hour):
     """Dutch dual-tariff low rate: weekends, public holidays and the night."""
-    from dao.prog.baseload import is_holiday
+    from dao.forecast.baseload.profile import is_holiday
 
     if dtime.weekday() >= 5:  # zaterdag en zondag
         return True

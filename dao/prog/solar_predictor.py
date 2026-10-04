@@ -795,111 +795,6 @@ class SolarPredictor(DaBase):
         os.remove(filename)
         return
 
-    def get_and_save_knmi_data(
-        self, start: dt.datetime, end: dt.datetime, variables: list = ["FH", "T", "Q"]
-    ):
-        """Delegates to the unified observation fetcher.
-
-        Kept for compatibility with existing call sites until Task 24; the
-        bespoke gap arithmetic this used to do is superseded by
-        ``update_observations`` always refreshing a trailing window, which
-        is idempotent (``savedata`` upserts) so there is no gap to track by
-        hand. ``variables`` is accepted but no longer selective: the KNMI
-        fetch behind this always retrieves gr/temp/winds together.
-        """
-        from dao.forecast.weather.observations import update_observations
-
-        days = max(1, (end.date() - start.date()).days + 1)
-        update_observations(
-            self.db_da,
-            self.latitude,
-            self.longitude,
-            self.ha_context.country,
-            "auto",
-            days=days,
-            now=end,
-        )
-
-    def import_knmi_df(self, start: dt.datetime, end: dt.datetime):
-        """Delegates to the unified observation fetcher; see
-        ``get_and_save_knmi_data`` for why the old gap-detection is gone."""
-        self.get_and_save_knmi_data(start, end)
-
-    def get_weatherdata(
-        self,
-        start: dt.datetime,
-        _end: dt.datetime | None = None,
-        prognose: bool = False,
-    ) -> pd.DataFrame:
-        """
-        vult database aan met ontbrekende data
-        load ned_nl_data from dao-database
-        :param start: begindatum laden vanaf
-        :param end: einddatum if None: tot gisteren 00:00
-        :param prognose: boolean, False: meetdata ophalen
-            True: prognoses ophalen
-        :return: dataframe with weatherdata
-        """
-        # haal ontbrekende data op bij knmi
-
-        if _end is None:
-            end = dt.datetime.now()
-        else:
-            end = _end
-        if not prognose:
-            # knmi data evt aanvullen
-            self.import_knmi_df(start, end)
-
-        start = dt.datetime(start.year, start.month, start.day, start.hour)
-        # get weather-dataframe from database
-        fields = ("gr", "temp", "winds")
-        weather_data = pd.DataFrame(columns=["utc", *fields])
-        for weather_item in fields:
-            if prognose:
-                table_name = "prognoses"
-            else:
-                latest_dt = self.db_da.get_time_border_record(weather_item, latest=True)
-                if latest_dt < end and _end is not None:
-                    table_name = "prognoses"
-                    logging.warning(
-                        f"Er zijn geen meetdata van {weather_item} op "
-                        f"{start.strftime('%Y-%m_%d')}"
-                    )
-                else:
-                    table_name = "values"
-            df_item = self.db_da.get_column_data(
-                table_name, weather_item, start=start, end=end
-            )
-            # Join on the timestamp, never on row position. The three series
-            # are fetched independently and do not have to be equally long:
-            # winds was added later than gr and temp and is backfilled by a
-            # separate path, so one missing hour used to shift an entire
-            # column against the others without any visible error.
-            part = df_item[["utc", "value"]].rename(columns={"value": weather_item})
-            part = part.dropna(subset=["utc"]).drop_duplicates(subset=["utc"])
-            if len(weather_data) == 0:
-                weather_data = part
-            else:
-                weather_data = weather_data.merge(part, on="utc", how="outer")
-        weather_data = weather_data.sort_values("utc").reset_index(drop=True)
-        missing = int(weather_data[list(fields)].isna().any(axis=1).sum())
-        if missing:
-            logging.warning(
-                f"Weerdata: {missing} van {len(weather_data)} uren missen een of "
-                f"meer velden en worden overgeslagen"
-            )
-        weather_data["utc"] = pd.to_datetime(weather_data["utc"], unit="s", utc=True)
-        weather_data = weather_data.set_index(weather_data["utc"])
-        weather_data = weather_data.rename(
-            columns={
-                "utc": "datetime",
-                "gr": "irradiance",
-                "temp": "temperature",
-                "winds": "windvelocity",
-            }
-        )
-        return weather_data
-
     def get_solar_data(self, start: dt.datetime, entities: list) -> pd.DataFrame:
         """
         haalt gemeten pv-productie op via de centrale HistoryReader, met
@@ -1030,17 +925,6 @@ class SolarPredictor(DaBase):
         logging.info(f"ML prediction {self.solar_name}\n{prediction}")
         return prediction
 
-    def test_solar_predictor(self, start, end):
-        solar_options = self.config.solar
-        for solar_option in solar_options:
-            if solar_option.model in ("ml", "auto"):
-                self.predict_solar_device(solar_option, start, end)
-        batteries = self.config.battery
-        for battery in batteries:
-            for solar_option in battery.solar:
-                if solar_option.model in ("ml", "auto"):
-                    self.predict_solar_device(solar_option, start, end)
-
 
 def main():
     arg = sys.argv[1]
@@ -1049,19 +933,9 @@ def main():
         start_dt = dt.datetime.strptime(arg2, "%Y-%m-%d")
     else:
         start_dt = None
-    if len(sys.argv) > 3:
-        arg3 = sys.argv[3]
-        end_dt = dt.datetime.strptime(arg3, "%Y-%m-%d")
-    else:
-        end_dt = None
     solar_predictor = SolarPredictor("")
     if arg.lower() == "train":
         solar_predictor.run_train(start=start_dt)
-    if arg.lower() == "predict":
-        solar_predictor.test_solar_predictor(
-            start=start_dt,
-            end=end_dt,
-        )
 
 
 if __name__ == "__main__":

@@ -254,7 +254,13 @@ class DaBase:
             country=self.ha_context.country,
         )
         if (self.ha_context.country == "NL") or (self.ha_context.country == "BE"):
-            self.knmi_station = self.meteo.which_station()
+            from dao.forecast.weather.observations import nearest_knmi_station
+
+            self.knmi_station = str(
+                nearest_knmi_station(
+                    self.ha_context.latitude, self.ha_context.longitude
+                )
+            )
         self.solar = self.config.solar
         self.interval = self.config.interval
         self.interval_s = 3600 if self.interval == "1hour" else 900

@@ -311,60 +311,6 @@ class CheckDB:
             print(f'Meteo-data verhuizen van "values" naar "prognoses"')
             self.move_meteodata_to_prognoses()
 
-        """
-        if l_version < 20250700:
-            # update variabel with records voor calculated pv_ac, pv_dc and corr. factors
-            records_2025_7_0 = [
-                [23, "pv_ac_0", "Zonne energie AC 1", "kWh"],
-                [24, "pv_ac_1", "Zonne energie AC 2", "kWh"],
-                [25, "pv_ac_2", "Zonne energie AC 3", "kWh"],
-                [26, "pv_ac_3", "Zonne energie AC 4", "kWh"],
-                [27, "pv_ac_4", "Zonne energie AC 5", "kWh"],
-                [28, "pv_ac_5", "Zonne energie AC 6", "kWh"],
-                [29, "pv_ac_6", "Zonne energie AC 7", "kWh"],
-                [30, "pv_ac_7", "Zonne energie AC 8", "kWh"],
-                [31, "pv_ac_8", "Zonne energie AC 9", "kWh"],
-                [32, "pv_ac_9", "Zonne energie AC 10", "kWh"],
-
-                [33, "pv_dc_0", "Zonne energie DC 1", "kWh"],
-                [34, "pv_dc_1", "Zonne energie DC 2", "kWh"],
-                [35, "pv_dc_2", "Zonne energie DC 3", "kWh"],
-                [36, "pv_dc_3", "Zonne energie DC 4", "kWh"],
-                [37, "pv_dc_4", "Zonne energie DC 5", "kWh"],
-                [38, "pv_dc_5", "Zonne energie DC 6", "kWh"],
-                [39, "pv_dc_6", "Zonne energie DC 7", "kWh"],
-                [40, "pv_dc_7", "Zonne energie DC 8", "kWh"],
-                [41, "pv_dc_8", "Zonne energie DC 9", "kWh"],
-                [42, "pv_dc_9", "Zonne energie DC 10", "kWh"],
-
-                [43, "cf_ac_0", "Correctie factor AC 1", "-"],
-                [44, "cf_ac_1", "Correctie factor AC 2", "-"],
-                [45, "cf_ac_2", "Correctie factor AC 3", "-"],
-                [46, "cf_ac_3", "Correctie factor AC 4", "-"],
-                [47, "cf_ac_4", "Correctie factor AC 5", "-"],
-                [48, "cf_ac_5", "Correctie factor AC 6", "-"],
-                [49, "cf_ac_6", "Correctie factor AC 7", "-"],
-                [50, "cf_ac_7", "Correctie factor AC 8", "-"],
-                [51, "cf_ac_8", "Correctie factor AC 9", "-"],
-                [52, "cf_ac_9", "Correctie factor AC 10", "-"],
-
-                [53, "cf_dc_0", "Correctie factor DC 1", "-"],
-                [54, "cf_dc_1", "Correctie factor DC 2", "-"],
-                [55, "cf_dc_2", "Correctie factor DC 3", "-"],
-                [56, "cf_dc_3", "Correctie factor DC 4", "-"],
-                [57, "cf_dc_4", "Correctie factor DC 5", "-"],
-                [58, "cf_dc_5", "Correctie factor DC 6", "-"],
-                [59, "cf_dc_6", "Correctie factor DC 7", "-"],
-                [60, "cf_dc_7", "Correctie factor DC 8", "-"],
-                [61, "cf_dc_8", "Correctie factor DC 9", "-"],
-                [62, "cf_dc_9", "Correctie factor DC 10", "-"],
-            ]
-            for i in range(len(records_2025_7_0)):
-                record = records_2025_7_0[i]
-                self.upsert_variabel(variabel_tabel, record)
-            print('Table "variabel" geupdated.')
-        """
-
         # Maak de kolom "aggregate" als deze niet bestaat
         inspector = inspect(self.engine)
         columns = [column["name"] for column in inspector.get_columns("variabel")]
