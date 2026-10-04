@@ -651,6 +651,16 @@ def solar():
     )
 
 
+@v2.route("/accuracy")
+def accuracy():
+    """How well the forecasts did, and which model is currently chosen.
+
+    All the data is fetched client-side from /v2/api/accuracy/, so a slow
+    or unavailable database cannot block the page itself from rendering.
+    """
+    return render_template("v2/accuracy.html")
+
+
 @v2.route("/reports-v2", methods=["GET"])
 def reportsv2():
     today = datetime.datetime.combine(

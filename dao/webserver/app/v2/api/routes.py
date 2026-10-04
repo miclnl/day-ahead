@@ -5,6 +5,8 @@ from subprocess import TimeoutExpired, run as subprocess_run
 from dao.prog import task_state
 from dao.prog import tasks as task_registry
 from datetime import datetime, timedelta
+from pathlib import Path
+import json
 from zoneinfo import ZoneInfo, available_timezones
 
 api = Blueprint("api", __name__)
@@ -141,3 +143,117 @@ def data_sql_ha():
         )
 
     return str(query)
+
+_DATA_PATH = Path("../data")
+
+
+def _read_json_or_none(path: Path):
+    """A JSON artefact, or ``None`` when it is absent or unreadable.
+
+    The accuracy page must render on a fresh install, where none of these
+    files exist yet; every one of them is therefore optional and a missing
+    one is an empty block on the page, not a 500.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def _pv_artefacts():
+    """Calibration and selection per PV installation, keyed by artefact key."""
+    pv_dir = _DATA_PATH / "forecast" / "pv"
+    result: dict = {}
+    if not pv_dir.is_dir():
+        return result
+    for path in sorted(pv_dir.glob("*.json")):
+        if path.name.endswith(".selection.json"):
+            key = path.name[: -len(".selection.json")]
+            result.setdefault(key, {})["selection"] = _read_json_or_none(path)
+        else:
+            key = path.stem
+            result.setdefault(key, {})["calibration"] = _read_json_or_none(path)
+    return result
+
+
+def _recent_pairs(days: int = 2):
+    """Forecast against measured for the last 48 hours, per component.
+
+    Best-effort: this needs a live database and Home Assistant history, and
+    the page is still useful without it, so any failure yields an empty
+    mapping rather than an error.
+    """
+    try:
+        from dao.forecast.evaluate import COMPONENTS, measured_series
+        from dao.forecast.history import HistoryReader
+        from dao.prog.da_base import DaBase
+    except ImportError:
+        return {}
+
+    try:
+        base = DaBase()
+        if base.config is None:
+            return {}
+        now = datetime.now(ZoneInfo(base.time_zone))
+        start = now - timedelta(days=days)
+        reader = HistoryReader(base.db_ha, base.time_zone) if base.db_ha else None
+        recent: dict = {}
+        for component in COMPONENTS:
+            rows = base.db_da.forecast_rows(
+                [component], [0], int(start.timestamp()), int(now.timestamp())
+            )
+            if rows is None or len(rows) == 0:
+                continue
+            measured = measured_series(
+                component, reader, base.config, base.db_da, start, now
+            )
+            lookup = (
+                {int(moment.timestamp()): float(value) for moment, value in measured.items()}
+                if measured is not None
+                else {}
+            )
+            recent[component] = [
+                {
+                    "tijd": datetime.fromtimestamp(
+                        int(row.target_time), tz=ZoneInfo(base.time_zone)
+                    ).isoformat(),
+                    "forecast": float(row.value),
+                    "measured": lookup.get(int(row.target_time)),
+                }
+                for row in rows.itertuples()
+            ]
+        return recent
+    except Exception:  # noqa: BLE001 - the page renders without this block
+        return {}
+
+
+@api.route("/accuracy/")
+def accuracy():
+    """Everything the accuracy page shows, in one call.
+
+    Every block is independently optional: a fresh install has no archive,
+    no calibration and no selection, and must still get valid JSON.
+    """
+    try:
+        days = int(request.args.get("days", 28))
+    except ValueError:
+        days = 28
+
+    baseload_dir = _DATA_PATH / "forecast" / "baseload"
+    profile = _read_json_or_none(baseload_dir / "profile.json")
+
+    return {
+        "days": days,
+        "accuracy": _read_json_or_none(_DATA_PATH / "forecast" / "accuracy.json"),
+        "baseload": {
+            "selection": _read_json_or_none(baseload_dir / "selection.json"),
+            "status": _read_json_or_none(baseload_dir / "status.json"),
+            "profile_created": (profile or {}).get("created"),
+        },
+        "pv": _pv_artefacts(),
+        "weather": _read_json_or_none(
+            _DATA_PATH / "forecast" / "weather" / "status.json"
+        ),
+        "recent": _recent_pairs(),
+    }
