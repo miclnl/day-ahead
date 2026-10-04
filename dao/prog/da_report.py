@@ -3269,8 +3269,8 @@ class Report(DaBase):
 
         # solar_predictor = SolarPredictor()
         # solar_prog = solar_predictor.predict_solar_device(device, start, end)
-        solar_prog = self.calc_solar_predictions(
-            device, start, end, interval="1hour", _ml_prediction=True
+        solar_prog = self.pv_service().forecast(
+            device, start, end, "1hour", model="ml"
         )
         if "date_time" in solar_prog.columns:
             solar_prog["tijd"] = solar_prog["date_time"].dt.tz_localize(None)

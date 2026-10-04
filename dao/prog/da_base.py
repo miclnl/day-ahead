@@ -999,7 +999,6 @@ class DaBase:
         vanaf: datetime.datetime,
         tot: datetime.datetime,
         interval: str = None,
-        _ml_prediction: bool = None,
     ) -> pd.DataFrame:
         """
         berekent de solar production
@@ -1007,71 +1006,15 @@ class DaBase:
         :param vanaf: datetime start
         :param tot: datetime tot
         :param interval: 15"min of 1 hour of None, als None wordt self.interval genomen
-        :param _ml_prediction: boolean default None(= from config)
-        :return:
+        :return: dataframe met kolommen tijd en prediction
+
+        Welk model dat doet (fysisch of ML) bepaalt de PV-service zelf uit
+        de opgeslagen keuze; de terugval naar het fysische model zit daar
+        ook, zodat elke aanroeper dezelfde kolommen terugkrijgt.
         """
-        from dao.prog.solar_predictor import SolarPredictor
-
-        if _ml_prediction is None:
-            ml_prediction = solar_option.ml_prediction
-        else:
-            ml_prediction = _ml_prediction
-        if interval is None:
-            interval = self.interval
-        solar_name = solar_option.name.replace(" ", "_").replace("-", "_")
-        if ml_prediction:
-            solar_predictor = SolarPredictor()
-            try:
-                solar_prog = solar_predictor.predict_solar_device(
-                    solar_option, vanaf, tot
-                )
-                if len(solar_prog) < 2:
-                    raise ValueError(
-                        f"ML-model gaf {len(solar_prog)} voorspellingen terug"
-                    )
-                if solar_prog.isnull().any().any():
-                    logging.warning(
-                        f"NaN-waarden aangetroffen in voorspelling van {solar_name}"
-                        f"Deze zijn op '0' gezet"
-                    )
-                    solar_prog.fillna(0, inplace=True)
-            except FileNotFoundError as ex:
-                logging.warning(ex)
-                logging.info(
-                    f"Voor {solar_option.name} is geen model "
-                    f"en dus wordt DAO-predictor gebruikt"
-                )
-
-                result = self.calc_solar_predictions(
-                    solar_option, vanaf, tot, interval=interval, _ml_prediction=False
-                )
-                if _ml_prediction:
-                    result["prediction"] = pd.NA
-                return result
-            except Exception as ex:
-                # A stale model file (xgboost upgrade, changed feature set) or a
-                # gap in the weather data must not take the whole optimisation
-                # down; the physical DAO predictor is always available.
-                error_handling(ex)
-                logging.warning(
-                    f"ML-voorspelling voor {solar_option.name} mislukt ({ex}); "
-                    f"DAO-predictor wordt gebruikt"
-                )
-                return self.calc_solar_predictions(
-                    solar_option, vanaf, tot, interval=interval, _ml_prediction=False
-                )
-            solar_prog["tijd"] = pd.to_datetime(solar_prog["date_time"])
-            if interval == "15min":
-                solar_prog = interpolate(solar_prog, "prediction", quantity=True)
-            while (
-                len(solar_prog) > 0
-                and solar_prog["tijd"].iloc[0].tz_localize(None) < vanaf
-            ):
-                solar_prog = solar_prog.iloc[1:]
-        else:
-            return self.pv_service().forecast(solar_option, vanaf, tot, interval)
-        solar_prog.reset_index(drop=True, inplace=True)
-        return solar_prog
+        return self.pv_service().forecast(
+            solar_option, vanaf, tot, interval or self.interval
+        )
 
     def train_ml_predictions(self):
         # Calibrates the physical model for every installation and, for

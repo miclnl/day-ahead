@@ -158,7 +158,7 @@ class TestCalcSolarPredictionsDaoBranch:
         monkeypatch.setattr(base, "pv_service", lambda: stub)
 
         result = base.calc_solar_predictions(
-            solar_option, vanaf, tot, interval="1hour", _ml_prediction=False
+            solar_option, vanaf, tot, interval="1hour"
         )
 
         assert list(result.columns) == ["tijd", "prediction"]

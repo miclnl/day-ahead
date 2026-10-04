@@ -16,10 +16,25 @@ from typing import Optional
 
 import pandas as pd
 
+from dao.forecast.baseload.store import read_json, write_json
+from dao.forecast.evaluate import Selection, backtest
 from dao.forecast.history import HistoryReader
 from dao.forecast.pv.calibrate import CalibrationResult, calibrate
 from dao.forecast.pv.physical import params_from_config, simulate, weather_for_pv
-from dao.forecast.pv.store import calibration_path, load_calibration, save_calibration
+from dao.forecast.pv.select import MLCandidate, PhysicalCandidate, select_pv_model
+from dao.forecast.pv.store import (
+    calibration_path,
+    load_calibration,
+    save_calibration,
+    selection_path,
+)
+
+
+def _parse_iso(value, fallback: datetime.datetime) -> datetime.datetime:
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return fallback
 
 #: Beyond this many days a stored calibration is still used, but flagged:
 #: the installation may have changed (shading, cleaning, a fault) since.
@@ -86,15 +101,72 @@ class PVService:
     def _interval_s(self, interval: str) -> int:
         return 900 if interval == "15min" else 3600
 
+    def selection_for(self, installation) -> Selection:
+        """The stored model choice for ``installation``, or the configured one."""
+        payload = read_json(selection_path(self.data_dir, installation.name))
+        if payload:
+            return Selection(
+                model=payload.get("model", "physical"),
+                scores=payload.get("scores", {}),
+                decided_at=_parse_iso(payload.get("decided_at"), self._now()),
+                reason=payload.get("reason", ""),
+            )
+        return select_pv_model(installation.effective_model, None)
+
+    def _forecast_ml(self, installation, start, end, interval) -> Optional[pd.DataFrame]:
+        """The ML model's forecast, or ``None`` to fall back to physical."""
+        from dao.prog.solar_predictor import SolarPredictor
+
+        try:
+            predictor = SolarPredictor()
+            frame = predictor.predict_solar_device(installation, start, end)
+        except FileNotFoundError:
+            logging.warning(
+                f"PV: ML-model gekozen voor {installation.name} maar niet "
+                f"aanwezig, fysisch model gebruikt"
+            )
+            return None
+        except Exception as ex:  # noqa: BLE001 - the physical model is the fallback
+            logging.warning(
+                f"PV: ML-voorspelling voor {installation.name} mislukt ({ex}), "
+                f"fysisch model gebruikt"
+            )
+            return None
+
+        if frame is None or len(frame) == 0:
+            logging.warning(
+                f"PV: ML-model gaf niets terug voor {installation.name}, "
+                f"fysisch model gebruikt"
+            )
+            return None
+
+        tijd = frame["date_time"] if "date_time" in frame.columns else frame["tijd"]
+        return pd.DataFrame(
+            {"tijd": tijd.to_numpy(), "prediction": frame["prediction"].to_numpy()}
+        ).reset_index(drop=True)
+
     def forecast(
-        self, installation, start: datetime.datetime, end: datetime.datetime, interval: str
+        self,
+        installation,
+        start: datetime.datetime,
+        end: datetime.datetime,
+        interval: str,
+        model: Optional[str] = None,
     ) -> pd.DataFrame:
         """Forecast production for ``installation`` between ``start`` and ``end``.
 
         Columns ``tijd`` (tz-aware) and ``prediction`` (kWh per interval),
-        one row per step of ``interval``. An empty weather forecast becomes
-        zeros rather than an exception: no data beats no plan.
+        one row per step of ``interval``. ``model`` overrides the stored
+        selection, which is how the solar report asks for the ML column
+        specifically. An empty weather forecast becomes zeros rather than
+        an exception: no data beats no plan.
         """
+        chosen = model or self.selection_for(installation).model
+        if chosen == "ml":
+            predicted = self._forecast_ml(installation, start, end, interval)
+            if predicted is not None:
+                return predicted
+
         interval_s = self._interval_s(interval)
         start_ts = int(start.timestamp())
         end_ts = int(end.timestamp())
@@ -268,16 +340,125 @@ class PVService:
             if installation.effective_model in ("ml", "auto")
             and installation.entities_sensors
         ]
-        if not ml_installations:
-            return
 
-        from dao.prog.solar_predictor import SolarPredictor
+        if ml_installations:
+            from dao.prog.solar_predictor import SolarPredictor
 
-        solar_predictor = SolarPredictor()
-        start = (self._now() - datetime.timedelta(days=3 * 365)).replace(tzinfo=None)
-        for installation in ml_installations:
+            solar_predictor = SolarPredictor()
+            start = (self._now() - datetime.timedelta(days=3 * 365)).replace(tzinfo=None)
+            for installation in ml_installations:
+                try:
+                    solar_predictor.train_solar_option(installation, start)
+                except Exception as ex:  # noqa: BLE001 - one bad model must not
+                    # abort every other installation's training in the same run.
+                    logging.warning(
+                        f"ML-training van {installation.name} mislukt: {ex}"
+                    )
+
+        for installation in installations:
+            self._select_and_store(installation)
+
+    def _select_and_store(self, installation) -> None:
+        """Backtest when configured for ``auto``, then record the choice."""
+        configured = installation.effective_model
+        result = None
+        if configured == "auto":
             try:
-                solar_predictor.train_solar_option(installation, start)
-            except Exception as ex:  # noqa: BLE001 - one bad model must not
-                # abort every other installation's training in the same run.
-                logging.warning(f"ML-training van {installation.name} mislukt: {ex}")
+                result = self._backtest_installation(installation)
+            except Exception as ex:  # noqa: BLE001 - physical is the fallback
+                logging.warning(
+                    f"PV-backtest van {installation.name} mislukt: {ex}"
+                )
+                result = None
+
+        selection = select_pv_model(configured, result)
+        logging.info(
+            f"PV-model {installation.name}: {selection.model} ({selection.reason})"
+        )
+        write_json(
+            selection_path(self.data_dir, installation.name), selection.to_dict()
+        )
+
+    def _backtest_installation(self, installation, days: int = 28):
+        """Compare the physical and ML model over the last ``days`` days."""
+        now = self._now()
+        start = now - datetime.timedelta(days=days + 1)
+
+        production = HistoryReader(self.db_ha, self.tz).read_energy(
+            list(installation.entities_sensors),
+            start,
+            now,
+            cap_kwh=1.2 * installation.total_capacity
+            if installation.total_capacity
+            else None,
+        )
+
+        archive = self._archive_weather(start, now)
+        perfect_weather = archive is None
+        weather = archive if archive is not None else self._calibration_weather(start, now)
+        if weather is None or len(weather) == 0:
+            return None
+
+        params, _source = self.params_for(installation)
+        candidates = [
+            PhysicalCandidate(params, self.latitude, self.longitude, 3600),
+            MLCandidate(
+                lambda inst, frame: self.forecast_from_weather(inst, frame),
+                installation,
+            ),
+        ]
+
+        def context_for_day(day):
+            day_start = pd.Timestamp(
+                datetime.datetime.combine(day, datetime.time.min)
+            ).tz_localize(self.tz)
+            day_end = day_start + pd.Timedelta(days=1)
+            window = weather[(weather.index >= day_start) & (weather.index < day_end)]
+            return {"weather": window}
+
+        return backtest(
+            "pv",
+            candidates,
+            production,
+            days,
+            end=now.date(),
+            context_for_day=context_for_day,
+            perfect_weather=perfect_weather,
+        )
+
+    def _archive_weather(self, start, end) -> Optional[pd.DataFrame]:
+        """Archived forecasts at lead bucket 12/24, in pv layout.
+
+        ``None`` when the archive does not cover the window: the caller
+        then falls back to observations and marks the result
+        ``perfect_weather``, because a model scored against the weather
+        that actually happened flatters itself.
+        """
+        try:
+            rows = self.db_da.forecast_rows(
+                ["gr", "dni", "dhi", "temp"],
+                [12, 24],
+                int(start.timestamp()),
+                int(end.timestamp()),
+            )
+        except Exception as ex:  # noqa: BLE001 - observations cover it
+            logging.debug(f"PV-backtest: archief niet leesbaar: {ex}")
+            return None
+        if rows is None or len(rows) == 0:
+            return None
+
+        pivot = (
+            rows.pivot_table(
+                index="target_time", columns="code", values="value", aggfunc="first"
+            )
+            .reset_index()
+            .rename(columns={"target_time": "time"})
+        )
+        expected_days = (end.date() - start.date()).days
+        covered = pd.to_datetime(pivot["time"], unit="s", utc=True).dt.date.nunique()
+        if covered < expected_days:
+            return None
+        for code in _WEATHER_CODES:
+            if code not in pivot.columns:
+                pivot[code] = float("nan")
+        return weather_for_pv(pivot, self.tz)

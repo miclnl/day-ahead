@@ -372,3 +372,62 @@ def test_run_training_logs_per_installation(pv_service_with_history, caplog):
         pv_service_with_history.run_training()
 
     assert any("PV-kalibratie" in message for message in caplog.messages)
+
+
+def test_service_forecast_ml_falls_back_to_physical_when_model_missing(
+    pv_service_with_prognoses, caplog
+):
+    """The selection says ml, but no trained model exists: the physical
+    model must answer anyway, with a warning rather than an exception."""
+    from dao.forecast.baseload.store import write_json
+    from dao.forecast.pv.store import selection_path
+
+    service, start = pv_service_with_prognoses
+    installation = service.installations()[0]
+    write_json(
+        selection_path(service.data_dir, installation.name),
+        {
+            "model": "ml",
+            "scores": {},
+            "decided_at": start.isoformat(),
+            "reason": "geconfigureerd",
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        result = service.forecast(
+            installation, start, start + dt.timedelta(hours=24), "1hour"
+        )
+
+    assert len(result) == 24
+    assert (result["prediction"] >= 0).all()
+    assert any("fysisch model" in message for message in caplog.messages)
+
+
+def test_service_forecast_model_override(pv_service_with_prognoses):
+    """An explicit model= beats the stored selection, which is how the
+    solar report asks for the ML column next to the physical one."""
+    service, start = pv_service_with_prognoses
+    installation = service.installations()[0]
+
+    physical = service.forecast(
+        installation, start, start + dt.timedelta(hours=24), "1hour", model="physical"
+    )
+    # "ml" has no trained model here, so it falls back to the same physical
+    # numbers -- the point is that the override is honoured without raising.
+    overridden = service.forecast(
+        installation, start, start + dt.timedelta(hours=24), "1hour", model="ml"
+    )
+
+    assert len(physical) == 24
+    assert len(overridden) == 24
+
+
+def test_selection_for_defaults_to_configured_without_a_file(pv_service_with_prognoses):
+    service, _start = pv_service_with_prognoses
+    installation = service.installations()[0]
+
+    selection = service.selection_for(installation)
+
+    assert selection.model == "physical"
+    assert selection.reason == "geconfigureerd"
