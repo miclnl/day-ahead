@@ -2,7 +2,6 @@ import datetime
 import re
 import sys
 import os
-import math
 import time
 import threading
 import warnings
@@ -33,7 +32,6 @@ from dao.prog import tasks as task_registry
 from dao.lib.db_connections import make_db_da, make_db_ha
 from dao.lib.da_meteo import Meteo
 from dao.lib.da_prices import DaPrices
-from dao.prog.utils import interpolate
 
 # from db_manager import DBmanagerObj
 from typing import Optional, Union
@@ -852,67 +850,54 @@ class DaBase:
         Report(self.file_name).check_baseload_sensors()
         self.baseload_service().fit()
 
-    #: Which forecast is compared against which realised series.
-    #: (forecast code, realised table, realised code, unit, label)
-    ACCURACY_PAIRS = (
-        ("hload", "values", "m_house", "kWh", "Huisvraag"),
-        ("pv_ac", "values", "m_pv", "kWh", "PV productie"),
-        ("gr", "values", "gr", "J/cm2", "Globale straling"),
-        ("temp", "values", "temp", "°C", "Temperatuur"),
-    )
-
     def forecast_accuracy(self, days: int = 30):
         """Report how far the forecasts were off, and prune the archive.
 
         This is the loop that was missing: DAO wrote forecasts and it wrote
-        measurements, but never subtracted the two. Without it there is no way
-        to tell whether the consumption forecast is 5 percent or 40 percent
-        off, and therefore no way to tell whether any change to it helped.
+        measurements, but never subtracted the two. Without it there is no
+        way to tell whether the consumption forecast is 5 percent or 40
+        percent off, and therefore no way to tell whether any change to it
+        helped.
 
-        All aggregation happens in the database, so only a handful of summary
-        rows ever reach Python. That keeps the nightly job light enough for a
-        Home Assistant Yellow.
+        The report covers every archived component over a short and a long
+        window, is logged as tables, and is written to
+        ``../data/forecast/accuracy.json`` for the dashboard.
         """
-        now = datetime.datetime.now()
-        end_ts = int(now.timestamp())
-        start_ts = int((now - datetime.timedelta(days=days)).timestamp())
+        from pathlib import Path as _Path
+
+        from dao.forecast.baseload.store import write_json
+        from dao.forecast.evaluate import archive_accuracy
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        windows = tuple(sorted({7, days}))
         logging.info(
-            f"Prognosefout over de laatste {days} dagen "
-            f"({datetime.datetime.fromtimestamp(start_ts).strftime('%Y-%m-%d')} "
-            f"t/m {now.strftime('%Y-%m-%d')})"
+            f"Prognosefout over de laatste {', '.join(str(w) for w in windows)} dagen"
+        )
+
+        report = archive_accuracy(
+            self.config, self.db_da, self.db_ha, self.time_zone, days=windows, now=now
         )
 
         any_data = False
-        for code, table, realised, unit, label in self.ACCURACY_PAIRS:
-            try:
-                rows = self.db_da.forecast_accuracy(
-                    code, table, realised, start_ts, end_ts
-                )
-            except Exception as ex:
-                logging.debug(f"Prognosefout {code} niet te bepalen: {ex}")
-                continue
-            if not rows:
+        for component, accuracy in report.components.items():
+            for window_days, window in accuracy.windows.items():
+                if not window["pairs"]:
+                    continue
+                any_data = True
                 logging.info(
-                    f"  {label:<18} geen gepaarde waarnemingen; "
-                    f"het archief moet zich nog vullen"
+                    f"  {component} ({accuracy.unit}), {window_days} dagen: "
+                    f"{window['pairs']} paren, {window['missing']} zonder meting"
                 )
-                continue
-            any_data = True
-            logging.info(f"  {label} ({unit})")
-            logging.info(
-                f"    {'vooruitblik':<14}{'n':>6}{'bias':>10}{'MAE':>10}"
-                f"{'RMSE':>10}{'rel. MAE':>10}"
-            )
-            for row in rows:
-                scale = row.get("scale") or 0.0
-                rel = (row["mae"] / scale * 100) if scale else float("nan")
                 logging.info(
-                    f"    {self._lead_label(row['lead_bucket']):<14}"
-                    f"{row['n']:>6.0f}{row['bias']:>10.3f}{row['mae']:>10.3f}"
-                    f"{math.sqrt(max(0.0, row['mse'])):>10.3f}{rel:>9.0f}%"
+                    f"    {'vooruitblik':<14}{'n':>6}{'bias':>10}{'MAE':>10}{'RMSE':>10}"
                 )
-
-        self._log_hour_bias(start_ts, end_ts)
+                for bucket in sorted(window["by_lead"]):
+                    score = window["by_lead"][bucket]
+                    logging.info(
+                        f"    {self._lead_label(bucket):<14}{score.n:>6}"
+                        f"{score.bias:>10.3f}{score.mae:>10.3f}{score.rmse:>10.3f}"
+                    )
+                self._log_hour_bias(component, window)
 
         if not any_data:
             logging.info(
@@ -920,6 +905,11 @@ class DaBase:
                 "elke optimalisatie; zet de snelle regellaag minimaal in 'shadow' "
                 "zodat de gemeten huisvraag wordt vastgelegd."
             )
+
+        try:
+            write_json(_Path("../data/forecast/accuracy.json"), report.to_dict())
+        except Exception as ex:  # noqa: BLE001 - the log already has the tables
+            logging.warning(f"accuracy.json niet geschreven: {ex}")
 
         keep_days = max(days, self.history_options.forecast_days)
         try:
@@ -936,37 +926,33 @@ class DaBase:
         labels = {0: "< 1 uur", 1: "1-4 uur", 4: "4-12 uur", 12: "12-24 uur"}
         return labels.get(bucket, f">= {bucket} uur")
 
-    def _log_hour_bias(self, start_ts: int, end_ts: int) -> None:
-        """The actionable table: is the forecast structurally off at some hour?"""
-        try:
-            rows = self.db_da.forecast_bias_by_hour(
-                "hload", "values", "m_house", start_ts, end_ts
-            )
-        except Exception as ex:
-            logging.debug(f"Bias per uur niet te bepalen: {ex}")
+    @staticmethod
+    def _log_hour_bias(component: str, window: dict) -> None:
+        """The actionable table: is this component structurally off at some hour?"""
+        by_hour = window.get("by_hour") or {}
+        if not by_hour:
             return
-        if not rows:
-            return
-        logging.info("  Huisvraag: afwijking per uur van de dag (prognose - gemeten)")
         logging.info(
-            f"    {'uur':<8}{'n':>5}{'gemeten':>10}{'bias':>10}{'MAE':>10}  verloop"
+            f"    {component}: afwijking per uur van de dag (prognose - gemeten)"
         )
-        worst = max(rows, key=lambda r: abs(r["bias"] or 0.0))
-        for row in rows:
-            bias = row["bias"] or 0.0
-            bar = ("+" if bias > 0 else "-") * min(20, int(abs(bias) * 20))
+        worst_hour = max(by_hour, key=lambda hour: abs(by_hour[hour].bias))
+        for hour in sorted(by_hour):
+            score = by_hour[hour]
+            bar = ("+" if score.bias > 0 else "-") * min(20, int(abs(score.bias) * 20))
             logging.info(
-                f"    {row['uur']:<8}{row['n']:>5.0f}{row['realised']:>10.3f}"
-                f"{bias:>10.3f}{row['mae']:>10.3f}  {bar}"
+                f"      {hour:02d}:00{score.n:>6}{score.bias:>10.3f}"
+                f"{score.mae:>10.3f}  {bar}"
             )
-        if abs(worst["bias"] or 0.0) > 0.1:
-            direction = "te hoog" if worst["bias"] > 0 else "te laag"
+        worst = by_hour[worst_hour]
+        if abs(worst.bias) > 0.1:
+            direction = "te hoog" if worst.bias > 0 else "te laag"
             logging.warning(
-                f"De huisvraag wordt rond {worst['uur']} structureel {direction} "
-                f"ingeschat ({worst['bias']:+.3f} kWh per interval). Daardoor "
+                f"{component} wordt rond {worst_hour:02d}:00 structureel "
+                f"{direction} ingeschat ({worst.bias:+.3f} per interval). Daardoor "
                 f"reserveert de optimalisatie de verkeerde hoeveelheid energie; "
                 f"de snelle regellaag kan dat achteraf niet repareren."
             )
+
 
     def fast_control_simulate(self):
         """Backtest the fast control layer on the recorded history.

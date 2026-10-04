@@ -11,6 +11,7 @@ times.
 from __future__ import annotations
 
 import datetime
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
@@ -192,3 +193,268 @@ def backtest(
         perfect_weather=perfect_weather,
         created=datetime.datetime.now(datetime.UTC),
     )
+
+
+# ---------------------------------------------------------------------------
+# Accuracy of the archive against what was actually measured
+# ---------------------------------------------------------------------------
+
+#: Every archived series worth scoring, and the unit it is reported in.
+COMPONENTS = ("base", "pv_ac", "pv_dc", "hload", "gr", "dni", "dhi", "temp")
+
+_UNITS = {
+    "base": "kWh",
+    "pv_ac": "kWh",
+    "pv_dc": "kWh",
+    "hload": "kWh",
+    "gr": "J/cm2",
+    "dni": "J/cm2",
+    "dhi": "J/cm2",
+    "temp": "\u00b0C",
+}
+
+#: Weather components are measured in "values", everything else is derived
+#: from the Home Assistant meters through the history reader.
+_WEATHER_COMPONENTS = ("gr", "dni", "dhi", "temp")
+
+
+@dataclass
+class ComponentAccuracy:
+    component: str
+    unit: str
+    windows: dict  # days -> grouped scores
+
+    def to_dict(self) -> dict:
+        return {
+            "component": self.component,
+            "unit": self.unit,
+            "windows": {
+                str(days): {
+                    group: (
+                        {str(key): _score_to_dict(score) for key, score in value.items()}
+                        if isinstance(value, dict)
+                        else value
+                    )
+                    for group, value in window.items()
+                }
+                for days, window in self.windows.items()
+            },
+        }
+
+
+@dataclass
+class AccuracyReport:
+    created: datetime.datetime
+    days: tuple
+    components: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "created": self.created.isoformat(),
+            "days": list(self.days),
+            "components": {
+                name: accuracy.to_dict() for name, accuracy in self.components.items()
+            },
+        }
+
+
+def _score_to_dict(score: Score) -> dict:
+    return {"mae": score.mae, "rmse": score.rmse, "bias": score.bias, "n": score.n}
+
+
+def _empty_window() -> dict:
+    return {
+        "by_lead": {},
+        "by_hour": {},
+        "by_weekday": {},
+        "by_regime": {},
+        "by_source": {},
+        "pairs": 0,
+        "missing": 0,
+    }
+
+
+def measured_series(
+    component: str, reader, config, db_da, start, end
+) -> Optional[pd.Series]:
+    """What actually happened for ``component`` between ``start`` and ``end``.
+
+    Returns ``None`` when the component cannot be measured at all on this
+    installation (no configured sensors, no weather observations), which
+    the report records as "no pairs" rather than as an error.
+    """
+    from dao.forecast.history import (
+        baseload_from_components,
+        component_caps,
+        component_groups,
+    )
+
+    if component in _WEATHER_COMPONENTS:
+        if db_da is None:
+            return None
+        try:
+            frame = db_da.get_column_data("values", component, start=start, end=end)
+        except Exception as ex:  # noqa: BLE001 - an absent series, not a failure
+            logging.debug(f"Accuratesse: {component} niet leesbaar: {ex}")
+            return None
+        if frame is None or len(frame) == 0:
+            return None
+        index = pd.to_datetime(frame["utc"], unit="s", utc=True)
+        return pd.Series(frame["value"].astype(float).to_numpy(), index=index)
+
+    if reader is None:
+        return None
+
+    if component in ("pv_ac", "pv_dc"):
+        if component == "pv_ac":
+            installations = list(config.solar or [])
+        else:
+            installations = [
+                solar
+                for battery in (config.battery or [])
+                for solar in (battery.solar or [])
+            ]
+        sensors = [
+            sensor
+            for installation in installations
+            for sensor in (installation.entities_sensors or [])
+        ]
+        if not sensors:
+            return None
+        capacity = sum(
+            (installation.total_capacity or 0.0) for installation in installations
+        )
+        return reader.read_energy(
+            sensors, start, end, cap_kwh=1.2 * capacity if capacity else None
+        )
+
+    groups = component_groups(config.report)
+    frame = reader.read_components(groups, start, end, component_caps(config))
+    if component == "base":
+        return baseload_from_components(frame)
+    # hload: what the optimizer plans for the house as a whole, which is
+    # the grid exchange corrected for whatever the battery did -- PV and
+    # the scheduled devices are deliberately still inside it.
+    return (
+        frame["grid_in"] - frame["grid_out"] - frame["bat_in"] + frame["bat_out"]
+    )
+
+
+def _away_dates(db_da, start, end) -> set:
+    """Dates labelled away, for splitting the report by regime."""
+    if db_da is None:
+        return set()
+    try:
+        frame = db_da.get_column_data("values", "away", start=start, end=end)
+    except Exception:  # noqa: BLE001 - the split is optional
+        return set()
+    if frame is None or len(frame) == 0:
+        return set()
+    moments = pd.to_datetime(frame["utc"], unit="s", utc=True)
+    return {
+        moment.date()
+        for moment, value in zip(moments, frame["value"], strict=True)
+        if float(value) >= 0.5
+    }
+
+
+def _window_scores(archive: pd.DataFrame, measured, away_dates: set, tz: str) -> dict:
+    """Group one component's archived/measured pairs every way the report shows."""
+    window = _empty_window()
+    if archive is None or len(archive) == 0:
+        return window
+    if measured is None or len(measured) == 0:
+        window["missing"] = int(len(archive))
+        return window
+
+    lookup = {
+        int(pd.Timestamp(moment).timestamp()): float(value)
+        for moment, value in measured.items()
+        if value == value  # skip NaN
+    }
+
+    grouped: dict = {
+        "by_lead": {},
+        "by_hour": {},
+        "by_weekday": {},
+        "by_regime": {},
+        "by_source": {},
+    }
+    missing = 0
+    for row in archive.itertuples():
+        actual = lookup.get(int(row.target_time))
+        if actual is None:
+            missing += 1
+            continue
+        forecast = float(row.value)
+        moment = pd.Timestamp(int(row.target_time), unit="s", tz="UTC").tz_convert(tz)
+        keys = {
+            "by_lead": int(row.lead_bucket),
+            "by_hour": int(moment.hour),
+            "by_weekday": int(moment.dayofweek),
+            "by_regime": "away" if moment.date() in away_dates else "home",
+            "by_source": getattr(row, "source", None) or "onbekend",
+        }
+        for group, key in keys.items():
+            grouped[group].setdefault(key, []).append((forecast, actual))
+
+    window["missing"] = missing
+    window["pairs"] = sum(len(pairs) for pairs in grouped["by_lead"].values())
+    for group, buckets in grouped.items():
+        window[group] = {
+            key: metrics(
+                np.array([f for f, _ in pairs]), np.array([a for _, a in pairs])
+            )
+            for key, pairs in buckets.items()
+        }
+    return window
+
+
+def archive_accuracy(
+    config, db_da, db_ha, tz: str, days: tuple = (7, 28), now=None
+) -> AccuracyReport:
+    """Compare every archived forecast against what was measured.
+
+    Every component is scored over every window independently, so one
+    component with no sensors configured does not take the rest of the
+    report down with it.
+    """
+    from dao.forecast.history import HistoryReader
+    from dao.lib.db_manager import LEAD_BUCKETS
+
+    now = now or datetime.datetime.now(datetime.UTC)
+    reader = HistoryReader(db_ha, tz) if db_ha is not None else None
+
+    components: dict = {}
+    for component in COMPONENTS:
+        windows: dict = {}
+        for window_days in days:
+            start = now - datetime.timedelta(days=window_days)
+            try:
+                archive = db_da.forecast_rows(
+                    [component], list(LEAD_BUCKETS), int(start.timestamp()),
+                    int(now.timestamp()),
+                )
+            except Exception as ex:  # noqa: BLE001 - an empty archive is normal
+                logging.debug(f"Accuratesse: archief van {component} niet leesbaar: {ex}")
+                archive = None
+
+            if archive is None or len(archive) == 0:
+                windows[window_days] = _empty_window()
+                continue
+
+            try:
+                measured = measured_series(component, reader, config, db_da, start, now)
+            except Exception as ex:  # noqa: BLE001 - report "no pairs", not a crash
+                logging.debug(f"Accuratesse: {component} niet te meten: {ex}")
+                measured = None
+
+            windows[window_days] = _window_scores(
+                archive, measured, _away_dates(db_da, start, now), tz
+            )
+
+        components[component] = ComponentAccuracy(
+            component=component, unit=_UNITS[component], windows=windows
+        )
+
+    return AccuracyReport(created=now, days=tuple(days), components=components)
