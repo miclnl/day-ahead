@@ -18,9 +18,11 @@ class Meteo:
         longitude: float,
         secrets: dict = None,
         country: str = "NL",
+        time_zone: str = "Europe/Amsterdam",
     ):
         self.config = config
         self.db_da = db_da
+        self.time_zone = time_zone
         self.secrets = secrets or {}
         mk = config.meteoserver_key
         self.meteoserver_key = mk.resolve(self.secrets) if mk is not None else None
@@ -37,14 +39,23 @@ class Meteo:
         self.interval_s = 3600 if config.interval == "1hour" else 900
 
     def make_graph_meteo(self, df, file=None, show=False):
+        # The weather frame carries an epoch and no local-time column; both
+        # the hour axis and the title have to come from it in the
+        # configured zone. Reading the title from column 2 by position used
+        # to land on "dni", which Meteoserver never supplies, so the title
+        # said "vanaf nan"; reading the hour in UTC put the whole axis one
+        # or two hours out.
         if "tijd_nl" in df.columns:
             df["uur"] = df.tijd_nl.apply(lambda x: x[11:13])
+            first_moment = df["tijd_nl"].iloc[0]
         else:
-            df["uur"] = pd.to_datetime(df["time"], unit="s", utc=True).apply(
-                lambda moment: moment.strftime("%H")
+            local = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(
+                self.time_zone
             )
+            df["uur"] = local.dt.strftime("%H")
+            first_moment = local.iloc[0].strftime("%Y-%m-%d %H:%M")
         meteo_options = {
-            "title": f"Opgehaalde meteodata vanaf {df.iloc[0, 2]}",
+            "title": f"Opgehaalde meteodata vanaf {first_moment}",
             "style": self.graphics_style,
             "graphs": [
                 {

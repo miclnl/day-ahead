@@ -8,6 +8,7 @@ import types
 from pathlib import Path
 
 import pytest
+import requests
 
 from dao.forecast.weather.service import WeatherService
 from dao.lib.db_manager import DBmanagerObj, forecasts_table
@@ -361,6 +362,43 @@ def test_get_prognose_fields_outer_merges_optional_codes(db):
 
     assert list(frame["gr"]) == [100.0, 110.0]
     assert frame["dni"].isna().all()
+
+
+def test_update_survives_an_observation_source_outage(tmp_path, monkeypatch, caplog):
+    """Refreshing the measured weather is an unguarded network call, and it
+    runs after the forecast has already been stored but before status.json
+    is written. A KNMI outage therefore threw away the status file and the
+    graph of a forecast that had been fetched perfectly well."""
+    now = dt.datetime(2026, 3, 10, 8, 0, tzinfo=dt.UTC)
+    start_epoch = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
+    session = _StubSession(meteoserver=meteoserver_payload(start_epoch, 72))
+    data_dir = tmp_path / "forecast" / "weather"
+
+    def explode(*args, **kwargs):
+        raise requests.ConnectionError("knmi onbereikbaar")
+
+    monkeypatch.setattr(
+        "dao.forecast.weather.service.update_observations", explode
+    )
+
+    service = WeatherService(
+        make_config(observations="auto"),
+        db_da=None,
+        latitude=52.1,
+        longitude=5.2,
+        secrets={},
+        data_dir=data_dir,
+        country="NL",
+        now=lambda: now,
+        session=session,
+    )
+
+    with caplog.at_level("WARNING"):
+        status = service.update(horizon_hours=72)
+
+    assert status.hours_total == 72
+    assert json.loads((data_dir / "status.json").read_text())["hours_total"] == 72
+    assert any("waarnemingen" in message for message in caplog.messages)
 
 
 def test_update_writes_status_json(tmp_path):

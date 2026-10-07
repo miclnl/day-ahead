@@ -42,11 +42,23 @@ def _numeric_series(values, length: int) -> pd.Series:
 def parse_openmeteo(payload: dict, source: str = "openmeteo") -> pd.DataFrame:
     """Open-Meteo's JSON response as a weather frame.
 
-    Open-Meteo's radiation is the mean over the hour *preceding* the
-    reported timestamp (its "time" labels the end of the interval); every
-    other source in this package labels a value by the start of the hour it
-    describes, so the timestamp is shifted back by one hour here, once, for
-    every caller downstream.
+    Every row of this package's weather frame describes the hour that
+    *starts* at its timestamp. Open-Meteo mixes two conventions within one
+    response, both documented in its "Hourly Parameter Definition" table:
+
+    * ``shortwave_radiation``, ``direct_normal_irradiance``,
+      ``diffuse_radiation`` and ``precipitation`` are the mean or sum over
+      the hour *preceding* the stated time, so the value at ``T`` belongs
+      to the row starting at ``T - 1h``. The whole index is shifted back by
+      one hour for them.
+    * ``temperature_2m`` and ``wind_speed_10m`` are instantaneous at the
+      stated time. They are shifted forward by one position to compensate,
+      which leaves them on their own timestamp.
+
+    The first row then has no instantaneous reading of its own (its hour
+    starts before the response begins); it borrows the next hour's, which
+    is one hour of drift on a single edge row rather than a gap the PV
+    model would have to fill with a default.
     """
     hourly = payload.get("hourly") or {}
     times = hourly.get("time") or []
@@ -58,13 +70,17 @@ def parse_openmeteo(payload: dict, source: str = "openmeteo") -> pd.DataFrame:
     epochs = ((moments - epoch) // pd.Timedelta(seconds=1)).astype("int64")
 
     length = len(times)
+
+    def instantaneous(key: str) -> pd.Series:
+        return _numeric_series(hourly.get(key), length).shift(1).bfill()
+
     frame = empty_weather_frame()
     frame["time"] = epochs
     frame["gr"] = _numeric_series(hourly.get("shortwave_radiation"), length) * 0.36
     frame["dni"] = _numeric_series(hourly.get("direct_normal_irradiance"), length) * 0.36
     frame["dhi"] = _numeric_series(hourly.get("diffuse_radiation"), length) * 0.36
-    frame["temp"] = _numeric_series(hourly.get("temperature_2m"), length)
-    frame["winds"] = _numeric_series(hourly.get("wind_speed_10m"), length)
+    frame["temp"] = instantaneous("temperature_2m")
+    frame["winds"] = instantaneous("wind_speed_10m")
     frame["neersl"] = _numeric_series(hourly.get("precipitation"), length)
     frame["source"] = source
     return frame

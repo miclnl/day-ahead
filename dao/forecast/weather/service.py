@@ -210,14 +210,26 @@ class WeatherService:
                         forecast_rows, issued_ts=issued_ts, source=source_name
                     )
 
-        update_observations(
-            self.db_da,
-            self.latitude,
-            self.longitude,
-            self.country,
-            self.config.weather.observations,
-            now=self._now(),
-        )
+        try:
+            update_observations(
+                self.db_da,
+                self.latitude,
+                self.longitude,
+                self.country,
+                self.config.weather.observations,
+                now=self._now(),
+            )
+        except Exception as ex:  # noqa: BLE001 - the forecast is already stored
+            # Refreshing the measured weather is a second network call to a
+            # different provider, and it runs after the forecast has been
+            # archived. An outage there must not throw away the status file
+            # and the graph of a forecast that was fetched perfectly well;
+            # the observations are only used for accuracy and calibration,
+            # both of which tolerate a day's gap.
+            logging.warning(
+                f"Weer: bijwerken van de waarnemingen mislukt ({ex}); de "
+                f"prognose is wel opgeslagen"
+            )
 
         write_json(self.data_dir / STATUS_FILE, status.to_dict())
         return status

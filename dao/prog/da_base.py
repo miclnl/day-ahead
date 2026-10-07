@@ -252,6 +252,7 @@ class DaBase:
             longitude=self.ha_context.longitude,
             secrets=self.loader.secrets,
             country=self.ha_context.country,
+            time_zone=self.time_zone,
         )
         if (self.ha_context.country == "NL") or (self.ha_context.country == "BE"):
             from dao.forecast.weather.observations import nearest_knmi_station

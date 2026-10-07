@@ -41,6 +41,28 @@ def calc_r2(serie_x: pd.Series, serie_y: pd.Series) -> float:
     return r2_score(serie_x, serie_y)
 
 
+def localize_hour_buckets(timestamps, time_zone):
+    """Attach ``time_zone`` to naive hour buckets without raising on a DST day.
+
+    Accepts a ``DatetimeIndex`` or a datetime ``Series`` and returns the
+    same shape, localized.
+
+    Every report in this module builds one row per hour *label* -- the API
+    data from an SQL GROUP BY on the hour string, the solar report from a
+    loop adding an hour at a time to local midnight. Neither produces the
+    repeated 02:00 that ``ambiguous="infer"`` needs to work out which
+    occurrence is meant, so a fixed policy is the only one that is
+    deterministic here: the bucket is standard (winter) time.
+    ``nonexistent="shift_forward"`` covers the spring day, whose
+    02:00-03:00 bucket does not exist at all.
+
+    Without both, any report covering one of those two days a year raised
+    outright.
+    """
+    localize = getattr(timestamps, "dt", timestamps).tz_localize
+    return localize(time_zone, ambiguous=False, nonexistent="shift_forward")
+
+
 class Report(DaBase):
     def __init__(
             self, file_name: str = "../data/options.json", _now: datetime.datetime = None
@@ -3114,7 +3136,9 @@ class Report(DaBase):
             else pd.Series(float("nan"), index=result.index)
         ).fillna(3.0)
 
-        weather = pd.DataFrame(index=result.index.tz_localize(self.time_zone))
+        weather = pd.DataFrame(
+            index=localize_hour_buckets(result.index, self.time_zone)
+        )
         weather["ghi"] = jcm2h_to_wm2(pd.to_numeric(straling, errors="coerce").to_numpy())
         weather["dni"] = float("nan")
         weather["dhi"] = float("nan")
@@ -3333,19 +3357,7 @@ class Report(DaBase):
             return result
 
         df["time"] = pd.to_datetime(df["time"])
-        # Every bucket here is one row per hour label (from an SQL GROUP BY
-        # on the hour string), not one row per actual wall-clock hour, so on
-        # the autumn DST day there is no repeated 02:00 in this series for
-        # pandas to infer the right occurrence from -- ambiguous="infer"
-        # still raises. ambiguous=False (the bucket is standard/winter time)
-        # is a fixed, deterministic choice that never depends on such a
-        # pattern. nonexistent="shift_forward" covers the spring day, whose
-        # 02:00-03:00 bucket does not exist at all. Without either, any
-        # report covering one of those two days a year crashed this
-        # endpoint outright.
-        df["time_ts"] = df["time"].dt.tz_localize(
-            self.time_zone, ambiguous=False, nonexistent="shift_forward"
-        )
+        df["time_ts"] = localize_hour_buckets(df["time"], self.time_zone)
         df["time"] = df["time"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M"))
         df.rename(columns={"datasoort": "datatype"}, inplace=True)
         cols = df.columns.tolist()
