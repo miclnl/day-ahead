@@ -93,3 +93,13 @@ def test_check_baseload_sensors_reports_unsupported_unit(report_with_ha_db):
     report.battery_consumption_sensors = ["sensor.test_soc"]
     problems = report.check_baseload_sensors()
     assert any("sensor.test_soc" in p for p in problems)
+
+
+def test_check_baseload_sensors_reports_a_sensor_without_statistics(report_with_ha_db):
+    """The reader no longer raises for a missing entity -- it degrades the
+    group to NaN -- so this diagnostic has to name it itself, or a renamed
+    entity becomes invisible instead of merely non-fatal."""
+    report, _helper = report_with_ha_db
+    report.battery_consumption_sensors = ["sensor.test_renamed_last_year"]
+    problems = report.check_baseload_sensors()
+    assert any("sensor.test_renamed_last_year" in p for p in problems)

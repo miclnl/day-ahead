@@ -513,14 +513,26 @@ class BaseloadService:
             pieces = []
             for day in sorted({timestamp.date() for timestamp in index}):
                 day_index = index[[timestamp.date() == day for timestamp in index]]
-                away = regime_for(day).away
-                if away and model.away_days < MIN_AWAY_DAYS_FOR_ML:
+                day_regime = regime_for(day)
+                if day_regime.away and model.away_days < MIN_AWAY_DAYS_FOR_ML:
                     logging.info(
                         f"Baseload: {model.away_days} afwezige dagen in het "
                         f"ML-model is te weinig, profiel gebruikt voor {day}"
                     )
                     return None
-                pieces.append(model.predict(day_index, temp.loc[day_index], away))
+                # The away feature is per hour, not per day: a transition
+                # day is predicted in two halves around its switch hour.
+                for away in (False, True):
+                    part = day_index[
+                        [
+                            day_regime.away_at(timestamp.hour) == away
+                            for timestamp in day_index
+                        ]
+                    ]
+                    if len(part):
+                        pieces.append(
+                            model.predict(part, temp.loc[part], away)
+                        )
             return pd.concat(pieces).reindex(index).rename("baseload")
         except Exception as ex:  # noqa: BLE001 - the profile is the fallback
             logging.warning(f"Baseload ML-voorspelling mislukt ({ex}), profiel gebruikt")
@@ -571,7 +583,10 @@ class BaseloadService:
             for timestamp in index:
                 day = timestamp.date()
                 day_regime = regime_for(day)
-                if day_regime.away:
+                # away_at, not away: a day you leave at 14:00 is home until
+                # 14:00 (spec 5.3), and planning it away from midnight puts
+                # the whole morning three to five times below reality.
+                if day_regime.away_at(timestamp.hour):
                     day_profile = profile_set.away or _standby_from_home(
                         profile_set.home
                     )
@@ -713,6 +728,9 @@ class BaseloadService:
             regime="away" if regime.away else "home",
             reason=regime.reason,
             switch_hour=regime.switch_hour,
+            # Without the direction a switch hour is ambiguous on the
+            # dashboard: 16 could mean leaving at four or coming home at four.
+            switch_to_away=regime.switch_to_away,
             decided_at=now.isoformat(),
         )
         return regime

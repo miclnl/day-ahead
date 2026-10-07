@@ -142,6 +142,22 @@ class Regime:
     away: bool = False
     reason: str = "none"  # "entity" | "calendar" | "presence" | "consumption" | "none"
     switch_hour: Optional[int] = None  # local hour the regime changes; None = whole day
+    #: Direction of that change: True = home until the switch hour then
+    #: away (a departure), False = away until it then home (an arrival).
+    switch_to_away: bool = True
+
+    def away_at(self, hour: int) -> bool:
+        """Away during the local ``hour`` of this day.
+
+        Spec 5.3: on a transition day the hours before the switch hour are
+        one regime and the hours after it the other. Without a switch hour
+        the regime holds for the whole day.
+        """
+        if self.switch_hour is None:
+            return self.away
+        if self.switch_to_away:
+            return hour >= self.switch_hour
+        return hour < self.switch_hour
 
 
 @dataclass
@@ -182,18 +198,23 @@ def _event_covers_day(event: CalendarEvent, day: date) -> bool:
     return event.start.date() <= day <= event.end.date()
 
 
-def _calendar_switch_hour(event: CalendarEvent, day: date) -> Optional[int]:
-    """The local hour the event's edge falls on within ``day``, or ``None``
-    when the event covers the whole day."""
+def _calendar_switch(event: CalendarEvent, day: date) -> tuple[Optional[int], bool]:
+    """The local hour the event's edge falls on within ``day`` and whether
+    that edge is a departure, or ``(None, True)`` when the event covers the
+    whole day.
+
+    An event that both starts and ends inside ``day`` is treated as a
+    departure at its start: one switch hour cannot express "away between
+    these two hours", and planning the later part of the day as away is
+    closer to the truth than planning all of it as home.
+    """
     starts_today = event.start.date() == day
     ends_today = event.end.date() == day
-    if starts_today and not ends_today:
-        return event.start.hour
-    if ends_today and not starts_today:
-        return event.end.hour
-    if starts_today and ends_today:
-        return event.start.hour
-    return None
+    if starts_today:
+        return event.start.hour, True
+    if ends_today:
+        return event.end.hour, False
+    return None, True
 
 
 def _trailing_zero_run(presence: pd.Series, now: datetime) -> tuple[int, bool]:
@@ -263,10 +284,12 @@ def determine_regime(day: date, signals: RegimeSignals) -> Regime:
         if _event_matches_keywords(event, signals.keywords) and _event_covers_day(
             event, day
         ):
+            switch_hour, to_away = _calendar_switch(event, day)
             return Regime(
                 away=True,
                 reason="calendar",
-                switch_hour=_calendar_switch_hour(event, day),
+                switch_hour=switch_hour,
+                switch_to_away=to_away,
             )
 
     today = signals.now.date()

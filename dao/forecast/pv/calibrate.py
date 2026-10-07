@@ -158,15 +158,40 @@ def _bounds_for_scale(config_params: PVParams):
     return x0, lower, upper
 
 
+def _clamped(value: float, bounds: tuple, label: str, name: str) -> float:
+    """``value`` brought inside ``bounds``, saying so when it had to move.
+
+    The fit starts from the configuration (spec 6.2) but is bounded to the
+    plausible band the same section names, and the configuration schema is
+    wider than that band: a flat roof is tilt 0, a north-east plane is
+    azimuth 45. Handing least_squares a start outside its bounds raises
+    before a single residual is computed.
+    """
+    low, high = bounds
+    if value < low or value > high:
+        clamped = min(max(value, low), high)
+        logging.warning(
+            f"PV-kalibratie: {label} {value:g} van {name} valt buiten de "
+            f"grenzen {low:g}-{high:g}, de fit begint bij {clamped:g}"
+        )
+        return clamped
+    return value
+
+
 def _bounds_for_planes(config_params: PVParams):
     _, ac_bounds = _ac_reference(config_params)
     lower: list = []
     upper: list = []
     x0: list = []
-    for plane in config_params.planes:
+    for index, plane in enumerate(config_params.planes, start=1):
+        name = f"vlak {index}"
         lower += [_PLANE_TILT_BOUNDS[0], _PLANE_AZIMUTH_BOUNDS[0], _PLANE_PDC0_FACTOR_BOUNDS[0]]
         upper += [_PLANE_TILT_BOUNDS[1], _PLANE_AZIMUTH_BOUNDS[1], _PLANE_PDC0_FACTOR_BOUNDS[1]]
-        x0 += [plane.tilt, plane.azimuth, 1.0]
+        x0 += [
+            _clamped(plane.tilt, _PLANE_TILT_BOUNDS, "hellingshoek", name),
+            _clamped(plane.azimuth, _PLANE_AZIMUTH_BOUNDS, "azimut", name),
+            1.0,
+        ]
     lower.append(ac_bounds[0])
     upper.append(ac_bounds[1])
     x0.append(1.0)

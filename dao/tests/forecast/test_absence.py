@@ -216,6 +216,49 @@ def consumption_series(now: datetime, measured: dict[int, float]) -> pd.Series:
     )
 
 
+def test_a_holiday_that_ends_today_switches_back_to_home():
+    """A departure and an arrival both produce a switch hour, in opposite
+    directions; the regime has to carry which one it is."""
+    now = datetime(2026, 3, 10, 8, 0, tzinfo=TZ)
+    event = CalendarEvent(
+        start=datetime(2026, 3, 5, 9, 0, tzinfo=TZ),
+        end=datetime(2026, 3, 10, 16, 0, tzinfo=TZ),
+        summary="Vakantie",
+    )
+    signals = RegimeSignals(now=now, calendar_events=[event])
+
+    regime = determine_regime(now.date(), signals)
+
+    assert regime.away is True
+    assert regime.switch_hour == 16
+    assert regime.switch_to_away is False
+    assert regime.away_at(8) is True
+    assert regime.away_at(16) is False
+
+
+def test_a_holiday_that_starts_today_switches_to_away():
+    now = datetime(2026, 3, 10, 8, 0, tzinfo=TZ)
+    event = CalendarEvent(
+        start=datetime(2026, 3, 10, 14, 0, tzinfo=TZ),
+        end=datetime(2026, 3, 17, 16, 0, tzinfo=TZ),
+        summary="Vakantie",
+    )
+    signals = RegimeSignals(now=now, calendar_events=[event])
+
+    regime = determine_regime(now.date(), signals)
+
+    assert regime.switch_hour == 14
+    assert regime.switch_to_away is True
+    assert regime.away_at(13) is False
+    assert regime.away_at(14) is True
+
+
+def test_a_regime_without_a_switch_hour_holds_all_day():
+    assert Regime(away=True, reason="entity").away_at(0) is True
+    assert Regime(away=True, reason="entity").away_at(23) is True
+    assert Regime().away_at(12) is False
+
+
 def test_consumption_rule_switches_after_six():
     now = datetime(2026, 3, 10, 9, 30, tzinfo=TZ)
     # Standby all morning while the profile expects a normal weekday.

@@ -256,6 +256,36 @@ def test_forecast_uses_target_date_not_now(service_with_profiles):
     assert series.values[0] == pytest.approx(0.9)
 
 
+def test_forecast_switches_to_away_at_the_switch_hour(service_with_profiles):
+    """Spec 5.3: on a transition day the hours before the switch hour are
+    home and the hours after it are away. Leaving at 14:00 used to be
+    forecast as away from midnight, i.e. the whole morning planned 3x too
+    low."""
+    start = dt.datetime(2026, 3, 2, 0, 0, tzinfo=ZONE)  # Monday: home 0.3, away 0.1
+    series = service_with_profiles.forecast(
+        start, 24, regime=Regime(away=True, reason="calendar", switch_hour=14)
+    )
+
+    assert list(series.values[:14]) == pytest.approx([0.3] * 14)
+    assert list(series.values[14:]) == pytest.approx([0.1] * 10)
+
+
+def test_forecast_switches_back_home_on_an_arrival_day(service_with_profiles):
+    """The other direction the spec names: a holiday that ends today is
+    away until the arrival hour and home after it."""
+    start = dt.datetime(2026, 3, 2, 0, 0, tzinfo=ZONE)
+    series = service_with_profiles.forecast(
+        start,
+        24,
+        regime=Regime(
+            away=True, reason="calendar", switch_hour=10, switch_to_away=False
+        ),
+    )
+
+    assert list(series.values[:10]) == pytest.approx([0.1] * 10)
+    assert list(series.values[10:]) == pytest.approx([0.3] * 14)
+
+
 def test_regime_away_uses_away_profile(service_with_profiles):
     start = dt.datetime(2026, 3, 2, 0, 0, tzinfo=ZONE)
     series = service_with_profiles.forecast(start, 5, regime=Regime(away=True))

@@ -73,6 +73,34 @@ def test_unsupported_unit_raises_with_sensor_name(ha_db, reader):
         reader.sensor_meta(["sensor.test_soc"])
 
 
+def test_a_sensor_without_statistics_is_a_gap_not_an_error(ha_db, reader, caplog):
+    """A renamed or removed entity id used to raise the same hard error as a
+    sensor measuring percent, which aborted the entire baseload fit and all
+    PV calibration. A missing sensor is a gap in the data: the group reads
+    NaN and the run continues."""
+    _, helper = ha_db
+    helper.add_energy("sensor.test_grid", "kWh", {T0: 10.0, T0 + HOUR: 10.4})
+
+    with caplog.at_level("WARNING"):
+        series = reader.read_energy(
+            ["sensor.test_grid", "sensor.test_renamed_last_year"],
+            local(T0),
+            local(T0 + HOUR),
+        )
+
+    assert series.isna().all()
+    assert any("sensor.test_renamed_last_year" in r.message for r in caplog.records)
+
+
+def test_a_sensor_with_an_unusable_unit_still_raises(ha_db, reader):
+    """Absent is a gap; present but measuring percent is a misconfiguration
+    the operator has to fix, and must not be papered over."""
+    _, helper = ha_db
+    helper.add_other("sensor.test_soc", "%")
+    with pytest.raises(UnsupportedSensorError, match="sensor.test_soc"):
+        reader.read_energy(["sensor.test_soc"], local(T0), local(T0 + HOUR))
+
+
 def test_missing_hours_are_nan_not_zero(ha_db, reader):
     _, helper = ha_db
     helper.add_energy(

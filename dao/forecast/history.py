@@ -123,9 +123,15 @@ class HistoryReader:
     def sensor_meta(self, sensors: Sequence[str]) -> dict[str, SensorMeta]:
         """Kind, unit and conversion factor per sensor.
 
-        Raises :class:`UnsupportedSensorError` for a sensor that is not in the
-        statistics tables or whose unit is not an energy or power unit, so a
-        misconfigured meter is a clear error rather than a silent zero.
+        Raises :class:`UnsupportedSensorError` for a sensor whose unit is
+        neither energy nor power: that is a misconfiguration the operator
+        has to fix, and reading it as kWh would be a silent lie.
+
+        A sensor with no statistics at all -- renamed, removed, purged -- is
+        a different thing: it is missing data, not a bad configuration. It
+        is logged and left out of the result, so one stale entity id does
+        not abort the baseload fit and every PV calibration with it.
+        :meth:`read_energy` turns the gap into NaN for the whole group.
         """
         if not sensors:
             return {}
@@ -145,9 +151,11 @@ class HistoryReader:
         for sensor in sensors:
             row = found.get(sensor)
             if row is None:
-                raise UnsupportedSensorError(
-                    f"{sensor}: geen statistieken gevonden in de Home Assistant database"
+                logging.warning(
+                    f"{sensor}: geen statistieken gevonden in de Home Assistant "
+                    f"database; de meting van deze groep is onbekend"
                 )
+                continue
             unit = row["unit_of_measurement"] or ""
             expected_kind, factor = _UNIT_FACTORS.get(unit, (None, 0.0))
             has_sum = bool(row["has_sum"])
@@ -247,9 +255,15 @@ class HistoryReader:
         index = _hour_index(start, end, self.tz)
         metas = self.sensor_meta(sensors)
         total: pd.Series | None = None
-        for sensor in sensors:
-            series = self._read_sensor(metas[sensor], index, cap_kwh)
-            total = series if total is None else total + series
+        # All or nothing: summing the sensors that happen to exist would
+        # under-report the group by exactly the missing meter and look like
+        # a real reading. Unknown is the honest answer.
+        if any(sensor not in metas for sensor in sensors):
+            total = None
+        else:
+            for sensor in sensors:
+                series = self._read_sensor(metas[sensor], index, cap_kwh)
+                total = series if total is None else total + series
         if total is None:
             total = pd.Series(float("nan"), index=index, dtype="float64")
         total.name = "kwh"

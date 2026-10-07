@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 
 import numpy as np
 import pandas as pd
@@ -93,6 +94,28 @@ def test_planes_mode_recovers_two_planes():
     for fitted, true in zip(fitted_azimuths, true_azimuths, strict=True):
         assert abs(fitted - true) <= 15
     assert result.params.total_kwp() == pytest.approx(2.2, rel=0.10)
+
+
+@pytest.mark.parametrize(
+    ("tilt", "azimuth", "what"),
+    [
+        (0.0, 180.0, "een plat dak"),
+        (35.0, 20.0, "een vlak op het noordnoordoosten"),
+    ],
+)
+def test_planes_mode_starts_inside_its_bounds(tilt, azimuth, what, caplog):
+    """The spec bounds the fit to tilt 5-70 and azimuth 60-300 but starts it
+    from the configuration, and SolarConfig allows tilt 0 and any
+    orientation. least_squares then raises "Initial guess is outside of
+    provided bounds" before a single residual is computed."""
+    true_params = PVParams(planes=[Plane(tilt=tilt, azimuth=azimuth, pdc0_kw=2.4)])
+    config_params = PVParams(planes=[Plane(tilt=tilt, azimuth=azimuth, pdc0_kw=3.6)])
+    production, weather = synthetic_production(true_params, days=70)
+
+    with caplog.at_level(logging.WARNING):
+        calibrate(config_params, production, weather, "planes", LAT, LON)
+
+    assert any("buiten de grenzen" in message for message in caplog.messages), what
 
 
 def test_rejects_when_holdout_not_better(caplog):

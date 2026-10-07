@@ -2871,11 +2871,13 @@ class Report(DaBase):
         }
 
     def _check_sensor_kinds(self) -> list:
-        """Every configured meter must be an energy or a power sensor.
+        """Every configured meter must exist and be an energy or power sensor.
 
         A state-of-charge or temperature sensor in one of the lists used to
-        contribute nothing, silently. Reported per sensor so the operator can
-        see which entry to fix.
+        contribute nothing, silently. An entity that no longer exists is
+        not fatal to the reader any more -- it degrades its whole group to
+        NaN -- which is exactly why it has to be named here. Reported per
+        sensor so the operator can see which entry to fix.
         """
         db_ha = getattr(self, "db_ha", None)
         if db_ha is None:
@@ -2887,11 +2889,17 @@ class Report(DaBase):
         for sensors in self._baseload_sensor_groups().values():
             for sensor in sensors:
                 try:
-                    reader.sensor_meta([sensor])
+                    if reader.sensor_meta([sensor]):
+                        continue
+                    reason = (
+                        f"{sensor}: geen statistieken gevonden in de Home "
+                        f"Assistant database"
+                    )
                 except UnsupportedSensorError as ex:
-                    message = f"{ex}; deze meter telt niet mee in de baseload"
-                    problems.append(message)
-                    logging.warning(f"Baseload: {message}")
+                    reason = str(ex)
+                message = f"{reason}; deze meter telt niet mee in de baseload"
+                problems.append(message)
+                logging.warning(f"Baseload: {message}")
         return problems
 
     def calc_baseload_frame(self) -> pd.DataFrame:
