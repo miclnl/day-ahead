@@ -892,6 +892,29 @@ class SolarPredictor(DaBase):
                 ):
                     self.train_solar_option(solar_option, start)
 
+    def prepare_for(self, solar_option: SolarConfig) -> None:
+        """Load one installation's trained model and physical parameters.
+
+        Separate from :meth:`predict_solar_device` because the ``auto``
+        backtest needs the same model loaded but feeds it its own weather
+        window rather than the stored prognoses.
+
+        Raises ``FileNotFoundError`` when the installation has never been
+        trained, which is a normal state, not a fault: the caller decides
+        whether to fall back or to skip.
+        """
+        self.solar_name = solar_option.name.replace(" ", "_").replace("-", "_")
+        self.tilt = solar_option.effective_tilt
+        self.azimut = solar_option.effective_orientation + 180
+        self.solar_capacity = solar_option.total_capacity
+        file_name = "../data/prediction/models/" + self.solar_name + ".json"
+        if not os.path.isfile(file_name):
+            raise FileNotFoundError(
+                f"Er is geen model aanwezig voor {self.solar_name},svp eerst trainen."
+            )
+        self.load_model(file_name)
+        self.pv_params, _source = self.pv_service().params_for(solar_option)
+
     def predict_solar_device(
         self, solar_option: SolarConfig, start: dt.datetime, end: dt.datetime
     ) -> pd.DataFrame:
@@ -906,18 +929,7 @@ class SolarPredictor(DaBase):
 
         from dao.forecast.pv.physical import weather_for_pv
 
-        self.solar_name = solar_option.name.replace(" ", "_").replace("-", "_")
-        self.tilt = solar_option.effective_tilt
-        self.azimut = solar_option.effective_orientation + 180
-        self.solar_capacity = solar_option.total_capacity
-        file_name = "../data/prediction/models/" + self.solar_name + ".json"
-        if os.path.isfile(file_name):
-            self.load_model(file_name)
-        else:
-            raise FileNotFoundError(
-                f"Er is geen model aanwezig voor {self.solar_name},svp eerst trainen."
-            )
-        self.pv_params, _source = self.pv_service().params_for(solar_option)
+        self.prepare_for(solar_option)
 
         tz = ZoneInfo(self.time_zone)
         start_aware = start if start.tzinfo is not None else start.replace(tzinfo=tz)

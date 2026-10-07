@@ -19,6 +19,11 @@
   Nog geen prognoses gearchiveerd. Het archief vult zich bij elke optimalisatie.
 </div>
 
+<div id="load-error" class="alert alert-warning d-none">
+  De accuratesse-gegevens konden niet worden opgehaald. Kijk in het logboek
+  van de add-on; dit is iets anders dan een nog leeg archief.
+</div>
+
 <!-- 1. Status -->
 <h2 class="h4 mt-4">Status</h2>
 <div id="status-cards" class="row g-3"></div>
@@ -187,11 +192,20 @@
 
   function load() {
     const days = document.getElementById("days").value;
+    document.getElementById("load-error").classList.add("d-none");
     fetch(`{{ url_for('api.accuracy') }}?days=${days}`)
-      .then((response) => response.json())
+      .then((response) => {
+        if (!response.ok) { throw new Error(`HTTP ${response.status}`); }
+        return response.json();
+      })
       .then((data) => { payload = data; render(); })
-      .catch(() => {
-        document.getElementById("empty-state").classList.remove("d-none");
+      .catch((error) => {
+        // Not the same thing as an empty archive: a failed request or a
+        // response the browser cannot parse is a fault to go looking for,
+        // and saying "nog geen prognoses" would hide it.
+        console.error("accuracy laden mislukt", error);
+        document.getElementById("empty-state").classList.add("d-none");
+        document.getElementById("load-error").classList.remove("d-none");
       });
   }
 

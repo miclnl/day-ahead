@@ -44,6 +44,10 @@ def select_pv_model(
         for name, score in backtest_result.scores.items()
     }
     reason = f"backtest over {backtest_result.days} dagen"
+    if "ml" not in backtest_result.scores:
+        # Not a comparison at all: say so, or "physical won the backtest"
+        # reads as a verdict on a model that was never run.
+        reason += " (geen getraind ML-model om tegen te vergelijken)"
     if backtest_result.perfect_weather:
         reason += " (op waarnemingen, niet op gearchiveerde prognoses)"
     return Selection(

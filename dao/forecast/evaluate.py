@@ -153,6 +153,13 @@ def backtest(
         actual = day_values.to_numpy()
         context = context_for_day(day)
 
+        # Collected first, appended only once every candidate produced a
+        # full day. A candidate's prediction is as long as whatever input
+        # it had -- the physical one returns len(weather_window) -- so a
+        # single archived hour missing from one day used to leave the
+        # accumulated arrays ragged, and metrics() raised on the very last
+        # step of a 28-day run.
+        day_forecasts: dict = {}
         for candidate in candidates:
             fitted_on = last_fit.get(candidate.name)
             if fitted_on is None or (day - fitted_on).days >= retrain_every_days:
@@ -161,8 +168,19 @@ def backtest(
                 last_fit[candidate.name] = day
 
             forecast = np.asarray(candidate.predict(day, context), dtype=float)
-            forecasts_by_name[candidate.name].append(forecast)
-            actuals_by_name[candidate.name].append(actual)
+            if len(forecast) != len(actual):
+                logging.warning(
+                    f"Backtest {component}: {candidate.name} gaf "
+                    f"{len(forecast)} waarden voor {day} in plaats van "
+                    f"{len(actual)}; die dag telt voor geen enkele kandidaat mee"
+                )
+                day_forecasts = {}
+                break
+            day_forecasts[candidate.name] = forecast
+
+        for name, forecast in day_forecasts.items():
+            forecasts_by_name[name].append(forecast)
+            actuals_by_name[name].append(actual)
 
         day += datetime.timedelta(days=1)
 

@@ -234,7 +234,14 @@ def accuracy():
 
     Every block is independently optional: a fresh install has no archive,
     no calibration and no selection, and must still get valid JSON.
+
+    The whole payload goes through json_safe: a score for a candidate that
+    could not be evaluated is NaN, and Flask would serialise that as a bare
+    NaN, which JSON.parse rejects -- the page would then show its "no
+    archive yet" message over a perfectly good archive.
     """
+    from dao.prog.config.loader import json_safe
+
     try:
         days = int(request.args.get("days", 28))
     except ValueError:
@@ -243,17 +250,19 @@ def accuracy():
     baseload_dir = _DATA_PATH / "forecast" / "baseload"
     profile = _read_json_or_none(baseload_dir / "profile.json")
 
-    return {
-        "days": days,
-        "accuracy": _read_json_or_none(_DATA_PATH / "forecast" / "accuracy.json"),
-        "baseload": {
-            "selection": _read_json_or_none(baseload_dir / "selection.json"),
-            "status": _read_json_or_none(baseload_dir / "status.json"),
-            "profile_created": (profile or {}).get("created"),
-        },
-        "pv": _pv_artefacts(),
-        "weather": _read_json_or_none(
-            _DATA_PATH / "forecast" / "weather" / "status.json"
-        ),
-        "recent": _recent_pairs(),
-    }
+    return json_safe(
+        {
+            "days": days,
+            "accuracy": _read_json_or_none(_DATA_PATH / "forecast" / "accuracy.json"),
+            "baseload": {
+                "selection": _read_json_or_none(baseload_dir / "selection.json"),
+                "status": _read_json_or_none(baseload_dir / "status.json"),
+                "profile_created": (profile or {}).get("created"),
+            },
+            "pv": _pv_artefacts(),
+            "weather": _read_json_or_none(
+                _DATA_PATH / "forecast" / "weather" / "status.json"
+            ),
+            "recent": _recent_pairs(),
+        }
+    )

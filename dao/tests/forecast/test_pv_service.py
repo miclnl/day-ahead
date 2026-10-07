@@ -321,6 +321,161 @@ def pv_service_with_history(da_db, tmp_path):
     return service
 
 
+@pytest.fixture
+def pv_service_for_backtest(da_db, tmp_path):
+    """Fourteen days of production and measured weather, inserted in bulk.
+
+    pv_service_with_history writes one row per hour per code in its own
+    transaction, which is fine for the two slow calibration tests but far
+    too slow for a backtest that only needs a week.
+    """
+    from dao.tests.forecast.conftest import RecorderHelper
+
+    ha_dir = tmp_path / "ha"
+    ha_dir.mkdir()
+    manager = DBmanagerObj(
+        db_dialect="sqlite", db_name="homeassistant.db", db_path=str(ha_dir)
+    )
+    from sqlalchemy import Column, Float, Integer, String, Table
+
+    metadata = manager.metadata
+    meta = Table(
+        "statistics_meta",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("statistic_id", String(255)),
+        Column("source", String(32)),
+        Column("unit_of_measurement", String(255)),
+        Column("has_mean", Integer, nullable=True),
+        Column("has_sum", Integer),
+        Column("name", String(255), nullable=True),
+        Column("mean_type", Integer),
+        Column("unit_class", String(255), nullable=True),
+    )
+    stats = Table(
+        "statistics",
+        metadata,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("created_ts", Float),
+        Column("metadata_id", Integer),
+        Column("start_ts", Float),
+        Column("mean", Float, nullable=True),
+        Column("min", Float, nullable=True),
+        Column("max", Float, nullable=True),
+        Column("last_reset_ts", Float, nullable=True),
+        Column("state", Float, nullable=True),
+        Column("sum", Float, nullable=True),
+        Column("mean_weight", Float, nullable=True),
+    )
+    metadata.create_all(manager.engine, tables=[meta, stats])
+    helper = RecorderHelper(manager, meta, stats)
+
+    now = dt.datetime(2026, 6, 21, 0, 0, tzinfo=dt.UTC)
+    start = now - dt.timedelta(days=14)
+    n_hours = 14 * 24
+
+    energy: dict[int, float] = {}
+    gr_rows: list[tuple[int, float]] = []
+    temp_rows: list[tuple[int, float]] = []
+    wind_rows: list[tuple[int, float]] = []
+    total = 0.0
+    for i in range(n_hours + 1):
+        moment = start + dt.timedelta(hours=i)
+        ts = int(moment.timestamp())
+        energy[ts] = total
+        if i < n_hours:
+            hour = moment.hour
+            gr = 150.0 if 8 <= hour <= 18 else 0.0
+            total += 0.3 if 8 <= hour <= 18 else 0.0
+            gr_rows.append((ts, gr))
+            temp_rows.append((ts, 18.0))
+            wind_rows.append((ts, 3.0))
+    helper.add_energy("sensor.test_pv_energy", "kWh", energy)
+    put_value(da_db, "gr", gr_rows)
+    put_value(da_db, "temp", temp_rows)
+    put_value(da_db, "winds", wind_rows)
+
+    config = make_config(solar=[make_installation()])
+    return PVService(
+        config, da_db, manager, LAT, LON, tmp_path / "pv", TZ, "1hour",
+        now=lambda: now,
+    )
+
+
+class _StubPredictor:
+    """Stands in for a trained SolarPredictor: a fixed fraction of GHI."""
+
+    prepared: list = []
+
+    def __init__(self):
+        self.installation = None
+
+    def prepare_for(self, installation):
+        self.installation = installation
+        _StubPredictor.prepared.append(installation.name)
+
+    def predict(self, weather):
+        import pandas as pd
+
+        return pd.DataFrame(
+            {
+                "date_time": weather.index,
+                "prediction": weather["ghi"].to_numpy() * 0.002,
+            }
+        )
+
+
+def test_auto_backtest_scores_two_different_models(
+    pv_service_for_backtest, monkeypatch
+):
+    """The ml candidate used to be wired to forecast_from_weather, which is
+    simulate() -- the physical model. The two scores then came out of one
+    computation, min() always returned physical, and selection.json showed
+    a comparison that never happened."""
+    monkeypatch.setattr(
+        "dao.prog.solar_predictor.SolarPredictor", _StubPredictor, raising=False
+    )
+    _StubPredictor.prepared = []
+    service = pv_service_for_backtest
+    installation = service.installations()[0]
+
+    result = service._backtest_installation(installation, days=7)
+
+    assert result is not None
+    assert set(result.scores) == {"physical", "ml"}
+    assert result.scores["ml"].n > 0
+    assert result.scores["physical"].mae != result.scores["ml"].mae
+    assert _StubPredictor.prepared == [installation.name]
+
+
+def test_auto_backtest_scores_physical_alone_without_a_trained_model(
+    pv_service_for_backtest, monkeypatch, caplog
+):
+    """No trained model means no ml score, not a second copy of the physical
+    one, and the stored reason has to say which it was."""
+
+    class _NoModel:
+        def prepare_for(self, installation):
+            raise FileNotFoundError("geen model")
+
+    monkeypatch.setattr(
+        "dao.prog.solar_predictor.SolarPredictor", _NoModel, raising=False
+    )
+    service = pv_service_for_backtest
+    installation = service.installations()[0]
+
+    with caplog.at_level("INFO"):
+        result = service._backtest_installation(installation, days=7)
+
+    assert set(result.scores) == {"physical"}
+    assert result.winner == "physical"
+
+    from dao.forecast.pv.select import select_pv_model
+
+    selection = select_pv_model("auto", result)
+    assert "geen getraind ML-model" in selection.reason
+
+
 def test_calibration_weather_falls_back_to_archive_when_values_empty(da_db, caplog, tmp_path):
     """values has nothing for gr; the forecast archive at lead bucket 0/1 does."""
     now = dt.datetime(2026, 6, 21, tzinfo=dt.UTC)

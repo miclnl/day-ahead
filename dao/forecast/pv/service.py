@@ -193,10 +193,64 @@ class PVService:
 
     def forecast_from_weather(self, installation, weather: pd.DataFrame) -> pd.Series:
         """Forecast production from a weather frame already in pv layout
-        (``ghi``/``dni``/``dhi``/``temp``/``wind``), for the solar report."""
+        (``ghi``/``dni``/``dhi``/``temp``/``wind``), for the solar report.
+
+        The step comes from the frame itself, not from the configured
+        interval: the solar report and the backtest both pass hourly
+        weather regardless of whether the optimizer plans in quarters, and
+        integrating hourly irradiance over 900 seconds scores four times
+        too low.
+        """
         params, _source = self.params_for(installation)
-        interval_s = self._interval_s(self.interval)
-        return simulate(params, weather, self.latitude, self.longitude, interval_s)
+        return simulate(
+            params,
+            weather,
+            self.latitude,
+            self.longitude,
+            self._interval_s_of(weather),
+        )
+
+    def _interval_s_of(self, weather: pd.DataFrame) -> int:
+        """The step of ``weather``'s own index, falling back to the
+        configured interval for a frame too short to tell."""
+        if len(weather.index) >= 2:
+            seconds = int((weather.index[1] - weather.index[0]).total_seconds())
+            if seconds > 0:
+                return seconds
+        return self._interval_s(self.interval)
+
+    def _ml_candidate(self, installation):
+        """The installation's trained ML model as a backtest candidate, or
+        ``None`` when there is nothing trained to compare against.
+
+        Returning ``None`` rather than a stand-in matters: wiring this to
+        the physical model made ``auto`` score one computation twice and
+        publish it as a comparison, so ``auto`` could never choose ML and
+        the dashboard showed two numbers that were the same number.
+        """
+        from dao.prog.solar_predictor import SolarPredictor
+
+        try:
+            predictor = SolarPredictor()
+            predictor.prepare_for(installation)
+        except FileNotFoundError:
+            logging.info(
+                f"PV-backtest {installation.name}: geen getraind ML-model, "
+                f"alleen het fysische model wordt gescoord"
+            )
+            return None
+        except Exception as ex:  # noqa: BLE001 - physical alone is a valid run
+            logging.warning(
+                f"PV-backtest {installation.name}: ML-model niet bruikbaar "
+                f"({ex}), alleen het fysische model wordt gescoord"
+            )
+            return None
+
+        def predict(_installation, weather):
+            frame = predictor.predict(weather)
+            return frame["prediction"].to_numpy()
+
+        return MLCandidate(predict, installation)
 
     def _values_weather(
         self, start: datetime.datetime, end: datetime.datetime
@@ -410,13 +464,10 @@ class PVService:
             return None
 
         params, _source = self.params_for(installation)
-        candidates = [
-            PhysicalCandidate(params, self.latitude, self.longitude, 3600),
-            MLCandidate(
-                lambda inst, frame: self.forecast_from_weather(inst, frame),
-                installation,
-            ),
-        ]
+        candidates = [PhysicalCandidate(params, self.latitude, self.longitude, 3600)]
+        ml_candidate = self._ml_candidate(installation)
+        if ml_candidate is not None:
+            candidates.append(ml_candidate)
 
         def context_for_day(day):
             day_start = pd.Timestamp(

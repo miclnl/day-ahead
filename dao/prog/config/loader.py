@@ -6,6 +6,7 @@ import copy
 import os
 import shutil
 import json
+import math
 import logging
 from pathlib import Path
 from typing import Any, Optional, Type
@@ -96,8 +97,29 @@ def atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def json_safe(data: Any) -> Any:
+    """``data`` with every non-finite float replaced by ``None``.
+
+    Python's json module happily writes bare ``NaN``, ``Infinity`` and
+    ``-Infinity``, which the JSON specification does not allow and
+    JavaScript's ``JSON.parse`` rejects outright. A score for a candidate
+    that could not be evaluated is genuinely NaN, so the artefacts do
+    produce them; written as ``null`` the reader sees "not available"
+    instead of failing to parse the whole document.
+    """
+    if isinstance(data, float):
+        return data if math.isfinite(data) else None
+    if isinstance(data, dict):
+        return {key: json_safe(value) for key, value in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [json_safe(value) for value in data]
+    return data
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
-    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    atomic_write_text(
+        path, json.dumps(json_safe(data), indent=2, ensure_ascii=False) + "\n"
+    )
 
 
 FAST_CONTROL_MODES = ("off", "shadow", "active")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import math
 
 import numpy as np
@@ -70,6 +71,43 @@ def test_backtest_skips_days_with_nan_target():
     result = backtest("baseload", [candidate], target, 28, end=end)
 
     assert result.scores["flat"].n == 27 * 24
+
+
+class ShortOnOneDayCandidate(ConstantCandidate):
+    """Returns 23 values on one day, 24 on all the others.
+
+    The physical candidate returns ``len(weather_window)``, so a single
+    hour missing from the archived forecasts of one day does exactly this.
+    """
+
+    def __init__(self, name: str, value: float, short_day: dt.date):
+        super().__init__(name, value)
+        self.short_day = short_day
+
+    def predict(self, day, context) -> np.ndarray:
+        if day == self.short_day:
+            return np.full(23, self.value)
+        return np.full(24, self.value)
+
+
+def test_backtest_skips_a_day_a_candidate_cannot_fill(caplog):
+    """One short prediction used to make np.concatenate produce ragged
+    lengths, metrics() raise, and the caller turn that into "backtest
+    mislukt" -- which silently disabled model selection altogether."""
+    target = hourly_target("2026-06-01", 40)
+    end = dt.date(2026, 7, 11)
+    short_day = dt.date(2026, 6, 20)
+    good = ConstantCandidate("good", 0.3)
+    short = ShortOnOneDayCandidate("short", 0.5, short_day)
+
+    with caplog.at_level(logging.WARNING):
+        result = backtest("pv", [good, short], target, 28, end=end)
+
+    # The day drops out for both candidates, so they stay comparable.
+    assert result.scores["good"].n == 27 * 24
+    assert result.scores["short"].n == 27 * 24
+    assert result.winner == "good"
+    assert any("2026-06-20" in record.message for record in caplog.records)
 
 
 def test_backtest_picks_lowest_mae():
