@@ -99,7 +99,7 @@ def build_features(
 
 def _archive_weather(db_da, start, end, tz: str) -> Optional[pd.DataFrame]:
     archive = db_da.forecast_rows(
-        ["gr", "dni", "dhi", "temp"], [12, 24], int(start.timestamp()), int(end.timestamp())
+        list(_WEATHER_CODES), [12, 24], int(start.timestamp()), int(end.timestamp())
     )
     if archive is None or len(archive) == 0:
         return None

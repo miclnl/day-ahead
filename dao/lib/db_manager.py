@@ -59,8 +59,13 @@ LEAD_BUCKETS = (0, 1, 4, 12, 24)
 #: plan: the net house demand, the PV production (AC and DC), the baseload,
 #: and the weather inputs they are derived from. Archiving every optimizer
 #: output would multiply the table for no analytical gain.
+#:
+#: ``winds`` is the one entry nothing reports on. It is here because the
+#: physical PV model's cell temperature needs it, and an installation
+#: without local weather observations has only this archive to calibrate
+#: and backtest against -- without it every such run came out NaN.
 ARCHIVED_FORECAST_CODES = frozenset(
-    {"hload", "pv_ac", "pv_dc", "base", "gr", "dni", "dhi", "temp"}
+    {"hload", "pv_ac", "pv_dc", "base", "gr", "dni", "dhi", "temp", "winds"}
 )
 
 

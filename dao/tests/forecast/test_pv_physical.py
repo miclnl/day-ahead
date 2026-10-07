@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import types
 
 import numpy as np
@@ -160,6 +161,27 @@ def test_nan_ghi_gives_zero_not_nan():
     result = simulate(params, weather, LAT, LON, 3600)
     assert result.iloc[0] == 0.0
     assert not np.isnan(result.iloc[0])
+
+
+def test_missing_wind_and_temperature_do_not_nan_the_whole_day(caplog):
+    """Faiman's cell temperature is temp + poa/(u0 + u1*wind); one NaN in
+    either turns a whole day of production into NaN. No weather source is
+    guaranteed to carry both, and the forecast archive did not even store
+    wind, so the model fills them and says so."""
+    times = pd.date_range("2026-06-21 00:00", periods=24, freq="h", tz=TZ)
+    weather = clear_sky_weather(times, 3600)
+    weather["temp"] = float("nan")
+    weather["wind"] = float("nan")
+
+    params = PVParams(planes=[Plane(tilt=35, azimuth=180, pdc0_kw=3.0)])
+    with caplog.at_level(logging.WARNING):
+        result = simulate(params, weather, LAT, LON, 3600)
+
+    assert not result.isna().any()
+    assert 15.0 <= result.sum() <= 24.0
+    messages = " ".join(record.message for record in caplog.records)
+    assert "temperatuur" in messages
+    assert "wind" in messages
 
 
 def test_clearsky_cap_limits_glitch_input():

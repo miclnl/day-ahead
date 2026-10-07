@@ -322,7 +322,17 @@ class PVService:
         """
         installations = self.installations()
         for installation in installations:
-            result = self.calibrate_installation(installation)
+            try:
+                result = self.calibrate_installation(installation)
+            except Exception as ex:  # noqa: BLE001 - the configured params
+                # remain usable, and the other installations still deserve
+                # their turn; least_squares raises for a bounds or a
+                # non-finite-residual problem that is specific to one roof.
+                logging.warning(
+                    f"PV-kalibratie {installation.name} mislukt ({ex}), "
+                    f"de geconfigureerde waarden blijven in gebruik"
+                )
+                continue
             if result is not None:
                 logging.info(
                     f"PV-kalibratie {installation.name}: geaccepteerd "
@@ -436,7 +446,7 @@ class PVService:
         """
         try:
             rows = self.db_da.forecast_rows(
-                ["gr", "dni", "dhi", "temp"],
+                list(_WEATHER_CODES),
                 [12, 24],
                 int(start.timestamp()),
                 int(end.timestamp()),

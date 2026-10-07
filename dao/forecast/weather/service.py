@@ -23,11 +23,13 @@ from dao.forecast.weather.observations import update_observations
 from dao.forecast.weather.openmeteo import fetch_openmeteo
 from dao.forecast.weather.schema import WEATHER_COLUMNS, validate_weather_frame
 
-#: Codes archived per source for later accuracy-by-source reporting. The
-#: other weather columns (winds, neersl) matter to the optimizer but are not
-#: part of any accuracy comparison, so archiving them would only grow the
-#: table.
-_ARCHIVED_WEATHER_CODES = ("gr", "dni", "dhi", "temp")
+#: Codes archived per source. The first four are what the accuracy report
+#: scores; ``winds`` is archived because the PV model needs it, not because
+#: anything reports on it -- Faiman's cell temperature is
+#: ``temp + poa/(u0 + u1*wind)``, and an installation without local
+#: observations has nothing but this archive to calibrate and backtest
+#: against. ``neersl`` stays out: nothing downstream reads it.
+_ARCHIVED_WEATHER_CODES = ("gr", "dni", "dhi", "temp", "winds")
 
 STATUS_FILE = "status.json"
 

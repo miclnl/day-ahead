@@ -31,6 +31,15 @@ _CLEARSKY_HEADROOM = 1.1
 #: pvlib's own examples use this as the fallback for that case.
 _AIRMASS_FALLBACK = 10.0
 
+#: Faiman's cell temperature is ``temp_air + poa / (u0 + u1 * wind)``, so a
+#: single NaN in either input turns a whole day of production into NaN. Not
+#: every weather source carries both -- KNMI observations have no wind at
+#: all on some stations, and Meteoserver's short-range model omits it --
+#: so a missing value falls back to pvlib's own faiman defaults rather than
+#: poisoning the chain.
+_DEFAULT_TEMP_C = 20.0
+_DEFAULT_WIND_MS = 1.0
+
 
 @dataclass(frozen=True)
 class Plane:
@@ -127,6 +136,19 @@ def weather_for_pv(prog: pd.DataFrame, tz: str) -> pd.DataFrame:
     return result
 
 
+def _filled(series: pd.Series, default: float, label: str, unit: str) -> np.ndarray:
+    """``series`` as a float array with NaN replaced by ``default``, logged."""
+    values = np.asarray(series, dtype=float)
+    missing = np.isnan(values)
+    count = int(missing.sum())
+    if count:
+        logging.warning(
+            f"PV: {count} uren zonder {label}, gerekend met {default:g} {unit}"
+        )
+        values = np.where(missing, default, values)
+    return values
+
+
 def _decompose_missing(ghi, zenith, times, dni, dhi):
     """Fill dni/dhi from Erbs decomposition wherever either is missing."""
     dni = np.array(dni, dtype=float)
@@ -207,8 +229,8 @@ def simulate(
     airmass = pvlib.atmosphere.get_relative_airmass(zenith)
     airmass = np.where(np.isnan(airmass), _AIRMASS_FALLBACK, airmass)
 
-    temp = weather["temp"].astype(float).to_numpy()
-    wind = weather["wind"].astype(float).to_numpy()
+    temp = _filled(weather["temp"], _DEFAULT_TEMP_C, "temperatuur", "\u00b0C")
+    wind = _filled(weather["wind"], _DEFAULT_WIND_MS, "windsnelheid", "m/s")
 
     ac_kw = _ac_kw(params, ghi, dni, dhi, temp, wind, zenith, azimuth, dni_extra, airmass)
     ac_kw = np.where(ghi_missing, 0.0, ac_kw)

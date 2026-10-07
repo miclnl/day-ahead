@@ -330,7 +330,11 @@ def test_update_writes_prognoses_and_archive_with_source(db):
     forecast_rows = stored(db, "forecasts")
     assert forecast_rows
     assert {source for _, _, _, source in forecast_rows} == {"meteoserver"}
-    assert {code for code, _, _, _ in forecast_rows} == {"gr", "temp"}
+    # winds belongs here even though no accuracy report scores it: the PV
+    # model's cell temperature needs it, and the archive is the only
+    # weather an installation without observations can be calibrated or
+    # backtested against.
+    assert {code for code, _, _, _ in forecast_rows} == {"gr", "temp", "winds"}
 
 
 def put_prognose(db, code, rows):

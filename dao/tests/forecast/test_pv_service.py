@@ -374,6 +374,36 @@ def test_run_training_logs_per_installation(pv_service_with_history, caplog):
     assert any("PV-kalibratie" in message for message in caplog.messages)
 
 
+def test_one_failing_calibration_does_not_abort_the_whole_run(
+    pv_service_with_prognoses, caplog
+):
+    """Calibration can raise for reasons the operator cannot see coming: a
+    flat roof puts the initial guess outside least_squares' bounds, an
+    all-NaN weather window makes the residuals non-finite. One installation
+    going down must not take the rest of the task with it."""
+    service, _start = pv_service_with_prognoses
+    service.config.solar = [
+        make_installation(name="Bad Roof"),
+        make_installation(name="Good Roof"),
+    ]
+
+    def explode(installation):
+        if installation.name == "Bad Roof":
+            raise ValueError("Residuals are not finite in the initial point")
+        return None
+
+    service.calibrate_installation = explode
+
+    with caplog.at_level("WARNING"):
+        service.run_training()
+
+    from dao.forecast.pv.store import selection_path
+
+    assert selection_path(service.data_dir, "Good Roof").exists()
+    assert selection_path(service.data_dir, "Bad Roof").exists()
+    assert any("Bad Roof" in message for message in caplog.messages)
+
+
 def test_service_forecast_ml_falls_back_to_physical_when_model_missing(
     pv_service_with_prognoses, caplog
 ):
