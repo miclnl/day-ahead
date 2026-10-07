@@ -20,7 +20,7 @@ import pytest
 
 from dao.forecast.baseload.service import BaseloadService
 from dao.forecast.evaluate import archive_accuracy
-from dao.forecast.pv.physical import Plane, PVParams, simulate
+from dao.forecast.pv.physical import Plane, PVParams, clearsky_irradiance, simulate
 from dao.forecast.pv.service import PVService
 from dao.forecast.pv.store import calibration_path, load_calibration
 from dao.forecast.weather.service import WeatherService
@@ -50,7 +50,7 @@ def clear_sky(index: pd.DatetimeIndex) -> pd.DataFrame:
     absolute = pvlib.atmosphere.get_absolute_airmass(airmass)
     turbidity = np.asarray(pvlib.clearsky.lookup_linke_turbidity(midpoints, LAT, LON))
     dni_extra = np.asarray(pvlib.irradiance.get_extra_radiation(midpoints))
-    sky = pvlib.clearsky.ineichen(zenith, absolute, turbidity, dni_extra=dni_extra)
+    sky = clearsky_irradiance(zenith, absolute, turbidity, dni_extra)
 
     days = len(index) // 24 + 1
     cloud = np.repeat(rng.uniform(0.45, 1.0, size=days), 24)[: len(index)]

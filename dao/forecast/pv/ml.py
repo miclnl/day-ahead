@@ -17,7 +17,12 @@ import numpy as np
 import pandas as pd
 import pvlib
 
-from dao.forecast.pv.physical import PVParams, simulate, weather_for_pv
+from dao.forecast.pv.physical import (
+    PVParams,
+    clearsky_irradiance,
+    simulate,
+    weather_for_pv,
+)
 
 #: Every column the ML model is trained and predicted on, in a fixed order.
 #: No ``day_of_week``: production does not know what day it is, only where
@@ -88,8 +93,8 @@ def build_features(
         dtype=float,
     )
     dni_extra = np.asarray(pvlib.irradiance.get_extra_radiation(sun_times), dtype=float)
-    clearsky = pvlib.clearsky.ineichen(
-        zenith, airmass_absolute, linke_turbidity, dni_extra=dni_extra
+    clearsky = clearsky_irradiance(
+        zenith, airmass_absolute, linke_turbidity, dni_extra
     )
 
     physical = simulate(params, weather, latitude, longitude, interval_s)

@@ -6,6 +6,7 @@ the parts that hold the scheduling logic.
 """
 
 import datetime
+import logging
 import threading
 from zoneinfo import ZoneInfo
 
@@ -188,3 +189,38 @@ def test_a_task_started_elsewhere_makes_the_scheduler_skip(monkeypatch, caplog):
     assert runs == []
     assert "overgeslagen" in caplog.text
     assert "dashboard" in caplog.text
+
+
+def test_apscheduler_does_not_log_every_poll(monkeypatch):
+    """The request poll runs every 5 seconds and APScheduler logs two INFO
+    lines per execution of every job. With the root logger at INFO that is
+    24 lines a minute, over 34000 a day, of pure bookkeeping -- and the
+    lines that matter ("Taak calc_optimum klaar na 60 s") drown in it.
+
+    The codebase already quiets PIL and matplotlib for the same reason;
+    APScheduler was simply forgotten. Its warnings and errors -- a missed
+    run, a job that raised -- must still come through.
+    """
+    executor_logger = logging.getLogger("apscheduler.executors.default")
+    apscheduler_logger = logging.getLogger("apscheduler")
+    previous_apscheduler = apscheduler_logger.level
+    previous_root = logging.root.level
+    try:
+        # The add-on's own condition: root at INFO ("logging level: info" is
+        # the default) and nothing said about APScheduler.
+        logging.root.setLevel(logging.INFO)
+        apscheduler_logger.setLevel(logging.NOTSET)
+        assert executor_logger.isEnabledFor(logging.INFO), (
+            "precondition: without a level of its own APScheduler inherits "
+            "root, so its per-job INFO lines reach the log"
+        )
+
+        instance = _bare_scheduler(monkeypatch, [])
+        instance.build_scheduler()
+
+        assert not executor_logger.isEnabledFor(logging.INFO)
+        assert executor_logger.isEnabledFor(logging.WARNING)
+        assert executor_logger.isEnabledFor(logging.ERROR)
+    finally:
+        apscheduler_logger.setLevel(previous_apscheduler)
+        logging.root.setLevel(previous_root)

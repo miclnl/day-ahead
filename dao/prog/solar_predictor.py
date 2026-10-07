@@ -26,6 +26,34 @@ from dao.prog.da_base import DaBase
 from dao.prog.config.models.devices.solar import SolarConfig
 # import pvlib
 
+#: Below this standard deviation a series counts as constant, and the
+#: spread-based outlier methods have nothing to say about it.
+#:
+#: Deliberately not zero. pandas' std() over thirty identical floats comes
+#: out at 1.1e-16 rather than 0.0, so a literal "> 0" test never fires --
+#: and scipy then warns about catastrophic cancellation while handing back
+#: a z-score of -1.0 for every row. Any real variation in kWh or W/m2 is
+#: many orders of magnitude above this.
+_FLAT_SPREAD = 1e-9
+
+#: The task that retrains the PV models, named in the message an operator
+#: sees when theirs is out of date.
+RETRAIN_TASK = "train_ml_predictions"
+
+
+class OutdatedModelError(ValueError):
+    """A saved model was trained on a different feature set than this code.
+
+    Its own class rather than a bare ValueError because it is a normal
+    state after an upgrade, with a known remedy, and the callers have to
+    tell it apart from a model that is genuinely unusable: an outdated one
+    is repaired by running the training task once, and until then the
+    physical model takes over without anything being wrong.
+
+    Subclasses ValueError so code written against the previous behaviour
+    keeps catching it.
+    """
+
 
 def _metadata_path(model_path: str) -> str:
     """Sidecar file next to a saved model holding the feature list it was
@@ -320,6 +348,17 @@ class SolarPredictor(DaBase):
 
             solar_values = hour_data["solar_kwh"]
 
+            # Every method below measures how far a value sits from the
+            # rest, which needs the rest to vary at all. A bucket where
+            # production never changes -- an hour that is always shaded, a
+            # string that was switched off, a capped inverter -- has no
+            # outliers by definition. Running z-score over it made scipy
+            # warn about catastrophic cancellation on every training run,
+            # straight into the operator's log, and hand back -1.0 for
+            # every row while it was at it.
+            if solar_values.std() < _FLAT_SPREAD:
+                continue
+
             # Statistical outliers (Z-score > 3)
             z_scores = np.abs(stats.zscore(solar_values))
             statistical_outliers = z_scores > 3
@@ -378,7 +417,13 @@ class SolarPredictor(DaBase):
                 if len(season_hour_data) < 20:
                     continue
 
-                if season_hour_data["ghi"].std() > 0:
+                # Both series, not just the irradiance: a correlation
+                # divides by each standard deviation, and production that
+                # never varies made numpy divide by zero here.
+                if (
+                    season_hour_data["ghi"].std() > _FLAT_SPREAD
+                    and season_hour_data["solar_kwh"].std() > _FLAT_SPREAD
+                ):
                     irradiance_corr = season_hour_data["solar_kwh"].corr(
                         season_hour_data["ghi"]
                     )
@@ -718,10 +763,10 @@ class SolarPredictor(DaBase):
 
         Raises:
             FileNotFoundError: no model at model_path.
-            ValueError: the model's sidecar metadata lists a different set
-                of feature columns than the current code uses. Loading it
-                anyway would silently feed the wrong values into the wrong
-                slots instead of failing.
+            OutdatedModelError: the model's sidecar metadata lists a
+                different set of feature columns than the current code
+                uses. Loading it anyway would silently feed the wrong
+                values into the wrong slots instead of failing.
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
@@ -732,7 +777,7 @@ class SolarPredictor(DaBase):
                 metadata = json.load(f)
             trained_columns = metadata.get("feature_columns")
             if trained_columns is not None and trained_columns != self.feature_columns:
-                raise ValueError(
+                raise OutdatedModelError(
                     f"Model {model_path} was trained with feature columns "
                     f"{trained_columns}, but the current code uses "
                     f"{self.feature_columns}. Retrain before using this model."

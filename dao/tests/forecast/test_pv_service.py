@@ -589,6 +589,74 @@ def test_service_forecast_ml_falls_back_to_physical_when_model_missing(
     assert any("fysisch model" in message for message in caplog.messages)
 
 
+def test_an_outdated_model_names_the_task_that_fixes_it(
+    pv_service_with_prognoses, monkeypatch, caplog
+):
+    """After an upgrade that changes the feature set, every existing model
+    on disk is outdated. That is a known state with a known remedy, not a
+    failure: the log has to say which task repairs it, in Dutch, instead of
+    pasting an English exception behind the word "mislukt" on every run."""
+    from dao.forecast.baseload.store import write_json
+    from dao.forecast.pv.store import selection_path
+    from dao.prog.solar_predictor import OutdatedModelError
+
+    service, start = pv_service_with_prognoses
+    installation = service.installations()[0]
+    write_json(
+        selection_path(service.data_dir, installation.name),
+        {
+            "model": "ml",
+            "scores": {},
+            "decided_at": start.isoformat(),
+            "reason": "geconfigureerd",
+        },
+    )
+
+    class _Outdated:
+        def predict_solar_device(self, *args, **kwargs):
+            raise OutdatedModelError("trained with other feature columns")
+
+    monkeypatch.setattr(
+        "dao.prog.solar_predictor.SolarPredictor", lambda: _Outdated()
+    )
+
+    with caplog.at_level("WARNING"):
+        result = service.forecast(
+            installation, start, start + dt.timedelta(hours=24), "1hour"
+        )
+
+    assert len(result) == 24
+    messages = " ".join(caplog.messages)
+    assert "train_ml_predictions" in messages
+    assert "verouderd" in messages
+    assert "mislukt" not in messages
+
+
+def test_an_outdated_model_is_no_backtest_candidate(
+    pv_service_for_backtest, monkeypatch, caplog
+):
+    """Same state on the auto path: there is nothing to compare against, so
+    the physical model is scored alone -- not blamed for an exception."""
+    from dao.prog.solar_predictor import OutdatedModelError
+
+    class _Outdated:
+        def prepare_for(self, installation):
+            raise OutdatedModelError("trained with other feature columns")
+
+    monkeypatch.setattr(
+        "dao.prog.solar_predictor.SolarPredictor", _Outdated, raising=False
+    )
+    service = pv_service_for_backtest
+    installation = service.installations()[0]
+
+    with caplog.at_level("INFO"):
+        result = service._backtest_installation(installation, days=7)
+
+    assert set(result.scores) == {"physical"}
+    messages = " ".join(caplog.messages)
+    assert "train_ml_predictions" in messages
+
+
 def test_service_forecast_model_override(pv_service_with_prognoses):
     """An explicit model= beats the stored selection, which is how the
     solar report asks for the ML column next to the physical one."""

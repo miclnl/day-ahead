@@ -115,7 +115,11 @@ class PVService:
 
     def _forecast_ml(self, installation, start, end, interval) -> Optional[pd.DataFrame]:
         """The ML model's forecast, or ``None`` to fall back to physical."""
-        from dao.prog.solar_predictor import SolarPredictor
+        from dao.prog.solar_predictor import (
+            RETRAIN_TASK,
+            OutdatedModelError,
+            SolarPredictor,
+        )
 
         try:
             predictor = SolarPredictor()
@@ -124,6 +128,17 @@ class PVService:
             logging.warning(
                 f"PV: ML-model gekozen voor {installation.name} maar niet "
                 f"aanwezig, fysisch model gebruikt"
+            )
+            return None
+        except OutdatedModelError:
+            # Not a failure: after an upgrade that changed the feature set
+            # every stored model is out of date, and one training run
+            # repairs it. Say which run, or this repeats forever on an
+            # installation that does not have the task scheduled.
+            logging.warning(
+                f"PV: ML-model van {installation.name} is verouderd (getraind "
+                f"op een andere featureset), fysisch model gebruikt. Draai de "
+                f"taak {RETRAIN_TASK} om het opnieuw te trainen"
             )
             return None
         except Exception as ex:  # noqa: BLE001 - the physical model is the fallback
@@ -228,7 +243,11 @@ class PVService:
         publish it as a comparison, so ``auto`` could never choose ML and
         the dashboard showed two numbers that were the same number.
         """
-        from dao.prog.solar_predictor import SolarPredictor
+        from dao.prog.solar_predictor import (
+            RETRAIN_TASK,
+            OutdatedModelError,
+            SolarPredictor,
+        )
 
         try:
             predictor = SolarPredictor()
@@ -237,6 +256,13 @@ class PVService:
             logging.info(
                 f"PV-backtest {installation.name}: geen getraind ML-model, "
                 f"alleen het fysische model wordt gescoord"
+            )
+            return None
+        except OutdatedModelError:
+            logging.info(
+                f"PV-backtest {installation.name}: het ML-model is verouderd, "
+                f"alleen het fysische model wordt gescoord. Draai de taak "
+                f"{RETRAIN_TASK} om het opnieuw te trainen"
             )
             return None
         except Exception as ex:  # noqa: BLE001 - physical alone is a valid run

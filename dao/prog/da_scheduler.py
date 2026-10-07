@@ -59,6 +59,25 @@ REQUEST_POLL_S = 5
 ALIVE_NOTE_S = 20
 
 
+def _quiet_apscheduler() -> None:
+    """Keep APScheduler's per-job bookkeeping out of the add-on log.
+
+    APScheduler logs 'Running job "..."' and 'Job "..." executed
+    successfully' at INFO for every execution of every job. The request
+    poll alone runs every REQUEST_POLL_S seconds, so with the root logger
+    at INFO -- the add-on's default -- that is two lines every five
+    seconds, over thirty thousand a day, and the lines that actually say
+    something scroll past between them.
+
+    WARNING and above still come through, which is where APScheduler says
+    anything worth reading: a missed run, a job that raised, a job skipped
+    because the previous one was still going. This mirrors what the code
+    already does for PIL and matplotlib, which were quieted for exactly
+    the same reason.
+    """
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+
 def cron_trigger(pattern: str, timezone) -> CronTrigger:
     """Translate a schedule time pattern into a cron trigger.
 
@@ -295,6 +314,7 @@ class DaScheduler(DaBase):
     # -- the schedule -------------------------------------------------------
 
     def build_scheduler(self) -> BlockingScheduler:
+        _quiet_apscheduler()
         try:
             timezone = ZoneInfo(self.time_zone)
         except Exception:  # noqa: BLE001 - unknown zone name from HA

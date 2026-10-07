@@ -2,6 +2,51 @@
 # Day Ahead Optimizer
 # Unreleased
 
+# 2026.10.7.1
+
+## Het logboek is weer leesbaar
+Drie bronnen van ruis, gevonden in een echt logboek van een draaiende
+installatie.
+
+**APScheduler.** De taakaanvragen van het dashboard worden elke vijf
+seconden opgepikt, en APScheduler schrijft per uitvoering van elke job twee
+INFO-regels. Met het logniveau op `info` is dat 24 regels per minuut,
+ruim 34.000 per dag, puur boekhouding — en de regels die er wel toe doen
+(`Taak calc_optimum klaar na 60 s`) verdwenen ertussen. De logger van
+APScheduler staat nu op WARNING, net zoals PIL en matplotlib al stonden.
+Gemiste runs, jobs die een fout gooien en overgeslagen runs komen gewoon
+door; die staan op WARNING of hoger.
+
+Het ophalen zelf blijft op vijf seconden staan: dat is wat een knop in het
+dashboard direct laat voelen, en de controle is goedkoop en idempotent.
+
+**pvlib.** Het clear-skymodel deelt door de cosinus van de zonshoek, en die
+is nul zodra de zon onder de horizon staat. Elke berekening over een hele
+dag zette daardoor `RuntimeWarning: divide by zero encountered in divide`
+in het logboek. pvlib vangt de uitkomst zelf een regel later af, dus er was
+niets mis met het getal — alleen met de waarschuwing.
+
+**Uitschieterdetectie.** Een uurvak waarin de productie nooit varieert — een
+uur dat altijd in de schaduw ligt, een string die uit stond — heeft per
+definitie geen uitschieters, maar er werd wel een z-score en een correlatie
+over berekend. Dat gaf bij elke trainingsronde `invalid value encountered
+in divide` en `Precision loss occurred in moment calculation`. Het ging ook
+echt mis: `std()` van dertig identieke waarden komt op `1.1e-16` uit in
+plaats van op nul, dus een controle op "groter dan nul" sloeg nooit aan en
+scipy gaf voor elke rij een z-score van -1.0 terug. Zulke uurvakken worden
+nu overgeslagen.
+
+## Een verouderd ML-model zegt nu wat je moet doen
+Wie upgradet van een versie van voor de nieuwe prognosemotor heeft
+zonnemodellen op schijf die op een andere featureset zijn getraind. Dat werd
+elke draai gemeld als `ML-voorspelling voor <naam> mislukt`, met een Engelse
+uitzonderingstekst erachter. Het is geen storing: het fysische model neemt
+het netjes over, en één trainingsronde repareert het.
+
+De melding zegt nu in het Nederlands dat het model verouderd is en welke
+taak (`train_ml_predictions`) het opnieuw traint. Staat die taak in je
+schema, dan lost het zichzelf de eerstvolgende nacht op.
+
 # 2026.10.7
 
 ## Nieuwe prognosemotor voor basislast, zon en weer

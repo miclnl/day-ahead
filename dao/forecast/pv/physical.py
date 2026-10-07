@@ -136,6 +136,25 @@ def weather_for_pv(prog: pd.DataFrame, tz: str) -> pd.DataFrame:
     return result
 
 
+def clearsky_irradiance(zenith, airmass_absolute, linke_turbidity, dni_extra):
+    """pvlib's Ineichen clear-sky model, without the numpy noise.
+
+    ``ineichen`` divides by ``cos(zenith)``, which is zero the moment the
+    sun reaches the horizon, so every call covering a whole day raised
+    "divide by zero encountered in divide" on stderr -- in an add-on that
+    means straight into the operator's log, several times per run. pvlib
+    clips the resulting infinity a line later (``np.fmin(np.fmax(...),
+    1e20)``), so the value is handled; only the warning was not.
+
+    Scoped with ``np.errstate`` rather than a global filter: anything
+    outside this one call keeps complaining as loudly as before.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return pvlib.clearsky.ineichen(
+            zenith, airmass_absolute, linke_turbidity, dni_extra=dni_extra
+        )
+
+
 def _filled(series: pd.Series, default: float, label: str, unit: str) -> np.ndarray:
     """``series`` as a float array with NaN replaced by ``default``, logged."""
     values = np.asarray(series, dtype=float)
@@ -242,8 +261,8 @@ def simulate(
         pvlib.clearsky.lookup_linke_turbidity(sun_times, latitude, longitude),
         dtype=float,
     )
-    clearsky = pvlib.clearsky.ineichen(
-        zenith, airmass_absolute, linke_turbidity, dni_extra=dni_extra
+    clearsky = clearsky_irradiance(
+        zenith, airmass_absolute, linke_turbidity, dni_extra
     )
     clear_ac_kw = _ac_kw(
         params,

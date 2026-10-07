@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +23,11 @@ from xgboost import XGBRegressor
 from dao.forecast.pv.ml import FEATURES, build_features, training_weather
 from dao.forecast.pv.physical import Plane, PVParams
 from dao.lib.db_manager import DBmanagerObj
-from dao.prog.solar_predictor import SolarPredictor, _metadata_path
+from dao.prog.solar_predictor import (
+    OutdatedModelError,
+    SolarPredictor,
+    _metadata_path,
+)
 
 TZ = "Europe/Amsterdam"
 LAT, LON = 52.1, 5.2
@@ -505,8 +510,12 @@ def test_load_model_rejects_a_feature_column_mismatch(tmp_path):
     # Current code expects a different (e.g. extended) feature set.
     loader = make_bare_predictor(trained_with + ["extra"])
 
-    with pytest.raises(ValueError, match="feature columns"):
+    # A dedicated type, not a bare ValueError: an outdated model after an
+    # upgrade is a known state with a known remedy, and the service has to
+    # tell it apart from a model that is genuinely broken.
+    with pytest.raises(OutdatedModelError, match="feature columns"):
         loader.load_model(model_path)
+    assert issubclass(OutdatedModelError, ValueError)
 
 
 def test_load_model_without_a_sidecar_still_loads(tmp_path):
@@ -529,3 +538,51 @@ def test_load_model_raises_file_not_found_for_a_missing_path(tmp_path):
     loader = make_bare_predictor(["ghi"])
     with pytest.raises(FileNotFoundError):
         loader.load_model(str(tmp_path / "missing.json"))
+
+
+def test_build_features_leaks_no_numpy_warnings_into_the_log():
+    """Same clear-sky call as simulate(), same divide by cos(zenith) at
+    night, same raw RuntimeWarning in the operator's log."""
+    weather = observation_weather(24)
+    params = PVParams(planes=[Plane(tilt=35, azimuth=180, pdc0_kw=3.0)])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        features = build_features(weather, LAT, LON, params)
+
+    runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert runtime == [], [str(w.message) for w in runtime]
+    assert not features["clearsky_ghi"].isna().any()
+
+
+def test_outlier_detection_leaks_no_numpy_warnings_on_a_flat_bucket():
+    """A correlation needs both series to vary. The guard checked only the
+    irradiance, so a season-hour bucket where production never changes --
+    a shaded hour, a capped inverter, a string that was off -- divided by a
+    zero standard deviation and printed "invalid value encountered in
+    divide" into the operator's log during every training run."""
+    predictor = make_predictor(tune_hyperparameters=False)
+    predictor.create_physics_based_constraints(3.6)
+    predictor.log_level = 20
+
+    index = pd.date_range("2026-03-01", periods=30 * 24, freq="h", tz=TZ)
+    hours = np.asarray([moment.hour for moment in index], dtype=float)
+    merged = pd.DataFrame(
+        {
+            "hour": hours,
+            "ghi": np.clip(700.0 * np.cos((hours - 13.0) / 7.0), 0.0, None)
+            + np.resize([0.0, 5.0], len(index)),
+            "solar_kwh": 0.4,  # never varies: the correlation is undefined
+        },
+        index=index,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cleaned = predictor._detect_outliers(merged)
+
+    runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert runtime == [], [str(w.message) for w in runtime]
+    # Nothing to flag either: an undefined correlation is not a reason to
+    # throw rows away.
+    assert len(cleaned) == len(merged)

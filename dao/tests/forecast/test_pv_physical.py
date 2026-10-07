@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import types
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,7 @@ from dao.forecast.pv.physical import (
     Plane,
     PVParams,
     azimuth_to_dao_orientation,
+    clearsky_irradiance,
     dao_orientation_to_azimuth,
     params_from_config,
     simulate,
@@ -82,7 +84,7 @@ def clear_sky_weather(times: pd.DatetimeIndex, interval_s: int) -> pd.DataFrame:
     airmass_abs = pvlib.atmosphere.get_absolute_airmass(airmass)
     turbidity = np.asarray(pvlib.clearsky.lookup_linke_turbidity(sun_times, LAT, LON))
     dni_extra = np.asarray(pvlib.irradiance.get_extra_radiation(sun_times))
-    clearsky = pvlib.clearsky.ineichen(zenith, airmass_abs, turbidity, dni_extra=dni_extra)
+    clearsky = clearsky_irradiance(zenith, airmass_abs, turbidity, dni_extra)
     return pd.DataFrame(
         {
             "ghi": clearsky["ghi"],
@@ -197,3 +199,22 @@ def test_clearsky_cap_limits_glitch_input():
     clear_result = simulate(params, reference, LAT, LON, 3600)
 
     assert glitched_result.iloc[0] <= 1.1 * clear_result.iloc[0] + 1e-9
+
+
+def test_simulate_leaks_no_numpy_warnings_into_the_log():
+    """pvlib's ineichen() divides by cos(zenith), which is zero the moment
+    the sun is below the horizon -- so every whole-day call emitted a raw
+    "divide by zero encountered in divide" to stderr, straight into the
+    add-on log. The clear-sky reference is a bounded internal calculation;
+    its intermediate infinities are clipped a line later."""
+    times = pd.date_range("2026-06-21 00:00", periods=24, freq="h", tz=TZ)
+    weather = clear_sky_weather(times, 3600)
+    params = PVParams(planes=[Plane(tilt=35, azimuth=180, pdc0_kw=3.0)])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = simulate(params, weather, LAT, LON, 3600)
+
+    runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert runtime == [], [str(w.message) for w in runtime]
+    assert not result.isna().any()

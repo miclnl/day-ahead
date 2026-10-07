@@ -12,7 +12,7 @@ import pvlib
 import pytest
 
 from dao.forecast.pv.calibrate import CalibrationResult, calibrate
-from dao.forecast.pv.physical import Plane, PVParams, simulate
+from dao.forecast.pv.physical import Plane, PVParams, clearsky_irradiance, simulate
 from dao.forecast.pv.store import calibration_path, load_calibration, save_calibration
 
 TZ = "Europe/Amsterdam"
@@ -28,7 +28,7 @@ def clear_sky_weather(times: pd.DatetimeIndex, interval_s: int) -> pd.DataFrame:
     airmass_abs = pvlib.atmosphere.get_absolute_airmass(airmass)
     turbidity = np.asarray(pvlib.clearsky.lookup_linke_turbidity(sun_times, LAT, LON))
     dni_extra = np.asarray(pvlib.irradiance.get_extra_radiation(sun_times))
-    clearsky = pvlib.clearsky.ineichen(zenith, airmass_abs, turbidity, dni_extra=dni_extra)
+    clearsky = clearsky_irradiance(zenith, airmass_abs, turbidity, dni_extra)
     return pd.DataFrame(
         {"ghi": clearsky["ghi"], "dni": clearsky["dni"], "dhi": clearsky["dhi"]},
         index=times,
