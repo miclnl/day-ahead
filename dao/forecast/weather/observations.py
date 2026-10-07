@@ -54,9 +54,18 @@ def nearest_knmi_station(latitude: float, longitude: float) -> int:
 def fetch_knmi(station: int, start: date, end: date) -> pd.DataFrame:
     """Hourly KNMI observations as a weather frame, for ``[start, end]``.
 
-    knmi-py's index is already the hour *start* in UTC -- unlike
-    Open-Meteo's, which labels the hour it ends -- so nothing is shifted
-    here; doing so would double-correct on top of :func:`parse_openmeteo`.
+    KNMI numbers its hourly slots 1-24, where slot *HH* covers the hour
+    ending at *HH* UTC; knmi-py already subtracts one, so its index is the
+    hour start and nothing about it needs shifting here.
+
+    The variables do not all share one convention, exactly as Open-Meteo's
+    do not. ``Q`` ("Globale straling per uurvak") and ``FH``
+    ("Uurgemiddelde windsnelheid") are aggregates over the slot and belong
+    on its start. ``T`` is the temperature "tijdens de waarneming", taken
+    at the *end* of the slot, so it is moved onto the hour it was actually
+    measured in; left where knmi-py puts it, every observed temperature is
+    an hour early.
+
     Rows with any missing variable are dropped rather than partially
     trusted: KNMI marks a sensor outage as absent data, not as zero.
     """
@@ -74,10 +83,21 @@ def fetch_knmi(station: int, start: date, end: date) -> pd.DataFrame:
     epoch = pd.Timestamp("1970-01-01", tz="UTC")
     epochs = ((moments - epoch) // pd.Timedelta(seconds=1)).astype("int64")
 
+    # Re-indexed by the moment the reading was taken, then looked up per
+    # output hour; a positional shift would silently cross a gap, which a
+    # dropna()'d KNMI frame regularly has. The first hour of a window has
+    # no reading of its own and stays NaN: update_observations skips NaN
+    # per code, so the value an earlier run already stored for that hour
+    # keeps standing instead of being overwritten with a guess.
+    observed_temp = pd.Series(
+        frame["T"].astype(float).to_numpy() / 10.0,
+        index=moments + pd.Timedelta(hours=1),
+    )
+
     result = empty_weather_frame()
     result["time"] = epochs.values
     result["gr"] = frame["Q"].astype(float).values
-    result["temp"] = frame["T"].astype(float).values / 10.0
+    result["temp"] = observed_temp.reindex(moments).to_numpy()
     result["winds"] = frame["FH"].astype(float).values / 10.0
     result["source"] = "knmi"
     return result[["time", *WEATHER_COLUMNS, "source"]]

@@ -121,7 +121,11 @@ def test_nearest_station_picks_closest_aws():
     assert nearest_knmi_station(52.928, 4.781) == 235  # De Kooy
 
 
-def test_fetch_knmi_does_not_shift_hours(monkeypatch):
+def test_fetch_knmi_does_not_shift_the_hour_aggregates(monkeypatch):
+    """knmi-py already subtracts one from KNMI's 1-24 hour field, so its
+    index is the hour start. Q ("Globale straling per uurvak") and FH
+    ("Uurgemiddelde windsnelheid") are aggregates over that slot and belong
+    exactly where knmi-py puts them."""
     knmi_frame = pd.DataFrame(
         {"Q": [50], "T": [183], "FH": [30]},
         index=pd.to_datetime(["2026-03-15 00:00:00"]),
@@ -135,15 +139,56 @@ def test_fetch_knmi_does_not_shift_hours(monkeypatch):
 
     expected_time = int(pd.Timestamp("2026-03-15 00:00:00", tz="UTC").timestamp())
     assert frame.iloc[0]["time"] == expected_time
-    assert frame.iloc[0]["temp"] == pytest.approx(18.3)
     assert frame.iloc[0]["gr"] == pytest.approx(50.0)
     assert frame.iloc[0]["winds"] == pytest.approx(3.0)
 
 
-def test_update_observations_saves_three_codes_per_row(db, monkeypatch):
+def test_fetch_knmi_puts_the_temperature_on_its_own_hour(monkeypatch):
+    """KNMI documents T as the temperature "tijdens de waarneming", and the
+    observation belonging to hour slot HH is made at the end of it. With
+    knmi-py's index at HH-1 the reading lands an hour early, the same
+    mismatch Open-Meteo has between its instantaneous and its aggregated
+    variables."""
     knmi_frame = pd.DataFrame(
-        {"T": [100, 110], "Q": [50, 60], "FH": [30, 40]},
-        index=pd.to_datetime(["2026-03-15 10:00:00", "2026-03-15 11:00:00"]),
+        {"Q": [10, 20, 30], "T": [100, 110, 120], "FH": [30, 30, 30]},
+        index=pd.to_datetime(
+            ["2026-03-15 00:00:00", "2026-03-15 01:00:00", "2026-03-15 02:00:00"]
+        ),
+    )
+    monkeypatch.setattr(
+        "dao.forecast.weather.observations.knmi.get_hour_data_dataframe",
+        lambda stations, start, end, variables: knmi_frame,
+    )
+
+    frame = fetch_knmi(260, date(2026, 3, 15), date(2026, 3, 15))
+
+    def at(hour: int):
+        stamp = int(pd.Timestamp(f"2026-03-15 0{hour}:00:00", tz="UTC").timestamp())
+        return frame[frame["time"] == stamp].iloc[0]
+
+    # The slot indexed 01:00 covers 01:00-02:00 and its reading was taken at
+    # 02:00, so 11.0 degrees belongs on the 02:00 row.
+    assert at(2)["temp"] == pytest.approx(11.0)
+    assert at(1)["temp"] == pytest.approx(10.0)
+    # ...while the radiation of that same slot stays where it was.
+    assert at(1)["gr"] == pytest.approx(20.0)
+
+
+def test_update_observations_saves_three_codes_per_row(db, monkeypatch):
+    """Three rows in, three codes out per hour -- except the first hour of
+    the window, whose temperature reading (taken at its end) belongs to the
+    hour before the window and was never fetched. That one is left out
+    rather than guessed; a trailing window overlaps the previous run, which
+    already stored it."""
+    knmi_frame = pd.DataFrame(
+        {"T": [90, 100, 110], "Q": [40, 50, 60], "FH": [20, 30, 40]},
+        index=pd.to_datetime(
+            [
+                "2026-03-15 09:00:00",
+                "2026-03-15 10:00:00",
+                "2026-03-15 11:00:00",
+            ]
+        ),
     )
     monkeypatch.setattr(
         "dao.forecast.weather.observations.knmi.get_hour_data_dataframe",
@@ -154,16 +199,19 @@ def test_update_observations_saves_three_codes_per_row(db, monkeypatch):
         db, 52.10, 5.18, "NL", "auto", now=dt.datetime(2026, 3, 16, tzinfo=dt.UTC)
     )
 
-    assert count == 6
-    t0 = int(pd.Timestamp("2026-03-15 10:00:00", tz="UTC").timestamp())
-    t1 = int(pd.Timestamp("2026-03-15 11:00:00", tz="UTC").timestamp())
+    assert count == 8
+    t0 = int(pd.Timestamp("2026-03-15 09:00:00", tz="UTC").timestamp())
+    t1 = int(pd.Timestamp("2026-03-15 10:00:00", tz="UTC").timestamp())
+    t2 = int(pd.Timestamp("2026-03-15 11:00:00", tz="UTC").timestamp())
     assert stored(db) == [
-        ("gr", t0, 50.0),
-        ("temp", t0, 10.0),
-        ("winds", t0, 3.0),
-        ("gr", t1, 60.0),
-        ("temp", t1, 11.0),
-        ("winds", t1, 4.0),
+        ("gr", t0, 40.0),
+        ("winds", t0, 2.0),
+        ("gr", t1, 50.0),
+        ("temp", t1, 9.0),
+        ("winds", t1, 3.0),
+        ("gr", t2, 60.0),
+        ("temp", t2, 10.0),
+        ("winds", t2, 4.0),
     ]
 
 
