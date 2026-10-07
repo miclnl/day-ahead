@@ -328,6 +328,31 @@ def engine_env(tmp_path):
         rows.append((ts, "winds", float(row["wind"])))
     db_da.savedata(pd.DataFrame(rows, columns=["time", "code", "value"]))
 
+    # An archive as it stands after a week of running: forecasts made 12 and
+    # 24 hours ahead of targets that have since happened. save_forecasts
+    # deliberately drops a target already in the past, so a single run can
+    # never produce this -- without it the accuracy report has nothing to
+    # score and every assertion on it is vacuous.
+    archive_rows = []
+    archive_start = NOW - dt.timedelta(days=7)
+    for moment, row in weather.iterrows():
+        if moment.to_pydatetime() < archive_start:
+            continue
+        ts = int(moment.timestamp())
+        for lead, error in ((12, 1.06), (24, 0.91)):
+            archive_rows.append(
+                {
+                    "variabel": 4,  # gr
+                    "target_time": ts,
+                    "lead_bucket": lead,
+                    "issued_time": ts - lead * HOUR,
+                    "value": float(row["ghi"]) * 0.36 * error,
+                    "source": "meteoserver",
+                }
+            )
+    with db_da.engine.begin() as connection:
+        connection.execute(insert(Table("forecasts", metadata)), archive_rows)
+
     installation = make_installation()
     config = make_config(installation)
     data_root = tmp_path / "forecast"
@@ -439,6 +464,11 @@ def test_engine_runs_all_tasks_on_synthetic_data(engine_env):
         env.config, env.db_da, env.db_ha, TZ, days=(7, 28), now=now
     )
     assert json.dumps(report.to_dict())
-    # The weather service archived its own forecast, so gr has pairs to score
-    # against the measured series written above.
-    assert "gr" in report.components
+    # The weather service archived its own forecast, so gr has pairs to
+    # score against the measured series written above. "gr" in components
+    # is unconditionally true -- every component gets a key, scored or not
+    # -- so the only assertion worth making is that it actually scored
+    # something.
+    gr_window = report.components["gr"].windows[7]
+    assert gr_window["pairs"] > 0
+    assert gr_window["by_lead"]

@@ -128,7 +128,16 @@ class WeatherService:
             int((floored + datetime.timedelta(hours=h)).timestamp())
             for h in range(horizon_hours)
         }
-        have = set(int(t) for t in primary_frame["time"]) if len(primary_frame) else set()
+        # An hour the source answered with a null radiation is as useless to
+        # the optimizer as an hour it did not answer at all, so "present"
+        # means "has a usable value". Keying this on the timestamp alone let
+        # a row of nulls block the fallback for that hour.
+        if len(primary_frame):
+            usable = primary_frame[primary_frame["gr"].notna()]
+            partial = primary_frame[primary_frame["gr"].isna()]
+        else:
+            usable = partial = primary_frame
+        have = set(int(t) for t in usable["time"]) if len(usable) else set()
         missing = needed - have
 
         frame = primary_frame
@@ -153,7 +162,14 @@ class WeatherService:
                     f"Weer: {len(fallback_rows)} uren aangevuld uit Open-Meteo "
                     f"({reason})"
                 )
-                frame = pd.concat([primary_frame, fallback_rows], ignore_index=True)
+                # validate_weather_frame keeps the first row of a duplicated
+                # hour, so this order is the priority: the primary where it
+                # has a value, then the fallback, then the primary's partial
+                # rows for hours the fallback could not supply either -- the
+                # temperature it did send beats nothing at all.
+                frame = pd.concat(
+                    [usable, fallback_rows, partial], ignore_index=True
+                )
 
         if len(frame):
             frame = validate_weather_frame(frame)

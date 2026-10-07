@@ -7,6 +7,7 @@ import json
 import types
 from pathlib import Path
 
+import pandas as pd
 import pytest
 import requests
 
@@ -227,6 +228,77 @@ def test_short_primary_horizon_is_filled_by_openmeteo():
 
     assert status.hours_by_source == {"meteoserver": 48, "openmeteo": 24}
     assert status.hours_total == 72
+
+
+def test_hours_without_radiation_are_filled_from_openmeteo(tmp_path):
+    """Review focus 5, second half: a source that answers with nulls has
+    not supplied that hour. Keying "present" on the timestamp alone meant
+    a Meteoserver row with no radiation blocked the fallback, and the
+    optimizer planned those hours with no PV at all."""
+    now = dt.datetime(2026, 3, 10, 8, 0, tzinfo=dt.UTC)
+    floored = now.replace(minute=0, second=0, microsecond=0)
+    start_epoch = int(floored.timestamp())
+
+    payload = meteoserver_payload(start_epoch, 72)
+    for row in payload["data"][10:16]:
+        row["gr"] = None
+
+    session = _StubSession(
+        meteoserver=payload, openmeteo=openmeteo_payload(floored, 96)
+    )
+    service = WeatherService(
+        make_config(),
+        db_da=None,
+        latitude=52.1,
+        longitude=5.2,
+        secrets={},
+        data_dir=tmp_path / "weather",
+        country="NL",
+        now=lambda: now,
+        session=session,
+    )
+
+    frame, status = service.fetch(horizon_hours=72)
+
+    assert status.hours_total == 72
+    assert status.hours_by_source == {"meteoserver": 66, "openmeteo": 6}
+    assert frame["gr"].notna().all()
+
+
+def test_an_hour_the_fallback_cannot_supply_keeps_what_the_primary_had(tmp_path):
+    """Dropping a partial row only pays off when something replaces it. The
+    temperature Meteoserver did send for that hour is better than nothing."""
+    now = dt.datetime(2026, 3, 10, 8, 0, tzinfo=dt.UTC)
+    floored = now.replace(minute=0, second=0, microsecond=0)
+    start_epoch = int(floored.timestamp())
+
+    payload = meteoserver_payload(start_epoch, 72)
+    payload["data"][70]["gr"] = None
+
+    session = _StubSession(
+        meteoserver=payload,
+        # Open-Meteo only reaches as far as hour 24, so hour 70 stays the
+        # primary's partial row.
+        openmeteo=openmeteo_payload(floored, 24),
+    )
+    service = WeatherService(
+        make_config(),
+        db_da=None,
+        latitude=52.1,
+        longitude=5.2,
+        secrets={},
+        data_dir=tmp_path / "weather",
+        country="NL",
+        now=lambda: now,
+        session=session,
+    )
+
+    frame, _status = service.fetch(horizon_hours=72)
+
+    hour_70 = frame[frame["time"] == start_epoch + 70 * HOUR].iloc[0]
+    assert pd.isna(hour_70["gr"])
+    assert hour_70["temp"] == pytest.approx(10.0)
+    assert len(frame) == 72
 
 
 def test_primary_failure_falls_back_entirely(caplog):
