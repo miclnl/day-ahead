@@ -1,9 +1,13 @@
-"""import_weatherdata / get_and_save_knmi_data: building the save frame.
+"""import_weatherdata: building the save frame.
 
-Both used to append three rows (temp, gr, winds) per source row with
+Used to append three rows (temp, gr, winds) per source row with
 save_df.loc[save_df.shape[0]] = [...], which is O(n^2) -- three years of
 hourly KNMI data is roughly 26000 source rows, ~78000 such appends. Rewritten
 to collect a plain list of tuples and build the DataFrame once.
+
+get_and_save_knmi_data's own tests moved to
+dao/tests/forecast/test_observations.py: that method is now a thin delegate
+to update_observations, so the real coverage belongs on that function.
 """
 
 import datetime as dt
@@ -116,69 +120,3 @@ def test_import_weatherdata_saves_three_codes_per_source_row(db, tmp_path):
     ]
     # The source file is consumed and removed.
     assert not csv_path.exists()
-
-
-def test_get_and_save_knmi_data_saves_three_codes_per_row(db, monkeypatch):
-    # knmi-py returns a naive DatetimeIndex (UTC-implied); the code itself
-    # localizes it to self.time_zone.
-    knmi_frame = pd.DataFrame(
-        {"T": [100, 110], "Q": [50, 60], "FH": [30, 40]},
-        index=pd.to_datetime(["2026-03-15 10:00:00", "2026-03-15 11:00:00"]),
-    )
-
-    def fake_get_hour_data_dataframe(stations, start, end, variables):
-        return knmi_frame
-
-    monkeypatch.setattr(
-        "dao.prog.solar_predictor.knmi.get_hour_data_dataframe",
-        fake_get_hour_data_dataframe,
-    )
-    predictor = make_predictor(db)
-
-    predictor.get_and_save_knmi_data(
-        dt.datetime(2026, 3, 15), dt.datetime(2026, 3, 16)
-    )
-
-    t0 = int(pd.Timestamp("2026-03-15 10:00:00", tz="UTC").timestamp())
-    t1 = int(pd.Timestamp("2026-03-15 11:00:00", tz="UTC").timestamp())
-    assert stored(db) == [
-        ("gr", t0, 50.0),
-        ("temp", t0, 10.0),
-        ("winds", t0, 3.0),
-        ("gr", t1, 60.0),
-        ("temp", t1, 11.0),
-        ("winds", t1, 4.0),
-    ]
-
-
-def test_get_and_save_knmi_data_only_saves_requested_variables(db, monkeypatch):
-    """variables=["Q"] means only "gr" ends up in the frame; the code must
-    not try to save temp/winds that were never fetched."""
-    knmi_frame = pd.DataFrame(
-        {"Q": [50]},
-        index=pd.to_datetime(["2026-03-15 10:00:00"]),
-    )
-    monkeypatch.setattr(
-        "dao.prog.solar_predictor.knmi.get_hour_data_dataframe",
-        lambda stations, start, end, variables: knmi_frame,
-    )
-    predictor = make_predictor(db)
-
-    predictor.get_and_save_knmi_data(
-        dt.datetime(2026, 3, 15), dt.datetime(2026, 3, 16), variables=["Q"]
-    )
-
-    codes = [code for code, _, _ in stored(db)]
-    assert codes == ["gr"]
-
-
-def test_get_and_save_knmi_data_is_a_no_op_when_nothing_is_returned(db, monkeypatch):
-    monkeypatch.setattr(
-        "dao.prog.solar_predictor.knmi.get_hour_data_dataframe",
-        lambda stations, start, end, variables: pd.DataFrame(),
-    )
-    predictor = make_predictor(db)
-
-    predictor.get_and_save_knmi_data(dt.datetime(2026, 3, 15), dt.datetime(2026, 3, 16))
-
-    assert stored(db) == []

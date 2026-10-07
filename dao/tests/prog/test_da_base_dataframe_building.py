@@ -131,28 +131,6 @@ class TestSaveDf:
         assert stored(db) == [("pl", t0, 1.5)]
 
 
-def _t0() -> int:
-    """A whole hour in the recent past (matches get_prognose_data's own
-    end-date default logic, exercised via test_prognose_data.py)."""
-    now = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
-    return int((now - datetime.timedelta(hours=6)).timestamp())
-
-
-def _put_prognoses(db, code, rows):
-    from sqlalchemy import Table, insert, select
-
-    variabel = Table("variabel", db.metadata, autoload_with=db.engine)
-    prognoses = Table("prognoses", db.metadata, autoload_with=db.engine)
-    with db.engine.begin() as connection:
-        ident = connection.execute(
-            select(variabel.c.id).where(variabel.c.code == code)
-        ).scalar_one()
-        connection.execute(
-            insert(prognoses),
-            [{"variabel": ident, "time": t, "value": v} for t, v in rows],
-        )
-
-
 class TestCalcSolarPredictionsDaoBranch:
     def test_builds_one_row_per_prognose_interval(self, db, monkeypatch):
         from types import SimpleNamespace
@@ -161,24 +139,29 @@ class TestCalcSolarPredictionsDaoBranch:
         base.interval = "1hour"
         base.interval_s = 3600
 
-        t0 = _t0()
-        _put_prognoses(db, "gr", [(t0 + i * HOUR, 100.0 * (i + 1)) for i in range(3)])
-        _put_prognoses(db, "temp", [(t0 + i * HOUR, 15.0) for i in range(3)])
-
-        vanaf = datetime.datetime.fromtimestamp(t0)
-        tot = datetime.datetime.fromtimestamp(t0 + 2 * HOUR)
-
+        vanaf = datetime.datetime(2026, 6, 1, 10, 0)
+        tot = datetime.datetime(2026, 6, 1, 12, 0)
         solar_option = SimpleNamespace(name="Test Panel")
-        monkeypatch.setattr(
-            base,
-            "calc_prod_solar",
-            lambda option, time, glob_rad, h_frac: glob_rad / 100,
-        )
+
+        class StubPVService:
+            def __init__(self):
+                self.calls = []
+
+            def forecast(self, installation, start, end, interval):
+                self.calls.append((installation, start, end, interval))
+                tijd = pd.date_range(start, end, freq="h", inclusive="left")
+                return pd.DataFrame(
+                    {"tijd": tijd, "prediction": [1.0, 2.0][: len(tijd)]}
+                )
+
+        stub = StubPVService()
+        monkeypatch.setattr(base, "pv_service", lambda: stub)
 
         result = base.calc_solar_predictions(
-            solar_option, vanaf, tot, interval="1hour", _ml_prediction=False
+            solar_option, vanaf, tot, interval="1hour"
         )
 
         assert list(result.columns) == ["tijd", "prediction"]
         assert list(result["prediction"]) == [1.0, 2.0]
         assert len(result) == 2
+        assert stub.calls == [(solar_option, vanaf, tot, "1hour")]

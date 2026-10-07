@@ -4,7 +4,6 @@ Runs against a real SQLite database created by the same CheckDB code that runs
 at add-on startup, so the schema under test is the schema that ships.
 """
 
-import datetime
 
 import pytest
 
@@ -193,90 +192,11 @@ class TestPrune:
         assert count_forecasts(db) == 5
 
 
-class TestAccuracy:
-    def seed(self, db):
-        """Forecast is 0.5 kWh too high at every lead, realised is 2.0."""
-        targets = [T0 + h * HOUR for h in range(1, 25)]
-        put_realised(db, "m_house", [(t, 2.0) for t in targets])
-        for issue_offset in (0, 20 * HOUR):
-            db.save_forecasts(
-                [(t, "hload", 2.5) for t in targets], T0 + issue_offset
-            )
-        return targets
-
-    def test_bias_and_mae_are_computed_per_bucket(self, db):
-        targets = self.seed(db)
-        rows = db.forecast_accuracy(
-            "hload", "values", "m_house", targets[0], targets[-1] + HOUR
-        )
-        assert rows
-        for row in rows:
-            assert row["bias"] == pytest.approx(0.5)
-            assert row["mae"] == pytest.approx(0.5)
-            assert row["mse"] == pytest.approx(0.25)
-            assert row["scale"] == pytest.approx(2.0)
-            assert row["n"] > 0
-
-    def test_several_buckets_are_present(self, db):
-        targets = self.seed(db)
-        rows = db.forecast_accuracy(
-            "hload", "values", "m_house", targets[0], targets[-1] + HOUR
-        )
-        assert len(rows) >= 2
-        assert sorted(r["lead_bucket"] for r in rows) == [
-            r["lead_bucket"] for r in rows
-        ]
-
-    def test_an_empty_window_yields_nothing(self, db):
-        self.seed(db)
-        assert db.forecast_accuracy("hload", "values", "m_house", 1, 2) == []
-
-    def test_only_matching_targets_are_joined(self, db):
-        """Realised values without a forecast, and vice versa, are ignored."""
-        targets = [T0 + h * HOUR for h in range(1, 5)]
-        put_realised(db, "m_house", [(targets[0], 2.0), (targets[1], 2.0)])
-        db.save_forecasts([(t, "hload", 3.0) for t in targets], T0)
-        rows = db.forecast_accuracy(
-            "hload", "values", "m_house", targets[0], targets[-1] + HOUR
-        )
-        assert sum(r["n"] for r in rows) == 2
-
-    def test_bias_by_hour_finds_a_time_of_day_pattern(self, db):
-        """The evening is underforecast, the rest of the day is spot on.
-
-        This is the pattern that matters: it makes the optimizer reserve too
-        little for the evening peak, and the realtime layer cannot repair it.
-        """
-        targets = []
-        realised = []
-        forecast = []
-        for day in range(6):
-            for hour in range(24):
-                target = T0 + (day * 24 + hour) * HOUR
-                local_hour = datetime.datetime.fromtimestamp(target).hour
-                actual = 3.0 if 17 <= local_hour <= 20 else 1.0
-                targets.append(target)
-                realised.append((target, actual))
-                forecast.append((target, "hload", 1.0))
-        put_realised(db, "m_house", realised)
-        db.save_forecasts(forecast, T0)
-
-        rows = db.forecast_bias_by_hour(
-            "hload", "values", "m_house", targets[0], targets[-1] + HOUR
-        )
-        by_hour = {r["uur"]: r["bias"] for r in rows}
-        assert by_hour["18:00"] == pytest.approx(-2.0)
-        assert by_hour["03:00"] == pytest.approx(0.0)
-
-    def test_bias_by_hour_can_be_limited_to_one_bucket(self, db):
-        targets = self.seed(db)
-        all_rows = db.forecast_bias_by_hour(
-            "hload", "values", "m_house", targets[0], targets[-1] + HOUR
-        )
-        one = db.forecast_bias_by_hour(
-            "hload", "values", "m_house", targets[0], targets[-1] + HOUR, bucket=0
-        )
-        assert sum(r["n"] for r in one) < sum(r["n"] for r in all_rows)
+# TestAccuracy lived here and exercised DBmanagerObj.forecast_accuracy /
+# forecast_bias_by_hour, the SQL-side accuracy aggregation. Both were
+# replaced by dao/forecast/evaluate.py's archive_accuracy, which scores
+# every component (not just hload/pv_ac/gr/temp) and splits by regime and
+# source as well; its tests are in dao/tests/forecast/test_accuracy_report.py.
 
 
 class TestVariabelIds:
@@ -288,3 +208,63 @@ class TestVariabelIds:
 
     def test_unknown_codes_are_absent_from_the_result(self, db):
         assert db.variabel_ids(["nope"]) == {}
+
+
+class TestForecastsSourceColumn:
+    def test_source_column_is_added_to_an_existing_table(self, tmp_path):
+        from sqlalchemy import (
+            BigInteger,
+            Column,
+            Float,
+            ForeignKey,
+            Integer,
+            String,
+            Table,
+            UniqueConstraint,
+            inspect,
+            insert,
+        )
+
+        manager = DBmanagerObj(
+            db_dialect="sqlite", db_name="day_ahead.db", db_path=str(tmp_path)
+        )
+        metadata = manager.metadata
+        variabel = Table(
+            "variabel",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("code", String(10), unique=True, nullable=False),
+            Column("name", String(50), unique=True, nullable=False),
+            Column("dim", String(10), nullable=False),
+            Column("aggregate", String(3), nullable=False, default="avg"),
+        )
+        # The pre-source shape: everything forecasts_table has today except
+        # the "source" column, i.e. what a database migrated before this
+        # column existed still has on disk.
+        Table(
+            "forecasts",
+            metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("variabel", ForeignKey("variabel.id"), nullable=False),
+            Column("target_time", BigInteger, nullable=False),
+            Column("lead_bucket", Integer, nullable=False),
+            Column("issued_time", BigInteger, nullable=False),
+            Column("value", Float),
+            UniqueConstraint("variabel", "target_time", "lead_bucket"),
+        )
+        metadata.create_all(manager.engine)
+        with manager.engine.begin() as connection:
+            connection.execute(
+                insert(variabel),
+                [{"id": 27, "code": "hload", "name": "Geplande huisvraag", "dim": "kWh"}],
+            )
+
+        columns_before = {c["name"] for c in inspect(manager.engine).get_columns("forecasts")}
+        assert "source" not in columns_before
+
+        assert manager.ensure_forecasts_source_column() is True
+        columns_after = {c["name"] for c in inspect(manager.engine).get_columns("forecasts")}
+        assert "source" in columns_after
+
+        # Idempotent: calling it again on an already-migrated table is a no-op.
+        assert manager.ensure_forecasts_source_column() is True

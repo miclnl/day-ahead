@@ -1,0 +1,60 @@
+# Local run of the add-on image against a real Home Assistant recorder
+# database, for testing tasks before anything is released.
+#
+#   docker compose -f release-testing/docker-compose.dev.yml up -d --build
+#   docker compose -f release-testing/docker-compose.dev.yml exec dao \
+#       bash -lc "cd /root/dao/prog && python3 day_ahead.py calc_baseloads"
+#
+# ./dev-data holds options.json and secrets.json (gitignored). The recorder
+# database is reached over the LAN with the "database ha" settings in that
+# options.json; the DAO database is the mariadb service below.
+services:
+  dao:
+    build:
+      context: ../dao
+      dockerfile: Dockerfile
+      args:
+        BUILD_ARCH: amd64
+        BUILD_VERSION: 2026.9.29.99
+    image: dao-plus:dev
+    # The add-on entrypoint needs bashio and /config; do the two things it
+    # would do for us (data link, schema check) and then wait for exec.
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        export PATH=/root/dao/venv/day_ahead/bin:$PATH
+        && ln -sfn /config/dao_data /root/dao/data
+        && cd /root/dao/prog
+        && python3 check_db.py;
+        sleep infinity
+    environment:
+      TZ: Europe/Amsterdam
+      PYTHONPATH: /root:/root/dao:/root/dao/lib:/root/dao/prog
+    volumes:
+      - ./dev-data:/config/dao_data:z
+    ports:
+      - "${DAO_PORT:-5150}:5000"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DEV_DB_ROOT_PASSWORD:-devroot}
+      MARIADB_DATABASE: day_ahead
+      MARIADB_USER: ${DEV_DB_USER:-day_ahead}
+      MARIADB_PASSWORD: ${DEV_DB_PASSWORD:-day_ahead_dev}
+    ports:
+      - "${DB_PORT:-5151}:3306"
+    volumes:
+      - dao-dev-mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  dao-dev-mariadb:

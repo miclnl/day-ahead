@@ -32,7 +32,7 @@ def options_file(tmp_path):
 def test_example_config_validates():
     data = json.loads(EXAMPLE.read_text(encoding="utf-8"))
     model = validate_config_data(data)
-    assert model.config_version == 2
+    assert model.config_version == 3
 
 
 def test_validate_rejects_non_object():

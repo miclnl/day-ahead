@@ -1,11 +1,152 @@
 {
   "$defs": {
+    "AbsenceConfig": {
+      "additionalProperties": true,
+      "description": "When the household is away, detected from consumption or told directly.",
+      "properties": {
+        "detect": {
+          "default": true,
+          "description": "Label past away days from consumption history",
+          "title": "Detect",
+          "type": "boolean",
+          "x-help": "Without any extra sensors, a day counts as away when its active energy (the day's total minus standby) falls well below what recent days led the estimator to expect. Past away days feed a separate away profile, so absences are forecast rather than papered over with the ordinary weekday pattern.",
+          "x-order": 120,
+          "x-ui-section": "Baseload"
+        },
+        "threshold": {
+          "default": 0.4,
+          "description": "Fraction of expected consumption below which a day counts as away",
+          "maximum": 0.9,
+          "minimum": 0.1,
+          "title": "Threshold",
+          "type": "number",
+          "x-help": "Once at least ten days have both a consumption label and an `entities presence` reading, this is recalibrated automatically against reality; the configured value only applies until then.",
+          "x-order": 121,
+          "x-ui-section": "Baseload"
+        },
+        "entities presence": {
+          "description": "Person-tracker entities, used both to detect the regime and to calibrate the threshold",
+          "items": {
+            "$ref": "#/$defs/EntityId"
+          },
+          "title": "Entities Presence",
+          "type": "array",
+          "x-order": 122,
+          "x-ui-section": "Baseload"
+        },
+        "entity away": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "An entity whose state alone decides the household is away",
+          "x-help": "Takes priority over every other signal. For `alarm_control_panel`, `away state: armed_away` is the usual choice.",
+          "x-order": 123,
+          "x-ui-section": "Baseload",
+          "title": "Entity Away"
+        },
+        "away state": {
+          "default": "on",
+          "description": "The state of `entity away` that means the household is away",
+          "title": "Away State",
+          "type": "string",
+          "x-order": 124,
+          "x-ui-section": "Baseload"
+        },
+        "entity calendar": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EntityId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A calendar entity whose events mark away periods",
+          "x-order": 125,
+          "x-ui-section": "Baseload",
+          "title": "Entity Calendar"
+        },
+        "calendar keywords": {
+          "description": "Case-insensitive words in an event's title that mark it as away",
+          "items": {
+            "type": "string"
+          },
+          "title": "Calendar Keywords",
+          "type": "array",
+          "x-order": 126,
+          "x-ui-section": "Baseload"
+        },
+        "away after hours": {
+          "default": 3,
+          "description": "Consecutive hours with nobody present marks the rest of today away",
+          "minimum": 1,
+          "title": "Away After Hours",
+          "type": "integer",
+          "x-order": 127,
+          "x-ui-section": "Baseload"
+        },
+        "assume next day after hours": {
+          "default": 24,
+          "description": "Consecutive hours with nobody present marks tomorrow away too",
+          "minimum": 1,
+          "title": "Assume Next Day After Hours",
+          "type": "integer",
+          "x-order": 128,
+          "x-ui-section": "Baseload"
+        }
+      },
+      "title": "AbsenceConfig",
+      "type": "object"
+    },
     "BaseloadOptionsConfig": {
       "additionalProperties": true,
       "description": "How the daily baseload profile is estimated from history.",
       "properties": {
+        "model": {
+          "default": "profile",
+          "description": "Which model forecasts the baseload",
+          "enum": [
+            "profile",
+            "ml",
+            "auto"
+          ],
+          "title": "Model",
+          "type": "string",
+          "x-help": "**profile** - the twenty-four values per weekday estimated from history. Predictable, needs little data, cannot react to the weather.\n\n**ml** - an XGBoost model on hour, weekday, season, temperature, sun elevation and the away flag. Needs roughly four months of history before it beats the profile.\n\n**auto** - backtests both on every `calc_baseloads` run over the last `backtest days` days and keeps whichever had the lower error. Below `ml min days` of history this is the same as `profile`.",
+          "x-order": 105,
+          "x-ui-section": "Baseload"
+        },
+        "ml min days": {
+          "default": 120,
+          "description": "History needed before 'auto' will consider the ML model",
+          "minimum": 30,
+          "title": "Ml Min Days",
+          "type": "integer",
+          "x-help": "An XGBoost model on a few weeks of history mostly memorises those weeks. Four months is roughly where it starts to beat the profile on a backtest instead of only on its own training data.",
+          "x-order": 106,
+          "x-ui-section": "Baseload",
+          "x-unit": "days"
+        },
+        "backtest days": {
+          "default": 28,
+          "description": "Window 'auto' compares the two models over",
+          "minimum": 7,
+          "title": "Backtest Days",
+          "type": "integer",
+          "x-help": "Both models forecast each day in this window using only data from before that day, and the one with the lower mean absolute error wins. Longer is a more reliable comparison but a slower `calc_baseloads` run.",
+          "x-order": 107,
+          "x-ui-section": "Baseload",
+          "x-unit": "days"
+        },
         "aggregate": {
-          "default": "median",
+          "default": "mean",
           "description": "Statistic used to combine the observations of one hour",
           "enum": [
             "median",
@@ -14,7 +155,7 @@
           ],
           "title": "Aggregate",
           "type": "string",
-          "x-help": "The profile rests on roughly eight observations per weekday and hour, so the choice matters.\n\n**median** - robust, a single odd day cannot move it. Recommended.\n\n**trimmed** - drops the extremes and averages the rest, a middle ground.\n\n**mean** - the old behaviour. One party or one recorder gap shifts the hour by an eighth of the excursion, for two months.",
+          "x-help": "The profile rests on roughly eight observations per weekday and hour, so the choice matters.\n\n**mean** - recommended. The optimizer plans an energy balance, and only the mean adds up to the energy actually used over the day; the median of each hour separately does not, and systematically under-plans a household with occasional heavy hours.\n\n**median** - the robust alternative. A single odd day cannot move an hour, at the cost of a profile whose daily total is too low.\n\n**trimmed** - drops the extremes and averages the rest, a middle ground between the two.",
           "x-order": 110,
           "x-ui-section": "Baseload"
         },
@@ -98,6 +239,13 @@
           "x-help": "Hours with fewer observations left after filtering borrow the estimate for the same hour pooled over all weekdays, rather than resting on one or two measurements.",
           "x-order": 117,
           "x-ui-section": "Baseload"
+        },
+        "absence": {
+          "$ref": "#/$defs/AbsenceConfig",
+          "description": "Away-day detection and anticipation",
+          "x-order": 118,
+          "x-ui-section": "Baseload",
+          "title": "Absence"
         }
       },
       "title": "BaseloadOptionsConfig",
@@ -2375,15 +2523,15 @@
           "x-validation-hint": "Must be >= 1, typical 7-30 days"
         },
         "forecast days": {
-          "default": 60,
+          "default": 400,
           "description": "Number of days of forecast history kept for accuracy reporting",
           "minimum": 7,
           "title": "Forecast Days",
           "type": "integer",
-          "x-help": "The forecast archive records what was predicted and how far ahead, so the forecast error can be measured afterwards. It holds one row per variable, moment and lead time bucket, which keeps it bounded no matter how often the optimizer runs: roughly 10 MB at the default of 60 days. Reduce it on a machine with limited storage, such as a Home Assistant Yellow on eMMC.",
+          "x-help": "The forecast archive records what was predicted and how far ahead, so the forecast error can be measured afterwards, and it is what the ML models train on: they then learn from the same imperfect forecasts they will later be given, rather than from measurements they will never see again. It holds one row per variable, moment and lead time bucket, which keeps it bounded no matter how often the optimizer runs: roughly 70 MB at the default of 400 days, which also covers a full year for season-to-season comparison. Reduce it on a machine with limited storage, such as a Home Assistant Yellow on eMMC.",
           "x-ui-section": "History",
           "x-unit": "days",
-          "x-validation-hint": "Must be >= 7, typical 30-90 days"
+          "x-validation-hint": "Must be >= 7, typical 400 days"
         }
       },
       "title": "HistoryConfig",
@@ -3301,14 +3449,6 @@
           "x-help": "Advanced: Configure multiple strings for panels with different orientations or tilts. Use this OR flat config (tilt/orientation/capacity/yield), not both.",
           "x-ui-section": "Panel Orientation"
         },
-        "ml_prediction": {
-          "default": false,
-          "description": "Use ML model to predict solar production for this installation",
-          "title": "Ml Prediction",
-          "type": "boolean",
-          "x-help": "Enable machine-learning-based solar production forecasting for this installation. Requires the predictor add-on to be set up and trained.",
-          "x-ui-section": "ML Prediction"
-        },
         "ml_training_start_date": {
           "anyOf": [
             {
@@ -3351,6 +3491,32 @@
           "x-help": "Optional. Limit the installation output to this value in kW. Use when your inverter/MPPT maximum power is less than the total panel capacity.",
           "x-ui-section": "Panel Orientation",
           "x-unit": "kW"
+        },
+        "model": {
+          "default": "physical",
+          "description": "Which forecasting model to use for this installation",
+          "enum": [
+            "physical",
+            "ml",
+            "auto"
+          ],
+          "title": "Model",
+          "type": "string",
+          "x-help": "physical uses the pvlib model; ml the trained XGBoost model (falls back to physical, with a warning, until one has been trained); auto backtests both on every training run and keeps whichever had the lower error.",
+          "x-ui-section": "ML Prediction"
+        },
+        "calibration": {
+          "default": "scale",
+          "description": "How the physical model is calibrated against measured production",
+          "enum": [
+            "off",
+            "scale",
+            "planes"
+          ],
+          "title": "Calibration",
+          "type": "string",
+          "x-help": "scale fits one overall factor against measured production; planes fits one per plane (needs enough history to separate them); off uses the nameplate capacity as configured, uncalibrated.",
+          "x-ui-section": "ML Prediction"
         }
       },
       "required": [
@@ -3417,11 +3583,19 @@
           "x-unit": "kW"
         },
         "yield": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
           "description": "Yield factor for production calculation",
-          "exclusiveMinimum": 0,
           "title": "Yield",
-          "type": "number",
-          "x-help": "Efficiency factor for this string. Typically 0.8-0.9. Accounts for inverter losses, cable losses, shading, and dirt on panels.",
+          "x-help": "Efficiency factor for this string. Typically 0.8-0.9. Accounts for inverter losses, cable losses, shading, and dirt on panels. Not used by the pvlib model, which works from capacity directly; kept for reporting and the legacy estimator.",
           "x-ui-section": "Panel Orientation",
           "x-unit": "ratio",
           "x-validation-hint": "Must be greater than 0, typically 0.8-0.9"
@@ -3430,8 +3604,7 @@
       "required": [
         "tilt",
         "orientation",
-        "capacity",
-        "yield"
+        "capacity"
       ],
       "title": "SolarString",
       "type": "object",
@@ -3477,6 +3650,55 @@
       "x-icon": "lightning-bolt",
       "x-order": 19,
       "x-ui-group": "Integration"
+    },
+    "WeatherConfig": {
+      "additionalProperties": true,
+      "description": "How the forecast and its fallback, and the observation source, are chosen.",
+      "properties": {
+        "fallback": {
+          "anyOf": [
+            {
+              "const": "openmeteo",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "openmeteo",
+          "description": "Weather source used to fill gaps in the primary forecast",
+          "title": "Fallback",
+          "x-help": "Meteoserver is the primary forecast source when a key is configured. When it is unreachable, or its horizon ends before the optimizer's, Open-Meteo fills the remaining hours. Leave empty to never fall back -- a gap then stays a gap.",
+          "x-order": 130,
+          "x-ui-section": "Weather"
+        },
+        "openmeteo model": {
+          "default": "knmi_seamless",
+          "description": "Open-Meteo forecast model",
+          "title": "Openmeteo Model",
+          "type": "string",
+          "x-help": "knmi_seamless blends KNMI's short-range model with a global one for the days beyond it. See open-meteo.com/en/docs for the full model list.",
+          "x-order": 131,
+          "x-ui-section": "Weather"
+        },
+        "observations": {
+          "default": "auto",
+          "description": "Source used to backfill measured weather (gr/temp/winds)",
+          "enum": [
+            "auto",
+            "knmi",
+            "openmeteo",
+            "off"
+          ],
+          "title": "Observations",
+          "type": "string",
+          "x-help": "auto uses KNMI in the Netherlands and Belgium and Open-Meteo's archive elsewhere. Measured weather is what the accuracy report and the PV calibration compare a forecast against.",
+          "x-order": 132,
+          "x-ui-section": "Weather"
+        }
+      },
+      "title": "WeatherConfig",
+      "type": "object"
     },
     "XGBoostConfig": {
       "additionalProperties": true,
@@ -3579,9 +3801,17 @@
       "x-ui-section": "Your home"
     },
     "meteoserver-key": {
-      "$ref": "#/$defs/SecretStr",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SecretStr"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
       "description": "Meteoserver API key (can use !secret)",
-      "x-help": "Meteoserver API access key. Get from Meteoserver.nl account. Use !secret for security. Required for weather forecasts.",
+      "x-help": "Meteoserver API access key. Get from Meteoserver.nl account. Use !secret for security. Without one, Open-Meteo is used as the primary forecast source instead of only as a fallback.",
       "x-ui-group": "DAO",
       "x-ui-section": "Weather",
       "x-validation-hint": "Use !secret for API keys",
@@ -3614,6 +3844,13 @@
       "title": "Meteoserver-Attemps",
       "x-ui-group": "DAO",
       "x-ui-section": "Weather"
+    },
+    "weather": {
+      "$ref": "#/$defs/WeatherConfig",
+      "description": "Forecast fallback and observation source",
+      "x-ui-group": "DAO",
+      "x-ui-section": "Weather",
+      "title": "Weather"
     },
     "prices": {
       "anyOf": [
@@ -3932,9 +4169,6 @@
       "title": "Scheduler"
     }
   },
-  "required": [
-    "meteoserver-key"
-  ],
   "title": "Day Ahead Optimizer Configuration",
   "type": "object",
   "$schema": "http://json-schema.org/draft-07/schema#"

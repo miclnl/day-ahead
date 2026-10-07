@@ -16,7 +16,7 @@ Four things are layered on top of a plain average, in this order:
 1. **Outlier rejection** per cell, on the interquartile range.
 2. **Recency weighting**, so a change in the household propagates in weeks
    rather than in two months.
-3. **A robust location estimate** -- weighted median by default.
+3. **A robust location estimate** -- weighted mean by default.
 4. **A pooled fallback** for cells with too few observations left, so a thin
    cell borrows from the same hour on other days instead of inventing a value.
 """
@@ -26,8 +26,9 @@ from __future__ import annotations
 import datetime
 import functools
 import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Sequence
+from typing import Optional
 
 import holidays
 
@@ -47,7 +48,7 @@ PROFILE_FORMAT_VERSION = 1
 class BaseloadOptions:
     """Tunables, mirrored from the configuration."""
 
-    aggregate: str = "median"
+    aggregate: str = "mean"
     trim_fraction: float = 0.2
     remove_outliers: bool = True
     outlier_factor: float = 2.0
@@ -73,6 +74,7 @@ class BaseloadProfile:
     values: list[float] = field(default_factory=lambda: [0.0] * 24)
     samples: list[int] = field(default_factory=lambda: [0] * 24)
     pooled: list[bool] = field(default_factory=lambda: [False] * 24)
+    spread: list[float] = field(default_factory=lambda: [0.0] * 24)
 
     @property
     def total(self) -> float:
@@ -178,7 +180,7 @@ def weighted_median(values: Sequence[float], weights: Sequence[float]) -> float:
     """Value at which half of the total weight is reached."""
     if not values:
         return 0.0
-    pairs = sorted(zip(values, weights))
+    pairs = sorted(zip(values, weights, strict=True))
     total = sum(weights)
     if total <= 0:
         return float(pairs[len(pairs) // 2][0])
@@ -195,7 +197,7 @@ def weighted_mean(values: Sequence[float], weights: Sequence[float]) -> float:
     total = sum(weights)
     if total <= 0:
         return sum(values) / len(values) if values else 0.0
-    return sum(v * w for v, w in zip(values, weights)) / total
+    return sum(v * w for v, w in zip(values, weights, strict=True)) / total
 
 
 def trimmed(values: Sequence[float], weights: Sequence[float], fraction: float):
@@ -228,8 +230,8 @@ def estimate_cell(
 
     if options.remove_outliers:
         mask = outlier_mask(values, options.outlier_factor)
-        values = [v for v, keep in zip(values, mask) if keep]
-        ages = [a for a, keep in zip(ages, mask) if keep]
+        values = [v for v, keep in zip(values, mask, strict=True) if keep]
+        ages = [a for a, keep in zip(ages, mask, strict=True) if keep]
 
     if len(values) < max(1, options.min_samples):
         return None, len(values)
@@ -252,6 +254,40 @@ def estimate_cell(
     return estimate, len(values)
 
 
+def cell_spread(samples: Sequence[Sample], options: BaseloadOptions) -> float:
+    """Weighted population standard deviation of one cell.
+
+    Uses the same outlier rejection and recency weighting as
+    :func:`estimate_cell`, so the reported spread describes the same
+    observations the point estimate rests on. A cell with fewer than two
+    surviving samples has no meaningful spread.
+    """
+    if not samples:
+        return 0.0
+
+    values = [s.value for s in samples]
+    ages = [s.age_days for s in samples]
+
+    if options.remove_outliers:
+        mask = outlier_mask(values, options.outlier_factor)
+        values = [v for v, keep in zip(values, mask, strict=True) if keep]
+        ages = [a for a, keep in zip(ages, mask, strict=True) if keep]
+
+    if len(values) < 2:
+        return 0.0
+
+    weights = recency_weights(ages, options.half_life_days)
+    mean = weighted_mean(values, weights)
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        variance = sum((v - mean) ** 2 for v in values) / len(values)
+    else:
+        variance = sum(
+            w * (v - mean) ** 2 for v, w in zip(values, weights, strict=True)
+        ) / total_weight
+    return math.sqrt(variance)
+
+
 def build_profile(
     cells: dict,
     pooled_cells: Optional[dict] = None,
@@ -266,16 +302,38 @@ def build_profile(
     options = options or BaseloadOptions()
     profile = BaseloadProfile()
     for hour in range(24):
-        estimate, count = estimate_cell(cells.get(hour, []), options)
+        hour_samples = cells.get(hour, [])
+        estimate, count = estimate_cell(hour_samples, options)
         pooled = False
         if estimate is None and pooled_cells is not None:
-            estimate, _ = estimate_cell(pooled_cells.get(hour, []), options)
+            hour_samples = pooled_cells.get(hour, [])
+            estimate, _ = estimate_cell(hour_samples, options)
             pooled = estimate is not None
         if estimate is None:
             estimate = 0.0
+            hour_samples = []
         profile.values[hour] = round(estimate, 3)
         profile.samples[hour] = count
         profile.pooled[hour] = pooled
+        profile.spread[hour] = round(cell_spread(hour_samples, options), 3)
+    return profile
+
+
+def standby_profile(cells_all: dict) -> BaseloadProfile:
+    """Profile for a period without occupants, pooled over every weekday.
+
+    The tenth percentile of everything ever seen at that hour, not a robust
+    estimate of the typical value: standby consumption is the floor a home
+    never goes below, not its middle.
+    """
+    profile = BaseloadProfile()
+    for hour in range(24):
+        samples = cells_all.get(hour, [])
+        values = sorted(s.value for s in samples)
+        estimate = quantile(values, 0.10) if values else 0.0
+        profile.values[hour] = round(estimate, 3)
+        profile.samples[hour] = len(values)
+        profile.pooled[hour] = False
     return profile
 
 

@@ -1,0 +1,219 @@
+{% extends "v2/base.html" %}
+
+{% block title %}Accuracy - DAO+{% endblock %}
+{% block content %}
+<h1>Accuracy</h1>
+<p class="text-muted">
+  Hoe ver zaten de prognoses ernaast, en welk model is op dit moment gekozen.
+</p>
+
+<div class="mb-3">
+  <label for="days" class="form-label">Venster</label>
+  <select id="days" class="form-select" style="max-width: 12rem;">
+    <option value="7">7 dagen</option>
+    <option value="28" selected>28 dagen</option>
+  </select>
+</div>
+
+<div id="empty-state" class="alert alert-info d-none">
+  Nog geen prognoses gearchiveerd. Het archief vult zich bij elke optimalisatie.
+</div>
+
+<div id="load-error" class="alert alert-warning d-none">
+  De accuratesse-gegevens konden niet worden opgehaald. Kijk in het logboek
+  van de add-on; dit is iets anders dan een nog leeg archief.
+</div>
+
+<!-- 1. Status -->
+<h2 class="h4 mt-4">Status</h2>
+<div id="status-cards" class="row g-3"></div>
+
+<!-- 2. Table -->
+<h2 class="h4 mt-4">Afwijking per component en vooruitblik</h2>
+<div class="table-responsive">
+  <table class="table table-sm" id="accuracy-table">
+    <thead>
+      <tr>
+        <th>Component</th><th>Eenheid</th><th>Vooruitblik</th>
+        <th class="text-end">n</th><th class="text-end">bias</th><th class="text-end">MAE</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<!-- 3. Line chart -->
+<h2 class="h4 mt-4">Voorspeld versus gemeten, laatste 48 uur</h2>
+<div class="mb-2">
+  <select id="recent-component" class="form-select" style="max-width: 16rem;"></select>
+</div>
+<canvas id="recent-chart" height="120"></canvas>
+
+<!-- 4. Bias per hour -->
+<h2 class="h4 mt-4">Afwijking per uur van de dag</h2>
+<canvas id="bias-chart" height="120"></canvas>
+
+<script>
+(function () {
+  const LEAD_LABELS = {
+    "0": "< 1 uur", "1": "1-4 uur", "4": "4-12 uur",
+    "12": "12-24 uur", "24": ">= 24 uur",
+  };
+  let recentChart = null;
+  let biasChart = null;
+  let payload = null;
+
+  function card(title, lines) {
+    const body = lines.map((l) => `<div class="small">${l}</div>`).join("");
+    return `<div class="col-md-4"><div class="card h-100"><div class="card-body">
+      <h3 class="h6 card-title">${title}</h3>${body}</div></div></div>`;
+  }
+
+  function renderStatus(data) {
+    const cards = [];
+    const bl = data.baseload || {};
+    const blLines = [];
+    if (bl.selection) {
+      blLines.push(`Model: <strong>${bl.selection.model}</strong>`);
+      blLines.push(`Reden: ${bl.selection.reason || "-"}`);
+    }
+    if (bl.status) {
+      blLines.push(`Regime: ${bl.status.regime || "-"} (${bl.status.reason || "-"})`);
+    }
+    if (bl.profile_created) {
+      blLines.push(`Profiel van: ${bl.profile_created.slice(0, 16).replace("T", " ")}`);
+    }
+    cards.push(card("Basisverbruik", blLines.length ? blLines : ["Nog geen profiel"]));
+
+    Object.entries(data.pv || {}).forEach(([key, pv]) => {
+      const lines = [];
+      if (pv.selection) {
+        lines.push(`Model: <strong>${pv.selection.model}</strong>`);
+        lines.push(`Reden: ${pv.selection.reason || "-"}`);
+      }
+      if (pv.calibration) {
+        const planes = (pv.calibration.planes || [])
+          .map((p) => `${p.pdc0_kw.toFixed(2)} kWp @ ${Math.round(p.tilt)}&deg;/${Math.round(p.orientation)}&deg;`)
+          .join(", ");
+        lines.push(`Kalibratie (${pv.calibration.mode}): ${planes}`);
+        lines.push(`Holdout-MAE: ${pv.calibration.holdout_mae_fit.toFixed(3)} kWh (config ${pv.calibration.holdout_mae_config.toFixed(3)})`);
+        lines.push(`Van: ${(pv.calibration.created || "").slice(0, 10)}`);
+      }
+      cards.push(card(`PV ${key}`, lines.length ? lines : ["Nog niet gekalibreerd"]));
+    });
+
+    if (data.weather) {
+      cards.push(card("Weer", [
+        `Bron: <strong>${data.weather.primary}</strong>`,
+        `Uren: ${data.weather.hours_total}`,
+        `Opgehaald: ${(data.weather.fetched_at || "").slice(0, 16).replace("T", " ")}`,
+      ]));
+    }
+    document.getElementById("status-cards").innerHTML = cards.join("");
+  }
+
+  function renderTable(data, days) {
+    const body = document.querySelector("#accuracy-table tbody");
+    body.innerHTML = "";
+    const components = (data.accuracy || {}).components || {};
+    let rows = 0;
+    Object.entries(components).forEach(([name, comp]) => {
+      const window = (comp.windows || {})[String(days)];
+      if (!window || !window.pairs) { return; }
+      Object.keys(window.by_lead || {})
+        .sort((a, b) => Number(a) - Number(b))
+        .forEach((bucket) => {
+          const s = window.by_lead[bucket];
+          body.insertAdjacentHTML("beforeend", `<tr>
+            <td>${name}</td><td>${comp.unit}</td><td>${LEAD_LABELS[bucket] || bucket}</td>
+            <td class="text-end">${s.n}</td>
+            <td class="text-end">${s.bias.toFixed(3)}</td>
+            <td class="text-end">${s.mae.toFixed(3)}</td></tr>`);
+          rows += 1;
+        });
+    });
+    return rows;
+  }
+
+  function renderRecent(data) {
+    const select = document.getElementById("recent-component");
+    const names = Object.keys(data.recent || {});
+    if (!select.options.length) {
+      names.forEach((name) => select.add(new Option(name, name)));
+    }
+    const chosen = select.value || names[0];
+    const series = (data.recent || {})[chosen] || [];
+    const ctx = document.getElementById("recent-chart");
+    if (recentChart) { recentChart.destroy(); }
+    if (!window.Chart || !series.length) { return; }
+    recentChart = new window.Chart(ctx, {
+      type: "line",
+      data: {
+        labels: series.map((p) => p.tijd.slice(5, 16).replace("T", " ")),
+        datasets: [
+          { label: "voorspeld", data: series.map((p) => p.forecast), borderWidth: 1 },
+          { label: "gemeten", data: series.map((p) => p.measured), borderWidth: 1 },
+        ],
+      },
+      options: { responsive: true, interaction: { intersect: false } },
+    });
+  }
+
+  function renderBias(data, days) {
+    const components = (data.accuracy || {}).components || {};
+    const datasets = [];
+    Object.entries(components).forEach(([name, comp]) => {
+      const window = (comp.windows || {})[String(days)];
+      if (!window || !window.by_hour) { return; }
+      const hours = Array.from({ length: 24 }, (_, h) => String(h));
+      const values = hours.map((h) => (window.by_hour[h] ? window.by_hour[h].bias : null));
+      if (values.some((v) => v !== null)) {
+        datasets.push({ label: name, data: values, borderWidth: 1 });
+      }
+    });
+    const ctx = document.getElementById("bias-chart");
+    if (biasChart) { biasChart.destroy(); }
+    if (!window.Chart || !datasets.length) { return; }
+    biasChart = new window.Chart(ctx, {
+      type: "bar",
+      data: { labels: Array.from({ length: 24 }, (_, h) => `${h}:00`), datasets },
+      options: { responsive: true },
+    });
+  }
+
+  function render() {
+    const days = Number(document.getElementById("days").value);
+    const rows = renderTable(payload, days);
+    renderStatus(payload);
+    renderRecent(payload);
+    renderBias(payload, days);
+    document.getElementById("empty-state").classList.toggle("d-none", rows > 0);
+  }
+
+  function load() {
+    const days = document.getElementById("days").value;
+    document.getElementById("load-error").classList.add("d-none");
+    fetch(`{{ url_for('api.accuracy') }}?days=${days}`)
+      .then((response) => {
+        if (!response.ok) { throw new Error(`HTTP ${response.status}`); }
+        return response.json();
+      })
+      .then((data) => { payload = data; render(); })
+      .catch((error) => {
+        // Not the same thing as an empty archive: a failed request or a
+        // response the browser cannot parse is a fault to go looking for,
+        // and saying "nog geen prognoses" would hide it.
+        console.error("accuracy laden mislukt", error);
+        document.getElementById("empty-state").classList.add("d-none");
+        document.getElementById("load-error").classList.remove("d-none");
+      });
+  }
+
+  document.getElementById("days").addEventListener("change", load);
+  document.getElementById("recent-component").addEventListener("change", () => {
+    if (payload) { renderRecent(payload); }
+  });
+  load();
+})();
+</script>
+{% endblock %}

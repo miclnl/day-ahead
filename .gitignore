@@ -29,3 +29,6 @@ dao/webserver/app/static/build
 /docs/superpowers/
 .pytest_tmp
 dao/webserver/app/static/data
+
+release-testing/dev-data/
+release-testing/.env

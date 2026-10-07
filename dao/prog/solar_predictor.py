@@ -14,8 +14,6 @@ import warnings
 from typing import Optional, Union, Dict, Any
 import datetime as dt
 import logging
-import knmi
-import copy
 import math
 
 # ML imports
@@ -62,6 +60,9 @@ class SolarPredictor(DaBase):
                                  For better accuracy, use create_physics_based_constraints()
                                  with your actual system capacity and location.
         """
+        from dao.forecast.pv.ml import FEATURES
+        from dao.forecast.pv.physical import PVParams
+
         super().__init__()
         if self.config is None:
             return
@@ -73,18 +74,11 @@ class SolarPredictor(DaBase):
         self.azimut = 180
         self.random_state = random_state
         self.model = None
-        self.feature_columns = [
-            "temperature",
-            "irradiance",
-            "windvelocity",
-            "day_of_week",
-            "hour",
-            "quarter",
-            "month",
-            "season",
-            "week_nr",
-            # "cos_angle_of_inc"
-        ]
+        self.feature_columns = list(FEATURES)
+        # Overwritten per installation in train_solar_option/predict_solar_device
+        # with the current (calibrated when available) physical parameters;
+        # this default only matters before either has run once.
+        self.pv_params = PVParams(planes=[])
         self.is_trained = False
         self.training_stats = {}
         self.ml_training_start_date = dt.date(2000, 1, 1)
@@ -101,87 +95,20 @@ class SolarPredictor(DaBase):
         )
         """
 
-    """
-    def calc_cos_sun_angle(self, time):
-        # time = pd.to_datetime(time)
-
-        solpos = pvlib.solarposition.get_solarposition(
-            time, self.latitude, self.longitude
-        )
-
-        aoi = pvlib.irradiance.aoi(
-            self.tilt,
-            self.azimut,
-            solar_zenith=90 - solpos['apparent_elevation'],
-            solar_azimuth=solpos['azimuth']
-        )
-
-        result = 0
-        elevation = solpos['apparent_elevation'].iloc[0]
-
-        angle = min(aoi.iloc[0], 90)
-        if elevation > 0:
-            result = math.cos(min(math.radians(angle),90.0))
-
-        return result
+    def create_features(self, weather: pd.DataFrame) -> pd.DataFrame:
         """
-
-    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        Feature engineering for a weather frame in pv layout (ghi/dni/dhi/
+        temp/wind, tz-aware DatetimeIndex): solar geometry, clear-sky ghi,
+        calendar features and the physical model's own prediction. See
+        dao.forecast.pv.ml.build_features for the full column list (FEATURES)
+        and the reasoning behind including the physical model's output.
         """
-        Perform feature engineering on a time-indexed DataFrame for energy modeling.
+        from dao.forecast.pv.ml import build_features
 
-        This function generates time-based and weather-related features from
-        the input DataFrame, which is assumed to have a DatetimeIndex and
-        columns for 'temperature' and 'irradiance'. It also computes derived
-        performance metrics for solar energy.
-
-        Parameters
-        ----------
-        df : pandas.DataFrame
-            Input DataFrame with at least the following columns:
-            - 'temperature' : float, ambient temperature in °C
-            - 'irradiance' : float, solar irradiance in J/cm²/h
-            - 'windvelocity': float in m/s
-            The DataFrame index must be a pandas.DatetimeIndex.
-
-        Returns
-        -------
-        pandas.DataFrame
-            A new DataFrame with the following additional columns:
-            - 'day_of_week' : int, day of the week (0=Monday, 6=Sunday)
-            - 'hour' : int, hour of the day (0–23)
-            - 'quarter' : int, quarter of the year (1–4)
-            - 'month' : int, month of the year (1–12)
-            - 'season' : int, mapped season (0=winter, 1=spring, 2=summer, 3=autumn)
-            - weeknr: int
-
-        """
-        df = copy.deepcopy(df)
-        df["day_of_week"] = df.index.dayofweek
-        df["hour"] = df.index.hour
-        df["quarter"] = df.index.quarter
-        df["month"] = df.index.month
-        df["season"] = df.index.month.map(
-            {
-                12: 0,
-                1: 0,
-                2: 0,  # winter
-                3: 1,
-                4: 1,
-                5: 1,  # spring
-                6: 2,
-                7: 2,
-                8: 2,  # summer
-                9: 3,
-                10: 3,
-                11: 3,  # autumn
-            }
+        interval_s = getattr(self, "interval_s", 3600)
+        return build_features(
+            weather, self.latitude, self.longitude, self.pv_params, interval_s
         )
-        df["week_nr"] = df.index.isocalendar().week
-        df["time"] = pd.to_datetime(df.index)
-        # df["cos_angle_of_inc"] = df.apply(lambda x: self.calc_cos_sun_angle(x["time"]), axis=1)
-        df.drop("time", axis=1, inplace=True)
-        return df
 
     def create_physics_based_constraints(
         self,
@@ -433,27 +360,33 @@ class SolarPredictor(DaBase):
 
             outlier_mask.loc[hour_data.index] = combined_outliers
 
-        # 2. Seasonal context outlier detection
+        # 2. Seasonal context outlier detection. "season" is not a stored
+        # feature since build_features() (day_of_week is deliberately gone
+        # too); derived here from the calendar month instead, local to this
+        # grouping rather than carried through the whole pipeline.
         seasonal_outlier_mask = pd.Series(False, index=merged_data.index)
         clean_data = merged_data[~outlier_mask]
+        season_of = clean_data.index.month.map(
+            {12: 0, 1: 0, 2: 0, 3: 1, 4: 1, 5: 1, 6: 2, 7: 2, 8: 2, 9: 3, 10: 3, 11: 3}
+        )
 
-        for season in clean_data["season"].unique():
+        for season in season_of.unique():
             for hour in range(6, 20):  # Daylight hours only
-                mask = (clean_data["season"] == season) & (clean_data["hour"] == hour)
+                mask = (season_of == season) & (clean_data["hour"] == hour)
                 season_hour_data = clean_data[mask]
 
                 if len(season_hour_data) < 20:
                     continue
 
-                if season_hour_data["irradiance"].std() > 0:
+                if season_hour_data["ghi"].std() > 0:
                     irradiance_corr = season_hour_data["solar_kwh"].corr(
-                        season_hour_data["irradiance"]
+                        season_hour_data["ghi"]
                     )
 
                     if irradiance_corr > 0.5:
                         # Use direct irradiance vs solar production ratio for outlier detection
                         irradiance_ratio = season_hour_data["solar_kwh"] / (
-                            season_hour_data["irradiance"] + 1e-6
+                            season_hour_data["ghi"] + 1e-6
                         )
                         Q1 = irradiance_ratio.quantile(0.25)
                         Q3 = irradiance_ratio.quantile(0.75)
@@ -487,19 +420,23 @@ class SolarPredictor(DaBase):
         test_size: float = 0.2,
         remove_outliers: bool = True,
         tune_hyperparameters: bool = True,
+        training_source: str = "observations",
     ) -> Dict[str, Any]:
         """
         Train the solar prediction model.
 
         Args:
             weather_data: Path to weather CSV or DataFrame with columns:
-                         ['datetime', 'temperature', 'irradiance','windvelocity']
+                         ['datetime', 'ghi', 'dni', 'dhi', 'temp', 'wind'] (pv layout)
             solar_data: Path to solar CSV or DataFrame with columns:
                        ['datetime', 'solar_kwh']
             model_save_path: Path where to save the trained model
             test_size: Fraction of data to use for testing
             remove_outliers: Whether to apply outlier detection
             tune_hyperparameters: Whether to perform hyperparameter tuning
+            training_source: "archive" or "observations" -- which weather
+                source training_weather() picked; recorded in the model's
+                metadata sidecar so a later mismatch is visible, not guessed at.
 
         Returns:
             Dictionary with training statistics
@@ -523,11 +460,20 @@ class SolarPredictor(DaBase):
         if solar_df.index.tz is None:
             solar_df.index = solar_df.index.tz_localize("UTC", ambiguous="NaT")
 
-        weather_features = weather_features.dropna()
+        # Only on the columns a row genuinely needs. dni and dhi are NaN
+        # for every row the observation branch produces (and for every
+        # Meteoserver or KNMI row), and XGBoost is fed them as missing on
+        # purpose -- dropping those rows dropped the entire training set.
+        from dao.forecast.pv.ml import REQUIRED_FEATURES
+
+        required = [
+            column for column in REQUIRED_FEATURES if column in weather_features.columns
+        ]
+        weather_features = weather_features.dropna(subset=required)
         solar_df = solar_df.dropna()
 
         merged_data = weather_features.join(solar_df, how="inner")
-        merged_data = merged_data.dropna()
+        merged_data = merged_data.dropna(subset=[*required, "solar_kwh"])
 
         # drop when irradiance=0 and solar_kwh=0
         # merged_data.query('irradiance > 0 or solar_kwh > 0', inplace=True)
@@ -547,8 +493,8 @@ class SolarPredictor(DaBase):
         X = merged_data[self.feature_columns].copy()
         y = merged_data["solar_kwh"].copy()
 
-        # Remove any remaining NaN values
-        mask = ~(X.isnull().any(axis=1) | y.isnull())
+        # Remove any remaining NaN values, again only where one matters.
+        mask = ~(X[required].isnull().any(axis=1) | y.isnull())
         X = X[mask]
         y = y[mask]
 
@@ -575,10 +521,15 @@ class SolarPredictor(DaBase):
             param_grid = _xgboost_cfg.param_grid or param_grid
             logging.info(f"Parameter grid: {param_grid}")
 
-            # Use subset for faster grid search
+            # Use a subset for faster grid search: the most recent rows,
+            # not the oldest -- a household's production characteristics
+            # (panel soiling, a tree that grew in, an added string) drift
+            # over a multi-year training window, so hyperparameters tuned
+            # on what is closest to what the model will actually predict
+            # generalise better than ones tuned on the oldest data.
             subset_size = min(5000, len(X_train))
-            X_train_subset = X_train.iloc[:subset_size]
-            y_train_subset = y_train.iloc[:subset_size]
+            X_train_subset = X_train.iloc[-subset_size:]
+            y_train_subset = y_train.iloc[-subset_size:]
 
             # TimeSeriesSplit, not a plain cv=3 (KFold): with an integer cv,
             # sklearn folds are contiguous but not time-ordered relative to
@@ -678,6 +629,7 @@ class SolarPredictor(DaBase):
                     "feature_columns": self.feature_columns,
                     "trained_at": dt.datetime.now().isoformat(),
                     "xgboost_version": xgboost.__version__,
+                    "training_weather": training_source,
                 },
                 f,
                 indent=2,
@@ -704,9 +656,8 @@ class SolarPredictor(DaBase):
         Make predictions using the trained model.
 
         Args:
-            weather_data: Either a dictionary with single prediction data or DataFrame with multiple predictions
-                        For single prediction (dict), required keys: temperature, irradiance, windvelocity, datetime
-                        For batch prediction (DataFrame), required columns: temperature, irradiance, windvelocity, datetime
+            weather_data: Either a dictionary with single prediction data or DataFrame with multiple predictions,
+                        both in pv layout (ghi, dni, dhi, temp, wind) plus a 'datetime' key/column.
 
         Returns:
             Predicted solar production in kWh
@@ -853,221 +804,41 @@ class SolarPredictor(DaBase):
         os.remove(filename)
         return
 
-    def get_and_save_knmi_data(
-        self, start: dt.datetime, end: dt.datetime, variables: list = ["FH", "T", "Q"]
-    ):
-        """
-        haalt data op en bewaart ze in dao-db
-        :param start: datetime
-        :param end: datetime
-        :return: None
-        """
-        knmi_df = knmi.get_hour_data_dataframe(
-            [self.knmi_station],
-            start=start - dt.timedelta(days=1),
-            end=end,
-            variables=variables,
-        )
-        if len(knmi_df) == 0:
-            logging.info(
-                f"Er zijn geen aanvullende knmi-data beschikbaar vanaf {start}-{end}"
-            )
-            return
-
-        knmi_df["utc"] = knmi_df.index
-        knmi_eerste = pd.to_datetime(knmi_df["utc"].iloc[0]).tz_localize(self.time_zone)
-        knmi_laatste = pd.to_datetime(knmi_df["utc"].iloc[-1]).tz_localize(
-            self.time_zone
-        )
-        logging.info(
-            f"Er zijn data van het KNMI binnengekomen vanaf {knmi_eerste} tot en met "
-            f"{knmi_laatste}"
-        )
-        knmi_df = knmi_df.rename(columns={"T": "temp", "Q": "gr", "FH": "winds"})
-        knmi_df["utc"] = pd.to_datetime(
-            knmi_df["utc"], utc=True
-        )  # , format='%Y-%m-%d %H:%M:%S')
-        # See import_weatherdata for why this collects into a plain list
-        # instead of appending to the DataFrame row by row.
-        has_temp = "temp" in knmi_df.columns
-        has_gr = "gr" in knmi_df.columns
-        has_winds = "winds" in knmi_df.columns
-        records = []
-        for row in knmi_df.itertuples():
-            utc = int(row.utc.timestamp())
-            if has_temp:
-                records.append((utc, "temp", row.temp / 10))
-            if has_gr:
-                records.append((utc, "gr", row.gr))
-            if has_winds:
-                records.append((utc, "winds", row.winds / 10))
-        save_df = pd.DataFrame(records, columns=["time", "code", "value"])
-        self.db_da.savedata(save_df, tablename="values")
-        return None
-
-    def import_knmi_df(self, start: dt.datetime, end: dt.datetime):
-        """
-        haalt data op bij knmi en slaat deze op in dao-database
-        :param start: begin-datum waarvan data aanwezig moeten zijn
-        :param end: datum tot data aanwezig meten zijn
-        :return:
-        """
-        """
-        # import and delete meteo-files
-        meteo_files = []
-        map = "../data/prediction/meteo/"
-        for f in os.listdir(map):
-            if not f ==".keep" and os.path.isfile(map+f):
-                meteo_files.append(map+f)
-        for meteo_file in meteo_files:
-            self.import_weatherdata(meteo_file)
-        """
-        # get dataframe with knmi-py
-        # datetime of latest data-reord
-        logging.info(
-            f"KNMI-weerstation: {self.knmi_station} {knmi.stations[int(self.knmi_station)].name}"
-        )
-
-        latest_wind_dt = self.db_da.get_time_border_record("winds", latest=True)
-        latest_dt = self.db_da.get_time_border_record("gr", latest=True)
-        if latest_wind_dt is None and latest_dt is not None:
-            logging.info("Er zijn nog geen winddata van knmi aanwezig")
-            self.get_and_save_knmi_data(start, latest_dt, ["FH"])
-        else:
-            if (
-                latest_dt is not None
-                and latest_wind_dt is not None
-                and latest_wind_dt < latest_dt
-            ):
-                self.get_and_save_knmi_data(latest_wind_dt, latest_dt, ["FH"])
-
-        first_dt = self.db_da.get_time_border_record("gr", latest=False)
-        latest_dt = self.db_da.get_time_border_record("gr", latest=True)
-        if latest_dt is None:  # er zijn nog geen data
-            logging.info(f"Er zijn nog geen knmi-data aanwezig")
-            self.get_and_save_knmi_data(start, end)
-            first_dt = self.db_da.get_time_border_record("gr", latest=False)
-            latest_dt = self.db_da.get_time_border_record("gr", latest=True)
-        else:
-            logging.info(f"Er zijn knmi-data aanwezig vanaf {first_dt} tot {latest_dt}")
-        if first_dt <= start and latest_dt >= end:
-            logging.info(f"Er worden geen knmi-data opgehaald")
-            return None
-        if first_dt > start:
-            self.get_and_save_knmi_data(start, first_dt)
-        if latest_dt < end:
-            self.get_and_save_knmi_data(latest_dt, end)
-        return None
-
-    def get_weatherdata(
-        self,
-        start: dt.datetime,
-        _end: dt.datetime | None = None,
-        prognose: bool = False,
-    ) -> pd.DataFrame:
-        """
-        vult database aan met ontbrekende data
-        load ned_nl_data from dao-database
-        :param start: begindatum laden vanaf
-        :param end: einddatum if None: tot gisteren 00:00
-        :param prognose: boolean, False: meetdata ophalen
-            True: prognoses ophalen
-        :return: dataframe with weatherdata
-        """
-        # haal ontbrekende data op bij knmi
-
-        if _end is None:
-            end = dt.datetime.now()
-        else:
-            end = _end
-        if not prognose:
-            # knmi data evt aanvullen
-            self.import_knmi_df(start, end)
-
-        start = dt.datetime(start.year, start.month, start.day, start.hour)
-        # get weather-dataframe from database
-        fields = ("gr", "temp", "winds")
-        weather_data = pd.DataFrame(columns=["utc", *fields])
-        for weather_item in fields:
-            if prognose:
-                table_name = "prognoses"
-            else:
-                latest_dt = self.db_da.get_time_border_record(weather_item, latest=True)
-                if latest_dt < end and _end is not None:
-                    table_name = "prognoses"
-                    logging.warning(
-                        f"Er zijn geen meetdata van {weather_item} op "
-                        f"{start.strftime('%Y-%m_%d')}"
-                    )
-                else:
-                    table_name = "values"
-            df_item = self.db_da.get_column_data(
-                table_name, weather_item, start=start, end=end
-            )
-            # Join on the timestamp, never on row position. The three series
-            # are fetched independently and do not have to be equally long:
-            # winds was added later than gr and temp and is backfilled by a
-            # separate path, so one missing hour used to shift an entire
-            # column against the others without any visible error.
-            part = df_item[["utc", "value"]].rename(columns={"value": weather_item})
-            part = part.dropna(subset=["utc"]).drop_duplicates(subset=["utc"])
-            if len(weather_data) == 0:
-                weather_data = part
-            else:
-                weather_data = weather_data.merge(part, on="utc", how="outer")
-        weather_data = weather_data.sort_values("utc").reset_index(drop=True)
-        missing = int(weather_data[list(fields)].isna().any(axis=1).sum())
-        if missing:
-            logging.warning(
-                f"Weerdata: {missing} van {len(weather_data)} uren missen een of "
-                f"meer velden en worden overgeslagen"
-            )
-        weather_data["utc"] = pd.to_datetime(weather_data["utc"], unit="s", utc=True)
-        weather_data = weather_data.set_index(weather_data["utc"])
-        weather_data = weather_data.rename(
-            columns={
-                "utc": "datetime",
-                "gr": "irradiance",
-                "temp": "temperature",
-                "winds": "windvelocity",
-            }
-        )
-        return weather_data
-
     def get_solar_data(self, start: dt.datetime, entities: list) -> pd.DataFrame:
         """
-        haalt solardata op uit HA database
+        haalt gemeten pv-productie op via de centrale HistoryReader, met
+        dezelfde uurresolutie en kolommen (datetime, solar_kwh) als voorheen
         :param start: begindatum
         :param entities: list van sensoren van ha
         :return:
         """
-        from dao.prog.da_report import Report
+        from zoneinfo import ZoneInfo
 
-        report = Report()
-        tot = dt.datetime.now()
-        count = 0
-        df_solar = pd.DataFrame()
-        for sensor in entities:
-            df_sensor = report.get_sensor_data(
-                sensor, col_name="solar_kwh", vanaf=start, tot=tot, agg="uur"
-            )
-            if count == 0:
-                df_solar = df_sensor
-            else:
-                df_sensor["overlap"] = df_sensor["tijd"].isin(df_solar["tijd"])
-                df_sensor_overlap = df_sensor[df_sensor["overlap"] == True]
-                report.add_col_df(df_sensor_overlap, df_solar, "solar_kwh")
-                df_sensor_new = df_sensor[df_sensor["overlap"] == False]
-                df_solar = pd.concat([df_solar, df_sensor_new])
-            count += 1
-        df_solar["utc"] = pd.to_datetime(df_solar["utc"], unit="s", utc=True)
-        df_solar = df_solar.set_index(df_solar["utc"])
-        df_solar = df_solar.rename(columns={"utc": "datetime"})
-        return df_solar
+        from dao.forecast.history import HistoryReader
 
-    def train_solar_option(
-        self, weather_data: pd.DataFrame, solar_option: SolarConfig, start: dt.datetime
-    ):
+        tz = ZoneInfo(self.time_zone)
+        now = dt.datetime.now(tz=tz)
+        start_aware = start if start.tzinfo is not None else start.replace(tzinfo=tz)
+        cap = 1.2 * self.solar_capacity if self.solar_capacity else None
+
+        reader = HistoryReader(self.db_ha, self.time_zone)
+        series = reader.read_energy(list(entities), start_aware, now, cap_kwh=cap)
+        frame = series.to_frame(name="solar_kwh")
+        frame.index.name = "datetime"
+        return frame.reset_index()
+
+    def train_solar_option(self, solar_option: SolarConfig, start: dt.datetime):
+        """Fetch training weather and measured production for one
+        installation, and train its model.
+
+        The weather source (archived forecasts once there is enough of
+        them, measured observations otherwise) is picked by
+        training_weather() and recorded in the model's metadata sidecar.
+        """
+        from zoneinfo import ZoneInfo
+
+        from dao.forecast.pv.ml import training_weather
+
         self.solar_name = solar_option.name.replace(" ", "_").replace("-", "_")
         self.tilt = solar_option.effective_tilt
         self.azimut = solar_option.effective_orientation + 180
@@ -1081,33 +852,68 @@ class SolarPredictor(DaBase):
                 f"No entities configured in your solar-option of {self.solar_name}"
             )
         self.create_physics_based_constraints(self.solar_capacity)
+        self.pv_params, _source = self.pv_service().params_for(solar_option)
+
+        tz = ZoneInfo(self.time_zone)
+        start_aware = start if start.tzinfo is not None else start.replace(tzinfo=tz)
+        now = dt.datetime.now(tz=tz)
+        weather_data, training_source = training_weather(
+            self.db_da, start_aware, now, self.time_zone
+        )
+
         solar_data = self.get_solar_data(start=start, entities=self.solar_entities)
         self.train(
             weather_data,
             solar_data,
             "../data/prediction/models/" + self.solar_name + ".json",
             tune_hyperparameters=True,
+            training_source=training_source,
         )
 
     def run_train(self, start: dt.datetime = None):
         """
         traint alle gedefinieerde ml-objecten
-        :param start: optionele begindatum om te trainen, anders een jaar geleden
+        :param start: optionele begindatum om te trainen, anders drie jaar geleden
         :return:
         """
         if start is None:
             now = dt.datetime.now()
             start = dt.datetime(year=now.year - 3, month=now.month, day=now.day)
-        weather_data = self.get_weatherdata(start=start)
         solar_options = self.config.solar
         for solar_option in solar_options:
-            if solar_option.ml_prediction:
-                self.train_solar_option(weather_data, solar_option, start)
+            if solar_option.model in ("ml", "auto") and solar_option.entities_sensors:
+                self.train_solar_option(solar_option, start)
         batteries = self.config.battery
         for battery in batteries:
             for solar_option in battery.solar:
-                if solar_option.ml_prediction:
-                    self.train_solar_option(weather_data, solar_option, start)
+                if (
+                    solar_option.model in ("ml", "auto")
+                    and solar_option.entities_sensors
+                ):
+                    self.train_solar_option(solar_option, start)
+
+    def prepare_for(self, solar_option: SolarConfig) -> None:
+        """Load one installation's trained model and physical parameters.
+
+        Separate from :meth:`predict_solar_device` because the ``auto``
+        backtest needs the same model loaded but feeds it its own weather
+        window rather than the stored prognoses.
+
+        Raises ``FileNotFoundError`` when the installation has never been
+        trained, which is a normal state, not a fault: the caller decides
+        whether to fall back or to skip.
+        """
+        self.solar_name = solar_option.name.replace(" ", "_").replace("-", "_")
+        self.tilt = solar_option.effective_tilt
+        self.azimut = solar_option.effective_orientation + 180
+        self.solar_capacity = solar_option.total_capacity
+        file_name = "../data/prediction/models/" + self.solar_name + ".json"
+        if not os.path.isfile(file_name):
+            raise FileNotFoundError(
+                f"Er is geen model aanwezig voor {self.solar_name},svp eerst trainen."
+            )
+        self.load_model(file_name)
+        self.pv_params, _source = self.pv_service().params_for(solar_option)
 
     def predict_solar_device(
         self, solar_option: SolarConfig, start: dt.datetime, end: dt.datetime
@@ -1119,57 +925,26 @@ class SolarPredictor(DaBase):
         :param end: eind-tijdstip voorspelling
         :return: dataframe met berekende voorspellingen per uur
         """
+        from zoneinfo import ZoneInfo
 
-        def check_prediction(prediction, irradiance):
-            if irradiance <= 0.0:
-                result = 0
-            else:
-                result = prediction
-            if result < 0.0:
-                result = 0
-            return result
+        from dao.forecast.pv.physical import weather_for_pv
 
-        self.solar_name = solar_option.name.replace(" ", "_").replace("-", "_")
-        self.tilt = solar_option.effective_tilt
-        self.azimut = solar_option.effective_orientation + 180
-        self.solar_capacity = solar_option.total_capacity
-        file_name = "../data/prediction/models/" + self.solar_name + ".json"
-        if os.path.isfile(file_name):
-            self.load_model(file_name)
-        else:
-            raise FileNotFoundError(
-                f"Er is geen model aanwezig voor {self.solar_name},svp eerst trainen."
-            )
-        latest_dt = self.db_da.get_time_border_record(
-            "gr", latest=True, table_name="prognoses"
+        self.prepare_for(solar_option)
+
+        tz = ZoneInfo(self.time_zone)
+        start_aware = start if start.tzinfo is not None else start.replace(tzinfo=tz)
+        end_aware = end if end.tzinfo is not None else end.replace(tzinfo=tz)
+        prog = self.db_da.get_prognose_fields(
+            ["gr", "dni", "dhi", "temp", "winds"],
+            int(start_aware.timestamp()),
+            int(end_aware.timestamp()),
+            self.interval,
         )
-        prognose = True  # latest_dt < end
-        weather_data = self.get_weatherdata(start, end, prognose=prognose)
+        weather_data = weather_for_pv(prog, self.time_zone)
         prediction = self.predict(weather_data)
-        weather_data.reset_index(inplace=True)
-        """
-        this check is excluded for using this method for windmils
-        prediction["irradiance"] = weather_data["irradiance"]
-        prediction["prediction"] = prediction.apply(
-            lambda x: check_prediction(x["prediction"], x["irradiance"]), axis=1
-        )
-        prediction.drop("irradiance", axis=1, inplace=True)
-        """
-        prediction["prediction"][prediction["prediction"] < 0] = 0
-        prediction["prediction"].round(3)
+        prediction["prediction"] = prediction["prediction"].clip(lower=0).round(3)
         logging.info(f"ML prediction {self.solar_name}\n{prediction}")
         return prediction
-
-    def test_solar_predictor(self, start, end):
-        solar_options = self.config.solar
-        for solar_option in solar_options:
-            if solar_option.ml_prediction:
-                self.predict_solar_device(solar_option, start, end)
-        batteries = self.config.battery
-        for battery in batteries:
-            for solar_option in battery.solar:
-                if solar_option.ml_prediction:
-                    self.predict_solar_device(solar_option, start, end)
 
 
 def main():
@@ -1179,19 +954,9 @@ def main():
         start_dt = dt.datetime.strptime(arg2, "%Y-%m-%d")
     else:
         start_dt = None
-    if len(sys.argv) > 3:
-        arg3 = sys.argv[3]
-        end_dt = dt.datetime.strptime(arg3, "%Y-%m-%d")
-    else:
-        end_dt = None
     solar_predictor = SolarPredictor("")
     if arg.lower() == "train":
         solar_predictor.run_train(start=start_dt)
-    if arg.lower() == "predict":
-        solar_predictor.test_solar_predictor(
-            start=start_dt,
-            end=end_dt,
-        )
 
 
 if __name__ == "__main__":

@@ -2,12 +2,10 @@ import datetime
 import re
 import sys
 import os
-import math
 import time
 import threading
 import warnings
 from dataclasses import dataclass
-import json
 from homeassistant_api import Client as HAClient
 from homeassistant_api.models import State as HAState
 from homeassistant_api.errors import InternalServerError, RequestTimeoutError
@@ -34,7 +32,6 @@ from dao.prog import tasks as task_registry
 from dao.lib.db_connections import make_db_da, make_db_ha
 from dao.lib.da_meteo import Meteo
 from dao.lib.da_prices import DaPrices
-from dao.prog.utils import interpolate
 
 # from db_manager import DBmanagerObj
 from typing import Optional, Union
@@ -79,6 +76,22 @@ _retry_ha_call = retry(
         )
     ),
 )
+
+
+def _parse_calendar_datetime(value, tz) -> datetime.datetime:
+    """A calendar event edge as a tz-aware datetime.
+
+    Home Assistant returns a timed event's edge as an ISO string directly
+    and an all-day event's as ``{"date": "YYYY-MM-DD"}``; both are handled
+    here rather than assuming the shape of the entity that happens to be
+    configured.
+    """
+    if isinstance(value, dict):
+        value = value.get("dateTime") or value.get("date")
+    moment = datetime.datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=tz)
+    return moment
 
 
 class NotificationHandler(Handler):
@@ -238,9 +251,17 @@ class DaBase:
             latitude=self.ha_context.latitude,
             longitude=self.ha_context.longitude,
             secrets=self.loader.secrets,
+            country=self.ha_context.country,
+            time_zone=self.time_zone,
         )
         if (self.ha_context.country == "NL") or (self.ha_context.country == "BE"):
-            self.knmi_station = self.meteo.which_station()
+            from dao.forecast.weather.observations import nearest_knmi_station
+
+            self.knmi_station = str(
+                nearest_knmi_station(
+                    self.ha_context.latitude, self.ha_context.longitude
+                )
+            )
         self.solar = self.config.solar
         self.interval = self.config.interval
         self.interval_s = 3600 if self.interval == "1hour" else 900
@@ -307,6 +328,38 @@ class DaBase:
     @_retry_ha_call
     def get_state(self, entity_id: str) -> HAState:
         return self._ha_client.get_state(entity_id=entity_id)
+
+    @_retry_ha_call
+    def get_calendar_events(
+        self, entity_id: str, start: datetime.datetime, end: datetime.datetime
+    ) -> list:
+        """Events on ``entity_id`` in ``[start, end]``, via the raw calendar API.
+
+        ``homeassistant_api`` has no calendar support of its own; the
+        underlying client's generic ``request()`` reaches the same
+        ``GET /api/calendars/<entity_id>`` endpoint the frontend uses.
+        """
+        from dao.forecast.baseload.absence import CalendarEvent
+
+        payload = self._ha_client.request(
+            f"calendars/{entity_id}",
+            params={"start": start.isoformat(), "end": end.isoformat()},
+        )
+        events = []
+        for item in payload or []:
+            try:
+                events.append(
+                    CalendarEvent(
+                        start=_parse_calendar_datetime(item.get("start"), start.tzinfo),
+                        end=_parse_calendar_datetime(item.get("end"), start.tzinfo),
+                        summary=item.get("summary") or "",
+                    )
+                )
+            except (TypeError, ValueError) as ex:
+                logging.warning(
+                    f"Kalenderevent van {entity_id} overgeslagen: {ex}"
+                )
+        return events
 
     @_retry_ha_call
     def call_service(self, service: str, entity_id: str, **kwargs) -> tuple:
@@ -636,69 +689,6 @@ class DaBase:
                 logging.warning(f"Prognose-archief niet bijgewerkt: {ex}")
         return
 
-    @staticmethod
-    def get_calculated_baseload(weekday: int) -> list:
-        """
-        Haalt de berekende baseload op voor de weekdag.
-
-        Leest zowel het oude formaat (een kale lijst van 24 getallen) als het
-        nieuwe (een dict met daarin het profiel en het aantal metingen per
-        uur). Waarschuwt als het profiel oud is: een verouderd profiel is
-        lastig te herkennen aan de uitkomst, maar kost wel geld.
-
-        :param weekday: : 0 = maandag, 6 zondag
-        :return: een lijst van 24 waarden voor de betreffende dag
-        """
-        from dao.prog.baseload import profile_age_days, profile_from_file
-
-        in_file = "../data/baseload/baseload_" + str(weekday) + ".json"
-        with open(in_file, "r") as f:
-            payload = json.load(f)
-        result = profile_from_file(payload)
-        age = profile_age_days(payload)
-        if age is not None and age > 14:
-            logging.warning(
-                f"Het baseload-profiel is {age:.0f} dagen oud. Plan de taak "
-                f"'calc_baseloads' in zodat het profiel je huidige verbruik volgt."
-            )
-        return result
-
-    def calc_prod_solar(
-        self, solar_opt: dict, act_time: int, act_gr: float, hour_fraction: float
-    ):
-        """
-        berekent de productie van een string
-        :param solar_opt: dict met alle instellingen van de string
-        :param act_time: timestamp in utc seconden van het moment
-        :param act_gr: de globale straling
-        :param hour_fraction: de uurfractie
-        :return: de productie in kWh
-        """
-        if solar_opt.strings:
-            prod = 0
-            str_num = len(solar_opt.strings)
-            for str_s in range(str_num):
-                prod_str = (
-                    self.meteo.calc_solar_rad(
-                        solar_opt.strings[str_s],
-                        act_time,
-                        act_gr,
-                    )
-                    * solar_opt.strings[str_s].yield_factor
-                    * hour_fraction
-                )
-                prod += prod_str
-        else:
-            prod = (
-                self.meteo.calc_solar_rad(solar_opt, act_time, act_gr)
-                * solar_opt.yield_factor
-                * hour_fraction
-            )
-        max_power = solar_opt.max_power
-        if max_power is not None:
-            prod = min(prod, max_power)
-        return prod
-
     def calc_da_avg(self) -> float:
         """
         calculates the average of the last '24' hour values of the day ahead prices
@@ -833,74 +823,88 @@ class DaBase:
         dacalc.debug = False
         dacalc.calc_optimum()
 
-    @staticmethod
-    def calc_baseloads():
+    def baseload_service(self):
+        from dao.forecast.baseload.service import BaseloadService
+
+        return BaseloadService(
+            self.config,
+            self.db_da,
+            self.db_ha,
+            Path("../data/forecast/baseload"),
+            self.time_zone,
+            ha=self,
+            latitude=self.ha_context.latitude,
+            longitude=self.ha_context.longitude,
+        )
+
+    def pv_service(self):
+        from dao.forecast.pv.service import PVService
+
+        return PVService(
+            self.config,
+            self.db_da,
+            self.db_ha,
+            self.ha_context.latitude,
+            self.ha_context.longitude,
+            Path("../data/forecast/pv"),
+            self.time_zone,
+            self.interval,
+        )
+
+    def calc_baseloads(self):
         from da_report import Report
 
-        report = Report()
-        report.calc_save_baseloads()
-
-    #: Which forecast is compared against which realised series.
-    #: (forecast code, realised table, realised code, unit, label)
-    ACCURACY_PAIRS = (
-        ("hload", "values", "m_house", "kWh", "Huisvraag"),
-        ("pv_ac", "values", "m_pv", "kWh", "PV productie"),
-        ("gr", "values", "gr", "J/cm2", "Globale straling"),
-        ("temp", "values", "temp", "°C", "Temperatuur"),
-    )
+        Report(self.file_name).check_baseload_sensors()
+        self.baseload_service().fit()
 
     def forecast_accuracy(self, days: int = 30):
         """Report how far the forecasts were off, and prune the archive.
 
         This is the loop that was missing: DAO wrote forecasts and it wrote
-        measurements, but never subtracted the two. Without it there is no way
-        to tell whether the consumption forecast is 5 percent or 40 percent
-        off, and therefore no way to tell whether any change to it helped.
+        measurements, but never subtracted the two. Without it there is no
+        way to tell whether the consumption forecast is 5 percent or 40
+        percent off, and therefore no way to tell whether any change to it
+        helped.
 
-        All aggregation happens in the database, so only a handful of summary
-        rows ever reach Python. That keeps the nightly job light enough for a
-        Home Assistant Yellow.
+        The report covers every archived component over a short and a long
+        window, is logged as tables, and is written to
+        ``../data/forecast/accuracy.json`` for the dashboard.
         """
-        now = datetime.datetime.now()
-        end_ts = int(now.timestamp())
-        start_ts = int((now - datetime.timedelta(days=days)).timestamp())
+        from pathlib import Path as _Path
+
+        from dao.forecast.baseload.store import write_json
+        from dao.forecast.evaluate import archive_accuracy
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        windows = tuple(sorted({7, days}))
         logging.info(
-            f"Prognosefout over de laatste {days} dagen "
-            f"({datetime.datetime.fromtimestamp(start_ts).strftime('%Y-%m-%d')} "
-            f"t/m {now.strftime('%Y-%m-%d')})"
+            f"Prognosefout over de laatste {', '.join(str(w) for w in windows)} dagen"
+        )
+
+        report = archive_accuracy(
+            self.config, self.db_da, self.db_ha, self.time_zone, days=windows, now=now
         )
 
         any_data = False
-        for code, table, realised, unit, label in self.ACCURACY_PAIRS:
-            try:
-                rows = self.db_da.forecast_accuracy(
-                    code, table, realised, start_ts, end_ts
-                )
-            except Exception as ex:
-                logging.debug(f"Prognosefout {code} niet te bepalen: {ex}")
-                continue
-            if not rows:
+        for component, accuracy in report.components.items():
+            for window_days, window in accuracy.windows.items():
+                if not window["pairs"]:
+                    continue
+                any_data = True
                 logging.info(
-                    f"  {label:<18} geen gepaarde waarnemingen; "
-                    f"het archief moet zich nog vullen"
+                    f"  {component} ({accuracy.unit}), {window_days} dagen: "
+                    f"{window['pairs']} paren, {window['missing']} zonder meting"
                 )
-                continue
-            any_data = True
-            logging.info(f"  {label} ({unit})")
-            logging.info(
-                f"    {'vooruitblik':<14}{'n':>6}{'bias':>10}{'MAE':>10}"
-                f"{'RMSE':>10}{'rel. MAE':>10}"
-            )
-            for row in rows:
-                scale = row.get("scale") or 0.0
-                rel = (row["mae"] / scale * 100) if scale else float("nan")
                 logging.info(
-                    f"    {self._lead_label(row['lead_bucket']):<14}"
-                    f"{row['n']:>6.0f}{row['bias']:>10.3f}{row['mae']:>10.3f}"
-                    f"{math.sqrt(max(0.0, row['mse'])):>10.3f}{rel:>9.0f}%"
+                    f"    {'vooruitblik':<14}{'n':>6}{'bias':>10}{'MAE':>10}{'RMSE':>10}"
                 )
-
-        self._log_hour_bias(start_ts, end_ts)
+                for bucket in sorted(window["by_lead"]):
+                    score = window["by_lead"][bucket]
+                    logging.info(
+                        f"    {self._lead_label(bucket):<14}{score.n:>6}"
+                        f"{score.bias:>10.3f}{score.mae:>10.3f}{score.rmse:>10.3f}"
+                    )
+                self._log_hour_bias(component, window)
 
         if not any_data:
             logging.info(
@@ -908,6 +912,11 @@ class DaBase:
                 "elke optimalisatie; zet de snelle regellaag minimaal in 'shadow' "
                 "zodat de gemeten huisvraag wordt vastgelegd."
             )
+
+        try:
+            write_json(_Path("../data/forecast/accuracy.json"), report.to_dict())
+        except Exception as ex:  # noqa: BLE001 - the log already has the tables
+            logging.warning(f"accuracy.json niet geschreven: {ex}")
 
         keep_days = max(days, self.history_options.forecast_days)
         try:
@@ -924,37 +933,33 @@ class DaBase:
         labels = {0: "< 1 uur", 1: "1-4 uur", 4: "4-12 uur", 12: "12-24 uur"}
         return labels.get(bucket, f">= {bucket} uur")
 
-    def _log_hour_bias(self, start_ts: int, end_ts: int) -> None:
-        """The actionable table: is the forecast structurally off at some hour?"""
-        try:
-            rows = self.db_da.forecast_bias_by_hour(
-                "hload", "values", "m_house", start_ts, end_ts
-            )
-        except Exception as ex:
-            logging.debug(f"Bias per uur niet te bepalen: {ex}")
+    @staticmethod
+    def _log_hour_bias(component: str, window: dict) -> None:
+        """The actionable table: is this component structurally off at some hour?"""
+        by_hour = window.get("by_hour") or {}
+        if not by_hour:
             return
-        if not rows:
-            return
-        logging.info("  Huisvraag: afwijking per uur van de dag (prognose - gemeten)")
         logging.info(
-            f"    {'uur':<8}{'n':>5}{'gemeten':>10}{'bias':>10}{'MAE':>10}  verloop"
+            f"    {component}: afwijking per uur van de dag (prognose - gemeten)"
         )
-        worst = max(rows, key=lambda r: abs(r["bias"] or 0.0))
-        for row in rows:
-            bias = row["bias"] or 0.0
-            bar = ("+" if bias > 0 else "-") * min(20, int(abs(bias) * 20))
+        worst_hour = max(by_hour, key=lambda hour: abs(by_hour[hour].bias))
+        for hour in sorted(by_hour):
+            score = by_hour[hour]
+            bar = ("+" if score.bias > 0 else "-") * min(20, int(abs(score.bias) * 20))
             logging.info(
-                f"    {row['uur']:<8}{row['n']:>5.0f}{row['realised']:>10.3f}"
-                f"{bias:>10.3f}{row['mae']:>10.3f}  {bar}"
+                f"      {hour:02d}:00{score.n:>6}{score.bias:>10.3f}"
+                f"{score.mae:>10.3f}  {bar}"
             )
-        if abs(worst["bias"] or 0.0) > 0.1:
-            direction = "te hoog" if worst["bias"] > 0 else "te laag"
+        worst = by_hour[worst_hour]
+        if abs(worst.bias) > 0.1:
+            direction = "te hoog" if worst.bias > 0 else "te laag"
             logging.warning(
-                f"De huisvraag wordt rond {worst['uur']} structureel {direction} "
-                f"ingeschat ({worst['bias']:+.3f} kWh per interval). Daardoor "
+                f"{component} wordt rond {worst_hour:02d}:00 structureel "
+                f"{direction} ingeschat ({worst.bias:+.3f} per interval). Daardoor "
                 f"reserveert de optimalisatie de verkeerde hoeveelheid energie; "
                 f"de snelle regellaag kan dat achteraf niet repareren."
             )
+
 
     def fast_control_simulate(self):
         """Backtest the fast control layer on the recorded history.
@@ -987,7 +992,6 @@ class DaBase:
         vanaf: datetime.datetime,
         tot: datetime.datetime,
         interval: str = None,
-        _ml_prediction: bool = None,
     ) -> pd.DataFrame:
         """
         berekent de solar production
@@ -995,98 +999,22 @@ class DaBase:
         :param vanaf: datetime start
         :param tot: datetime tot
         :param interval: 15"min of 1 hour of None, als None wordt self.interval genomen
-        :param _ml_prediction: boolean default None(= from config)
-        :return:
+        :return: dataframe met kolommen tijd en prediction
+
+        Welk model dat doet (fysisch of ML) bepaalt de PV-service zelf uit
+        de opgeslagen keuze; de terugval naar het fysische model zit daar
+        ook, zodat elke aanroeper dezelfde kolommen terugkrijgt.
         """
-        from dao.prog.solar_predictor import SolarPredictor
+        return self.pv_service().forecast(
+            solar_option, vanaf, tot, interval or self.interval
+        )
 
-        if _ml_prediction is None:
-            ml_prediction = solar_option.ml_prediction
-        else:
-            ml_prediction = _ml_prediction
-        if interval is None:
-            interval = self.interval
-            interval_s = self.interval_s
-        else:
-            interval_s = 900 if interval == "15min" else 3600
-        solar_name = solar_option.name.replace(" ", "_").replace("-", "_")
-        if ml_prediction:
-            solar_predictor = SolarPredictor()
-            try:
-                solar_prog = solar_predictor.predict_solar_device(
-                    solar_option, vanaf, tot
-                )
-                if len(solar_prog) < 2:
-                    raise ValueError(
-                        f"ML-model gaf {len(solar_prog)} voorspellingen terug"
-                    )
-                if solar_prog.isnull().any().any():
-                    logging.warning(
-                        f"NaN-waarden aangetroffen in voorspelling van {solar_name}"
-                        f"Deze zijn op '0' gezet"
-                    )
-                    solar_prog.fillna(0, inplace=True)
-            except FileNotFoundError as ex:
-                logging.warning(ex)
-                logging.info(
-                    f"Voor {solar_option.name} is geen model "
-                    f"en dus wordt DAO-predictor gebruikt"
-                )
-
-                result = self.calc_solar_predictions(
-                    solar_option, vanaf, tot, interval=interval, _ml_prediction=False
-                )
-                if _ml_prediction:
-                    result["prediction"] = pd.NA
-                return result
-            except Exception as ex:
-                # A stale model file (xgboost upgrade, changed feature set) or a
-                # gap in the weather data must not take the whole optimisation
-                # down; the physical DAO predictor is always available.
-                error_handling(ex)
-                logging.warning(
-                    f"ML-voorspelling voor {solar_option.name} mislukt ({ex}); "
-                    f"DAO-predictor wordt gebruikt"
-                )
-                return self.calc_solar_predictions(
-                    solar_option, vanaf, tot, interval=interval, _ml_prediction=False
-                )
-            solar_prog["tijd"] = pd.to_datetime(solar_prog["date_time"])
-            if interval == "15min":
-                solar_prog = interpolate(solar_prog, "prediction", quantity=True)
-            while (
-                len(solar_prog) > 0
-                and solar_prog["tijd"].iloc[0].tz_localize(None) < vanaf
-            ):
-                solar_prog = solar_prog.iloc[1:]
-        else:
-            start_ts = datetime.datetime(
-                year=vanaf.year, month=vanaf.month, day=vanaf.day, hour=vanaf.hour
-            ).timestamp()
-            prog_data = self.db_da.get_prognose_data(
-                start=start_ts, end=tot.timestamp(), interval=interval
-            )
-            prog_data.index = pd.to_datetime(prog_data["tijd"])
-            while len(prog_data) > 0 and prog_data.iloc[0]["tijd"] < vanaf:
-                prog_data = prog_data.iloc[1:]
-            rows = []
-            for row in prog_data.itertuples():
-                h_frac = interval_s / 3600
-                prod = self.calc_prod_solar(
-                    solar_option, row.time, row.glob_rad, h_frac
-                )
-                prod = round(prod, 3)
-                rows.append((row.tijd, prod))
-            solar_prog = pd.DataFrame(rows, columns=["tijd", "prediction"])
-        solar_prog.reset_index(drop=True, inplace=True)
-        return solar_prog
-
-    @staticmethod
-    def train_ml_predictions():
-        from dao.prog.solar_predictor import SolarPredictor
-
-        solar_predictor = SolarPredictor()
-        solar_predictor.run_train()
+    def train_ml_predictions(self):
+        # Calibrates the physical model for every installation and, for
+        # those configured for ml/auto, trains the ML model too -- in that
+        # order, since the ML model's own features include the physical
+        # model's (now current) output.
+        self.pv_service().run_training()
 
     def run_task_function(self, task, logfile: bool = True):
         """Run *task* in this process, logging it to its own file.

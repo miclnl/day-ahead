@@ -1,15 +1,13 @@
-"""Sun position timing and temperature-forecast edge cases in da_meteo.py.
+"""Temperature-forecast edge cases in da_meteo.py.
 
-get_dif_rad_factor() (the diffuse/max-theoretical component of solar_rad())
-evaluates the sun at the middle of the interval a radiation reading stands
-for; the direct component used to evaluate it at the interval's start
-instead, which zeroed the direct component in the first daylight interval of
-the day. get_avg_temperature() used to return None on empty data with no
-upper time bound, which crashed calc_graaddagen()'s '>= 16' comparison.
+Sun position and radiation-on-a-plane tests moved to
+dao/tests/forecast/test_pv_physical.py: that logic now lives in the pvlib
+chain, not in Meteo. get_avg_temperature() used to return None on empty data
+with no upper time bound, which crashed calc_graaddagen()'s '>= 16'
+comparison.
 """
 
 import datetime
-import math
 
 import pytest
 
@@ -17,54 +15,6 @@ pytest.importorskip("pandas")
 
 from dao.lib.db_manager import DBmanagerObj  # noqa: E402
 from dao.lib.da_meteo import Meteo  # noqa: E402
-
-
-class _FakeSunPosition(Meteo):
-    """A Meteo whose sun_position() records the instant it was asked for."""
-
-    def __init__(self, latitude, longitude, interval_s):
-        # Bypass Meteo.__init__ (needs a live config/db); only the attributes
-        # solar_rad()/get_dif_rad_factor() actually read are set here.
-        self.latitude = latitude
-        self.longitude = longitude
-        self.interval_s = interval_s
-        self.calls = []
-
-    def sun_position(self, utc_time):
-        self.calls.append(utc_time)
-        # A generous elevation so direct_radiation_factor is well-defined.
-        return {"h": math.radians(30), "A": 0.0}
-
-
-def test_direct_and_diffuse_components_are_evaluated_at_the_same_instant():
-    meteo = _FakeSunPosition(52.0, 5.0, interval_s=3600)
-    utc_time = 1_750_000_000  # start of the interval
-
-    meteo.solar_rad(utc_time, radiation=200.0, h_col=0.0, a_col=0.0)
-
-    # solar_rad() calls sun_position once directly and once through
-    # get_dif_rad_factor(); both must land on the same corrected instant.
-    assert len(meteo.calls) == 2
-    assert meteo.calls[0] == meteo.calls[1]
-    assert meteo.calls[0] == pytest.approx(utc_time + 1800)
-
-
-def test_the_offset_is_half_the_configured_interval_not_a_fixed_half_hour():
-    """A 15-minute interval's midpoint is 450s in, not 1800s: the earlier
-    hard-coded +1800 overshot past the interval into the next one."""
-    meteo = _FakeSunPosition(52.0, 5.0, interval_s=900)
-    utc_time = 1_750_000_000
-
-    meteo.solar_rad(utc_time, radiation=200.0, h_col=0.0, a_col=0.0)
-
-    assert meteo.calls[0] == pytest.approx(utc_time + 450)
-
-
-def test_low_or_zero_radiation_never_needs_the_sun_position():
-    meteo = _FakeSunPosition(52.0, 5.0, interval_s=3600)
-    assert meteo.solar_rad(0, radiation=0.0, h_col=0.0, a_col=0.0) == 0
-    assert meteo.solar_rad(0, radiation=3.0, h_col=0.0, a_col=0.0) == 3.0
-    assert meteo.calls == []
 
 
 # -- get_avg_temperature / calc_graaddagen -----------------------------------

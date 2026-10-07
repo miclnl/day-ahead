@@ -2,6 +2,79 @@
 # Day Ahead Optimizer
 # Unreleased
 
+# 2026.10.7
+
+## Nieuwe prognosemotor voor basislast, zon en weer
+Het voorspellen zat verspreid over `da_report.py`, `da_base.py`,
+`da_meteo.py`, `solar_predictor.py` en `day_ahead.py`, met lezen, schatten
+en gebruiken door elkaar. Dat is nu één pakket, `dao/forecast`, met per
+onderdeel een eigen module en een sluitende terugvalketen. De uitkomst van
+de optimalisatie verandert hierdoor, meestal ten goede: de schattingen
+waarop ze gebaseerd is zijn op een aantal punten aantoonbaar fout geweest.
+
+**Basislast.** Zeven weekdagprofielen uit de Home Assistant-statistieken,
+met feestdagen, uitschieterverwijdering en een gewicht dat recente weken
+zwaarder laat tellen. Een uur zonder meting is nu `NaN` en geen nul meer,
+dus een gat in de recorder trekt het profiel niet omlaag. Optioneel een
+XGBoost-model, en met `model: auto` kiest een backtest over de laatste 28
+dagen zelf welk van de twee beter voorspelt.
+
+**Afwezigheid.** Vakantiedagen worden uit het verbruik zelf herkend, zonder
+extra sensoren; `entity away`, een agenda en `entities presence` tellen mee
+als ze zijn ingesteld. Op een dag dat je 's middags vertrekt wordt vanaf dat
+uur met het afwezig-profiel gepland, niet vanaf middernacht.
+
+**Zon.** Een pvlib-model (zonpositie, Erbs, Perez, Faiman, PVWatts) dat
+zichzelf kalibreert op de gemeten productie van het afgelopen jaar. Het
+AC-plafond wordt nu op het vermogen toegepast vóór de integratie, dus ook
+in 15-minutenmodus klopt het. Daarnaast het bestaande ML-model, en weer een
+backtest die kiest.
+
+**Weer.** Meteoserver blijft primair; Open-Meteo vult aan bij uitval én bij
+uren die de primaire bron niet levert. KNMI-waarnemingen worden dagelijks
+opgehaald voor iedereen in NL en BE, en daarbuiten uit het Open-Meteo-
+archief.
+
+**Meetbaarheid.** De fout per component, vooruitblik, uur, weekdag, regime
+en weerbron staat in de log en op de nieuwe pagina *Accuracy*. Dit is de
+lus die ontbrak: DAO schreef prognoses en metingen, maar trok ze nooit van
+elkaar af.
+
+Instellingen die hierbij horen staan in `SETTINGS.md`. De configuratie gaat
+naar versie 3; `ml_prediction: true/false` per installatie wordt
+automatisch omgezet naar `model: ml` of `model: physical`.
+
+## Opgeloste fouten in die motor, gevonden bij de eindreview
+Allemaal paden die ongemerkt verkeerd gingen in plaats van een foutmelding
+te geven:
+
+- Een `calc_baseloads` zonder bruikbare historie (een opgeschoonde
+  recorder, een hernoemde entiteit, een meter die stopte) overschreef het
+  profiel met 24 nullen. Vanaf dat moment plande DAO een huis dat niets
+  verbruikt. Het bestaande profiel blijft nu staan, met uitleg in de log.
+- Een gat in de recorder liet het huishouden afwezig lijken, waarna de rest
+  van de dag drie tot vijf keer te laag werd ingeschat. Er wordt nu per uur
+  vergeleken, en een dag die voor minder dan 80% gemeten is levert geen
+  oordeel meer op.
+- Het ML-model voor zon kon nooit trainen: elke rij werd weggegooid omdat
+  de directe en diffuse straling ontbraken, wat bij waarnemingen altijd zo
+  is. `model: ml` bleef daardoor stilletjes het fysische model gebruiken.
+- Windsnelheid stond niet in het prognose-archief, waardoor de
+  zonnekalibratie op installaties zonder lokale waarnemingen op `NaN`
+  uitkwam en de hele taak afbrak.
+- `model: auto` vergeleek het fysische model met zichzelf, dus ML kon nooit
+  winnen, en het dashboard toonde twee uitkomsten van één berekening als
+  vergelijking.
+- Het zonrapport liep vast op beide dagen dat de klok verzet wordt.
+- De meteografiek stond op "vanaf nan" en had een klok in UTC.
+- Open-Meteo's temperatuur en wind stonden een uur te vroeg: dat zijn
+  momentwaarden, geen uurgemiddelden zoals de straling. Hetzelfde gold voor
+  de KNMI-temperatuur.
+- Een entiteit die niet meer bestaat brak de hele basislastberekening af in
+  plaats van alleen die groep onbekend te maken.
+- Een onbereikbare KNMI gooide de weerstatus en de grafiek weg van een
+  prognose die wél was opgehaald.
+
 ## Prognose-archief werkt nu ook op een bijgewerkte database
 Bij het opstarten verscheen op bestaande installaties:
 

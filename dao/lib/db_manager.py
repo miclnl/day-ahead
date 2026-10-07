@@ -31,6 +31,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    String,
     UniqueConstraint,
     bindparam,
     delete,
@@ -55,10 +56,17 @@ LEAD_BUCKETS = (0, 1, 4, 12, 24)
 #: Which forecasts are worth archiving.
 #:
 #: Deliberately short. These are the series whose error actually moves the
-#: plan: the net house demand, the PV production, and the two weather inputs
-#: they are derived from. Archiving every optimizer output would multiply the
-#: table for no analytical gain.
-ARCHIVED_FORECAST_CODES = frozenset({"hload", "pv_ac", "gr", "temp"})
+#: plan: the net house demand, the PV production (AC and DC), the baseload,
+#: and the weather inputs they are derived from. Archiving every optimizer
+#: output would multiply the table for no analytical gain.
+#:
+#: ``winds`` is the one entry nothing reports on. It is here because the
+#: physical PV model's cell temperature needs it, and an installation
+#: without local weather observations has only this archive to calibrate
+#: and backtest against -- without it every such run came out NaN.
+ARCHIVED_FORECAST_CODES = frozenset(
+    {"hload", "pv_ac", "pv_dc", "base", "gr", "dni", "dhi", "temp", "winds"}
+)
 
 
 def lead_bucket(lead_hours: float) -> int:
@@ -104,6 +112,7 @@ def forecasts_table(metadata: MetaData) -> Table:
         Column("lead_bucket", Integer, nullable=False),
         Column("issued_time", BigInteger, nullable=False),
         Column("value", Float),
+        Column("source", String(16), nullable=True),
         UniqueConstraint("variabel", "target_time", "lead_bucket"),
         sqlite_autoincrement=True,
         extend_existing=True,
@@ -447,6 +456,23 @@ class DBmanagerObj(object):
             index_elements=["variabel", "time"], set_={"value": statement.excluded.value}
         )
 
+    def save_daily_value(self, code: str, day: datetime.date, value: float) -> None:
+        """Upsert one value at the local midnight epoch of ``day``.
+
+        For once-a-day labels (``away``) that belong to a calendar date
+        rather than a measured hour.
+        """
+        midnight = datetime.datetime.combine(day, datetime.time.min, tzinfo=self.tzinfo)
+        self.savedata(
+            pd.DataFrame([{"code": code, "time": self.epoch(midnight), "value": value}])
+        )
+
+    def save_hourly_value(self, code: str, moment: datetime.datetime, value: float) -> None:
+        """Upsert one value at the epoch of ``moment``."""
+        self.savedata(
+            pd.DataFrame([{"code": code, "time": self.epoch(moment), "value": value}])
+        )
+
     def get_time_border_record(
         self, code: str, latest: bool = True, table_name: str = "values"
     ) -> datetime.datetime:
@@ -615,6 +641,86 @@ class DBmanagerObj(object):
                     )
             result_df["time"] = result_df["time"].astype("int64")
             return result_df[columns]
+
+    def forecast_rows(
+        self, codes, lead_buckets, start_ts: int, end_ts: int
+    ) -> pd.DataFrame:
+        """Archived forecasts for ``codes``/``lead_buckets`` in ``[start_ts, end_ts)``.
+
+        Columns: ``target_time``, ``code``, ``lead_bucket``, ``value``,
+        ``source``. Used to train the PV ML model on what a forecast at a
+        given lead time actually looked like, rather than on measurements
+        it will never be fed again at prediction time.
+        """
+        from sqlalchemy import Table, and_, select
+        from sqlalchemy.exc import NoSuchTableError
+
+        columns = ["target_time", "code", "lead_bucket", "value", "source"]
+        try:
+            forecasts = Table("forecasts", self.metadata, autoload_with=self.engine)
+            variabel = Table("variabel", self.metadata, autoload_with=self.engine)
+        except NoSuchTableError:
+            return pd.DataFrame(columns=columns)
+
+        query = select(
+            forecasts.c.target_time,
+            variabel.c.code,
+            forecasts.c.lead_bucket,
+            forecasts.c.value,
+            forecasts.c.source,
+        ).where(
+            and_(
+                forecasts.c.variabel == variabel.c.id,
+                variabel.c.code.in_(list(codes)),
+                forecasts.c.lead_bucket.in_(list(lead_buckets)),
+                forecasts.c.target_time >= int(start_ts),
+                forecasts.c.target_time < int(end_ts),
+            )
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(query).fetchall()
+        return pd.DataFrame(rows, columns=columns)
+
+    def get_prognose_fields(
+        self, codes, start, end=None, interval: str = "1hour"
+    ) -> pd.DataFrame:
+        """One column per code, outer-merged on "time".
+
+        Unlike :meth:`get_prognose_data`'s fixed temp/gr pair (an implicit
+        inner join: an hour missing either field drops out entirely), this
+        takes an arbitrary set of codes and keeps every hour any of them
+        has, leaving ``NaN`` for a code that has nothing to say about it --
+        dni/dhi from Meteoserver, say, which never reports them.
+        """
+        codes = list(codes)
+        merged = None
+        for code in codes:
+            field_df = self.get_prognose_field(code, start, end, interval)
+            if interval != "1hour":
+                if field_df is None or len(field_df) < 2:
+                    continue
+                field_df = interpolate(field_df, code, False).reset_index(drop=True)
+            if field_df is None or len(field_df) == 0:
+                continue
+            piece = field_df[["time", code]]
+            merged = piece if merged is None else merged.merge(
+                piece, on="time", how="outer"
+            )
+
+        if merged is None:
+            return pd.DataFrame(columns=["time", "tijd", *codes])
+
+        merged["time"] = merged["time"].astype("int64")
+        merged = merged.sort_values("time").reset_index(drop=True)
+        merged["tijd"] = (
+            pd.to_datetime(merged["time"], unit="s", utc=True)
+            .dt.tz_convert(self.tzinfo)
+            .dt.tz_localize(None)
+        )
+        for code in codes:
+            if code not in merged.columns:
+                merged[code] = float("nan")
+        return merged[["time", "tijd", *codes]]
 
     def get_column_data(
         self,
@@ -786,6 +892,34 @@ class DBmanagerObj(object):
                     self._variabel_cache[code] = ident
         return {c: self._variabel_cache[c] for c in codes if c in self._variabel_cache}
 
+    def ensure_forecasts_source_column(self) -> bool:
+        """Add the "source" column to an existing "forecasts" table.
+
+        A database whose table predates this column keeps working without
+        it (``save_forecasts``'s own default is ``None``), but reporting
+        accuracy per source needs it there. Plain ``ALTER TABLE ADD COLUMN``
+        for a nullable column with no default works unchanged on SQLite,
+        MySQL and PostgreSQL, so no dialect branch is needed here.
+        """
+        if not inspect(self.engine).has_table("forecasts"):
+            return False
+        columns = {c["name"] for c in inspect(self.engine).get_columns("forecasts")}
+        if "source" in columns:
+            return True
+        try:
+            with self.engine.begin() as connection:
+                connection.execute(
+                    text("ALTER TABLE forecasts ADD COLUMN source VARCHAR(16)")
+                )
+        except Exception as exception:  # noqa: BLE001 - best-effort migration
+            logging.warning(
+                f'Kolom "source" kon niet worden toegevoegd aan "forecasts" '
+                f"({exception})"
+            )
+            return False
+        logging.info('Kolom "source" toegevoegd aan tabel "forecasts".')
+        return True
+
     def ensure_forecasts_table(self) -> bool:
         """Create the forecast archive table if it is not there yet.
 
@@ -831,6 +965,7 @@ class DBmanagerObj(object):
         issued_ts: int,
         tablename: str = "forecasts",
         codes_filter=ARCHIVED_FORECAST_CODES,
+        source: str | None = None,
     ):
         """Archive forecast values with the lead time at which they were made.
 
@@ -838,7 +973,9 @@ class DBmanagerObj(object):
         target already lies in the past are dropped: a "forecast" for a moment
         that has been and gone carries no information about forecast skill.
         Codes outside ``codes_filter`` are ignored, which is what keeps the
-        table small; pass ``None`` to archive everything.
+        table small; pass ``None`` to archive everything. ``source`` names
+        which provider the values came from (``"meteoserver"``,
+        ``"openmeteo"``, ...), written the same for every row of this call.
 
         Written as two executemany statements inside one transaction, rather
         than the row-at-a-time select-then-update that :meth:`savedata` uses,
@@ -876,6 +1013,7 @@ class DBmanagerObj(object):
                 "lead_bucket": bucket,
                 "issued_time": int(issued_ts),
                 "value": value,
+                "source": source,
             }
             for target_time, code, value, bucket in prepared
             if code in ids
@@ -926,93 +1064,3 @@ class DBmanagerObj(object):
         with self.engine.begin() as connection:
             result = connection.execute(statement)
         return result.rowcount or 0
-
-    def _accuracy_query(
-        self, code: str, realised_table: str, realised_code: str, start_ts, end_ts
-    ):
-        """Join the archive to the realised series. Shared by the two reports."""
-        forecasts = Table("forecasts", self.metadata, autoload_with=self.engine)
-        realised = Table(realised_table, self.metadata, autoload_with=self.engine)
-        var_f = Table("variabel", self.metadata, autoload_with=self.engine).alias("vf")
-        var_r = Table("variabel", self.metadata, autoload_with=self.engine).alias("vr")
-        joined = (
-            forecasts.join(var_f, var_f.c.id == forecasts.c.variabel)
-            .join(realised, realised.c.time == forecasts.c.target_time)
-            .join(var_r, var_r.c.id == realised.c.variabel)
-        )
-        condition = and_(
-            var_f.c.code == code,
-            var_r.c.code == realised_code,
-            forecasts.c.target_time >= int(start_ts),
-            forecasts.c.target_time < int(end_ts),
-        )
-        error = forecasts.c.value - realised.c.value
-        return joined, condition, error, forecasts, realised
-
-    def forecast_accuracy(
-        self, code: str, realised_table: str, realised_code: str, start_ts, end_ts
-    ) -> list:
-        """Error statistics per lead time bucket, aggregated by the database.
-
-        Returns at most five rows, so nothing large ever reaches Python. That
-        matters on low powered hardware where the alternative -- pulling the
-        whole join into pandas -- would be the heaviest thing DAO does all day.
-        """
-        joined, condition, error, forecasts, realised = self._accuracy_query(
-            code, realised_table, realised_code, start_ts, end_ts
-        )
-        query = (
-            select(
-                forecasts.c.lead_bucket.label("lead_bucket"),
-                func.count().label("n"),
-                func.avg(func.abs(error)).label("mae"),
-                func.avg(error).label("bias"),
-                func.avg(error * error).label("mse"),
-                func.avg(func.abs(realised.c.value)).label("scale"),
-            )
-            .select_from(joined)
-            .where(condition)
-            .group_by(forecasts.c.lead_bucket)
-            .order_by(forecasts.c.lead_bucket)
-        )
-        with self.engine.connect() as connection:
-            rows = connection.execute(query).mappings().all()
-        return [dict(row) for row in rows]
-
-    def forecast_bias_by_hour(
-        self,
-        code: str,
-        realised_table: str,
-        realised_code: str,
-        start_ts,
-        end_ts,
-        bucket: int | None = None,
-    ) -> list:
-        """Mean error per hour of the local day. This is the actionable one.
-
-        A forecast that is consistently too low between 17:00 and 20:00 makes
-        the optimizer reserve too little energy for the evening peak, and no
-        amount of realtime correction can repair that afterwards.
-        """
-        joined, condition, error, forecasts, realised = self._accuracy_query(
-            code, realised_table, realised_code, start_ts, end_ts
-        )
-        if bucket is not None:
-            condition = and_(condition, forecasts.c.lead_bucket == bucket)
-        hour = self.hour(forecasts.c.target_time)
-        query = (
-            select(
-                hour.label("uur"),
-                func.count().label("n"),
-                func.avg(error).label("bias"),
-                func.avg(func.abs(error)).label("mae"),
-                func.avg(realised.c.value).label("realised"),
-            )
-            .select_from(joined)
-            .where(condition)
-            .group_by(hour)
-            .order_by(hour)
-        )
-        with self.engine.connect() as connection:
-            rows = connection.execute(query).mappings().all()
-        return [dict(row) for row in rows]

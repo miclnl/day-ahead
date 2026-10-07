@@ -194,7 +194,7 @@ def get_solar_items_with_ml():
     return {
         solar_option.name or "default": solar_option
         for solar_option in solar_options
-        if solar_option.ml_prediction
+        if solar_option.model in ("ml", "auto")
     }
 
 
@@ -649,6 +649,16 @@ def solar():
             for key in solar_items.keys()
         ]
     )
+
+
+@v2.route("/accuracy")
+def accuracy():
+    """How well the forecasts did, and which model is currently chosen.
+
+    All the data is fetched client-side from /v2/api/accuracy/, so a slow
+    or unavailable database cannot block the page itself from rendering.
+    """
+    return render_template("v2/accuracy.html")
 
 
 @v2.route("/reports-v2", methods=["GET"])

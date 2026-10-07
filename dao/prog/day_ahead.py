@@ -12,6 +12,7 @@ import tempfile
 import time
 import sys
 import math
+from zoneinfo import ZoneInfo
 import pandas as pd
 from contextlib import contextmanager
 from mip import Model, xsum, minimize, BINARY, CONTINUOUS, INTEGER
@@ -110,6 +111,54 @@ class DaCalc(DaBase):
             )
         self.machines = self.config.machines
         # self.start_logging()
+
+    def _baseload_for_horizon(
+        self, start_interval_dt: dt.datetime, intervals: int
+    ) -> list:
+        """The baseload the optimizer plans against, for its whole horizon.
+
+        Either the fitted profile service (``use_calc_baseload``) or the
+        static configuration, repeated and interpolated exactly as before.
+        Always returns exactly ``intervals`` values so the caller never has
+        to pad or truncate.
+        """
+        if self.use_calc_baseload:
+            logging.info("Zelf berekende baseload")
+            start_aware = start_interval_dt
+            if start_aware.tzinfo is None:
+                start_aware = start_aware.replace(tzinfo=ZoneInfo(self.time_zone))
+            return self.baseload_service().forecast_for_optimizer(
+                start_aware, intervals, self.interval
+            )
+
+        logging.info("Baseload uit instellingen")
+        base_cons = self.config.baseload
+        if intervals >= self.steps_day:
+            base_cons = base_cons + base_cons
+        if self.interval == "15min":
+            start = dt.datetime(
+                year=start_interval_dt.year,
+                month=start_interval_dt.month,
+                day=start_interval_dt.day,
+            )
+            base_tijd = [
+                start + datetime.timedelta(hours=i) for i in range(len(base_cons))
+            ]
+            base_cons_df = pd.DataFrame({"tijd": base_tijd, "base_cons": base_cons})
+            base_cons_df = interpolate(base_cons_df, "base_cons", quantity=True)
+            base_cons = base_cons_df["base_cons"].tolist()
+            first_interval_nr = start_interval_dt.hour * 4 + round(
+                start_interval_dt.minute / 15
+            )
+        else:
+            first_interval_nr = start_interval_dt.hour
+
+        b_l = base_cons[first_interval_nr:]
+        while len(b_l) > intervals:
+            b_l = b_l[:-1]
+        while len(b_l) < intervals:
+            b_l.append(b_l[-1])
+        return b_l
 
     def calc_optimum(
         self,
@@ -245,37 +294,23 @@ class DaCalc(DaBase):
             pl_avg.append(p_avg)
 
         # base load
-        if self.use_calc_baseload:
-            logging.info(f"Zelf berekende baseload")
-            weekday = dt.datetime.weekday(dt.datetime.now())
-            base_cons = self.get_calculated_baseload(weekday)
-            if U > self.steps_day:
-                # volgende dag ophalen
-                weekday += 1
-                weekday = weekday % 7
-                base_cons = base_cons + self.get_calculated_baseload(weekday)
-        else:
-            logging.info(f"Baseload uit instellingen")
-            base_cons = self.config.baseload
-            if U >= self.steps_day:
-                base_cons = base_cons + base_cons
-        if self.interval == "15min":
-            start = datetime.datetime(
-                year=start_dt.year, month=start_dt.month, day=start_dt.day
+        b_l = self._baseload_for_horizon(start_interval_dt, U)
+        if len(b_l) != U:
+            logging.error(
+                f"Baseload: verkeerd aantal waarden ({len(b_l)} in plaats van "
+                f"{U}), de berekening wordt afgebroken"
             )
-            base_tijd = [
-                start + datetime.timedelta(hours=i) for i in range(len(base_cons))
-            ]
-            base_cons_df = pd.DataFrame({"tijd": base_tijd, "base_cons": base_cons})
-            base_cons_df = interpolate(base_cons_df, "base_cons", quantity=True)
-            base_cons = base_cons_df["base_cons"].tolist()
+            return None
+        try:
+            self.baseload_service().record_presence()
+        except Exception as ex:
+            logging.warning(f"Aanwezigheid registreren mislukt: {ex}")
 
         # 0.015 kWh/J/cm² productie van mijn panelen per J/cm²
         solar_prod = []
         entity_pv_ac_switch = []
         max_solar_power = []
         pv_ac_varcode = []
-        solar_ml_prediction = []
         solar_num = len(self.solar)
         for s in range(solar_num):
             if s <= 9:
@@ -286,16 +321,6 @@ class DaCalc(DaBase):
                 entity = None
             entity_pv_ac_switch.append(entity)
             max_solar_power.append(self.solar[s].max_power)
-            prediction = self.solar[s].ml_prediction
-            solar_ml_prediction.append(prediction)
-        time_first_interval = prog_data["tijd"].iloc[0]
-        if self.interval == "1hour":
-            first_interval_nr = int(time_first_interval.hour)
-        else:
-            first_interval_nr = time_first_interval.hour * 4 + round(
-                time_first_interval.minute / 15
-            )
-        b_l = base_cons[first_interval_nr:]
         uur = []  # hulparray met uren
         tijd = []
         ts = []
@@ -410,10 +435,6 @@ class DaCalc(DaBase):
             pv_org_dc.append(pv_total)
             first_interval = False
 
-        while len(b_l) > len(uur):
-            b_l = b_l[:-1]
-        while len(b_l) < len(uur):
-            b_l.append(b_l[-1])
         try:
             if self.debug or self.log_level <= logging.DEBUG:
                 start_df = pd.DataFrame(

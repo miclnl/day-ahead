@@ -15,6 +15,7 @@ from ..models.pricing import PricingConfig
 from ..models.graphics import GraphicsConfig
 from ..models.notifications import NotificationsConfig
 from ..models.baseload import BaseloadOptionsConfig
+from ..models.weather import WeatherConfig
 from ..models.grid import GridConfig
 from ..models.fastcontrol import FastControlConfig
 from ..models.history import HistoryConfig
@@ -73,13 +74,16 @@ class ConfigurationV0(DAOConfigBaseModel):
     )
 
     # Meteoserver
-    meteoserver_key: SecretStr = Field(
+    meteoserver_key: Optional[SecretStr] = Field(
+        default=None,
         alias="meteoserver-key",
         description="Meteoserver API key (can use !secret)",
         json_schema_extra={
             "x-ui-group": "DAO",
             "x-ui-section": "Weather",
-            "x-help": "Meteoserver API access key. Get from Meteoserver.nl account. Use !secret for security. Required for weather forecasts.",
+            "x-help": "Meteoserver API access key. Get from Meteoserver.nl account. "
+            "Use !secret for security. Without one, Open-Meteo is used as the "
+            "primary forecast source instead of only as a fallback.",
             "x-validation-hint": "Use !secret for API keys",
         },
     )
@@ -95,6 +99,12 @@ class ConfigurationV0(DAOConfigBaseModel):
         alias="meteoserver-attemps",
         ge=1,
         description="Number of meteoserver fetch attempts",
+        json_schema_extra={"x-ui-group": "DAO", "x-ui-section": "Weather"},
+    )
+
+    weather: WeatherConfig = Field(
+        default_factory=WeatherConfig,
+        description="Forecast fallback and observation source",
         json_schema_extra={"x-ui-group": "DAO", "x-ui-section": "Weather"},
     )
 

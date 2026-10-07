@@ -1,15 +1,8 @@
 import datetime
-import json
-import math
 import logging
-import time
 from typing import Optional
 import pandas as pd
-import ephem
-import requests
-from requests import get
 import matplotlib.pyplot as plt
-import knmi
 from dao.lib.da_graph import GraphBuilder
 from dao.lib.db_manager import DBmanagerObj
 from sqlalchemy import Table, select, func, and_
@@ -24,16 +17,20 @@ class Meteo:
         latitude: float,
         longitude: float,
         secrets: dict = None,
+        country: str = "NL",
+        time_zone: str = "Europe/Amsterdam",
     ):
         self.config = config
         self.db_da = db_da
-        _secrets = secrets or {}
+        self.time_zone = time_zone
+        self.secrets = secrets or {}
         mk = config.meteoserver_key
-        self.meteoserver_key = mk.resolve(_secrets) if mk is not None else None
+        self.meteoserver_key = mk.resolve(self.secrets) if mk is not None else None
         self.meteoserver_model = config.meteoserver_model
         self.meteoserver_attempts = config.meteoserver_attempts
         self.latitude = latitude
         self.longitude = longitude
+        self.country = country
         self.solar = config.solar
         self.bat = config.battery
         self.graphics_style = config.graphics.style
@@ -41,326 +38,24 @@ class Meteo:
         # a radiation value stands for, whatever that interval's length is.
         self.interval_s = 3600 if config.interval == "1hour" else 900
 
-    @staticmethod
-    def makerefmoment(moment):
-        """
-        :param moment: timestamp in utc
-        :return: zelfde moment in 1972 in utc timestamp
-        """
-        mom = datetime.datetime.fromtimestamp(moment)
-        date_ref = datetime.datetime(1972, mom.month, mom.day, mom.hour, 30, 0)
-        return datetime.datetime.timestamp(date_ref)
-
-    @staticmethod
-    def direct_radiation_factor(
-        hcol: float, acol: float, hzon: float, azon: float
-    ) -> float:
-        """
-        berekent de omrekenfacor van directe zon straling op het collectorvlak
-        alle parameters in radialen
-        :param hcol: helling van de collector: 0 = horizontaal, 0.5 pi verticaal
-        :param acol: azimuth van de collector: 0 = zuid, -0,5 pi = oost, +0,5 pi = west
-        :param hzon: hoogte van de zon, 0 = horizontaal, 0.5 pi verticaal
-        :param azon: azimuth van de zon 0 = zuid, -0,5 pi = oost, +0,5 pi = west
-        :return: de omrekenfactor
-        """
-        if hzon <= 0:
-            return 0
-        else:
-            return max(
-                0.0,
-                (
-                    math.cos(hcol) * math.sin(hzon)
-                    + math.sin(hcol) * math.cos(hzon) * math.cos(acol - azon)
-                ),
-            ) / math.sin(hzon)
-
-    def sun_position(self, utc_time):
-        """
-        Berekent postie van de zon op tijdstip 'time' op coordinaten noorderbreedte en oosterlengte
-        :param utc_time: timestamp in utc seconds
-        :return: een array met positie van de zon hoogte(h) (elevatie) en azimuth(A) in radialen
-        """
-        # param nb: latitude: noorderbreed in graden
-        # param ol: longitude: oosterlengte in graden
-        """
-        # oude methode
-
-        jd = (float(utc_time) / 86400.0) + 2440587.5
-        delta_j = jd - 2451545  # J - J2000
-        m_deg = (357.5291 + 0.98560028 * delta_j) % 360  # in graden
-        m_rad = math.radians(m_deg)  # in radialen
-        c_aarde = 1.9148 * math.sin(m_rad) + 0.02 * math.sin(2 * m_rad) + \
-            0.0003 * math.sin(3 * m_rad)  # in graden
-        c_aarde = math.degrees(c_aarde)
-        lamda_zon_deg = (m_deg + 102.9372 + c_aarde + 180) % 360  # in graden
-        lamda_zon_rad = math.radians(lamda_zon_deg)
-
-        alfa_zon = lamda_zon_deg - 2.468 * math.sin(2 * lamda_zon_rad) + 0.053 * math.sin(
-            4 * lamda_zon_rad) - 0.0014 * math.sin(6 * lamda_zon_rad)  # in graden
-        delta_zon = 22.8008 * math.sin(lamda_zon_rad) + 0.5999 * pow(math.sin(lamda_zon_rad), 3) 
-                    + 0.0493 * pow(math.sin(lamda_zon_rad), 5)
-        delta_zon_rad = math.radians(delta_zon)
-        noorder_breedte = self.latitude
-        ooster_lengte = self.longitude
-        # wester_lengte_rad = math.radians(-ooster_lengte)
-        noorder_breedte_rad = math.radians(noorder_breedte)
-
-        theta = 280.16 + 360.9856235 * delta_j + ooster_lengte
-        theta_deg = theta % 360
-        # theta_rad = math.radians(theta_deg)
-
-        h_deg = theta_deg - alfa_zon
-        h_rad = math.radians(h_deg)
-
-        # hoogte boven horizon
-        h_rad = math.asin(math.sin(noorder_breedte_rad) * math.sin(delta_zon_rad)
-                          + math.cos(noorder_breedte_rad) * math.cos(delta_zon_rad) * 
-                          math.cos(h_rad))
-        a_rad = math.atan2(math.sin(h_rad),
-                           math.cos(h_rad) * math.sin(noorder_breedte_rad) - 
-                           math.tan(delta_zon_rad) * math.cos(noorder_breedte_rad))  
-                           # links of rechts van zuid
-        result = {'h': h_rad, 'A': a_rad}
-
-        # tot hier oude methode
-        """
-        # vanaf hier nieuwe methode
-        """
-   
-        Declinatie en uurhoek
-        De in de afbeelding over deklinatie en uurhoek getekende hoeken zoals u en d leggen 
-        de stralingsrichting vast. 
-        Op iedere datum geldt: d = constant. Deze constante kan op de n- de dag van het jaar 
-        met grote nauwkeurigheid 
-        worden berekend met behulp van formule 1:
-        d = 23,44° sin {360°(284 + n)/365} (1)
-        Eveneens op iedere datum geldt, dat:
-        u = t x 15° (2)
-        met t gelijk aan de tijd in uren volgens Z.T. Met gehulp van (1) en (2) kan nu de 
-        stralingsrichting worden 
-        gevonden op ieder gewenst tijdstip op iedere gewenste datum.
-
-        Azimut en zonshoogte
-        De stralingsrichting is ook vast te leggen met behulp van de hoeken a en h. Zie de figuur 
-        over Azimut en  
-        zonshoogte. In appendix A is afgeleid, hoe deze hoeken kunnen worden geschreven als functie 
-        van de zojuist 
-        genoemde hoeken u en d. Het blijkt handiger om h te schrijven als functie van u en d en 
-        om a te schrijven als 
-        functie van u, d en h. Gevonden wordt:
-        h = arcsin (sin ф sin d – cos ф cos d cos u) (3)
-        a = arcsin { (cos d sin u) / cos h } (4)
-        De hoek ф is gelijk aan de breedtegraad van de plaats op aarde, waar a en h moeten 
-        worden bepaald. 
-        De waarden, die a en h aannemen, zijn nu dus plaatsafhankelijk. 
-        """
-        """
-        dt = datetime.datetime.fromtimestamp(utc_time)
-        dt_start = datetime.datetime(dt.year,1,1)
-        dif = dt - dt_start
-        n = dif.days
-        d = math.radians(23.44 *  math.sin(math.radians(360*(284 + n) / 365))) # declinatie 
-        in radialen
-        dtz = datetime.datetime.fromtimestamp(utc_time, tz=datetime.timezone.utc)
-        t = dtz.hour
-        u = t * math.radians(15) #uurhoek in radialen
-        br = math.radians(self.latitude) # breedtegraad
-        h = math.asin(math.sin(br) * math.sin(d) - math.cos(br) * math.cos(d) * math.cos(u))
-        a = math.asin((math.cos(d) * math.sin(u)) / math.cos(h))
-        h_degrees = math.degrees(h)
-        a_degrees = math.degrees(a)
-        result = {'d': math.degrees(d), 'u': math.degrees(u), 'h': h, 'A': a}
-        """
-
-        observer = ephem.Observer()
-        observer.lat = math.radians(self.latitude)  # breedtegraad
-        observer.lon = math.radians(self.longitude)
-        dtz = datetime.datetime.fromtimestamp(utc_time, tz=datetime.timezone.utc)
-        observer.date = dtz.strftime("%Y-%m-%d %H:%M:%S.%f")  # '2023-09-19 12:00:00'
-        sun = ephem.Sun(observer)
-        result = {"h": sun.alt * 1.0, "A": (sun.az + math.pi) % (2 * math.pi)}
-        return result
-
-    def get_dif_rad_factor(self, utc_time):
-        # naar het midden van het interval voor de gemiddelde zonpositie
-        # daarin; 1800s (half uur) alleen juist bij uur-intervallen, vandaar
-        # self.interval_s / 2 in plaats van een hard-coded 1800.
-        cor_utc_time = float(utc_time) + self.interval_s / 2
-        # 52 graden noorderbreedte, 5 graden oosterlengte
-        sunpos = self.sun_position(cor_utc_time)
-        sun_h = sunpos["h"]  # hoogte boven horizon in rad
-        if sun_h > 0:
-            # maximale theoretische straling op hor vlak
-            value = 360 * 1.37 * math.sin(sun_h)
-        else:
-            value = 0.0
-        return value
-
-    @staticmethod
-    def is_aws(station: int):
-        """
-        station :code van een knmi station
-        :return: boolean
-        """
-        """ 
-        start = datetime.date.today() - datetime.timedelta(days=4)
-        knmi_df = knmi.get_hour_data_dataframe(
-            [station],
-            start=start,
-            end=start,
-            variables=["Q", "T"],
-        )
-        result = len(knmi_df) > 0 and not knmi_df.isnull().values.any()
-        """
-        # onderstaande lijst is gegenereerd met prof/tst.py/generate_list_knmi-aws.py
-        # beter bij iedere nieuwe versie autoamtisch checken en vernieuwen op github
-        list_aws = [
-            215,
-            235,
-            240,
-            249,
-            251,
-            257,
-            260,
-            267,
-            269,
-            270,
-            273,
-            275,
-            277,
-            278,
-            279,
-            280,
-            283,
-            286,
-            290,
-            310,
-            319,
-            323,
-            330,
-            344,
-            348,
-            350,
-            356,
-            370,
-            375,
-            377,
-            380,
-        ]
-        return station in list_aws
-
-    def which_station(self) -> str:
-        """
-        berekent welk weerstation het dichtst bij is
-        :param latitude:
-        :param longitude:
-        :return: code weerstation
-        """
-        stations = knmi.stations
-        distance = None
-        result = None
-        for key in stations:
-            if self.is_aws(key):
-                station = stations[key]
-                afstand = (self.latitude - station.latitude) ** 2 + (
-                    self.longitude - station.longitude
-                ) ** 2
-                if result is None or afstand < distance:
-                    distance = afstand
-                    result = key
-        return str(result)
-
-    def solar_rad(
-        self, utc_time: float, radiation: float, h_col: float, a_col: float
-    ) -> float:
-        """
-        :param utc_time: utc tijd in sec
-        :param radiation: globale straling in J/cm²
-        :param h_col: hoogte van de collector in radialen
-        :param a_col: azimuth van de collector in radialen
-        :return: de straling (direct en diffuus) in J/cm² op het vlak van de collector
-        """
-        if radiation <= 0:
-            q_tot = 0
-        elif radiation <= 5:
-            q_tot = radiation
-        else:
-            # Same instant get_dif_rad_factor() (called just below) evaluates
-            # the sun at. Using utc_time itself (the start of the interval)
-            # here made the direct component 0 in the first daylight interval
-            # of the day: the sun could still be below the horizon at the
-            # exact start while already up for most of the interval.
-            sun_pos = self.sun_position(float(utc_time) + self.interval_s / 2)
-            dir_rad_factor = min(
-                2.0,
-                self.direct_radiation_factor(h_col, a_col, sun_pos["h"], sun_pos["A"]),
-            )
-
-            # maximale straling op horz.vlak
-            q_oz = self.get_dif_rad_factor(utc_time)
-
-            if q_oz > 0:
-                k_t = max(0.2, min(0.8, radiation / q_oz))
-                q_dif0 = radiation * (1 - 1.12 * k_t)
-            else:
-                q_dif0 = radiation
-
-            q_dir0 = radiation - q_dif0
-
-            coshcol = math.cos(h_col)
-            q_difc = q_dif0 * (1 + coshcol + 0.2 * (1 - coshcol)) / 2
-            q_dirc = q_dir0 * dir_rad_factor
-            q_tot = q_difc + q_dirc
-        return q_tot
-
-    """
-    def solar_rad_df(self, global_rad):
-        '''
-        argumemten
-            global_rad: df met tijden en globale straling (time, gr)
-        berekent netto instraling op collector in J/cm2
-        retouneert dataframe met (time, solar_rad)
-        '''
-        # tilt: helling t.o.v. plat vlak in graden
-        # orientation: orientatie oost = -90, zuid = 0, west = 90 in graden
-        # zoekt de eerste de beste pv installatie op
-        solar = None
-        if len(self.solar) > 0:
-            solar = self.solar[0]
-            if solar.strings:
-                solar = solar.strings[0]
-        else:
-            for b in range(len(self.bat)):
-                if self.bat[b].solar:
-                    solar = self.bat[b].solar[0]
-                    if solar.strings:
-                        solar = solar.strings[0]
-                    break
-        if solar is None:
-            tilt = 45
-            orientation = 0
-        else:
-            tilt = solar.tilt
-            orientation = solar.orientation
-        tilt = min(90, max(0, tilt))
-        hcol = math.radians(tilt)
-        acol = math.radians(orientation)
-        global_rad["solar_rad"] = ""  # new column empty
-        # make sure indexes pair with number of rows
-        global_rad = global_rad.reset_index()
-        for row in global_rad.itertuples():
-            utc_time = row.tijd
-            radiation = float(row.gr)
-            q_tot = self.solar_rad(int(utc_time) - 3600, radiation, hcol, acol)
-            global_rad.loc[(global_rad.tijd == utc_time), "solar_rad"] = q_tot
-        return global_rad
-    """
-
     def make_graph_meteo(self, df, file=None, show=False):
-        df["uur"] = df.tijd_nl.apply(lambda x: x[11:13])
+        # The weather frame carries an epoch and no local-time column; both
+        # the hour axis and the title have to come from it in the
+        # configured zone. Reading the title from column 2 by position used
+        # to land on "dni", which Meteoserver never supplies, so the title
+        # said "vanaf nan"; reading the hour in UTC put the whole axis one
+        # or two hours out.
+        if "tijd_nl" in df.columns:
+            df["uur"] = df.tijd_nl.apply(lambda x: x[11:13])
+            first_moment = df["tijd_nl"].iloc[0]
+        else:
+            local = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(
+                self.time_zone
+            )
+            df["uur"] = local.dt.strftime("%H")
+            first_moment = local.iloc[0].strftime("%Y-%m-%d %H:%M")
         meteo_options = {
-            "title": f"Opgehaalde meteodata vanaf {df.iloc[0, 2]}",
+            "title": f"Opgehaalde meteodata vanaf {first_moment}",
             "style": self.graphics_style,
             "graphs": [
                 {
@@ -406,221 +101,33 @@ class Meteo:
         return
         """
 
-    def get_from_meteoserver(self, model: str) -> pd.DataFrame:
-        if not self.meteoserver_key:
-            logging.error("Geen meteoserver key geconfigureerd, geen meteodata opgehaald")
-            return pd.DataFrame()
-        params = {
-            "lat": str(self.latitude),
-            "long": str(self.longitude),
-            "key": self.meteoserver_key,
-        }
-        data = None
-        if model == "harmonie":
-            url = "https://data.meteoserver.nl/api/uurverwachting.php"
-        else:
-            url = "https://data.meteoserver.nl/api/uurverwachting_gfs.php"
-        # attempts is the number of retries on top of the first request, so the
-        # loop runs attempts + 1 times. A hung socket must never block the
-        # scheduler, hence the explicit timeout; a short pause between attempts
-        # keeps a meteoserver outage from turning into a request storm.
-        max_attempts = max(1, int(self.meteoserver_attempts or 0) + 1)
-        for attempt in range(1, max_attempts + 1):
-            try:
-                resp = get(url, params=params, timeout=(5, 30))
-                resp.raise_for_status()
-                json_object = resp.json()
-            except (requests.RequestException, ValueError) as ex:
-                logging.warning(
-                    f"Meteoserver poging {attempt} van {max_attempts} mislukt: {ex}"
-                )
-                json_object = {}
-            if isinstance(json_object, dict) and json_object.get("data"):
-                data = json_object["data"]
-                break
-            if attempt < max_attempts:
-                time.sleep(min(30, 2**attempt))
-
-        if data is None:
-            logging.error(
-                f"Geen meteodata ontvangen van meteoserver na {max_attempts} pogingen"
-            )
-            return pd.DataFrame()
-
-        df = pd.DataFrame.from_records(data)
-        missing = [
-            c for c in ["tijd", "tijd_nl", "gr", "temp", "winds", "neersl"]
-            if c not in df.columns
-        ]
-        if missing:
-            logging.error(f"Meteoserver antwoord mist kolommen {missing}")
-            return pd.DataFrame()
-        df1 = df[["tijd", "tijd_nl", "gr", "temp", "winds", "neersl"]]
-        df1 = df1[:96]
-        logging.info(f"Meteodata model {model}")
-        logging.info(
-            f"Aantal uitgevoerde ophaalpogingen: {attempt} van maximaal: {max_attempts}"
-        )
-        logging.info(f"Aantal records: {len(df1)}")
-        logging.info(f"Data {model}: \n{df1.to_string(index=True)}")
-        return df1
-
     def get_meteo_data(self, show_graph=False):
-        df1 = self.get_from_meteoserver(self.meteoserver_model)
-        df_db = pd.DataFrame(columns=["time", "code", "value"])
-        count = len(df1)
-        if count == 0:
-            logging.error(f"No {self.meteoserver_model}-data recieved from meteoserver")
-        else:
-            df1 = df1.reset_index()  # make sure indexes pair with number of rows
-            # Melt (tijd, gr, temp, winds, neersl) into long-format (time,
-            # code, value) rows via a plain list instead of four
-            # df_db.loc[df_db.shape[0]] = row appends per source row, which
-            # copies the whole frame on every one of the up to 384 appends.
-            rows = []
-            for row in df1.itertuples():
-                time_str = str(int(row.tijd))
-                rows.append((time_str, "gr", float(row.gr)))
-                rows.append((time_str, "temp", float(row.temp)))
-                rows.append((time_str, "winds", float(row.winds)))
-                rows.append((time_str, "neersl", float(row.neersl)))
-            df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
+        from pathlib import Path
 
-        """
-        df2 = pd.DataFrame()
-        if count < 96:
-            df2 = self.get_from_meteoserver("gfs")
-            len_df2 = len(df2)
-            if len_df2 == 0:
-                logging.error("No gfs-data recieved from meteoserver")
-            else:
-                for row in df2[count:].itertuples():
-                    df_db.loc[df_db.shape[0]] = [
-                        str(int(row.tijd)),
-                        "gr",
-                        float(row.gr),
-                    ]
-                    df_db.loc[df_db.shape[0]] = [
-                        str(int(row.tijd)),
-                        "temp",
-                        float(row.temp),
-                    ]
-                    df_db.loc[df_db.shape[0]] = [
-                        str(int(row.tijd)),
-                        "solar_rad",
-                        float(row.solar_rad),
-                    ]
-                    count += 1
-                    if count >= 96:
-                        break
-        """
-        df_tostring = df_db
-        df_tostring["tijd"] = df_tostring["time"].apply(
-            lambda x: datetime.datetime.fromtimestamp(int(x)).strftime("%Y-%m-%d %H:%M")
+        from dao.forecast.weather.service import WeatherService
+
+        service = WeatherService(
+            self.config,
+            self.db_da,
+            self.latitude,
+            self.longitude,
+            self.secrets,
+            Path("../data/forecast/weather"),
+            self.country,
         )
-        logging.debug(f"Meteo data records \n{df_tostring.to_string(index=False)}")
-        self.db_da.savedata(df_db, tablename="prognoses")
-        # Archiveer met de vooruitblik erbij. "prognoses" wordt overschreven,
-        # dus zonder dit is achteraf niet meer te zien hoe goed de verwachting
-        # van gisteren voor vanavond eigenlijk was.
-        try:
-            self.db_da.save_forecasts(
-                (
-                    (int(row.time), row.code, row.value)
-                    for row in df_db.itertuples()
-                ),
-                issued_ts=int(datetime.datetime.now().timestamp()),
-            )
-        except Exception as ex:
-            logging.warning(f"Prognose-archief niet bijgewerkt: {ex}")
-        """
-        if len(df1) > 0:
-            if len(df2) > len(df1):
-                df_gr = pd.concat([df1, df2[len(df1):96]])
-            else:
-                df_gr = df1
-        else:
-            df_gr = df2[:96]
-        """
-        df_gr = df1
-        if len(df_gr) > 0:
+        status = service.update()
+        df = status.frame
+        if len(df) > 0:
             style = self.graphics_style
             plt.style.use(style)
             self.make_graph_meteo(
-                df_gr,
+                df,
                 file="../data/images/meteo_"
                 + datetime.datetime.now().strftime("%Y-%m-%d__%H-%M")
                 + ".png",
                 show=show_graph,
             )
-
-        """
-        url = "https://api.forecast.solar/estimate/watthours/"+str(self.latitude)+"/"
-                +str(self.longitude)+"/45/5/5.5"
-        resp = get(url)
-        
-        print (resp.text)
-        json_object = json.loads(resp.text)
-        data = json_object["result"]
-        df_db = pd.DataFrame(columns = ['time', 'time_str', 'code', 'value'])
-        last_hour = -1
-        last_value = 0
-        last_day = -1
-        last_datetime_obj = None
-        for time_str, pv_w in data.items():
-            datetime_obj = dt.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-            hour = datetime_obj.hour
-            if hour == last_hour:
-                hour = hour + 1
-            day = datetime_obj.day
-            if (day != last_day): # or (last_hour < hour-1):
-                if last_day == -1:
-                    for h in range(last_hour+1, hour):
-                        time_h = dt.datetime(datetime_obj.year, datetime_obj.month, 
-                        datetime_obj.day, h,0,0 )
-                        time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
-                        time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
-                else:
-                    for h in range(last_hour + 1, 24):
-                        time_h = dt.datetime(last_datetime_obj.year,last_datetime_obj.month,
-                        last_datetime_obj.day,h,0,0)
-                        time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
-                        time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
-                    for h in range(0, hour):
-                        time_h = dt.datetime(datetime_obj.year, datetime_obj.month, 
-                        datetime_obj.day, h, 0, 0)
-                        time_utc = dt.datetime.timestamp(time_h) - 3600
-                        df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
-                        time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
-                    last_value = 0
-            time_h = dt.datetime(datetime_obj.year, datetime_obj.month, d
-            atetime_obj.day, hour, 0, 0)
-            time_utc = dt.datetime.timestamp(time_h) -3600
-            df_db.loc[df_db.shape[0]] = [str(int(time_utc)), time_h.strftime("%Y-%m-%d %H:%M"), 
-            'pv', pv_w - last_value]
-            last_hour = hour
-            last_value = pv_w
-            last_day = day
-            last_datetime_obj = datetime_obj
-        for h in range(last_hour + 1, 24):
-            time_h = dt.datetime(last_datetime_obj.year, last_datetime_obj.month, 
-            last_datetime_obj.day, h, 0, 0)
-            time_utc = dt.datetime.timestamp(time_h) - 3600
-            df_db.loc[df_db.shape[0]] = [str(int(time_utc)), 
-            time_h.strftime("%Y-%m-%d %H:%M"), 'pv', 0]
-
-        print(df_db)
-
-        graphs.make_graph_meteo(df_db, file = "../data/images/meteo" + 
-                                              datetime.datetime.now().strftime("%H%M") + 
-                                             ".png", show=show_graph)
-                               
-        del df_db["time_str"]
-        print(df_db)
-        self.db_da.savedata(df_db)
-        """
+        return status
 
     def get_avg_temperature(self, date: datetime.datetime = None) -> Optional[float]:
         """
@@ -734,36 +241,3 @@ class Meteo:
         else:
             result = weight_factor * (16 - avg_temp)
         return result
-
-    def calc_solar_rad(
-        self, solar_opt: dict, utc_time: int, global_rad: float
-    ) -> float:
-        """
-        :param solar_opt: definitie van paneel met
-            tilt: helling t.o.v. plat vlak in graden, 0 = vlak (horizontaal), 90 = verticaal
-            orienation: orientatie oost = -90, zuid = 0, west = 90 in graden
-        :param utc_time: utc tijd in seconden
-        :param global_rad: globale straling in J/cm²
-        :return: alle straling op paneel J/cm²
-        """
-        # tilt:
-        # orientation: orientatie oost = -90, zuid = 0, west = 90 in graden
-        tilt = solar_opt.tilt
-        tilt = min(90, max(0, tilt))
-        hcol = math.radians(tilt)
-        orientation = solar_opt.orientation
-        acol = math.radians(orientation)
-        q_tot = self.solar_rad(float(utc_time), global_rad, hcol, acol)
-        return q_tot
-
-
-"""
-def main():
-    from dao.prog.da_base import DaBase
-    dbase = DaBase("../data/options.json")
-    meteo = Meteo(dbase.config, dbase.db_da)
-    station = meteo.which_station()
-
-if __name__ == "__main__":
-    main()
-"""

@@ -11,19 +11,10 @@ from pandas.core.dtypes.inference import is_number
 
 from dao.lib.da_graph import GraphBuilder
 from dao.prog.da_base import DaBase
-from dao.prog.baseload import (
-    BaseloadOptions,
-    BaseloadProfile,
-    build_profile,
-    iter_samples,
-    profile_to_dict,
-)
 from dao.prog.utils import get_value_from_dict
 import math
-import json
 import itertools
 import logging
-import os
 from sqlalchemy import (
     Table,
     select,
@@ -48,6 +39,28 @@ def calc_r2(serie_x: pd.Series, serie_y: pd.Series) -> float:
     if serie_x.count() < 24 or serie_y.count() < 24:
         return pd.NA
     return r2_score(serie_x, serie_y)
+
+
+def localize_hour_buckets(timestamps, time_zone):
+    """Attach ``time_zone`` to naive hour buckets without raising on a DST day.
+
+    Accepts a ``DatetimeIndex`` or a datetime ``Series`` and returns the
+    same shape, localized.
+
+    Every report in this module builds one row per hour *label* -- the API
+    data from an SQL GROUP BY on the hour string, the solar report from a
+    loop adding an hour at a time to local midnight. Neither produces the
+    repeated 02:00 that ``ambiguous="infer"`` needs to work out which
+    occurrence is meant, so a fixed policy is the only one that is
+    deterministic here: the bucket is standard (winter) time.
+    ``nonexistent="shift_forward"`` covers the spring day, whose
+    02:00-03:00 bucket does not exist at all.
+
+    Without both, any report covering one of those two days a year raised
+    outright.
+    """
+    localize = getattr(timestamps, "dt", timestamps).tz_localize
+    return localize(time_zone, ambiguous=False, nonexistent="shift_forward")
 
 
 class Report(DaBase):
@@ -2791,151 +2804,6 @@ class Report(DaBase):
     """
 
     #  ------------------------------------------------
-    def get_sensor_week_data(
-            self,
-            sensor: str,
-            weekday: int | None,
-            vanaf: datetime.datetime,
-            tot: datetime.datetime,
-            col_name: str,
-    ) -> pd.DataFrame:
-        """
-        Berekent de waarde van een HA-sensor per uur
-        :param sensor:
-        :param weekday: 0..6, of None voor alle dagen in de periode
-        :param vanaf:
-        :param tot:
-        :param col_name:
-        :return:
-        """
-        """
-        sql = "SELECT FROM_UNIXTIME(t2.`start_ts`) 'tijd', \
-            GREATEST(0, round(t2.state - t1.`state`,3)) '" + col_name + "', \
-            WEEKDAY(FROM_UNIXTIME(t2.`start_ts`))  'weekdag', \
-            HOUR(FROM_UNIXTIME(t2.`start_ts`)) 'uur' \
-            FROM `statistics` t1,`statistics` t2, `statistics_meta`  \
-            WHERE statistics_meta.`id` = t1.`metadata_id` 
-            AND statistics_meta.`id` = t2.`metadata_id`   \
-            AND statistics_meta.`statistic_id` = '" + sensor + "'  \
-            AND (t2.`start_ts` = t1.`start_ts` + 3600)   \
-            AND t1.`state` IS NOT null AND t2.`state` IS NOT null   \
-            AND t1.`start_ts` >= UNIX_TIMESTAMP('" + str(vanaf) + "') - 3600  \
-            AND  WEEKDAY(FROM_UNIXTIME(t2.`start_ts`))= " + str(weekday) + " \
-            ORDER BY t1.`start_ts`;"
-        df = self.db_ha.run_select_query(sql)
-        """
-        statistics = Table(
-            "statistics", self.db_ha.metadata, autoload_with=self.db_ha.engine
-        )
-        statistics_meta = Table(
-            "statistics_meta", self.db_ha.metadata, autoload_with=self.db_ha.engine
-        )
-
-        # Define aliases for the tables
-        t1 = statistics.alias("t1")
-        t2 = statistics.alias("t2")
-
-        # Define parameters
-        start_ts_param1 = self.db_ha.epoch(vanaf)
-        tot_ts_param1 = self.db_ha.epoch(tot)
-
-        # Build the query to retrieve raw data
-        query = (
-            select(
-                t2.c.start_ts.label("tijd"),
-                t1.c.state.label("state_t1"),
-                t2.c.state.label("state_t2"),
-                statistics_meta.c.unit_of_measurement.label("dim"),
-            )
-            .select_from(
-                t1.join(t2, t2.c.start_ts == t1.c.start_ts + 3600).join(
-                    statistics_meta,
-                    (statistics_meta.c.id == t1.c.metadata_id)
-                    & (statistics_meta.c.id == t2.c.metadata_id),
-                )
-            )
-            .where(
-                (statistics_meta.c.statistic_id == sensor)
-                & (t1.c.state.isnot(None))
-                & (t2.c.state.isnot(None))
-                & (t1.c.start_ts >= start_ts_param1 - 3600)
-                & (t1.c.start_ts < tot_ts_param1 - 3600)
-            )
-        )
-
-        # Execute the query and load results into a DataFrame
-        with self.db_ha.engine.connect() as connection:
-            df_raw = pd.read_sql(query, connection)
-
-        if len(df_raw) > 0:
-            dim = df_raw.iloc[0]["dim"]
-            if dim == "Wh":
-                factor = 0.001
-            elif dim == "MWh":
-                factor = 1000
-            else:
-                factor = 1
-            # Convert UNIX timestamps to datetime
-            df_raw["tijd"] = df_raw.apply(
-                lambda x: datetime.datetime.fromtimestamp(x["tijd"]), axis=1
-            )
-            # Calculate the value
-            df_raw[col_name] = df_raw.apply(
-                lambda row: round(
-                    max(row["state_t2"] - row["state_t1"], 0) * factor, 3
-                ),
-                axis=1,
-            )
-            df_raw["weekdag"] = df_raw.apply(
-                lambda x: self.tijd_at_interval("weekdag", x["tijd"]), axis=1
-            )
-            df_raw["uur"] = df_raw.apply(
-                lambda x: self.tijd_at_interval("heel_uur", x["tijd"]), axis=1
-            )
-
-        else:
-            df_raw = pd.DataFrame(columns=["weekdag", "tijd", "tot", col_name])
-        df_raw.index = pd.to_datetime(df_raw["tijd"])
-        # when NaN in result replace with zero (0.0)
-        df_raw.fillna(0.0, inplace=True)
-        if weekday is None:
-            return df_raw
-        df_wd = df_raw.loc[df_raw["weekdag"] == weekday]
-        return df_wd
-
-    def get_sensor_period_sum(
-            self,
-            sensor_list: list,
-            vanaf: datetime.datetime,
-            tot: datetime.datetime,
-            col_name: str,
-    ) -> pd.DataFrame:
-        """Hourly sum of a group of sensors over the whole period.
-
-        Deliberately without a weekday filter. The previous implementation
-        fetched the identical series once per weekday, so the whole history
-        was pulled from the Home Assistant database seven times over. On a
-        Home Assistant Yellow that is the difference between a few seconds and
-        most of a minute.
-        """
-        result = self.generate_df(vanaf, tot, "uur", None, col_name)
-        result["weekdag"] = result.apply(
-            lambda x: self.tijd_at_interval("weekdag", x["tijd"]), axis=1
-        )
-        result["uur"] = result.apply(
-            lambda x: self.tijd_at_interval("heel_uur", x["tijd"]), axis=1
-        )
-        for sensor in sensor_list:
-            df = self.get_sensor_week_data(sensor, None, vanaf, tot, col_name)
-            df.dropna(subset=[col_name], inplace=True)
-            # Always match on the timestamp. The old code took a shortcut and
-            # added column to column whenever the two frames happened to have
-            # the same length, which silently produced NaN as soon as one
-            # sensor had a recorder gap that the other did not.
-            result = Report.add_col_df(df, result, col_name)
-        logging.debug(f"Baseload berekening {col_name}:\n {result.to_string()}\n")
-        return result
-
     def check_baseload_sensors(self) -> list:
         """Warn when a modelled device has no meter to subtract it with.
 
@@ -3005,8 +2873,55 @@ class Report(DaBase):
                 )
                 problems.append(message)
                 logging.warning(f"Baseload: {message}")
+        problems.extend(self._check_sensor_kinds())
         if not problems:
             logging.info("Baseload: de meetpunten voor de apparaten zijn consistent")
+        return problems
+
+    def _baseload_sensor_groups(self) -> dict:
+        """The configured sensors per component group of the history reader."""
+        return {
+            "grid_in": list(self.grid_consumption_sensors or []),
+            "grid_out": list(self.grid_production_sensors or []),
+            "pv_ac": list(self.solar_production_ac_sensors or []),
+            "ev": list(self.ev_consumption_sensors or []),
+            "wp": list(self.wp_consumption_sensors or []),
+            "boiler": list(self.boiler_consumption_sensors or []),
+            "machines": list(self.machine_consumption_sensors or []),
+            "bat_in": list(self.battery_consumption_sensors or []),
+            "bat_out": list(self.battery_production_sensors or []),
+        }
+
+    def _check_sensor_kinds(self) -> list:
+        """Every configured meter must exist and be an energy or power sensor.
+
+        A state-of-charge or temperature sensor in one of the lists used to
+        contribute nothing, silently. An entity that no longer exists is
+        not fatal to the reader any more -- it degrades its whole group to
+        NaN -- which is exactly why it has to be named here. Reported per
+        sensor so the operator can see which entry to fix.
+        """
+        db_ha = getattr(self, "db_ha", None)
+        if db_ha is None:
+            return []
+        from dao.forecast.history import HistoryReader, UnsupportedSensorError
+
+        reader = HistoryReader(db_ha, getattr(self, "time_zone", None) or "UTC")
+        problems = []
+        for sensors in self._baseload_sensor_groups().values():
+            for sensor in sensors:
+                try:
+                    if reader.sensor_meta([sensor]):
+                        continue
+                    reason = (
+                        f"{sensor}: geen statistieken gevonden in de Home "
+                        f"Assistant database"
+                    )
+                except UnsupportedSensorError as ex:
+                    reason = str(ex)
+                message = f"{reason}; deze meter telt niet mee in de baseload"
+                problems.append(message)
+                logging.warning(f"Baseload: {message}")
         return problems
 
     def calc_baseload_frame(self) -> pd.DataFrame:
@@ -3015,115 +2930,39 @@ class Report(DaBase):
         baseload = grid in - grid out + pv ac - ev - heat pump - boiler
                    - machines - battery in + battery out
 
-        One pass over the history, so the result can be sliced per weekday
-        afterwards instead of re-querying the database seven times.
+        Read through the history reader, which takes the right statistics
+        column for each sensor kind and leaves hours without a measurement
+        as NaN instead of zero.
         """
-        calc_periode = self.config.baseload_calc_periode
-        now = datetime.datetime.now()
-        tot = datetime.datetime(now.year, now.month, now.day)
-        vanaf = datetime.datetime.combine(
-            (now - datetime.timedelta(days=calc_periode)).date(), datetime.time()
+        from zoneinfo import ZoneInfo
+
+        from dao.forecast.history import (
+            HistoryReader,
+            baseload_from_components,
+            component_caps,
         )
 
-        groups = [
-            (self.grid_consumption_sensors, "grid_consumption", False),
-            (self.grid_production_sensors, "grid_production", True),
-            (self.solar_production_ac_sensors, "solar_production", False),
-            (self.ev_consumption_sensors, "ev_consumption", True),
-            (self.wp_consumption_sensors, "wp_consumption", True),
-            (self.boiler_consumption_sensors, "boiler_consumption", True),
-            (self.machine_consumption_sensors, "machine_consumption", True),
-            (self.battery_consumption_sensors, "battery_consumption", True),
-            (self.battery_production_sensors, "battery_production", False),
-        ]
+        zone = ZoneInfo(self.time_zone)
+        calc_periode = self.config.baseload_calc_periode
+        now = datetime.datetime.now(tz=zone)
+        tot = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        vanaf = tot - datetime.timedelta(days=calc_periode)
 
-        result = None
-        for sensors, col_name, subtract in groups:
-            frame = self.get_sensor_period_sum(sensors, vanaf, tot, col_name)
-            if result is None:
-                result = frame.rename(columns={col_name: "baseload"})
-                if subtract:
-                    result["baseload"] = -result["baseload"]
-                continue
-            result = Report.add_col_df(frame, result, col_name, "baseload", subtract)
-
-        if result is None:
-            return pd.DataFrame(columns=["tijd", "weekdag", "uur", "baseload"])
+        reader = HistoryReader(self.db_ha, self.time_zone)
+        frame = reader.read_components(
+            self._baseload_sensor_groups(), vanaf, tot, component_caps(self.config)
+        )
+        base = baseload_from_components(frame)
+        result = pd.DataFrame(
+            {
+                "tijd": base.index,
+                "weekdag": base.index.weekday,
+                "uur": base.index.hour,
+                "baseload": base.values,
+            }
+        )
         logging.debug(f"Baseload berekening per uur:\n {result.to_string()}\n")
         return result
-
-    def baseload_options(self) -> BaseloadOptions:
-        """Translate the configuration into the pure estimator's options."""
-        options = self.config.baseload_options
-        return BaseloadOptions(
-            aggregate=options.aggregate,
-            trim_fraction=options.trim_fraction,
-            remove_outliers=options.remove_outliers,
-            outlier_factor=options.outlier_factor,
-            half_life_days=options.half_life_days,
-            holidays=options.holidays,
-            clip_negative=options.clip_negative,
-            min_samples=options.min_samples,
-        )
-
-    def calc_weekday_baseload(self, wd: int, frame: pd.DataFrame = None) -> list:
-        """
-        :param wd : weekdag 0= maandag, 6 = zondag
-        :param frame: het resultaat van calc_baseload_frame, wordt anders opgehaald
-        :return: de berekende basislast voor die dag
-        """
-        return self.calc_weekday_profile(wd, frame).values
-
-    def calc_weekday_profile(
-        self, wd: int, frame: pd.DataFrame = None
-    ) -> BaseloadProfile:
-        """Robust 24 hour profile for one weekday, with its sample counts."""
-        if frame is None:
-            frame = self.calc_baseload_frame()
-        options = self.baseload_options()
-        reference = datetime.datetime.now()
-        if frame is None or len(frame) == 0:
-            return BaseloadProfile()
-
-        rows = list(zip(frame["tijd"], frame["baseload"]))
-        grouped = iter_samples(rows, reference, options.holidays)
-        pooled: dict = {}
-        for cells in grouped.values():
-            for hour, samples in cells.items():
-                pooled.setdefault(hour, []).extend(samples)
-        return build_profile(grouped.get(wd, {}), pooled, options)
-
-    def calc_save_baseloads(self):
-        """Recompute and store the seven weekday profiles."""
-        self.check_baseload_sensors()
-        frame = self.calc_baseload_frame()
-        if frame is None or len(frame) == 0:
-            logging.error(
-                "Baseload: geen meetdata gevonden; de profielen zijn niet bijgewerkt"
-            )
-            return
-        options = self.baseload_options()
-        period = self.config.baseload_calc_periode
-        os.makedirs("../data/baseload", exist_ok=True)
-        for weekday in range(7):
-            profile = self.calc_weekday_profile(weekday, frame)
-            thin = [h for h in range(24) if profile.pooled[h]]
-            logging.info(
-                f"baseload weekdag {weekday}: totaal {profile.total:.2f} kWh, "
-                f"mediaan aantal metingen per uur "
-                f"{sorted(profile.samples)[12]}"
-                + (f", {len(thin)} uur uit de gepoolde schatting" if thin else "")
-            )
-            logging.info(" ".join(str(x) for x in profile.values))
-            out_file = "../data/baseload/baseload_" + str(weekday) + ".json"
-            with open(out_file, "w") as f:
-                print(
-                    json.dumps(
-                        profile_to_dict(profile, weekday, period, options), indent=2
-                    ),
-                    file=f,
-                )
-        return
 
     # ------------------------------------------------
     def get_field_data(self, field: str, periode: str, tot=None, dict=None):
@@ -3281,29 +3120,44 @@ class Report(DaBase):
         self.add_col_df(df_solar, result, "gemeten", "gemeten_prod")
 
         # voorspelling DAO
-        pred_dao = []
-        for row in result.itertuples():
-            if pd.notna(row.tijd):
-                straling = row.gemeten_straling
-                if pd.isna(straling):
-                    straling = row.prognose_straling
-                if pd.notna(straling):
-                    prod = self.calc_prod_solar(
-                        device, row.tijd.timestamp(), straling, 1
-                    )
-                else:
-                    prod = pd.NA
-            else:
-                prod = pd.NA
-            pred_dao.append(prod)
+        from dao.forecast.weather.schema import jcm2h_to_wm2
+
+        straling = result["gemeten_straling"].fillna(result["prognose_straling"])
+        temp_real = self.get_da_data("temp", start, end, "uur", "uur", "values")
+        winds_real = self.get_da_data("winds", start, end, "uur", "uur", "values")
+        temp = (
+            pd.to_numeric(temp_real["temp"], errors="coerce").reindex(result.index)
+            if "temp" in temp_real.columns
+            else pd.Series(float("nan"), index=result.index)
+        ).fillna(15.0)
+        wind = (
+            pd.to_numeric(winds_real["winds"], errors="coerce").reindex(result.index)
+            if "winds" in winds_real.columns
+            else pd.Series(float("nan"), index=result.index)
+        ).fillna(3.0)
+
+        weather = pd.DataFrame(
+            index=localize_hour_buckets(result.index, self.time_zone)
+        )
+        weather["ghi"] = jcm2h_to_wm2(pd.to_numeric(straling, errors="coerce").to_numpy())
+        weather["dni"] = float("nan")
+        weather["dhi"] = float("nan")
+        weather["temp"] = temp.to_numpy()
+        weather["wind"] = wind.to_numpy()
+
+        pred_dao = pd.Series(pd.NA, index=result.index, dtype="object")
+        if len(weather) > 0:
+            predictions = self.pv_service().forecast_from_weather(device, weather)
+            valid = straling.notna()
+            pred_dao.loc[valid] = predictions.to_numpy()[valid.to_numpy()]
         result["prognose_dao"] = pred_dao
 
         # voorspelling ML
 
         # solar_predictor = SolarPredictor()
         # solar_prog = solar_predictor.predict_solar_device(device, start, end)
-        solar_prog = self.calc_solar_predictions(
-            device, start, end, interval="1hour", _ml_prediction=True
+        solar_prog = self.pv_service().forecast(
+            device, start, end, "1hour", model="ml"
         )
         if "date_time" in solar_prog.columns:
             solar_prog["tijd"] = solar_prog["date_time"].dt.tz_localize(None)
@@ -3503,19 +3357,7 @@ class Report(DaBase):
             return result
 
         df["time"] = pd.to_datetime(df["time"])
-        # Every bucket here is one row per hour label (from an SQL GROUP BY
-        # on the hour string), not one row per actual wall-clock hour, so on
-        # the autumn DST day there is no repeated 02:00 in this series for
-        # pandas to infer the right occurrence from -- ambiguous="infer"
-        # still raises. ambiguous=False (the bucket is standard/winter time)
-        # is a fixed, deterministic choice that never depends on such a
-        # pattern. nonexistent="shift_forward" covers the spring day, whose
-        # 02:00-03:00 bucket does not exist at all. Without either, any
-        # report covering one of those two days a year crashed this
-        # endpoint outright.
-        df["time_ts"] = df["time"].dt.tz_localize(
-            self.time_zone, ambiguous=False, nonexistent="shift_forward"
-        )
+        df["time_ts"] = localize_hour_buckets(df["time"], self.time_zone)
         df["time"] = df["time"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M"))
         df.rename(columns={"datasoort": "datatype"}, inplace=True)
         cols = df.columns.tolist()

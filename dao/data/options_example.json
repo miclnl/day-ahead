@@ -10,6 +10,11 @@
     "db_path": "../data"
   },
   "meteoserver-key": "!secret meteoserver-key",
+  "weather": {
+    "fallback": "openmeteo",
+    "openmeteo model": "knmi_seamless",
+    "observations": "auto"
+  },
   "prices": {
     "source day ahead": "nordpool",
     "entsoe-api-key": "!secret entsoe-api-key",
@@ -60,7 +65,8 @@
   "use_calc_baseload": "True",
   "baseload calc periode": 56,
   "baseload options": {
-    "aggregate": "median",
+    "model": "auto",
+    "aggregate": "mean",
     "remove outliers": true,
     "half life days": 28.0,
     "holidays": "sunday"
@@ -366,7 +372,7 @@
     {
       "name": "woning",
       "entity pv switch": "input_boolean.pv_woning_aan_uit",
-      "ml_prediction": "true",
+      "model": "ml",
       "entities sensors": "sensor.solaredge_woning_ac_energy_kwh",
       "strings": [
         {
@@ -385,7 +391,7 @@
     },
     {
       "name": "garage",
-      "ml_prediction": "true",
+      "model": "ml",
       "entities sensors": [
         "sensor.solaredge_garage_ac_energy_kwh_2"
       ],
