@@ -335,6 +335,87 @@ def test_grid_search_uses_most_recent_rows(monkeypatch, tmp_path):
     assert X.index[-1] == weather.index[6399]
 
 
+def observation_weather(n_hours: int) -> pd.DataFrame:
+    """Weather in exactly the shape the observation branch produces.
+
+    ``update_observations`` writes gr, temp and winds and nothing else, so
+    ``training_weather`` hands back a frame whose dni and dhi are NaN for
+    every single row. This is the normal case for a fresh install: the
+    archive branch only takes over after 90 days.
+    """
+    times = pd.date_range("2026-03-01", periods=n_hours, freq="h", tz=TZ)
+    hours = np.asarray([moment.hour for moment in times], dtype=float)
+    ghi = np.clip(700.0 * np.cos((hours - 13.0) / 7.0), 0.0, None)
+    return pd.DataFrame(
+        {
+            "ghi": ghi,
+            "dni": float("nan"),
+            "dhi": float("nan"),
+            "temp": 12.0 + 6.0 * np.sin((hours - 9.0) / 4.0),
+            "wind": 3.0,
+        },
+        index=times,
+    )
+
+
+def test_training_on_observations_keeps_its_rows(tmp_path):
+    """build_features leaves dni/dhi NaN on purpose -- XGBoost handles
+    missing values natively -- but train() used to drop every row with any
+    NaN in it, which on the observation branch is every row there is. The
+    model then trained on nothing and the installation silently kept using
+    the physical model forever."""
+    n = 480
+    weather = observation_weather(n)
+    predictor = make_predictor(tune_hyperparameters=False)
+    # What train_solar_option actually runs with: outlier removal on.
+    predictor.create_physics_based_constraints(3.6)
+    predictor.log_level = 20
+
+    features = predictor.create_features(weather)
+    assert features["dni"].isna().all()  # the premise this test exists for
+    assert features["dhi"].isna().all()
+
+    solar = pd.DataFrame(
+        {"solar_kwh": features["physical"].to_numpy() * 0.95}, index=weather.index
+    )
+
+    stats = predictor.train(
+        weather_data=weather,
+        solar_data=solar,
+        model_save_path=str(tmp_path / "model.json"),
+        tune_hyperparameters=False,
+    )
+
+    assert stats["training_samples"] > 0.5 * n
+    assert (tmp_path / "model.json").exists()
+
+
+def test_training_still_drops_rows_without_irradiance(tmp_path):
+    """Optional means dni and dhi only. A row with no ghi, no temperature or
+    no physical prediction has nothing to teach the model and must still
+    go."""
+    n = 480
+    weather = observation_weather(n)
+    weather.iloc[:120, weather.columns.get_loc("ghi")] = float("nan")
+    predictor = make_predictor(tune_hyperparameters=False)
+
+    features = predictor.create_features(weather)
+    solar = pd.DataFrame(
+        {"solar_kwh": np.nan_to_num(features["physical"].to_numpy())},
+        index=weather.index,
+    )
+
+    stats = predictor.train(
+        weather_data=weather,
+        solar_data=solar,
+        model_save_path=str(tmp_path / "model.json"),
+        remove_outliers=False,
+        tune_hyperparameters=False,
+    )
+
+    assert stats["training_samples"] + stats["testing_samples"] == n - 120
+
+
 def test_model_meta_records_training_source(tmp_path):
     n = 60
     weather = hourly_frame(n, list(FEATURES))

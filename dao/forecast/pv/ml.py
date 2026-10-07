@@ -36,6 +36,18 @@ FEATURES = (
     "physical",
 )
 
+#: The only two features allowed to be missing. Meteoserver and KNMI never
+#: supply the direct and diffuse components, and ``update_observations``
+#: writes gr/temp/winds only, so on the observation branch these are NaN
+#: for every row there is. XGBoost learns a default split direction for a
+#: missing value, which is exactly the right behaviour here; dropping the
+#: rows instead meant dropping all of them.
+OPTIONAL_FEATURES = ("dni", "dhi")
+
+#: Features a training row must actually have. A row missing any of these
+#: has nothing to teach the model and is dropped.
+REQUIRED_FEATURES = tuple(name for name in FEATURES if name not in OPTIONAL_FEATURES)
+
 #: Below this many distinct days, archived forecasts are not enough to
 #: train on; a fresh install has no archive yet, and a short one is not
 #: representative of what the model will be fed once deployed.

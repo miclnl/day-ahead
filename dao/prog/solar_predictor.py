@@ -460,11 +460,20 @@ class SolarPredictor(DaBase):
         if solar_df.index.tz is None:
             solar_df.index = solar_df.index.tz_localize("UTC", ambiguous="NaT")
 
-        weather_features = weather_features.dropna()
+        # Only on the columns a row genuinely needs. dni and dhi are NaN
+        # for every row the observation branch produces (and for every
+        # Meteoserver or KNMI row), and XGBoost is fed them as missing on
+        # purpose -- dropping those rows dropped the entire training set.
+        from dao.forecast.pv.ml import REQUIRED_FEATURES
+
+        required = [
+            column for column in REQUIRED_FEATURES if column in weather_features.columns
+        ]
+        weather_features = weather_features.dropna(subset=required)
         solar_df = solar_df.dropna()
 
         merged_data = weather_features.join(solar_df, how="inner")
-        merged_data = merged_data.dropna()
+        merged_data = merged_data.dropna(subset=[*required, "solar_kwh"])
 
         # drop when irradiance=0 and solar_kwh=0
         # merged_data.query('irradiance > 0 or solar_kwh > 0', inplace=True)
@@ -484,8 +493,8 @@ class SolarPredictor(DaBase):
         X = merged_data[self.feature_columns].copy()
         y = merged_data["solar_kwh"].copy()
 
-        # Remove any remaining NaN values
-        mask = ~(X.isnull().any(axis=1) | y.isnull())
+        # Remove any remaining NaN values, again only where one matters.
+        mask = ~(X[required].isnull().any(axis=1) | y.isnull())
         X = X[mask]
         y = y[mask]
 
