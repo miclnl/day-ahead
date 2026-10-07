@@ -12,6 +12,7 @@ Two separate questions, answered separately:
 
 from __future__ import annotations
 
+import logging
 import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -37,6 +38,10 @@ _MIN_HISTORY_DAYS = 7
 
 #: Candidate thresholds for calibration, matching the spec's grid search.
 _THRESHOLD_GRID = tuple(round(t, 2) for t in np.arange(0.20, 0.70 + 1e-9, 0.05))
+
+#: The consumption rule needs at least this fraction of today's elapsed
+#: hours actually measured before it will call the household away.
+MIN_MEASURED_FRACTION = 0.8
 
 
 def standby_kwh(series: pd.Series) -> float:
@@ -209,6 +214,43 @@ def _trailing_zero_run(presence: pd.Series, now: datetime) -> tuple[int, bool]:
     return length, started_today
 
 
+def _consumption_regime(signals: RegimeSignals) -> Optional[Regime]:
+    """Away purely from today's consumption so far, or ``None`` to say nothing.
+
+    Only hours that were actually measured are compared, and the profile is
+    summed over exactly those same hours. Measured hours come from the
+    history reader, which leaves a recorder gap as NaN and has not yet seen
+    the one or two most recent hours (Home Assistant writes hour *H* at the
+    top of *H+1*). Counting those as "consumed nothing" while the profile
+    still expects their full value is what made a household behaving
+    exactly as predicted look away.
+
+    Below :data:`MIN_MEASURED_FRACTION` of the elapsed hours the day is too
+    patchy to judge at all, and no answer is better than a wrong one: the
+    whole remaining horizon would otherwise be planned on the away profile.
+    """
+    hour = signals.now.hour
+    measured = pd.Series(signals.consumption_today).dropna()
+    measured = measured[[moment.hour < hour for moment in measured.index]]
+
+    if len(measured) < MIN_MEASURED_FRACTION * hour:
+        logging.warning(
+            f"Afwezigheid: verbruik van vandaag is te onvolledig om te "
+            f"beoordelen ({len(measured)} van {hour} uren gemeten), "
+            f"thuis aangenomen"
+        )
+        return None
+
+    hours = [moment.hour for moment in measured.index]
+    consumed = float(measured.sum())
+    expected = sum(signals.home_profile_today[h] for h in hours)
+    floor = len(hours) * signals.standby
+
+    if consumed - floor < signals.threshold * (expected - floor):
+        return Regime(away=True, reason="consumption", switch_hour=hour)
+    return None
+
+
 def determine_regime(day: date, signals: RegimeSignals) -> Regime:
     """Home or away for ``day``, from the configured signals in order of
     precedence: entity, calendar, presence, consumption, none. The first
@@ -245,12 +287,8 @@ def determine_regime(day: date, signals: RegimeSignals) -> Regime:
         and signals.consumption_today is not None
         and signals.home_profile_today is not None
     ):
-        hour = signals.now.hour
-        consumed = float(pd.Series(signals.consumption_today).sum())
-        expected = sum(signals.home_profile_today[:hour])
-        if consumed - hour * signals.standby < signals.threshold * (
-            expected - hour * signals.standby
-        ):
-            return Regime(away=True, reason="consumption", switch_hour=hour)
+        regime = _consumption_regime(signals)
+        if regime is not None:
+            return regime
 
     return Regime()

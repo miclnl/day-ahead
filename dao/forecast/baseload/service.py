@@ -62,6 +62,13 @@ from dao.prog.utils import interpolate
 #: household may have changed since the last fit.
 MAX_PROFILE_AGE_DAYS = 14.0
 
+#: Fewer measured hours than this in the whole fit window and the result is
+#: not a profile but an artefact of missing data. One day's worth is a
+#: deliberately low bar: it does not promise a good profile, it only rules
+#: out the case where a purge, a renamed entity or a stopped meter would
+#: otherwise replace a working profile with twenty-four zeros.
+MIN_FIT_HOURS = 24
+
 
 class BaseloadUnavailable(RuntimeError):
     """Neither a fitted profile set nor a static baseload is configured."""
@@ -201,6 +208,28 @@ class BaseloadService:
             )
         return calibrated
 
+    def _keep_previous_profile_set(self, reason: str) -> ProfileSet:
+        """Refuse to replace the stored profile set, and say why.
+
+        A fit that found no usable history produces twenty-four zeros per
+        weekday, and the optimizer would then plan a household that consumes
+        nothing. The previous profile set is stale but real, so it stays;
+        with nothing stored either there is genuinely nothing to forecast
+        with and the caller has to hear about it.
+        """
+        existing = self.profile_set()
+        if existing is None:
+            raise BaseloadUnavailable(
+                f"Baseload: profiel niet berekend, {reason}, en er is geen "
+                f"eerder profiel om op terug te vallen"
+            )
+        age = profile_age_days(existing, self._now())
+        logging.warning(
+            f"Baseload: profiel niet herberekend, {reason}; het bestaande "
+            f"profiel van {age:.1f} dagen oud blijft in gebruik"
+        )
+        return existing
+
     def fit(self) -> ProfileSet:
         """Recompute the seven weekday profiles from history and save them."""
         now = self._now()
@@ -214,6 +243,12 @@ class BaseloadService:
         caps = component_caps(self.config)
         frame = reader.read_components(groups, vanaf, tot, caps)
         base = baseload_from_components(frame).dropna()
+
+        if len(base) < MIN_FIT_HOURS:
+            return self._keep_previous_profile_set(
+                f"slechts {len(base)} gemeten uren in {period_days} dagen "
+                f"(minimaal {MIN_FIT_HOURS} nodig)"
+            )
 
         rows = list(zip(base.index, base.values, strict=True))
         grouped = iter_samples(rows, now, options.holidays)
@@ -236,6 +271,12 @@ class BaseloadService:
                 )
             )
             home[weekday] = profile
+
+        if sum(profile.total for profile in home.values()) <= 0.0:
+            return self._keep_previous_profile_set(
+                f"alle zeven weekdagprofielen kwamen op 0 kWh uit over "
+                f"{len(base)} gemeten uren"
+            )
 
         away_profile = None
         away_source = None
@@ -645,7 +686,10 @@ class BaseloadService:
                     caps = component_caps(self.config)
                     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
                     frame = reader.read_components(groups, midnight, now, caps)
-                    consumption_today = baseload_from_components(frame).tolist()
+                    # The series, not a bare list: determine_regime pairs
+                    # each measured hour with the same hour of the profile,
+                    # which needs the index.
+                    consumption_today = baseload_from_components(frame)
                 except Exception as ex:  # noqa: BLE001 - a signal, not the calculation
                     logging.warning(f"Kon verbruik van vandaag niet lezen: {ex}")
 

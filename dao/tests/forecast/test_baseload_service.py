@@ -314,6 +314,67 @@ def test_fit_writes_profile_set(service_with_history):
     assert (data_dir / "profile.json").exists()
 
 
+def _service_with_no_rows_in_window(ha_db, tmp_path, *, previous=True):
+    """Sensors registered in ``statistics_meta`` but without a single row in
+    the window ``fit()`` reads: a recorder purge, a renamed entity, a meter
+    that stopped reporting."""
+    manager, helper = ha_db
+    now = dt.datetime(2026, 3, 4, 6, 0, tzinfo=ZONE)
+    period_days = 60
+    tot = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    vanaf = tot - dt.timedelta(days=period_days)
+
+    stale = {
+        int((vanaf - dt.timedelta(hours=i)).timestamp()): 0.3 * (24 - i)
+        for i in range(1, 25)
+    }
+    helper.add_energy("sensor.test_grid_in", "kWh", stale)
+    helper.add_energy("sensor.test_grid_out", "kWh", dict.fromkeys(stale, 0.0))
+    helper.add_power("sensor.test_pv", "W", dict.fromkeys(stale, 0.0))
+
+    data_dir = tmp_path / "forecast" / "baseload"
+    if previous:
+        save_profile_set(
+            ProfileSet(
+                created=dt.datetime(2026, 2, 1, tzinfo=ZONE),
+                period_days=period_days,
+                aggregate="mean",
+                home={wd: flat_profile(0.4) for wd in range(7)},
+            ),
+            data_dir,
+        )
+    config = make_config(baseload=None, calc_periode=period_days, absence_detect=False)
+    service = BaseloadService(
+        config, db_da=None, db_ha=manager, data_dir=data_dir, tz=TZ, now=lambda: now
+    )
+    return service, data_dir
+
+
+def test_fit_keeps_the_previous_profile_when_the_window_is_empty(ha_db, tmp_path, caplog):
+    service, data_dir = _service_with_no_rows_in_window(ha_db, tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        profile_set = service.fit()
+
+    assert profile_set.home[0].values == [0.4] * 24
+    saved = json.loads((data_dir / "profile.json").read_text(encoding="utf-8"))
+    assert saved["home"]["0"]["values"] == [0.4] * 24
+    assert saved["created"].startswith("2026-02-01")
+    assert any(
+        "niet herberekend" in record.message and "0 gemeten uren" in record.message
+        for record in caplog.records
+    )
+
+
+def test_fit_without_history_and_without_a_previous_profile_raises(ha_db, tmp_path):
+    service, data_dir = _service_with_no_rows_in_window(ha_db, tmp_path, previous=False)
+
+    with pytest.raises(BaseloadUnavailable):
+        service.fit()
+
+    assert not (data_dir / "profile.json").exists()
+
+
 def test_profile_set_migrates_legacy_directory(service_without_profiles, tmp_path):
     legacy_dir = tmp_path / "baseload"
     for weekday in range(7):
@@ -379,6 +440,59 @@ def test_forecast_picks_regime_from_entity(service_with_profiles, fake_ha):
     )
     assert status["regime"] == "away"
     assert status["reason"] == "entity"
+
+
+def test_current_regime_is_home_when_today_matches_the_profile(ha_db, tmp_path):
+    """The whole path, from the recorder to the regime: a household using
+    exactly what its profile predicts, read back through the history reader
+    with its real NaN tail, must not be called away."""
+    manager, helper = ha_db
+    now = dt.datetime(2026, 3, 4, 6, 30, tzinfo=ZONE)  # Wednesday morning
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # 0.25 kWh overnight, 0.6 kWh from 06:00: a plausible weekday. Home
+    # Assistant has written through 04:00, so 05:00 and 06:00 are missing.
+    profile_values = [0.25] * 6 + [0.6] * 18
+    grid_in: dict[int, float] = {}
+    total = 0.0
+    for hour in range(6):
+        grid_in[int((midnight + dt.timedelta(hours=hour)).timestamp())] = total
+        total += profile_values[hour]
+
+    helper.add_energy("sensor.test_grid_in", "kWh", grid_in)
+    helper.add_energy("sensor.test_grid_out", "kWh", dict.fromkeys(grid_in, 0.0))
+    helper.add_power("sensor.test_pv", "W", dict.fromkeys(grid_in, 0.0))
+
+    home = {
+        wd: BaseloadProfile(
+            values=list(profile_values), samples=[8] * 24, pooled=[False] * 24
+        )
+        for wd in range(7)
+    }
+    data_dir = tmp_path / "forecast" / "baseload"
+    save_profile_set(
+        ProfileSet(
+            created=dt.datetime(2026, 3, 3, tzinfo=ZONE),
+            period_days=56,
+            aggregate="mean",
+            home=home,
+            standby_kwh=0.2,
+        ),
+        data_dir,
+    )
+    service = BaseloadService(
+        make_config(baseload=None),
+        db_da=None,
+        db_ha=manager,
+        data_dir=data_dir,
+        tz=TZ,
+        now=lambda: now,
+    )
+
+    regime = service.current_regime(now.date())
+
+    assert regime.away is False
+    assert regime.reason == "none"
 
 
 def test_record_presence_writes_fraction(da_db, fake_ha, tmp_path):

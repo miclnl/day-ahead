@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -196,12 +197,33 @@ def test_someone_home_breaks_the_run():
     assert regime.switch_hour == now.hour
 
 
+#: A plausible weekday: near standby overnight, normal use from 06:00.
+NIGHT_DAY_PROFILE = [0.25] * 6 + [0.6] * 18
+
+
+def consumption_series(now: datetime, measured: dict[int, float]) -> pd.Series:
+    """Today's measured baseload in the shape the history reader produces.
+
+    One entry per hour start in ``[midnight, now)`` -- so ``now.hour + 1``
+    entries, the last of which is the hour in progress -- with NaN for
+    every hour Home Assistant has not written yet or lost to a recorder
+    gap. ``measured`` maps local hour to its kWh; everything else is NaN.
+    """
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    index = pd.date_range(midnight, periods=now.hour + 1, freq="h", tz=now.tzinfo)
+    return pd.Series(
+        [measured.get(moment.hour, float("nan")) for moment in index], index=index
+    )
+
+
 def test_consumption_rule_switches_after_six():
-    now = datetime(2026, 3, 10, 9, 0, tzinfo=TZ)
+    now = datetime(2026, 3, 10, 9, 30, tzinfo=TZ)
+    # Standby all morning while the profile expects a normal weekday.
+    measured = dict.fromkeys(range(8), 0.2)
     signals = RegimeSignals(
         now=now,
-        consumption_today=[0.2] * 9,  # roughly standby all morning
-        home_profile_today=[0.5] * 24,  # normal use expected
+        consumption_today=consumption_series(now, measured),
+        home_profile_today=NIGHT_DAY_PROFILE,
         standby=0.2,
         threshold=0.4,
     )
@@ -215,13 +237,67 @@ def test_consumption_rule_not_before_six():
     now = datetime(2026, 3, 10, 5, 0, tzinfo=TZ)
     signals = RegimeSignals(
         now=now,
-        consumption_today=[0.2] * 5,
-        home_profile_today=[0.5] * 24,
+        consumption_today=consumption_series(now, dict.fromkeys(range(5), 0.2)),
+        home_profile_today=NIGHT_DAY_PROFILE,
         standby=0.2,
         threshold=0.4,
     )
     regime = determine_regime(now.date(), signals)
     assert regime == Regime()
+
+
+def test_a_household_matching_its_profile_is_home_despite_the_recorder_lag():
+    """Home Assistant writes hour H at the top of H+1, so the last one or two
+    entries of today are always NaN. Those hours must not count as consumed
+    nothing."""
+    now = datetime(2026, 3, 10, 6, 30, tzinfo=TZ)
+    measured = {hour: NIGHT_DAY_PROFILE[hour] for hour in range(5)}
+    signals = RegimeSignals(
+        now=now,
+        consumption_today=consumption_series(now, measured),
+        home_profile_today=NIGHT_DAY_PROFILE,
+        standby=0.2,
+        threshold=0.4,
+    )
+    regime = determine_regime(now.date(), signals)
+    assert regime == Regime()
+
+
+def test_a_recorder_gap_is_not_an_absence(caplog):
+    """A household that used exactly what its profile predicted, with seven
+    hours missing from the recorder, is not away -- and the rule says so
+    rather than deciding on the hours that happen to be there."""
+    now = datetime(2026, 3, 10, 18, 30, tzinfo=TZ)
+    present = list(range(8)) + [15, 16]
+    measured = {hour: NIGHT_DAY_PROFILE[hour] for hour in present}
+    signals = RegimeSignals(
+        now=now,
+        consumption_today=consumption_series(now, measured),
+        home_profile_today=NIGHT_DAY_PROFILE,
+        standby=0.2,
+        threshold=0.4,
+    )
+    with caplog.at_level(logging.WARNING):
+        regime = determine_regime(now.date(), signals)
+
+    assert regime == Regime()
+    assert any("verbruik van vandaag" in record.message for record in caplog.records)
+
+
+def test_a_real_absence_is_still_detected_with_the_recorder_lag():
+    now = datetime(2026, 3, 10, 12, 30, tzinfo=TZ)
+    measured = dict.fromkeys(range(11), 0.2)  # standby since midnight
+    signals = RegimeSignals(
+        now=now,
+        consumption_today=consumption_series(now, measured),
+        home_profile_today=NIGHT_DAY_PROFILE,
+        standby=0.2,
+        threshold=0.4,
+    )
+    regime = determine_regime(now.date(), signals)
+    assert regime.away is True
+    assert regime.reason == "consumption"
+    assert regime.switch_hour == 12
 
 
 def test_no_signal_is_home():
