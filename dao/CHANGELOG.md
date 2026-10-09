@@ -2,6 +2,82 @@
 # Day Ahead Optimizer
 # Unreleased
 
+# 2026.10.9
+
+## Het tabblad Tasks liet zijn uitvoer niet meer zien
+Gemeld vanaf een draaiende installatie: de knoppen stonden onder elkaar en
+vulden het hele scherm, en van het uitvoervenster was niets te zien.
+
+De twee panelen gebruikten Bootstraps `.col` zonder een `.row` eromheen,
+binnen een `<main>` die `d-flex flex-column` is. In een kolom-flexbox
+verdeelt `.col{flex:1 0 0}` *hoogte*, dus de panelen stapelden en het
+knoppenblok — twaalf rijen over de volle breedte, 644 px — duwde de uitvoer
+van het scherm. Op een scherm van 768 px bleef er min vier pixel over, en
+omdat een flexitem met `overflow` zijn `min-height:auto` als nul leest,
+klapte het paneel helemaal dicht.
+
+De knoppen staan nu in een raster van drie kolommen, en in vier groepen:
+Berekenen, Ophalen, Onderhoud en Snelle regellaag. Dat scheelt 140 px en
+scheelt vooral zoeken tussen twaalf lange labels. De console eronder heeft
+een eigen ondergrens van 24 rem, zodat de pagina gaat schuiven in plaats van
+dat het venster verdwijnt, en komt vanzelf in beeld zodra je een taak start.
+
+Verder aan diezelfde console:
+
+- De statusbalk zat als `sticky-top` *binnen* het scrollende paneel en
+  prikte daar honderd pixel kop vast in een venster dat er honderd had.
+  Hij staat nu naast het log in plaats van erin.
+- Het log stond in een kale `<pre>`, dus zonder afbreken: regels hier zijn
+  zo'n honderd tekens, en het eind van elke regel zat achter een
+  horizontale schuifbalk.
+- `Afbreken` stond onder de takenlijst en had twee losse scriptjes nodig om
+  zichzelf bij elke poll aan en uit te zetten. De knop hoort bij de taak die
+  draait en staat nu in de statusbalk, waar de status al bekend is.
+- Een afgebroken taak draait door tot hij klaar is. De uitvoer bevroor
+  zodra je op Afbreken drukte, omdat de poll alleen bij `running` doorliep.
+- `Afbreken` gaf de *hele pagina* terug — nav, footer, een tweede
+  `#status-target` — en htmx propte dat in het uitvoervenster.
+- De poll las elke seconde het volledige logbestand. Dat is nu de laatste
+  200 kB, met een regel erboven als er iets is weggelaten; het hele bestand
+  staat onder Logs.
+- Scrollen blijft nu aan de onderkant plakken, tenzij je zelf omhoog bent
+  gegaan om iets te lezen.
+- De kop toonde `calc_optimum: done`. Nu de naam van de taak zoals hij in de
+  lijst staat, met de status als label ernaast.
+
+## De snelle regellaag stond permanent op 0 W
+Gemeld vanaf een draaiende installatie in schaduwmodus: de optimalisering
+schreef elk uur netjes een plan weg, en toch stond er in het tabblad Fast
+control al twee weken één enkele trigger, `setpoint_change plan_expired
+0.0 W`, van de dag dat het begon.
+
+Het plan lag structureel twee uur in de toekomst. De optimalisering rekent
+met een kolom naive pandas-Timestamps, en `pandas.Timestamp.timestamp()`
+leest een naive wandklok als UTC, waar `datetime.timestamp()` hem als
+lokale tijd leest. Het verschil is precies de UTC-offset: twee uur in de
+zomertijd, één in de wintertijd. Daardoor vond `interval_at(nu)` nooit een
+interval, kwam elke beslissing terug als `plan_expired` en bleef het
+setpoint op 0 W staan. En omdat er alleen een event wordt vastgelegd als
+het setpoint verandert, zag je van die hele storing niets anders dan die
+ene oude regel.
+
+De overdracht gebruikt nu de epoch die de database zelf opslaat, in plaats
+van de weergavekolom terug te rekenen. `da_report` en de backtest hadden
+deze val al afgedekt; alleen deze ene plek niet.
+
+De optimalisering controleert daarnaast na het wegschrijven of de horizon
+het huidige moment bevat, en zegt het met een foutregel als dat niet zo is.
+Precies die toestand bleef anders onzichtbaar.
+
+## De snelle regellaag deed één HTTP-verzoek per sensor per tick
+De gebatchte uitlezing — één template-aanroep voor alle entiteiten samen —
+riep `render_template` aan op de Home Assistant-client, en die methode
+bestond daar helemaal niet. Elke start liep dus tegen een AttributeError
+aan, schakelde over op losse state-verzoeken en bleef daar de rest van de
+run op staan. De methode is toegevoegd; een test leidt nu uit de broncode
+af welke aanroepen de gateway doet en controleert dat de client ze allemaal
+kent.
+
 # 2026.10.7.1
 
 ## Het logboek is weer leesbaar
