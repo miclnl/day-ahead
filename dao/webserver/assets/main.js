@@ -196,3 +196,31 @@ function renderFastChart() {
 }
 
 document.addEventListener('DOMContentLoaded', renderFastChart);
+
+
+// Task console: stay at the bottom while a task runs, unless the reader
+// scrolled up to look at something. The poll replaces the whole log every
+// second, so without this it either jumps back to the top on every swap or
+// yanks the reader back down mid-sentence.
+const CONSOLE_ID = 'status-target';
+const STUCK_TO_BOTTOM_PX = 32;
+let consoleWasAtBottom = true;
+
+function taskConsoleLog() {
+    const console_ = document.getElementById(CONSOLE_ID);
+    return console_ ? console_.querySelector('.task-console-log') : null;
+}
+
+document.body.addEventListener('htmx:beforeSwap', (event) => {
+    if (event.detail.target.id !== CONSOLE_ID) return;
+    const log = taskConsoleLog();
+    consoleWasAtBottom =
+        !log ||
+        log.scrollHeight - log.scrollTop - log.clientHeight <= STUCK_TO_BOTTOM_PX;
+});
+
+document.body.addEventListener('htmx:afterSwap', (event) => {
+    if (event.detail.target.id !== CONSOLE_ID) return;
+    const log = taskConsoleLog();
+    if (log && consoleWasAtBottom) log.scrollTop = log.scrollHeight;
+});

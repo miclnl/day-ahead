@@ -34,6 +34,63 @@ h1 {
   min-height: calc(80vh);
 }
 
+// The task page: a grid of buttons over a console.
+//
+// The group heading is a label, not a section title competing with the h1,
+// so it is set small and tracked out rather than large. Keeping it quiet is
+// what lets four of them sit above the fold without crowding the buttons.
+.task-group-name {
+  margin-bottom: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--bs-secondary-color);
+}
+
+// Deliberately the same panel as code-input above: the Logs tab and the
+// task output are the same kind of thing, and they should read as siblings.
+.task-console {
+  min-height: 24rem;
+  margin-top: 0.5rem;
+
+  background-color: var(--bs-body-bg);
+  border: var(--bs-border-width) solid var(--bs-border-color);
+  border-radius: var(--bs-border-radius);
+  overflow: hidden;
+}
+
+.task-console-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: var(--bs-border-width) solid var(--bs-border-color);
+}
+
+.task-console-log {
+  // min-height: a flex item defaults to min-height:auto, which refuses to
+  // shrink below its content, so the log would stretch the console instead
+  // of scrolling inside it.
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0.75rem;
+  overflow: auto;
+
+  font-family: var(--bs-font-monospace);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  tab-size: 4;
+
+  // Log lines here run to about a hundred characters. A bare <pre> keeps
+  // white-space:pre, which put the end of every line behind a horizontal
+  // scrollbar.
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 #tab-report-data {
   .spinner {
     display: none;

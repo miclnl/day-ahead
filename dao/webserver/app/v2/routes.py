@@ -108,6 +108,10 @@ def get_task_state() -> dict:
     task at a time: the running one, or the most recently finished when
     nothing runs. Returns the flat shape the template and the poll endpoint
     already expected.
+
+    ``running`` says whether the task is still going. "cancelled" alone does
+    not: a cancel that has been asked for but not yet taken effect is also
+    "cancelled", and the poll has to keep going until the task winds down.
     """
     state = task_state.read()
     running = state["running"]
@@ -116,6 +120,7 @@ def get_task_state() -> dict:
         entry = running[key]
         return {
             "status": "cancelled" if entry.get("cancel") else "running",
+            "running": True,
             "task": key,
             "logfile": entry.get("logfile"),
             "started": entry.get("started"),
@@ -127,12 +132,19 @@ def get_task_state() -> dict:
         entry = finished[key]
         return {
             "status": entry.get("status", "idle"),
+            "running": False,
             "task": key,
             "logfile": entry.get("logfile"),
             "started": entry.get("started"),
             "returncode": entry.get("returncode"),
         }
-    return {"status": "idle", "task": None, "logfile": None, "started": None}
+    return {
+        "status": "idle",
+        "running": False,
+        "task": None,
+        "logfile": None,
+        "started": None,
+    }
 
 
 def log_chart(datapath: str, pattern: str):
@@ -249,17 +261,22 @@ def delete_file():
 
 @v2.route("/tasks")
 def tasks():
-    return render_template("v2/tasks.html", tasks=task_page_entries())
+    return render_template("v2/tasks.html", groups=task_page_groups())
+
 
 @v2.route("/task-cancel")
 def task_cancel():
     try:
         for key in task_state.running_tasks():
             task_state.request_cancel(key)
-        return render_template("v2/tasks.html")
     except Exception:
         logging.exception("Afbreken van de taak is mislukt")
         return "Error cancelling task", 500
+    # The same fragment the poll returns. This used to render the whole of
+    # tasks.html, so htmx swapped a complete document -- nav, footer, a
+    # second #status-target and a second cancel button -- into the output
+    # pane the fragment was supposed to fill.
+    return task_state_page()
 
 
 @v2.route("/task-exec", methods=["POST"])
@@ -302,6 +319,44 @@ def task_exec():
     return redirect(url_for('v2.task_state'))
 
 
+#: How much of a task log the console shows. The poll re-reads the file
+#: every second, so an unbounded read meant shipping and re-parsing the
+#: whole of a multi-hour training log once a second. The tail is what you
+#: watch a running task for; the Logs page serves the complete file.
+TASK_LOG_TAIL_BYTES = 200_000
+
+#: What each state is called in the interface, and which colour carries it.
+#: The stored values are the vocabulary of the claim file, not of the person
+#: reading the page. The label is always shown next to the colour, so the
+#: state never depends on colour alone.
+TASK_STATUS_DISPLAY = {
+    "running": {"label": "Bezig", "variant": "warning"},
+    "cancelled": {"label": "Afbreken", "variant": "warning"},
+    "done": {"label": "Klaar", "variant": "success"},
+    "error": {"label": "Mislukt", "variant": "danger"},
+    "idle": {"label": "Niets gedraaid", "variant": "secondary"},
+}
+
+
+def read_task_log(path: str) -> str:
+    """The tail of a task log, with a note when the head was left out."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, errors="replace") as handle:
+            if size > TASK_LOG_TAIL_BYTES:
+                handle.seek(size - TASK_LOG_TAIL_BYTES)
+                handle.readline()  # drop the half line the seek landed in
+                skipped = (size - TASK_LOG_TAIL_BYTES) // 1024
+                return (
+                    f"[ eerste {skipped} kB overgeslagen, volledige log staat "
+                    f"onder Logs ]\n\n" + handle.read()
+                )
+            return handle.read()
+    except OSError as exception:
+        logging.warning(f"Taaklog {path} kon niet worden gelezen: {exception}")
+        return "Logbestand kon niet worden gelezen."
+
+
 # endpoint="task_state" keeps url_for('v2.task_state') and the two
 # templates using it working; the function itself is renamed because
 # task_state is also the module holding the shared claims (imported above)
@@ -310,7 +365,7 @@ def task_exec():
 def task_state_page():
     current_state = get_task_state()
 
-    content = "No logfile available"
+    content = "Nog geen taak gedraaid."
     started = None
     seconds_running = None
     status = current_state["status"]
@@ -335,22 +390,39 @@ def task_state_page():
             seconds_running = int((last_update - started).total_seconds())
 
         if current_state.get("logfile") is None:
-            content = "No log data available yet"
+            content = "Nog geen uitvoer."
         else:
-            try:
-                with open(current_state["logfile"], "r") as f:
-                    content = f.read()
-            except:
-                content = "Could not read logfile"
+            content = read_task_log(current_state["logfile"])
 
     headers = {
         "HX-Push-Url": "false",
     }
 
+    task_key = current_state.get("task")
+    task = task_registry.get(task_key) if task_key else None
+
+    # The date only when it is not today's: the console mostly shows a task
+    # from a minute ago, and a bare clock time on something from last week
+    # reads as if it just ran.
+    started_label = None
+    if started is not None:
+        same_day = started.date() == datetime.date.today()
+        started_label = started.strftime(
+            "%H:%M:%S" if same_day else "%d-%m %H:%M:%S"
+        )
+
     return render_template(
         "v2/task-status.html",
-        task_state=current_state,
-        started=started,
+        task_name=(task["name"] if task else task_key),
+        status=TASK_STATUS_DISPLAY.get(
+            status, {"label": status, "variant": "secondary"}
+        ),
+        # A cancel that was requested leaves the task running until it winds
+        # down, so the poll has to carry on; only "running" may be cancelled
+        # again.
+        polling=current_state["running"],
+        cancellable=status == "running",
+        started=started_label,
         seconds_running=seconds_running,
         content=content,
     ), headers
@@ -365,50 +437,70 @@ PARAMETER_FIELDS = {
     "days": {"label": "Dagen", "type": "number", "default": "14"},
 }
 
-#: The tasks the page offers, in the order they appear. Keyed by the
-#: registry's canonical names.
-TASK_PAGE_ORDER = (
-    "calc_optimum_met_debug",
-    "calc_optimum",
-    "calc_baseloads",
-    "prices",
-    "meteo",
-    "tibber",
-    "consolidate",
-    "forecast_accuracy",
-    "train_ml_predictions",
-    "clean",
-    "fast_once",
-    "fast_control_simulate",
+#: The tasks the page offers, grouped by what you are trying to do and in
+#: the order they appear. Twelve long labels in one flat list meant reading
+#: all of them to find one; these four headings are the question you came
+#: to the page with. Keyed by the registry's canonical names.
+#:
+#: Grouping lives here for the same reason PARAMETER_FIELDS does: the
+#: registry describes what a task *is*, the dashboard decides how to present
+#: it. The scheduler reads the same registry and wants nothing to do with
+#: either.
+TASK_PAGE_GROUPS = (
+    ("Berekenen", ("calc_optimum_met_debug", "calc_optimum", "calc_baseloads")),
+    ("Ophalen", ("prices", "meteo", "tibber")),
+    (
+        "Onderhoud",
+        ("consolidate", "forecast_accuracy", "train_ml_predictions", "clean"),
+    ),
+    ("Snelle regellaag", ("fast_once", "fast_control_simulate")),
 )
 
+#: Button labels that differ from the registry name. Only where the group
+#: heading already says it: "Snelle regellaag: een regelcyclus" under a
+#: heading reading "Snelle regellaag" stutters. Everything else keeps the
+#: registry's wording, which is the wording the scheduler page and the log
+#: use as well.
+TASK_PAGE_LABELS = {
+    "fast_once": "Eén regelcyclus",
+    "fast_control_simulate": "Terugrekenen op historie",
+}
 
-def task_page_entries() -> list[dict]:
-    """The task buttons and their parameter fields, from the registry.
+
+def task_page_groups() -> list[dict]:
+    """The task buttons and their parameter fields, grouped, from the registry.
 
     The page used to hard-code a subset of buttons with no parameter inputs
     at all, so five tasks were unreachable and the price fetch could not be
     given a date range -- the one thing the v1 page could do that this one
     could not.
     """
-    entries = []
-    for key in TASK_PAGE_ORDER:
-        task = task_registry.get(key)
-        if task is None:  # pragma: no cover - guards a typo above
-            logging.error(f"Onbekende taak {key!r} in de takenlijst, overgeslagen")
-            continue
-        entries.append(
-            {
-                "key": key,
-                "name": task["name"],
-                "fields": [
-                    {"name": parameter, **PARAMETER_FIELDS[parameter]}
-                    for parameter in task.get("parameters", ())
-                    if parameter in PARAMETER_FIELDS
-                ],
-            }
-        )
-    return entries
+    groups = []
+    for name, keys in TASK_PAGE_GROUPS:
+        entries = []
+        for key in keys:
+            task = task_registry.get(key)
+            if task is None:  # pragma: no cover - guards a typo above
+                logging.error(f"Onbekende taak {key!r} in de takenlijst, overgeslagen")
+                continue
+            entries.append(
+                {
+                    "key": key,
+                    "name": TASK_PAGE_LABELS.get(key, task["name"]),
+                    "fields": [
+                        {"name": parameter, **PARAMETER_FIELDS[parameter]}
+                        for parameter in task.get("parameters", ())
+                        if parameter in PARAMETER_FIELDS
+                    ],
+                }
+            )
+        groups.append({"name": name, "tasks": entries})
+    return groups
+
+
+def task_page_entries() -> list[dict]:
+    """Every task the page offers, flattened out of its groups."""
+    return [entry for group in task_page_groups() for entry in group["tasks"]]
 
 
 #: Every report period, in the order the dropdown shows them.

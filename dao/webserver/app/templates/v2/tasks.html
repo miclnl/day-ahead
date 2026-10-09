@@ -1,44 +1,59 @@
 {% extends "v2/base.html" %}
 
-{% block title %}Run - DAO+{% endblock %}
+{% block title %}Tasks - DAO+{% endblock %}
 {% block content %}
-<div class="col flex-grow-0">
-    <h1>Run</h1>
-    {# Built from the task registry in dao/prog/tasks.py rather than a
-       hard-coded list: the buttons used to cover only a subset, so five
-       tasks were unreachable from here, and there were no parameter inputs
-       at all -- which is why the price fetch could not be given a date
-       range the way the old interface could. #}
-    <form method="POST" action="{{url_for('v2.task_exec')}}" hx-boost="true" hx-target="#status-target" hx-push-url="false" hx-replace-url="false">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
-        <div class="d-flex flex-column gap-2">
-            {% for task in tasks %}
-            <div class="d-flex align-items-center gap-2 flex-wrap">
+<h1>Tasks</h1>
+
+{# Grouped and gridded, from the registry via task_page_groups(). Twelve
+   tasks used to sit in twelve full-width rows inside a .col with no .row
+   around it, which in <main>'s column flexbox divided height rather than
+   width: the buttons claimed 644 px and the console below them got what was
+   left, which on a laptop was nothing. #}
+{# show: brings the console into view on submit. The controls are taller
+   than a laptop viewport once the console has its height floor, and
+   pressing a task button means you want to watch it. The poll sets its own
+   hx-swap, so this does not fire again every second. #}
+<form method="POST" action="{{url_for('v2.task_exec')}}" hx-boost="true"
+      hx-target="#status-target" hx-swap="innerHTML show:#status-target:top"
+      hx-push-url="false" hx-replace-url="false">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+    {% for group in groups %}
+    <section class="mb-3">
+        <h2 class="task-group-name">{{ group.name }}</h2>
+        <div class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-2">
+            {% for task in group.tasks %}
+            <div class="col">
                 <button type="submit" name="task" value="{{ task.key }}"
-                        class="btn btn-outline-secondary text-start" style="min-width: 18rem;">
+                        class="btn btn-outline-secondary w-100 text-start">
                     {{ task.name }}
                 </button>
-                {% for field in task.fields %}
-                <label class="form-label mb-0" for="{{ task.key }}-{{ field.name }}">
-                    {{ field.label }}
-                </label>
-                <input type="{{ field.type }}"
-                       id="{{ task.key }}-{{ field.name }}"
-                       name="{{ field.name }}"
-                       value="{{ field.default }}"
-                       class="form-control" style="max-width: 10rem;">
-                {% endfor %}
+                {% if task.fields %}
+                <div class="d-flex align-items-end gap-2 mt-2">
+                    {% for field in task.fields %}
+                    <div class="flex-fill">
+                        <label class="form-label mb-1 small text-body-secondary"
+                               for="{{ task.key }}-{{ field.name }}">{{ field.label }}</label>
+                        <input type="{{ field.type }}"
+                               id="{{ task.key }}-{{ field.name }}"
+                               name="{{ field.name }}"
+                               value="{{ field.default }}"
+                               class="form-control form-control-sm">
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
             </div>
             {% endfor %}
         </div>
-        <div class="mt-3">
-            <a href="{{url_for('v2.task_cancel')}}" hx-boost="false"
-               hx-get="{{url_for('v2.task_cancel')}}" hx-target="#status-target"
-               class="btn btn-outline-danger disabled" id="run-cancel">Cancel</a>
-        </div>
-    </form>
-</div>
-<div class="col mt-2 flex-grow-1 overflow-auto" id="status-target"
-     hx-get="{{url_for('v2.task_state')}}" hx-trigger="load" hx-target="#status-target" hx-push-url="false">
-</div>
+    </section>
+    {% endfor %}
+</form>
+
+{# min-height lives in the stylesheet: a flex item that scrolls resolves
+   min-height:auto to 0, which is how this pane disappeared entirely. #}
+<section class="task-console d-flex flex-column flex-grow-1" id="status-target"
+         aria-label="Uitvoer van de taak"
+         hx-get="{{url_for('v2.task_state')}}" hx-trigger="load"
+         hx-target="#status-target" hx-push-url="false">
+</section>
 {% endblock %}
