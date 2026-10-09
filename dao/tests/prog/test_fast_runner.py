@@ -191,6 +191,34 @@ class TestGateway:
         gateway = HomeAssistantGateway(FakeHass({}, fail_template=True))
         assert gateway.read(["sensor.missing"])["sensor.missing"] == (None, 0.0)
 
+    def test_dabase_answers_every_call_the_gateway_makes(self):
+        """FakeHass is allowed to be minimal, not to be more capable.
+
+        ``render_template`` existed on the fake from day one but never on
+        DaBase, so in production the batched read raised AttributeError on
+        its first attempt of every run and the layer quietly degraded to one
+        HTTP request per sensor per tick. Derived from the source so a newly
+        added call is covered without anyone remembering to list it here.
+        """
+        import ast
+        import inspect
+
+        from dao.prog.da_base import DaBase
+
+        tree = ast.parse(inspect.getsource(HomeAssistantGateway).lstrip())
+        used = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "hass"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "self"
+        }
+        assert used, "the gateway no longer talks to Home Assistant"
+        missing = sorted(n for n in used if not callable(getattr(DaBase, n, None)))
+        assert not missing, f"DaBase is missing {missing}"
+
 
 class TestSensorParsing:
     def test_kilowatts_are_converted(self, workspace):

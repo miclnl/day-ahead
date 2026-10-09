@@ -1943,7 +1943,13 @@ met een regel bij het opstarten), of het plan dekt het huidige moment
 niet meer (`plan_expired`). In dat laatste geval staan alle batterijen
 op 0 W en herhaalt het log elk half uur hoe oud het plan is; zoek dan
 op `Plan voor de snelle regellaag` om te zien waarom de
-optimalisering geen nieuw plan wegschrijft.
+optimalisering geen bruikbaar plan wegschrijft.
+
+Let erop dat de triggertabel alleen een regel krijgt als het setpoint
+*verandert*. Blijft de laag op 0 W staan, dan zie je dus één oude regel
+en verder niets — dat is geen bewijs dat de laag stilstaat. De laatste
+beslissing boven de tabel ververst elke vijf seconden en is wel een
+betrouwbaar teken van leven.
 
 
 ---

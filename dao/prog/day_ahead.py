@@ -324,6 +324,7 @@ class DaCalc(DaBase):
         uur = []  # hulparray met uren
         tijd = []
         ts = []
+        interval_ts = []  # epoch van elke intervalgrens
         global_rad = []  # globale straling per uur
         pv_org_ac = []  # opwekking zonnepanelen[]
         pv_org_dc = []
@@ -402,6 +403,11 @@ class DaCalc(DaBase):
             hour = dtime.strftime("%H:%M")
             uur.append(hour)
             tijd.append(dtime)
+            # The epoch of the interval this row describes, straight from the
+            # database. ts[0] holds the moment the run started instead, for the
+            # partial first interval, so anything that needs the boundary -- the
+            # hand-off to the fast control layer -- reads this list.
+            interval_ts.append(int(row.time))
             gr = row.glob_rad
             global_rad.append(gr)
             pv_total = 0
@@ -4663,8 +4669,11 @@ class DaCalc(DaBase):
         # hand-off naar de snelle regellaag
         #############################################
         try:
+            # interval_ts, not tijd: the fast layer compares its boundaries
+            # against time.time(), and tijd holds naive pandas Timestamps,
+            # which convert to epoch as if they were UTC. See export_fast_plan.
             self.export_fast_plan(
-                tijd=tijd,
+                interval_ts=interval_ts[:U],
                 hour_fraction=hour_fraction,
                 pl=pl,
                 pt=pt,
@@ -5302,7 +5311,7 @@ class DaCalc(DaBase):
 
     def export_fast_plan(
         self,
-        tijd: list,
+        interval_ts: list,
         hour_fraction: list,
         pl: list,
         pt: list,
@@ -5331,6 +5340,17 @@ class DaCalc(DaBase):
         planned net grid power and the planned house load, and per battery the
         planned AC power and state of charge, plus the static battery
         properties it needs to clamp its corrections.
+
+        ``interval_ts`` holds the epoch of every interval boundary, taken
+        straight from the database. It must not be derived from the optimizer's
+        ``tijd`` column: those are naive pandas Timestamps, and
+        ``pandas.Timestamp.timestamp()`` reads a naive wall clock as UTC where
+        ``datetime.timestamp()`` reads it as local time. Every boundary
+        therefore landed a full UTC offset in the future -- two hours in CEST,
+        one in CET -- ``interval_at(now)`` never matched, and the fast layer
+        reported ``plan_expired`` and parked at 0 W for as long as it ran.
+        da_report._local_epoch and fastctrl.simulate._local_epoch guard the
+        same trap where a naive frame does have to be converted.
 
         Skipped in debug mode, so a debug run never disturbs a live fast loop.
         """
@@ -5375,11 +5395,12 @@ class DaCalc(DaBase):
             for b in range(B)
         ]
 
+        created_ts = int(time.time())
         plan = build_plan(
-            created_ts=int(time.time()),
+            created_ts=created_ts,
             interval_s=self.interval_s,
             specs=specs,
-            start_ts=[int(tijd[u].timestamp()) for u in range(U)],
+            start_ts=[int(interval_ts[u]) for u in range(U)],
             hour_fraction=[hour_fraction[u] for u in range(U)],
             price_import=[float(pl[u]) for u in range(U)],
             price_export=[float(pt[u]) for u in range(U)],
@@ -5399,6 +5420,23 @@ class DaCalc(DaBase):
             f"Plan voor de snelle regellaag opgeslagen: {len(plan.intervals)} "
             f"intervallen, {len(specs)} batterij(en)"
         )
+        # The optimisation starts at the current interval and takes a good deal
+        # longer than the ten seconds calc_optimum may snap the start forward
+        # by, so by now the horizon has to contain this moment. When it does
+        # not, the fast layer reports plan_expired on every tick and parks at
+        # 0 W, and that condition is otherwise close to invisible: an event is
+        # only recorded when the setpoint changes, so weeks of it look like one
+        # stale row in the web UI.
+        if not plan.intervals[0].start_ts <= created_ts < plan.horizon_end_ts:
+            moment = dt.datetime.fromtimestamp
+            logging.error(
+                f"Plan voor de snelle regellaag dekt het huidige moment niet: "
+                f"de horizon loopt van "
+                f"{moment(plan.intervals[0].start_ts):%Y-%m-%d %H:%M} tot "
+                f"{moment(plan.horizon_end_ts):%Y-%m-%d %H:%M}, nu is het "
+                f"{moment(created_ts):%Y-%m-%d %H:%M}. De snelle regellaag "
+                f"blijft op 0 W staan tot er een plan komt dat wel aansluit."
+            )
 
     def _read_window_time(
         self, entity_id: str | None, start_dt: dt.datetime, what: str

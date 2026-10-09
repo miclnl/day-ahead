@@ -6,8 +6,9 @@ breaks a test instead of silently producing a plan the realtime loop cannot
 use.
 """
 
-import datetime
 import json
+import logging
+import time
 
 import pytest
 
@@ -52,9 +53,10 @@ def exporter():
 
 
 def call(exporter, path, steps=4, **overrides):
-    start = datetime.datetime(2026, 1, 15, 18, 0, 0)
+    # The epoch axis the optimizer carries alongside its display column.
+    start = 1768496400  # 2026-01-15 18:00 CET
     kwargs = dict(
-        tijd=[start + datetime.timedelta(hours=i) for i in range(steps)],
+        interval_ts=[start + 3600 * i for i in range(steps)],
         hour_fraction=[1.0] * steps,
         pl=[0.32, 0.46, 0.38, 0.28][:steps],
         pt=[0.08, 0.14, 0.11, 0.06][:steps],
@@ -169,6 +171,61 @@ class TestExport:
         assert plan.intervals[0].battery(0).ac_power_w == -1200.0
         assert plan.intervals[1].battery(0).ac_power_w == pytest.approx(-3000.0)
 
+    def test_the_boundaries_are_the_epochs_the_optimizer_handed_over(
+        self, exporter, tmp_path
+    ):
+        """No zone conversion happens here, in either direction.
+
+        The optimizer's own time axis is a column of naive pandas Timestamps,
+        and ``pandas.Timestamp.timestamp()`` reads a naive wall clock as UTC
+        where ``datetime.timestamp()`` reads it as local time. The exporter
+        therefore takes the epoch the database already stores and passes it
+        through untouched.
+        """
+        epochs = [1768496400 + 3600 * i for i in range(4)]
+        plan = call(exporter, str(tmp_path / "fast_plan.json"), interval_ts=epochs)
+        assert [i.start_ts for i in plan.intervals] == epochs
+
+    def test_the_plan_covers_the_moment_it_was_written(self, exporter, tmp_path):
+        """Regression: the fast layer sat at 0 W for a fortnight.
+
+        Converting the optimizer's naive Timestamps put every boundary a full
+        UTC offset into the future, so ``interval_at(now)`` never matched,
+        every decision came back as ``plan_expired`` and the setpoint stayed
+        at 0 W. Because an event is only recorded when the setpoint changes,
+        the whole outage showed up as a single stale row in the web UI and
+        nothing else.
+        """
+        now = int(time.time())
+        boundary = now - now % 3600
+        plan = call(
+            exporter,
+            str(tmp_path / "fast_plan.json"),
+            interval_ts=[boundary + 3600 * i for i in range(4)],
+        )
+        assert plan.interval_at(now) is plan.intervals[0]
+
+    def test_a_plan_that_misses_the_current_moment_is_reported(
+        self, exporter, tmp_path, caplog
+    ):
+        """The condition that stayed invisible for two weeks must be loud.
+
+        Writing it anyway is deliberate: the fast layer copes with a horizon
+        it cannot use, and withholding the plan would take the optimizer's
+        own schedule away as well.
+        """
+        now = int(time.time())
+        ahead = now - now % 3600 + 2 * 3600
+        path = tmp_path / "fast_plan.json"
+        with caplog.at_level(logging.ERROR):
+            plan = call(
+                exporter,
+                str(path),
+                interval_ts=[ahead + 3600 * i for i in range(4)],
+            )
+        assert plan is not None and path.exists()
+        assert "dekt het huidige moment niet" in caplog.text
+
     def test_debug_mode_writes_nothing(self, exporter, tmp_path):
         exporter.debug = True
         path = tmp_path / "fast_plan.json"
@@ -178,7 +235,7 @@ class TestExport:
     def test_an_empty_horizon_writes_nothing(self, exporter, tmp_path):
         path = tmp_path / "fast_plan.json"
         exporter.export_fast_plan(
-            tijd=[],
+            interval_ts=[],
             hour_fraction=[],
             pl=[],
             pt=[],
@@ -235,3 +292,28 @@ class TestSignatureContract:
         declared.discard("self")
         optional = {"path"}
         assert called == declared - optional
+
+    def test_the_hand_off_takes_the_epoch_axis_not_the_display_column(self):
+        """``tijd`` must never reach the exporter.
+
+        It holds naive pandas Timestamps, which convert to epoch as if their
+        wall clock were UTC. That moved every boundary a full UTC offset into
+        the future, and the fast layer reported ``plan_expired`` on every tick
+        for a fortnight. The optimizer carries the database's own epoch
+        alongside it; that is what the exporter gets.
+        """
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(DaCalc).lstrip())
+        passed = None
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "export_fast_plan"
+            ):
+                passed = {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+        assert passed is not None, "calc_optimum no longer exports the plan"
+        assert passed["interval_ts"].startswith("interval_ts")
+        assert "tijd" not in "".join(passed.values())

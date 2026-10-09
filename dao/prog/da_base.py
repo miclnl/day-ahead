@@ -330,6 +330,17 @@ class DaBase:
         return self._ha_client.get_state(entity_id=entity_id)
 
     @_retry_ha_call
+    def render_template(self, template: str) -> str:
+        """Render a Jinja2 template against Home Assistant's own context.
+
+        The fast control layer uses this to read every entity it needs in a
+        single round trip instead of one per sensor per tick. Until this
+        method existed the gateway fell back to individual state reads on its
+        first attempt, every run.
+        """
+        return self._ha_client.get_rendered_template(template)
+
+    @_retry_ha_call
     def get_calendar_events(
         self, entity_id: str, start: datetime.datetime, end: datetime.datetime
     ) -> list:
