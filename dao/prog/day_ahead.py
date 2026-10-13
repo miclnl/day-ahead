@@ -7,26 +7,29 @@ Zie verder: DOCS.md
 import ctypes
 import datetime
 import datetime as dt
+import logging
+import math
 import os
+import sys
 import tempfile
 import time
-import sys
-import math
-from zoneinfo import ZoneInfo
-import pandas as pd
 from contextlib import contextmanager
-from mip import Model, xsum, minimize, BINARY, CONTINUOUS, INTEGER
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+from mip import BINARY, CONTINUOUS, INTEGER, Model, minimize, xsum
 from pandas.core.dtypes.inference import is_number
-from dao.prog.da_report import Report
 from utils import (
-    interpolate,
-    convert_timestr,
-    calc_uur_index,
-    error_handling,
     calc_adjustment_heatcurve,
+    calc_uur_index,
+    convert_timestr,
+    error_handling,
+    interpolate,
 )
-import logging
+
+from dao.prog import production_bonus
 from dao.prog.da_base import DaBase
+from dao.prog.da_report import Report
 from dao.prog.fastctrl.plan import (
     FAST_PLAN_FILE,
     BatterySpec,
@@ -268,12 +271,16 @@ class DaCalc(DaBase):
         prog_data["da_ex"] = price_data["da_ex"]
         prog_data["da_cons"] = price_data["da_cons"]
         prog_data["da_prod"] = price_data["da_prod"]
+        prog_data["da_bonus"] = (
+            price_data["da_bonus"] if "da_bonus" in price_data.columns else 0.0
+        )
 
         logging.debug("Prognose data:\n{}".format(prog_data.to_string()))
         pd.options.display.float_format = "{:.3f}".format
 
         pl = []  # prijs levering day_ahead
         pt = []  # prijs teruglevering day_ahead
+        pb = []  # bonus op teruglevering per kWh, 0 buiten het bonusvenster
         p_spot = []  # prijs op de spot markt
         pl_avg = []  # prijs levering day_ahead gemiddeld
         uur = []  # datum_tijd van het betreffende uur
@@ -286,6 +293,7 @@ class DaCalc(DaBase):
             p_spot.append(row.da_ex)
             pl.append(row.da_cons)
             pt.append(row.da_prod)
+            pb.append(0.0 if math.isnan(row.da_bonus) else row.da_bonus)
 
         B = len(self.battery_options)
         U = len(pl)
@@ -450,6 +458,7 @@ class DaCalc(DaBase):
                         "spot": p_spot,
                         "p_l": pl,
                         "p_t": pt,
+                        "p_b": pb,
                         "base": b_l,
                         "pv_ac": pv_org_ac,
                         "pv_dc": pv_org_dc,
@@ -3294,6 +3303,34 @@ class DaCalc(DaBase):
         model += delivery == xsum(c_l[u] for u in range(U))
         model += production == xsum(c_t[u] for u in range(U))
 
+        ##################################################################
+        #        bonus op teruglevering (bijv. Budget Thuis ZonneBonus)   #
+        ##################################################################
+        bonus_cfg = getattr(self, "production_bonus", None)
+        bonus_active = any(p > 0 for p in pb)
+        if bonus_active:
+            bonus_remaining = self.production_bonus_remaining_kwh(start)
+            # PV-productie per interval in kWh: de bovengrens in de modus "pv only"
+            pv_kwh = [
+                xsum(pv_ac[s][u] for s in range(solar_num))
+                + xsum(pv_prod_dc_sum[b][u] for b in range(B)) * hour_fraction[u]
+                for u in range(U)
+            ]
+            c_t_bonus, bonus_revenue = production_bonus.add_to_model(
+                model,
+                bonus_cfg,
+                c_t,
+                pb,
+                pv_kwh,
+                [self.grid_max_power * hour_fraction[u] for u in range(U)],
+                bonus_remaining,
+            )
+            logging.info(production_bonus.describe(bonus_cfg, start, bonus_remaining))
+        else:
+            bonus_remaining = None
+            c_t_bonus = None
+            bonus_revenue = 0
+
         #  cycle cost per batterij
         cycle_cost = [model.add_var(var_type=CONTINUOUS, lb=0) for _ in range(B)]
         for b in range(B):
@@ -3333,6 +3370,7 @@ class DaCalc(DaBase):
         # alles in kWh * prijs = kosten in euro
         model += cost == (
             xsum(c_l[u] * pl[u] - c_t[u] * pt[u] for u in range(U))
+            - bonus_revenue
             + xsum(cycle_cost[b] + penalty_cost[b] for b in range(B))
             + xsum(switch_cost[e] + low_soc_penalty[e] for e in range(EV))
             + xsum(
@@ -3816,7 +3854,7 @@ class DaCalc(DaBase):
                 c_ev_sum[u],
                 solar_hour_sum_opt[u],
                 c_l[u].x * pl[u],
-                -c_t[u].x * pt[u],
+                -(c_t[u].x * pt[u] + (c_t_bonus[u].x * pb[u] if c_t_bonus is not None else 0.0)),
                 boiler_temp[u + 1].x,
             ]
             if M > 0:
@@ -4760,6 +4798,7 @@ class DaCalc(DaBase):
 
         # grafiek 1
         import numpy as np
+
         from dao.lib.da_graph import GraphBuilder
 
         gr1_df = pd.DataFrame()
@@ -4857,9 +4896,9 @@ class DaCalc(DaBase):
         grid0_df["pv_ac"] = pv_ac_p
         grid0_df["pv_dc"] = pv_p_org
         style = self.config.graphics.style
+        import matplotlib.lines as mlines
         import matplotlib.pyplot as plt
         import matplotlib.ticker as ticker
-        import matplotlib.lines as mlines
 
         plt.set_loglevel(level="warning")
         pil_logger = logging.getLogger("PIL")
