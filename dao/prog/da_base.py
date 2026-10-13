@@ -1,20 +1,25 @@
 import datetime
+import logging
+import os
 import re
 import sys
-import os
-import time
 import threading
+import time
 import warnings
 from dataclasses import dataclass
-from homeassistant_api import Client as HAClient
-from homeassistant_api.models import State as HAState
-from homeassistant_api.errors import InternalServerError, RequestTimeoutError
-from niquests.exceptions import RequestException as HARequestException
-import pandas as pd
-from subprocess import PIPE, run
-import logging
 from logging import Handler
-from sqlalchemy import Table, select, func, and_
+from pathlib import Path
+from subprocess import PIPE, run
+
+# from db_manager import DBmanagerObj
+from typing import Optional, Union
+
+import pandas as pd
+from homeassistant_api import Client as HAClient
+from homeassistant_api.errors import InternalServerError, RequestTimeoutError
+from homeassistant_api.models import State as HAState
+from niquests.exceptions import RequestException as HARequestException
+from sqlalchemy import Table, and_, func, select
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -22,19 +27,17 @@ from tenacity import (
     wait_exponential,
 )
 
-# from dao.prog.solar_predictor import SolarPredictor
-from dao.prog.utils import get_tibber_data, error_handling
-from dao.prog.version import __version__
-from pathlib import Path
-from dao.prog.config.loader import ConfigurationLoader
-from dao.prog.config.models.base import UNUSABLE_STATES
-from dao.prog import tasks as task_registry
-from dao.lib.db_connections import make_db_da, make_db_ha
 from dao.lib.da_meteo import Meteo
 from dao.lib.da_prices import DaPrices
+from dao.lib.db_connections import make_db_da, make_db_ha
+from dao.prog import production_bonus
+from dao.prog import tasks as task_registry
+from dao.prog.config.loader import ConfigurationLoader
+from dao.prog.config.models.base import UNUSABLE_STATES
 
-# from db_manager import DBmanagerObj
-from typing import Optional, Union
+# from dao.prog.solar_predictor import SolarPredictor
+from dao.prog.utils import error_handling, get_tibber_data
+from dao.prog.version import __version__
 
 
 @dataclass
@@ -309,6 +312,9 @@ class DaBase:
             self.prices_options.multiplier_production if self.prices_options else None
         )
         self.salderen = self.prices_options.tax_refund if self.prices_options else True
+        self.production_bonus = (
+            self.prices_options.production_bonus if self.prices_options else None
+        )
 
         self.history_options = self.config.history
         self.strategy = self.config.strategy.resolve(
@@ -623,6 +629,43 @@ class DaBase:
                 return
         report.consolidate_data(start_dt)
 
+    def production_bonus_remaining_kwh(self, moment: datetime.datetime) -> float | None:
+        """kWh teruglevering die in het lopende leveringsjaar nog bonus krijgt,
+        of None als er geen limiet geldt of die niet bijgehouden kan worden.
+
+        Somt de geconsolideerde teruglevering ("prod" in de tabel "values")
+        vanaf het begin van de bonusperiode tot `moment`. Een databasefout
+        wordt gelogd en levert None op: de berekening gaat dan zonder limiet
+        door in plaats van af te breken.
+        """
+        cfg = getattr(self, "production_bonus", None)
+        if cfg is None or not cfg.enabled or cfg.yearly_cap_kwh is None:
+            return None
+        period_start = production_bonus.bonus_period_start(cfg, moment)
+        if period_start is None:
+            if not getattr(self, "_production_bonus_cap_warned", False):
+                logging.warning(
+                    "Bonus teruglevering: 'yearly cap kwh' is ingesteld maar "
+                    "'delivery year start' ontbreekt; de limiet wordt niet bijgehouden"
+                )
+                self._production_bonus_cap_warned = True
+            return None
+        try:
+            df = self.db_da.get_column_data(
+                "values",
+                "prod",
+                start=datetime.datetime.combine(period_start, datetime.time()),
+                end=moment,
+            )
+            exported = float(df["value"].sum()) if df is not None and len(df) > 0 else 0.0
+        except Exception as ex:
+            logging.warning(
+                f"Bonus teruglevering: teruglevering sinds {period_start} kon niet "
+                f"worden opgehaald ({ex}); de limiet wordt niet toegepast"
+            )
+            return None
+        return production_bonus.remaining_cap_kwh(cfg, exported)
+
     def get_day_ahead_prices(self):
         """Fetch day-ahead prices; ``day_ahead.py prices [start [end]]`` backfills.
 
@@ -680,7 +723,7 @@ class DaBase:
             for c in columns:
                 rows.append((str(utc), c, float(df.loc[index, c])))
         df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
-        logging.debug("Save calculated data:\n{}".format(df_db.to_string()))
+        logging.debug(f"Save calculated data:\n{df_db.to_string()}")
         self.db_da.savedata(df_db, tablename=tablename)
         if vintage:
             # "prognoses" is upserted, so it only ever holds the most recent
@@ -886,7 +929,7 @@ class DaBase:
         from dao.forecast.baseload.store import write_json
         from dao.forecast.evaluate import archive_accuracy
 
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         windows = tuple(sorted({7, days}))
         logging.info(
             f"Prognosefout over de laatste {', '.join(str(w) for w in windows)} dagen"
