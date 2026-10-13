@@ -2,10 +2,13 @@
 Pricing configuration models.
 """
 
-from typing import Optional, Literal
-from pydantic import BaseModel, Field, field_validator, ConfigDict
-from .base import SecretStr
 from datetime import date
+from typing import Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .base import SecretStr
+from .production_bonus import ProductionBonusConfig
 
 
 class PricingConfig(BaseModel):
@@ -139,6 +142,16 @@ class PricingConfig(BaseModel):
         json_schema_extra={
             "x-help": "Enable tax refund calculation if eligible. Some regions/users get energy tax refunds for solar production.",
             "x-ui-section": "Taxes",
+        },
+    )
+    production_bonus: Optional[ProductionBonusConfig] = Field(
+        default=None,
+        alias="production bonus",
+        description="Supplier bonus on grid feed-in (e.g. Budget Thuis ZonneBonus)",
+        json_schema_extra={
+            "x-help": "Leave out, or set enabled to false, when your supplier pays no bonus. "
+            "See the Production bonus section for the fields and their defaults.",
+            "x-ui-section": "Prices",
         },
     )
 
