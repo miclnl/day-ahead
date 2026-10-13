@@ -3895,6 +3895,13 @@ class DaCalc(DaBase):
         logging.info(f"Production             {production.x: 7.2f} (kWh)")
         logging.info(f"Profit production      {profit_production: 7.2f} (€)")
         logging.info(f"Tariff production      {tariff_production: 8.3f} (€/kWh)\n")
+        if c_t_bonus is not None:
+            bonus_kwh = sum(c_t_bonus[u].x for u in range(U))
+            bonus_eur = sum(c_t_bonus[u].x * pb[u] for u in range(U))
+            logging.info(f"Bonus teruglevering    {bonus_kwh: 7.2f} (kWh)")
+            logging.info(f"Opbrengst bonus        {bonus_eur: 7.2f} (€)")
+            if bonus_remaining is not None:
+                logging.info(f"Resterend bonusplafond {bonus_remaining - bonus_kwh: 7.2f} (kWh)\n")
         battery_storage = 0
         total_cycle_cost = 0
         total_penalty_cost = 0
@@ -5277,6 +5284,18 @@ class DaCalc(DaBase):
         prices_production = prices_production_str.lower() == "true"
 
         if prices_production:
+            ln6 = None
+            if c_t_bonus is not None:
+                pt_bonus = [pt[u] + pb[u] for u in range(U)]
+                pt_bonus = pt_bonus + [pt_bonus[-1]]
+                ln6 = axis22.step(
+                    ind,
+                    np.array(pt_bonus),
+                    label="Tarief teruglev.\nincl. bonus",
+                    color="green",
+                    linestyle="dashed",
+                    where="post",
+                )
             pt = pt + [pt[-1]]
             ln3 = axis22.step(
                 ind,
@@ -5287,6 +5306,7 @@ class DaCalc(DaBase):
             )
         else:
             ln3 = None
+            ln6 = None
 
         if str((_g.prices_spot if _g else True) or "true").lower() == "true":
             p_spot = p_spot + [p_spot[-1]]
@@ -5332,6 +5352,8 @@ class DaCalc(DaBase):
             lns += ln2
         if ln3:
             lns += ln3
+        if ln6:
+            lns += ln6
         if ln4:
             lns += ln4
         if ln5:

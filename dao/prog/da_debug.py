@@ -1352,6 +1352,7 @@ SHAPES: dict[str, tuple[tuple[str, ...], str, str]] = {
     "c_t": (("u",), "kWh", "grid export"),
     "c_l_on": (("u",), "bool", "importing this interval"),
     "c_t_on": (("u",), "bool", "exporting this interval"),
+    "c_t_bonus": (("u",), "kWh", "grid export that earns the production bonus"),
     # heat pump — mutually exclusive per run depending on
     # heating_options.adjustment: "on/off" builds hp_bl_on/hp_start_index,
     # "power"/"heating curve" builds p_hp/hp_s_w (a third active add_sos()
@@ -1448,6 +1449,7 @@ FAMILY: dict[str, str] = {
     "c_t": "grid",
     "c_l_on": "grid",
     "c_t_on": "grid",
+    "c_t_bonus": "grid",
     "c_hp": "heatpump",
     "hp_on": "heatpump",
     "h_hp": "heatpump",
@@ -1921,6 +1923,7 @@ _CONSTRAINT_PATTERNS: dict[frozenset, str] = {
     frozenset({"c_l", "c_l_on"}): "grid import <= on*max",
     frozenset({"c_t", "c_t_on"}): "grid export <= on*max",
     frozenset({"c_l_on", "c_t_on"}): "grid import/export exclusion",
+    frozenset({"c_t", "c_t_bonus"}): "bonus export <= grid export",
     frozenset({"ac_from_dc", "ac_to_dc", "c_b", "c_ev", "c_hp", "c_l", "c_ma_u", "c_t"}): "AC energy balance",
     frozenset({"ev_start_stops_sum", "switch_cost"}): "EV switch-cost definition",
     frozenset({"low_soc_penalty", "low_soc_penalty_int"}): "EV low-SoC penalty definition",
