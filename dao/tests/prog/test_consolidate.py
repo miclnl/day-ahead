@@ -75,7 +75,7 @@ def _hours(start: datetime.datetime, count: int):
     return [start + datetime.timedelta(hours=i) for i in range(count)]
 
 
-def make_report(db, start, sensor_values, prices):
+def make_report(db, start, sensor_values, prices, bonus=None):
     """A Report with the recorder and the tariff lookups replaced."""
     report = Report.__new__(Report)
     report.db_da = db
@@ -103,12 +103,17 @@ def make_report(db, start, sensor_values, prices):
         return frame
 
     def get_price_data(vanaf, tot, interval="1hour"):
-        rows = [
-            {"time": moment, "da_ex": p, "da_cons": p * 1.2, "da_prod": p * 0.9}
-            for moment, p in zip(hours, prices)
-            if vanaf <= moment < tot
-        ]
-        return pd.DataFrame(rows, columns=["time", "da_ex", "da_cons", "da_prod"])
+        rows = []
+        for moment, p, b in zip(hours, prices, bonus or [0.0] * len(prices)):
+            if vanaf <= moment < tot:
+                row = {"time": moment, "da_ex": p, "da_cons": p * 1.2, "da_prod": p * 0.9}
+                if bonus is not None:
+                    row["da_bonus"] = b
+                rows.append(row)
+        columns = ["time", "da_ex", "da_cons", "da_prod"] + (
+            ["da_bonus"] if bonus is not None else []
+        )
+        return pd.DataFrame(rows, columns=columns)
 
     report.get_sensor_sum = get_sensor_sum
     report.get_price_data = get_price_data
@@ -187,3 +192,29 @@ def test_consolidation_without_prices_skips_cost_but_stores_energy(db, caplog):
     assert len(stored(db, "cons")) == 1
     assert stored(db, "cost") == []
     assert "Geen tarieven" in caplog.text
+
+
+def test_consolidation_pays_the_production_bonus_on_profit(db):
+    start = datetime.datetime(2027, 6, 15, 0, 0)
+    report = make_report(
+        db,
+        start,
+        {"cons": [1.0, 1.0, 1.0], "prod": [0.5, 0.0, 0.25]},
+        [0.10, 0.20, 0.30],
+        bonus=[0.03, 0.0, 0.06],
+    )
+
+    report.consolidate_data(_start=start, _end=start + datetime.timedelta(hours=3))
+
+    t0 = int(start.timestamp())
+    # profit = production x (producer tariff + bonus); cost is untouched
+    assert stored(db, "profit") == [
+        (t0, round(0.5 * (0.09 + 0.03), 6)),
+        (t0 + HOUR, 0.0),
+        (t0 + 2 * HOUR, round(0.25 * (0.27 + 0.06), 6)),
+    ]
+    assert stored(db, "cost") == [
+        (t0, round(1.0 * 0.12, 6)),
+        (t0 + HOUR, round(1.0 * 0.24, 6)),
+        (t0 + 2 * HOUR, round(1.0 * 0.36, 6)),
+    ]

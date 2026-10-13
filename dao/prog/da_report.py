@@ -1384,6 +1384,9 @@ class Report(DaBase):
         if len(prices) == 0:
             logging.warning(f"Geen tarieven tussen {vanaf} en {tot}, {code} niet berekend")
             return None
+        if "da_bonus" in prices.columns:
+            # De uitbetaalde terugleverprijs is inclusief de bonus op teruglevering.
+            prices["da_prod"] = prices["da_prod"] + prices["da_bonus"]
         energy = energy.reset_index(drop=True)
         energy["tijd"] = pd.to_datetime(energy["tijd"])
         prices = prices.rename(columns={"time": "tijd"})
@@ -1494,7 +1497,10 @@ class Report(DaBase):
             else:
                 col_3 = 0
             if is_number(row.production) and is_number(row.da_prod):
-                col_4 = row.production * row.da_prod
+                bonus = getattr(row, "da_bonus", 0.0)
+                if not is_number(bonus) or pd.isna(bonus):
+                    bonus = 0.0
+                col_4 = row.production * (row.da_prod + bonus)
             else:
                 col_4 = 0
             col_5 = row.datasoort
@@ -2118,9 +2124,10 @@ class Report(DaBase):
                     # or a different length between result and df_prices
                     # (missing prices, DST, ...) used to shift every price
                     # onto the wrong row instead of leaving it blank.
-                    prices = df_prices.rename(columns={"time": "tijd"})[
-                        ["tijd", "da_cons", "da_prod"]
-                    ]
+                    price_columns = ["tijd", "da_cons", "da_prod"]
+                    if "da_bonus" in df_prices.columns:
+                        price_columns.append("da_bonus")
+                    prices = df_prices.rename(columns={"time": "tijd"})[price_columns]
                     result = result.reset_index(drop=True).merge(
                         prices, on="tijd", how="left"
                     )
@@ -2370,6 +2377,8 @@ class Report(DaBase):
             df_prices.index = pd.to_datetime(df_prices["tijd"])
             df_ha = self.copy_col_df(df_prices, df_ha, "da_cons")
             df_ha = self.copy_col_df(df_prices, df_ha, "da_prod")
+            if "da_bonus" in df_prices.columns:
+                df_ha = self.copy_col_df(df_prices, df_ha, "da_bonus")
             df_ha["tijd"] = pd.to_datetime(df_ha["tijd"])
             df_ha = self.recalc_df_ha(df_ha, interval)
 
@@ -2532,13 +2541,16 @@ class Report(DaBase):
         """
         calc_dict = self.saving_cost_dict
         df = self.get_columns(calc_dict, active_period, _tot)
+        paid_prod_price = (
+            df["da_prod"] + df["da_bonus"] if "da_bonus" in df.columns else df["da_prod"]
+        )
         df["cost"] = df["cons"] * df["da_cons"]
-        df["profit"] = df["prod"] * df["da_prod"]
+        df["profit"] = df["prod"] * paid_prod_price
         df["netto_cost"] = df["cost"] - df["profit"]
         df["bruto_cons_zonder"] = df["cons"] - df["prod"] - df["bat_in"] + df["bat_out"]
         df = self.split_column(df, "bruto_cons_zonder", "cons_zonder", "prod_zonder")
         df["cost_zonder"] = df["cons_zonder"] * df["da_cons"]
-        df["profit_zonder"] = df["prod_zonder"] * df["da_prod"]
+        df["profit_zonder"] = df["prod_zonder"] * paid_prod_price
         df["netto_cost_zonder"] = df["cost_zonder"] - df["profit_zonder"]
         df["saving"] = df["netto_cost_zonder"] - df["netto_cost"]
         df_result = self.clean_df(
