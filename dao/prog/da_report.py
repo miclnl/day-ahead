@@ -1,38 +1,35 @@
+import base64
 import calendar
 import datetime
+import logging
+import math
+from io import BytesIO
+
+import matplotlib.pyplot as plt
 
 # from unittest.mock import inplace
-
 import pandas as pd
-import base64
-from io import BytesIO
 from dateutil.relativedelta import relativedelta
 from pandas.core.dtypes.inference import is_number
-
-from dao.lib.da_graph import GraphBuilder
-from dao.prog.da_base import DaBase
-from dao.prog.utils import get_value_from_dict
-import math
-import itertools
-import logging
+from sklearn.metrics import r2_score
 from sqlalchemy import (
+    BigInteger,
+    String,
     Table,
-    select,
-    func,
-    literal,
     and_,
     case,
-    true,
-    bindparam,
-    union_all,
-    String,
-    values,
     column,
-    BigInteger,
+    func,
+    literal,
+    select,
     union,
+    values,
 )
-import matplotlib.pyplot as plt
-from sklearn.metrics import r2_score
+
+from dao.lib.da_graph import GraphBuilder
+from dao.prog import production_bonus
+from dao.prog.da_base import DaBase
+from dao.prog.utils import get_value_from_dict
 
 
 def calc_r2(serie_x: pd.Series, serie_y: pd.Series) -> float:
@@ -73,7 +70,7 @@ class Report(DaBase):
 
         self.report_options = self.config.report
         if self.report_options is None:
-            logging.error(f"Er zijn geen report-instellingen gevonden")
+            logging.error("Er zijn geen report-instellingen gevonden")
         # Per-instance, not a class attribute: it used to be declared on the
         # class body, so every Report instance (a new one per web request)
         # mutated the same shared dict via self.periodes.update(...) below.
@@ -689,7 +686,7 @@ class Report(DaBase):
             for key in self.co2_graph_options["graphs"][graph_num]["series_keys"]:
                 serie = self.co2_dict[key]
                 serie["column"] = key
-                if not ("type" in serie):
+                if "type" not in serie:
                     serie["type"] = "stacked"
                 serie["title"] = serie["name"]
                 self.co2_graph_options["graphs"][graph_num]["series"].append(serie)
@@ -2969,7 +2966,7 @@ class Report(DaBase):
         period = self.periodes[periode]
         if dict is None:
             dict = self.energy_balance_dict
-        if not (field in dict):
+        if field not in dict:
             result = None
             return result
         categorie = dict[field]
@@ -3049,8 +3046,17 @@ class Report(DaBase):
         btw_t = 0
         multiplier_l = 1
         multiplier_t = 1
-        columns = ["time", "da_ex", "da_cons", "da_prod", "datasoort"]
+        columns = ["time", "da_ex", "da_cons", "da_prod", "da_bonus", "datasoort"]
         salderen = self.prices_options.tax_refund if self.prices_options else True
+        bonus_cfg = getattr(self, "production_bonus", None)
+        bonus_on = bonus_cfg is not None and bonus_cfg.enabled
+        cap_exhausted = False
+        if bonus_on:
+            # De limiet wordt eenmaal per aanroep beoordeeld, op het beginmoment.
+            remaining = self.production_bonus_remaining_kwh(
+                start if start is not None else datetime.datetime.now()
+            )
+            cap_exhausted = remaining is not None and remaining <= 0
         rows = []
         for row in df_da.itertuples():
             if pd.isnull(row.time):
@@ -3073,12 +3079,18 @@ class Report(DaBase):
                 )
             else:
                 da_prod = (row.value + ol_t) * (1 + btw_t / 100)
+            moment = datetime.datetime.strptime(row.time, "%Y-%m-%d %H:%M")
+            if bonus_on and not cap_exhausted:
+                da_bonus = production_bonus.bonus_per_kwh(bonus_cfg, moment, row.value, btw_t)
+            else:
+                da_bonus = 0.0
             rows.append(
                 (
-                    datetime.datetime.strptime(row.time, "%Y-%m-%d %H:%M"),
+                    moment,
                     row.value,
                     da_cons,
                     da_prod,
+                    da_bonus,
                     "expected",
                 )
             )
@@ -3564,10 +3576,10 @@ class Report(DaBase):
                 sensors_cte.c.code.label("code"),
                 sensors_cte.c.sensor.label("sensor"),
                 (
-                        (
+
                                 func.max(statistics.c.sum)
                                 - func.min(statistics.c.sum)
-                        )
+
                 ).label("sensor_value"),
             )
             .select_from(

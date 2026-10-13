@@ -15,6 +15,7 @@ import pytest
 pytest.importorskip("pandas")
 
 from dao.lib.db_manager import DBmanagerObj  # noqa: E402
+from dao.prog.config.models.production_bonus import ProductionBonusConfig  # noqa: E402
 from dao.prog.da_report import Report  # noqa: E402
 
 HOUR = 3600
@@ -210,8 +211,63 @@ class TestGetPriceData:
             datetime.datetime(2026, 6, 1, 12, 0),
         )
 
-        assert list(result.columns) == ["time", "da_ex", "da_cons", "da_prod", "datasoort"]
+        assert list(result.columns) == ["time", "da_ex", "da_cons", "da_prod", "da_bonus", "datasoort"]
         assert len(result) == 2
         assert list(result["da_ex"]) == [0.10, 0.20]
         expected_cons_0 = (0.10 * 1.0 + 0.10 + 0.0) * (1 + 21.0 / 100)
         assert result["da_cons"].iloc[0] == pytest.approx(expected_cons_0)
+
+
+def insert_prices(db, rows):
+    from sqlalchemy import Table, insert
+
+    values = Table("values", db.metadata, autoload_with=db.engine)
+    with db.engine.begin() as connection:
+        connection.execute(
+            insert(values),
+            [{"variabel": 1, "time": int(moment.timestamp()), "value": price} for moment, price in rows],
+        )
+
+
+class TestGetPriceDataProductionBonus:
+    def test_without_configuration_the_bonus_column_is_zero(self, db):
+        insert_prices(db, [(datetime.datetime(2027, 6, 1, 10, 0), 0.10)])
+        report = make_report_with_prices(db)
+        result = report.get_price_data(datetime.datetime(2027, 6, 1, 10, 0), datetime.datetime(2027, 6, 1, 11, 0))
+        assert list(result["da_bonus"]) == [0.0]
+
+    def test_the_bonus_follows_window_price_cap_and_vat(self, db):
+        insert_prices(
+            db,
+            [
+                (datetime.datetime(2027, 6, 1, 10, 0), 0.10),
+                (datetime.datetime(2027, 6, 1, 11, 0), -0.05),
+                (datetime.datetime(2027, 6, 1, 12, 0), 0.25),
+                (datetime.datetime(2027, 6, 1, 23, 0), 0.10),  # outside the June window
+            ],
+        )
+        report = make_report_with_prices(db)
+        report.production_bonus = ProductionBonusConfig(enabled=True)
+        report.production_bonus_remaining_kwh = lambda moment: 1000.0
+        result = report.get_price_data(datetime.datetime(2027, 6, 1, 10, 0), datetime.datetime(2027, 6, 2, 0, 0))
+        assert list(result["da_bonus"]) == pytest.approx([0.03 * 1.21, 0.0, 0.06 * 1.21, 0.0])
+        # da_prod itself stays the feed-in price without bonus
+        assert result["da_prod"].iloc[0] == pytest.approx((0.10 * 1.0 + 0.05 + 0.0) * 1.21)
+
+    def test_an_exhausted_cap_zeroes_the_bonus(self, db):
+        insert_prices(db, [(datetime.datetime(2027, 6, 1, 12, 0), 0.10)])
+        report = make_report_with_prices(db)
+        report.production_bonus = ProductionBonusConfig(enabled=True)
+        report.production_bonus_remaining_kwh = lambda moment: 0.0
+        result = report.get_price_data(datetime.datetime(2027, 6, 1, 12, 0), datetime.datetime(2027, 6, 1, 13, 0))
+        assert list(result["da_bonus"]) == [0.0]
+
+    def test_start_none_evaluates_the_cap_at_now(self, db):
+        insert_prices(db, [(datetime.datetime(2027, 6, 1, 12, 0), 0.10)])
+        report = make_report_with_prices(db)
+        report.production_bonus = ProductionBonusConfig(enabled=True)
+        seen = []
+        report.production_bonus_remaining_kwh = lambda moment: seen.append(moment) or 1000.0
+        report.get_price_data(None, None)
+        assert len(seen) == 1
+        assert abs((seen[0] - datetime.datetime.now()).total_seconds()) < 60
