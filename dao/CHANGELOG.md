@@ -2,6 +2,8 @@
 # Day Ahead Optimizer
 # Unreleased
 
+# 2026.10.13
+
 ## Bonus op teruglevering (Budget Thuis ZonneBonus)
 Vanaf 1 januari 2027 betaalt Budget Thuis 30% bovenop de beursprijs voor
 teruglevering binnen een maandelijks tijdvak, tot 0,06 euro/kWh en over de
