@@ -2,6 +2,16 @@
 # Day Ahead Optimizer
 # Unreleased
 
+## Bonus op teruglevering (Budget Thuis ZonneBonus)
+Vanaf 1 januari 2027 betaalt Budget Thuis 30% bovenop de beursprijs voor
+teruglevering binnen een maandelijks tijdvak, tot 0,06 euro/kWh en over de
+eerste 5.000 kWh per leveringsjaar. Met `prices` -> `production bonus` ->
+`enabled: true` rekent DAO+ daarmee: de optimalisatie beloont teruglevering
+in het tijdvak, in de modus `pv only` alleen voor het PV-deel (de
+actievoorwaarden verbieden het inzetten van een thuisbatterij voor de
+bonus), en de rapporten tellen de bonus mee in de opbrengst. Standaard
+staat de bonus uit; zonder de instelling verandert er niets.
+
 # 2026.10.9
 
 ## Het tabblad Tasks liet zijn uitvoer niet meer zien

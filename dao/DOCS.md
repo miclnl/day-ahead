@@ -1027,7 +1027,37 @@ De meteodata worden opgehaald bij meteoserver. Ook hiervoor heb je een key nodig
       * 2023-01-01: 21,  
    
   * last invoice: datum laatste jaarfactuur en/of de begindatum van je contractjaar (formaat "yyyy-mm-dd")
-  * tax refund: kun je alles salderen of is je teruglevering hoger dan je verbruik  (True of False) 
+  * tax refund: kun je alles salderen of is je teruglevering hoger dan je verbruik  (True of False)
+
+  * production bonus: een bonus van je leverancier bovenop de beursprijs voor teruglevering,
+    bijvoorbeeld de ZonneBonus van Budget Thuis (vanaf 1 januari 2027). Laat dit blok weg als
+    je leverancier geen bonus geeft. Alle waarden hieronder zijn de Budget Thuis-waarden; een
+    Budget Thuis-klant hoeft alleen `enabled` op true te zetten en `delivery year start` in te
+    vullen.
+    * enabled: de schakelaar (true/false), default false
+    * mode: `pv only` (default) of `all export`. Bij `pv only` rekent de optimalisatie de bonus
+      alleen toe aan teruglevering tot de PV-productie van dat interval; ontladen van de
+      batterij naar het net levert dan geen bonus op. Budget Thuis staat het gebruik van een
+      thuisbatterij om meer bonus te krijgen niet toe (artikel 8 van de actievoorwaarden). Bij
+      `all export` krijgt alle teruglevering in het venster de bonus; de optimalisatie zal dan
+      ook batterij-ontlading naar het venster verschuiven.
+    * start date: eerste dag waarop de bonus geldt, default 2027-01-01
+    * percentage: bonus als percentage van de beursprijs, default 30
+    * max exchange price: beursprijs (euro/kWh, ex btw) waarboven de bonus niet verder groeit,
+      default 0.20 (dus maximaal 0.06 euro/kWh bonus)
+    * windows: per maand (1-12) het [begin, eind] uur van het venster; een interval telt mee
+      als het begint op of na het beginuur en voor het einduur. Default de tabel van Budget Thuis.
+    * yearly cap kwh: teruglevering per leveringsjaar waarover de bonus geldt, default 5000;
+      null = geen limiet
+    * delivery year start: begindatum van je contract; maand en dag bepalen wanneer een nieuw
+      leveringsjaar begint. Zonder deze datum wordt de limiet niet bijgehouden.
+
+    De bonus wordt berekend over de kale beursprijs en krijgt daarna dezelfde `vat production`
+    als de rest van de terugleverprijs. Noemt je leverancier de beursprijs inclusief btw, zet
+    `max exchange price` dan op 0.20 / 1.21. In de rapporten zit de bonus in de opbrengst;
+    `da_prod` blijft de terugleverprijs zonder bonus. De limiet wordt per berekening beoordeeld
+    op het beginmoment; in een rapport over een lange periode in het verleden wordt de bonus
+    over de hele periode toegepast op basis van de stand aan het begin. 
 
 ### **interval**
 Standaard rekent het programma met een 1 uur interval (default settings = "**1hour**")
@@ -2243,11 +2273,12 @@ Voor **\<variabele>** kun je (voorlopig) een van de volgende mogelijkheden invul
     ...
 
 ```
-per uur worden de drie prijzen geretourneerd:
+per uur worden de vier prijzen geretourneerd:
   - ```da_ex```: kale day ahead prijs, excl. belasting, excl. btw en excl opslag leverancier
   - ```da_cons```: de day ahead prijs waarvoor jij elektriciteit koopt, dus inclusief energiebelasting, btw en opslag leverancier
   - ```da_prod```: de day ahead prijs waarvoor jij elektriciteit teruglevert. Dit is afhankelijk van: kun je nog salderen en in hoeverre
   (voorlopig is dit bij de meeste gelijk aan da_cons) 
+  - ```da_bonus```: de bonus van je leverancier op teruglevering in dit uur (0 als die niet geldt), zie `production bonus` bij de instellingen 
 - **consumption** <br/>
   Hiermee vraag je je verbruiksgegevens op. Bijvoorbeeld:<br/>
 
