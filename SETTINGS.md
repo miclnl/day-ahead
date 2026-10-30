@@ -35,6 +35,8 @@
 - [Pricing](#pricing)
   - [💰 PricingConfig](#pricingconfig)
   - [💰 ProductionBonusConfig](#productionbonusconfig)
+  - [💰 SettlementConfig](#settlementconfig)
+  - [💰 SettlementContractConfig](#settlementcontractconfig)
 - [Reporting](#reporting)
   - [📈 GraphicsConfig](#graphicsconfig)
   - [⏰ HistoryConfig](#historyconfig)
@@ -1534,6 +1536,7 @@ System uses tariff active on optimization date.
 | `last invoice` | string | Yes | — | Date of last invoice (YYYY-MM-DD) _Must be YYYY-MM-DD format_ |
 | `tax refund` | boolean | No | `true` | Whether tax refund applies |
 | `production bonus` | [ProductionBonusConfig](#productionbonusconfig) (optional) | No | `null` | Supplier bonus on grid feed-in (e.g. Budget Thuis ZonneBonus) |
+| `settlement` | [SettlementConfig](#settlementconfig) (optional) | No | `null` | Optional explicit contract-based electricity settlement |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
@@ -1590,6 +1593,10 @@ Enable tax refund calculation if eligible. Some regions/users get energy tax ref
 
 Leave out, or set enabled to false, when your supplier pays no bonus. See the Production bonus section for the fields and their defaults.
 
+**`settlement`**
+
+Omit to preserve legacy behavior. The settlement mode defaults to off; configuring draft terms does not activate them or establish 2027 readiness.
+
 </details>
 
 
@@ -1604,10 +1611,15 @@ Budget Thuis ZonneBonus from 1 January 2027: 30% extra inside a monthly daytime
 window, only when the exchange price is positive, at most 0.06 euro/kWh, over
 the first 5000 kWh per delivery year.
 
-All defaults are the Budget Thuis values. A Budget Thuis customer sets
-`enabled: true` and `delivery year start`; everything else can stay.
+Legacy defaults remain readable, but do not confirm a new settlement contract.
+Contract-based settlement additionally requires the actual supply start, an
+explicit `cap basis`, `vat percent`, and complete dated financial terms.
+Under that model all export consumes the annual cap and bonus eligibility
+requires verified PV origin and known zero gross battery discharge. The old
+`pv only` optimizer shortcut is not proof of eligibility; `all export` is not
+allowed in the Budget settlement profile.
 
-The bonus shows up as the column `da_bonus` next to `da_prod` (which stays the
+In the legacy path the bonus shows up as the column `da_bonus` next to `da_prod` (which stays the
 feed-in price without bonus), in the `profit` of the reports and prognoses, and
 as a dashed line in the price graph. The yearly cap is evaluated once per
 calculation at its start moment; a report over a long past period applies the
@@ -1620,10 +1632,12 @@ bonus to the whole period based on the cap state at its start.
 | `mode` | string | No | `"pv only"` | Which feed-in the optimizer counts for the bonus. Options: `pv only`, `all export` |
 | `start date` | string | No | `"2027-01-01"` | First day the bonus applies (YYYY-MM-DD) |
 | `percentage` | number | No | `30.0` | Bonus as a percentage of the exchange price (Unit: `%`) |
-| `max exchange price` | number | No | `0.2` | Exchange price above which the bonus no longer grows (euro/kWh ex VAT) (Unit: `€/kWh`) |
+| `max exchange price` | number | No | `0.2` | Exchange-price ceiling above which the bonus no longer grows (euro/kWh) (Unit: `€/kWh`) |
 | `windows` | object | No | `{'1': [9, 17], '2': [8, 18], '3': [7, 19], '4': [7, 21], '5': [6, 21], '6': [5, 22], '7': [6, 22], '8': [6, 21], '9': [7, 20], '10': [8, 19], '11': [8, 17], '12': [9, 17]}` | Per month (1-12) the [start, end] hours of the bonus window |
 | `yearly cap kwh` | number (optional) | No | `5000.0` | Feed-in per delivery year that earns the bonus; null for no cap (Unit: `kWh`) |
 | `delivery year start` | string (optional) | No | `null` | Start date of the supplier contract; its month and day mark each new delivery year |
+| `cap basis` | string | No | `"unconfirmed"` | VAT basis of the exchange-price ceiling. Options: `ex_vat`, `inc_vat`, `unconfirmed` |
+| `vat percent` | string (optional) | No | `null` | Explicit VAT percentage applicable to the production bonus (Unit: `%`) |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
@@ -1634,7 +1648,7 @@ The single switch. With false (or without this section) nothing changes: no bonu
 
 **`mode`**
 
-'pv only': the optimizer counts the bonus only on export up to the PV production of that interval, so discharging the battery into the grid earns no bonus and there is no incentive to do so. Budget Thuis forbids using a home battery to collect more bonus (art. 8 of the action conditions). 'all export': every kWh exported in the window earns the bonus; the optimizer will then shift battery discharge into the window. Reports always count the bonus on all metered export, which is what the supplier pays.
+Legacy behavior: 'pv only' limits the optimizer bonus to export up to interval PV production; legacy reports count all metered export. Neither is proof of supplier eligibility. Contract-based Budget settlement instead requires verified PV origin and known zero gross battery discharge; 'all export' is not allowed in that profile.
 
 **`start date`**
 
@@ -1646,7 +1660,7 @@ Before this date the bonus is 0. Set it to today to try the feature before 2027.
 
 **`max exchange price`**
 
-The bonus is percentage x min(exchange price, this value), so 30% of 0.20 gives at most 0.06 euro/kWh. The bonus is computed on the raw exchange price (ex VAT) and then gets the same 'vat production' as the rest of the feed-in price. If your supplier quotes the exchange price including VAT, enter 0.20 / 1.21 here.
+Legacy calculation treats this ceiling as ex VAT and uses vat production for the bonus. For contract-based settlement, explicitly confirm cap basis as ex_vat or inc_vat and supply the separate bonus vat percent; do not silently reinterpret an old value as confirmed terms.
 
 **`windows`**
 
@@ -1659,6 +1673,119 @@ Budget Thuis pays the bonus over the first 5000 kWh per delivery year. DAO+ sums
 **`delivery year start`**
 
 A delivery year runs 12 months from the start of the contract. Only month and day are used. The first bonus year runs from 'start date' to the next anniversary. Without this date the yearly cap is not tracked.
+
+**`cap basis`**
+
+Explicitly confirm whether max exchange price is quoted excluding or including VAT. The legacy default does not prove the basis for a confirmed settlement contract.
+
+**`vat percent`**
+
+Required when the bonus is enabled under confirmed settlement terms. Null is unknown, not zero; export VAT is a separate dated pricing parameter.
+
+</details>
+
+
+### 💰 SettlementConfig
+
+_Optional settlement configuration; omission preserves the legacy calculation._
+
+Optional contract-based electricity settlement, default off. Leaving out prices.settlement preserves legacy behavior and does not establish readiness for 2027. Complete means sufficient model input coverage, never official invoice finality.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `mode` | string | No | `"off"` | Settlement calculation mode. Options: `off`, `shadow`, `active` |
+| `meter id` | string (optional) | No | `null` | Stable metering-installation identifier |
+| `contracts` | list[[SettlementContractConfig](#settlementcontractconfig)] | No | `[]` | Non-overlapping contract versions |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`mode`**
+
+off is the default; shadow is for non-actuating comparisons. active requires a meter and confirmed contracts, but configuration alone does not implement or authorize live activation.
+
+**`meter id`**
+
+Used with interval start and registered input revision to identify input. An input content hash is not a revision identifier.
+
+**`contracts`**
+
+Each version has explicit validity and terms. Drafts cannot be used in active mode; tariff changes may keep the same contract identifier.
+
+</details>
+
+
+### 💰 SettlementContractConfig
+
+_A dated contract version; draft terms are not an active financial basis._
+
+Explicit, half-open contract versions. Confirm applicability against supplier evidence before confirmation; synthetic test values are not customer settings.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `id` | string | Yes | — | Stable supplier contract identifier |
+| `status` | string | No | `"draft"` | Whether the applicable contract terms are confirmed. Options: `draft`, `confirmed` |
+| `valid from` | string | Yes | — | First local date of this contract version, inclusive |
+| `valid to` | string (optional) | No | `null` | Last local boundary of this version, exclusive |
+| `supply start` | string (optional) | No | `null` | Actual first delivery date of the supplier contract |
+| `timezone` | string | Yes | — | IANA timezone for contract dates and calendar rules |
+| `product` | string | Yes | — | Supplier product whose explicit rules apply. Options: `legacy`, `budget_dynamic_2027` |
+| `regime` | string | Yes | — | Electricity settlement regime for this version. Options: `legacy_interval`, `no_net_metering` |
+| `price interval seconds` | integer | Yes | — | Duration of a contractual spot-price interval. Options: `900`, `3600` |
+| `meter interval seconds` | integer | Yes | — | Required metering interval in seconds |
+| `hour price rule` | string | No | `"unconfirmed"` | Confirmed construction of an hourly contract price. Options: `native`, `mean_quarters`, `unconfirmed` |
+| `monthly export floor` | string | Yes | — | Separate monthly export spot-price adjustment rule. Options: `none`, `spot_zero` |
+
+<details>
+<summary><b>📖 Field Details</b> (click to expand)</summary>
+
+**`id`**
+
+Keep this identifier on tariff changes; a new tariff snapshot does not restart the delivery year.
+
+**`status`**
+
+Draft terms are for shadow/what-if only. Confirmed terms require explicit financial components at the contract start.
+
+**`valid from`**
+
+Use YYYY-MM-DD in the contract timezone. No tariff value for this date is guessed.
+
+**`valid to`**
+
+Null leaves the version open-ended. Adjacent versions may share this exclusive boundary but may not overlap.
+
+**`supply start`**
+
+Required for confirmed terms. Never inferred from the invoice date or the legacy bonus delivery-year anchor.
+
+**`timezone`**
+
+Budget dynamic 2027 uses Europe/Amsterdam. Interval identities themselves use UTC epoch seconds.
+
+**`product`**
+
+The Budget profile requires hourly spot prices, quarter-hour metering, no export tax/adder and an export spot multiplier of one.
+
+**`regime`**
+
+Use no_net_metering for the Budget 2027 profile. This does not globally change legacy tax-refund settings.
+
+**`price interval seconds`**
+
+Independent of metering and solver steps. The current Budget contract profile requires 3600 seconds.
+
+**`meter interval seconds`**
+
+Quarter-hour metering is 900 seconds; hourly statistics cannot prove four measured quarters.
+
+**`hour price rule`**
+
+native uses supplied hourly prices; mean_quarters explicitly confirms duration-weighted averaging of four market quarters. unconfirmed cannot support a confirmed hourly contract.
+
+**`monthly export floor`**
+
+spot_zero floors the covered monthly ex-VAT spot export proceeds, not individual intervals, import costs or bonus revenue. It is a model adjustment, not an official invoice.
 
 </details>
 

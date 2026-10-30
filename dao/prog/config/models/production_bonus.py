@@ -1,9 +1,12 @@
 """Bonus on grid feed-in, modelled after the Budget Thuis ZonneBonus (2027)."""
 
 from datetime import date
+from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .settlement import reject_alias_conflicts
 
 # Budget Thuis ZonneBonus: [beginuur, einduur] per maand, begin inclusief, eind exclusief.
 DEFAULT_WINDOWS: dict[str, list[int]] = {
@@ -30,7 +33,7 @@ class ProductionBonusConfig(BaseModel):
         default="pv only",
         description="Which feed-in the optimizer counts for the bonus",
         json_schema_extra={
-            "x-help": "'pv only': the optimizer counts the bonus only on export up to the PV production of that interval, so discharging the battery into the grid earns no bonus and there is no incentive to do so. Budget Thuis forbids using a home battery to collect more bonus (art. 8 of the action conditions). 'all export': every kWh exported in the window earns the bonus; the optimizer will then shift battery discharge into the window. Reports always count the bonus on all metered export, which is what the supplier pays.",
+            "x-help": "Legacy behavior: 'pv only' limits the optimizer bonus to export up to interval PV production; legacy reports count all metered export. Neither is proof of supplier eligibility. Contract-based Budget settlement instead requires verified PV origin and known zero gross battery discharge; 'all export' is not allowed in that profile.",
             "x-ui-section": SECTION,
         },
     )
@@ -58,9 +61,9 @@ class ProductionBonusConfig(BaseModel):
         default=0.20,
         gt=0,
         alias="max exchange price",
-        description="Exchange price above which the bonus no longer grows (euro/kWh ex VAT)",
+        description="Exchange-price ceiling above which the bonus no longer grows (euro/kWh)",
         json_schema_extra={
-            "x-help": "The bonus is percentage x min(exchange price, this value), so 30% of 0.20 gives at most 0.06 euro/kWh. The bonus is computed on the raw exchange price (ex VAT) and then gets the same 'vat production' as the rest of the feed-in price. If your supplier quotes the exchange price including VAT, enter 0.20 / 1.21 here.",
+            "x-help": "Legacy calculation treats this ceiling as ex VAT and uses vat production for the bonus. For contract-based settlement, explicitly confirm cap basis as ex_vat or inc_vat and supply the separate bonus vat percent; do not silently reinterpret an old value as confirmed terms.",
             "x-unit": "€/kWh",
             "x-ui-section": SECTION,
         },
@@ -92,6 +95,31 @@ class ProductionBonusConfig(BaseModel):
             "x-ui-section": SECTION,
         },
     )
+
+    cap_basis: Literal["ex_vat", "inc_vat", "unconfirmed"] = Field(
+        default="unconfirmed",
+        alias="cap basis",
+        description="VAT basis of the exchange-price ceiling",
+        json_schema_extra={
+            "x-help": "Explicitly confirm whether max exchange price is quoted excluding or including VAT. The legacy default does not prove the basis for a confirmed settlement contract.",
+            "x-ui-section": SECTION,
+        },
+    )
+    vat_percent: Decimal | None = Field(
+        default=None, ge=0, le=100, decimal_places=12,
+        alias="vat percent",
+        description="Explicit VAT percentage applicable to the production bonus",
+        json_schema_extra={
+            "x-help": "Required when the bonus is enabled under confirmed settlement terms. Null is unknown, not zero; export VAT is a separate dated pricing parameter.",
+            "x-unit": "%",
+            "x-ui-section": SECTION,
+        },
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_aliases(cls, data):
+        return reject_alias_conflicts(cls, data)
 
     @field_validator("windows")
     @classmethod
@@ -139,10 +167,15 @@ Budget Thuis ZonneBonus from 1 January 2027: 30% extra inside a monthly daytime
 window, only when the exchange price is positive, at most 0.06 euro/kWh, over
 the first 5000 kWh per delivery year.
 
-All defaults are the Budget Thuis values. A Budget Thuis customer sets
-`enabled: true` and `delivery year start`; everything else can stay.
+Legacy defaults remain readable, but do not confirm a new settlement contract.
+Contract-based settlement additionally requires the actual supply start, an
+explicit `cap basis`, `vat percent`, and complete dated financial terms.
+Under that model all export consumes the annual cap and bonus eligibility
+requires verified PV origin and known zero gross battery discharge. The old
+`pv only` optimizer shortcut is not proof of eligibility; `all export` is not
+allowed in the Budget settlement profile.
 
-The bonus shows up as the column `da_bonus` next to `da_prod` (which stays the
+In the legacy path the bonus shows up as the column `da_bonus` next to `da_prod` (which stays the
 feed-in price without bonus), in the `profit` of the reports and prognoses, and
 as a dashed line in the price graph. The yearly cap is evaluated once per
 calculation at its start moment; a report over a long past period applies the

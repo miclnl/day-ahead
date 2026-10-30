@@ -3,12 +3,22 @@ Pricing configuration models.
 """
 
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .base import SecretStr
 from .production_bonus import ProductionBonusConfig
+from .settlement import SettlementConfig, reject_alias_conflicts
+
+
+SETTLEMENT_TARIFF_FIELDS = (
+    "energy_taxes_consumption", "energy_taxes_production",
+    "cost_supplier_consumption", "cost_supplier_production",
+    "vat_consumption", "vat_production",
+    "multiplier_consumption", "multiplier_production",
+)
 
 
 class PricingConfig(BaseModel):
@@ -154,6 +164,82 @@ class PricingConfig(BaseModel):
             "x-ui-section": "Prices",
         },
     )
+
+    settlement: SettlementConfig | None = Field(
+        default=None,
+        description="Optional explicit contract-based electricity settlement",
+        json_schema_extra={
+            "x-help": "Omit to preserve legacy behavior. The settlement mode defaults to off; configuring draft terms does not activate them or establish 2027 readiness.",
+            "x-ui-section": "Settlement",
+        },
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_settlement_input(cls, data):
+        data = reject_alias_conflicts(cls, data)
+        if not isinstance(data, dict) or data.get("settlement") is None:
+            return data
+        for name in SETTLEMENT_TARIFF_FIELDS:
+            table = data.get(cls.model_fields[name].alias, data.get(name))
+            if not isinstance(table, dict):
+                continue
+            for effective, raw in table.items():
+                try:
+                    if date.fromisoformat(effective).isoformat() != effective:
+                        raise ValueError("Noncanonical date")
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{name}: settlement tariff dates must use YYYY-MM-DD") from exc
+                try:
+                    value = Decimal(str(raw))
+                except InvalidOperation as exc:
+                    raise ValueError(f"{name}: settlement tariff must be a finite decimal") from exc
+                if not value.is_finite() or value.as_tuple().exponent < -12:
+                    raise ValueError(f"{name}: settlement tariff must be finite with at most 12 decimals")
+        return data
+
+    @model_validator(mode="after")
+    def validate_settlement_terms(self):
+        if self.settlement is None:
+            return self
+        for name in SETTLEMENT_TARIFF_FIELDS:
+            table = getattr(self, name)
+            if table and any(not Decimal(str(value)).is_finite() for value in table.values()):
+                raise ValueError(f"{name}: settlement tariff must remain finite after pricing conversion")
+        for contract in self.settlement.contracts:
+            bonus = self.production_bonus
+            if (contract.product == "budget_dynamic_2027" and bonus is not None
+                    and bonus.enabled and bonus.mode == "all export"):
+                raise ValueError("Budget settlement does not permit bonus mode all export")
+            if contract.status != "confirmed":
+                continue
+            for name in SETTLEMENT_TARIFF_FIELDS:
+                if name not in self.model_fields_set:
+                    raise ValueError(f"{name}: confirmed settlement requires an explicit dated component")
+                table = getattr(self, name)
+                if not table or not any(date.fromisoformat(key) <= contract.valid_from for key in table):
+                    raise ValueError(f"{name}: no tariff available at contract start")
+                if contract.product == "budget_dynamic_2027" and name in {
+                    "energy_taxes_production", "cost_supplier_production", "multiplier_production",
+                }:
+                    expected = 1 if name == "multiplier_production" else 0
+                    applicable = max(key for key in table if date.fromisoformat(key) <= contract.valid_from)
+                    for key, value in table.items():
+                        in_period = (date.fromisoformat(key) >= contract.valid_from
+                                     and (contract.valid_to is None or date.fromisoformat(key) < contract.valid_to))
+                        if (key == applicable or in_period) and value != expected:
+                            raise ValueError(f"{name}: Budget export component must be {expected}")
+            if bonus is not None and bonus.enabled:
+                if bonus.cap_basis == "unconfirmed" or bonus.vat_percent is None:
+                    raise ValueError("Confirmed bonus requires explicit cap basis and vat percent")
+                for name, places in (("percentage", 12), ("max_exchange_price", 12), ("yearly_cap_kwh", 9)):
+                    raw = getattr(bonus, name)
+                    if raw is None:
+                        continue
+                    value = Decimal(str(raw))
+                    if not value.is_finite() or value.as_tuple().exponent < -places:
+                        raise ValueError(f"{name}: confirmed bonus requires a finite value with at most {places} decimals")
+        return self
 
     @field_validator(
         "energy_taxes_consumption",
