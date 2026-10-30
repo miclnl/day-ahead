@@ -133,6 +133,38 @@ def test_confirmed_bonus_rejects_nonfinite_and_overprecise_terms(field, value):
                                             "vat percent": "0", field: value}})
 
 
+@pytest.mark.parametrize("field,value", [
+    ("max exchange price", "0.200000000000000001"),
+    ("percentage", "30.000000000000001"),
+    ("yearly cap kwh", "5000.0000000000001"),
+    ("max_exchange_price", "0.200000000000000001"),
+    ("yearly_cap_kwh", "5000.0000000000001"),
+])
+def test_confirmed_bonus_rejects_precision_lost_by_float_conversion(field, value):
+    with pytest.raises(ValueError, match="at most"):
+        configured(**{"production bonus": {"enabled": True, "cap basis": "ex_vat",
+                                            "vat percent": "0", field: value}})
+
+
+@pytest.mark.parametrize("field,value,expected", [
+    ("max exchange price", "0.200000000000000001", 0.2),
+    ("percentage", "30.000000000000001", 30.0),
+    ("yearly cap kwh", "5000.0000000000001", 5000.0),
+])
+@pytest.mark.parametrize("route", ["legacy", "draft", "disabled", "disabled_string"])
+def test_original_bonus_precision_check_preserves_unconfirmed_routes(field, value, expected, route):
+    bonus = {"enabled": True, "cap basis": "ex_vat", "vat percent": "0", field: value}
+    if route == "legacy":
+        cfg = PricingConfig.model_validate(pricing(**{"production bonus": bonus}))
+    elif route == "draft":
+        cfg = configured(contract(status="draft"), mode="shadow", **{"production bonus": bonus})
+    else:
+        bonus["enabled"] = False if route == "disabled" else "false"
+        cfg = configured(**{"production bonus": bonus})
+        assert cfg.production_bonus.enabled is False
+    assert getattr(cfg.production_bonus, field.replace(" ", "_")) == expected
+
+
 def test_confirmed_bonus_does_not_infer_supply_start_from_invoice_or_bonus_anchor():
     with pytest.raises(ValueError):
         configured(contract(**{"supply start": None}), **{"production bonus": {

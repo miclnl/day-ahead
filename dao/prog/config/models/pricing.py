@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from .base import SecretStr
 from .production_bonus import ProductionBonusConfig
@@ -196,6 +196,23 @@ class PricingConfig(BaseModel):
                     raise ValueError(f"{name}: settlement tariff must be a finite decimal") from exc
                 if not value.is_finite() or value.as_tuple().exponent < -12:
                     raise ValueError(f"{name}: settlement tariff must be finite with at most 12 decimals")
+        bonus = data.get("production bonus", data.get("production_bonus"))
+        if isinstance(bonus, dict):
+            settlement = SettlementConfig.model_validate(data["settlement"])
+            if (any(contract.status == "confirmed" for contract in settlement.contracts)
+                    and TypeAdapter(bool).validate_python(bonus.get("enabled", False))):
+                bonus = reject_alias_conflicts(ProductionBonusConfig, bonus)
+                for name, places in (("percentage", 12), ("max_exchange_price", 12), ("yearly_cap_kwh", 9)):
+                    alias = ProductionBonusConfig.model_fields[name].alias or name
+                    raw = bonus.get(alias, bonus.get(name))
+                    if raw is None:
+                        continue
+                    try:
+                        value = Decimal(str(raw))
+                    except InvalidOperation as exc:
+                        raise ValueError(f"{name}: confirmed bonus requires a finite decimal") from exc
+                    if not value.is_finite() or value.as_tuple().exponent < -places:
+                        raise ValueError(f"{name}: confirmed bonus requires a finite value with at most {places} decimals")
         return data
 
     @model_validator(mode="after")
