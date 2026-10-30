@@ -190,6 +190,25 @@ def make_report_with_prices(db):
 
 
 class TestGetPriceData:
+    @pytest.mark.parametrize("mode", [None, "off", "shadow"])
+    def test_non_refund_export_still_uses_its_multiplier(self, db, mode):
+        insert_prices(db, [(datetime.datetime(2026, 12, 31, 12, 0), 0.10)])
+        report = make_report_with_prices(db)
+        report.prices_options.tax_refund = False
+        report.prices_options.settlement = None if mode is None else SimpleNamespace(mode=mode)
+        report.multiplier_t_def = {"2026-01-01": 0.9}
+        report.ol_t_def = {"2026-01-01": 0.01682}
+        result = report.get_price_data(datetime.datetime(2026, 12, 31, 12, 0),
+                                       datetime.datetime(2026, 12, 31, 13, 0))
+        assert result["da_prod"].iloc[0] == pytest.approx(0.1292522)
+        assert result["da_bonus"].iloc[0] == 0.0
+
+    def test_active_settlement_cannot_use_the_legacy_price_function(self, db):
+        report = make_report_with_prices(db)
+        report.prices_options.settlement = SimpleNamespace(mode="active")
+        with pytest.raises(ValueError):
+            report.get_price_data(datetime.datetime(2027, 1, 1), datetime.datetime(2027, 1, 2))
+
     def test_builds_one_row_per_hour_with_taxes_and_btw_applied(self, db):
         from sqlalchemy import Table, insert
 

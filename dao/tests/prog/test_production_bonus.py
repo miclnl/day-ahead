@@ -72,6 +72,20 @@ class TestBonusPerKwh:
         cfg = ProductionBonusConfig(enabled=True, percentage=10, **{"max exchange price": 0.50})
         assert production_bonus.bonus_per_kwh(cfg, JUNE_NOON, 0.40, 0.0) == pytest.approx(0.04)
 
+    @pytest.mark.parametrize("basis,expected", [("ex_vat", 0.06171), ("inc_vat", 0.06)])
+    def test_explicit_bonus_vat_basis_is_not_replaced_by_export_vat(self, basis, expected):
+        cfg = ProductionBonusConfig(enabled=True, cap_basis=basis, vat_percent="21")
+        assert production_bonus.bonus_per_kwh(cfg, JUNE_NOON, 0.17, 0.0) == pytest.approx(expected)
+
+    def test_explicit_basis_with_unknown_bonus_vat_has_no_positive_rate(self):
+        cfg = ProductionBonusConfig(enabled=True, cap_basis="ex_vat")
+        assert production_bonus.bonus_per_kwh(cfg, JUNE_NOON, 0.10, 21.0) == 0.0
+
+    def test_legacy_bonus_rate_keeps_preexisting_precision_and_unused_cap_behavior(self):
+        cfg = ProductionBonusConfig(enabled=True, percentage=33.33333333333333,
+                                    yearly_cap_kwh=5000.1234567891)
+        assert production_bonus.bonus_per_kwh(cfg, JUNE_NOON, 0.10, 0.0) == pytest.approx(0.03333333333333333)
+
 
 class TestBonusPeriodStart:
     ANCHOR = datetime.date(2025, 8, 10)

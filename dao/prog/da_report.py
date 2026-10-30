@@ -3042,6 +3042,9 @@ class Report(DaBase):
         return df, last_moment
 
     def get_price_data(self, start, end, interval: str = "1hour"):
+        settlement = getattr(self.prices_options, "settlement", None)
+        if settlement is not None and settlement.mode == "active":
+            raise ValueError("Actieve afrekening mag de legacy-prijsfunctie niet gebruiken")
         if interval == "1hour":
             agg_func = "avg"
         else:
@@ -3090,7 +3093,8 @@ class Report(DaBase):
                         1 + btw_t / 100
                 )
             else:
-                da_prod = (row.value + ol_t) * (1 + btw_t / 100)
+                # De exportspotfactor geldt ook zonder belastingteruggave.
+                da_prod = (row.value * multiplier_t + ol_t) * (1 + btw_t / 100)
             moment = datetime.datetime.strptime(row.time, "%Y-%m-%d %H:%M")
             if bonus_on and not cap_exhausted:
                 da_bonus = production_bonus.bonus_per_kwh(bonus_cfg, moment, row.value, btw_t)

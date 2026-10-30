@@ -6,8 +6,10 @@ aanroepers geen eigen guard nodig hebben.
 """
 
 import datetime
+from decimal import Decimal
 
 from dao.prog.config.models.production_bonus import DEFAULT_WINDOWS
+from dao.prog.settlement.tariffs import bonus_rules_from_config, potential_bonus_rate
 
 __all__ = [
     "DEFAULT_WINDOWS",
@@ -34,21 +36,19 @@ def bonus_per_kwh(
     exchange_price: float,
     vat_pct: float,
 ) -> float:
-    """Bonus in euro/kWh voor het interval dat op `moment` begint."""
+    """Legacycompatibiliteit en floatgrens rond de expliciete Decimal-bonusregel.
+
+    Onbevestigde oude config behoudt de ex-btw-cap en meegegeven export-btw.
+    Expliciete nieuwe grondslagen gebruiken alleen hun eigen bonus-btw.
+    """
     if cfg is None or not cfg.enabled:
         return 0.0
-    if moment.date() < cfg.start_date:
-        return 0.0
-    if exchange_price <= 0:
-        return 0.0
-    if not in_window(cfg, moment):
-        return 0.0
-    return (
-        cfg.percentage
-        / 100
-        * min(exchange_price, cfg.max_exchange_price)
-        * (1 + vat_pct / 100)
-    )
+    if cfg.cap_basis == "unconfirmed":
+        # Oude config blijft ongewijzigd bruikbaar, ook zonder nieuwe DTO-precisie.
+        if moment.date() < cfg.start_date or exchange_price <= 0 or not in_window(cfg, moment):
+            return 0.0
+        return cfg.percentage / 100 * min(exchange_price, cfg.max_exchange_price) * (1 + vat_pct / 100)
+    return float(potential_bonus_rate(bonus_rules_from_config(cfg), moment, Decimal(str(exchange_price))))
 
 
 def _same_day_in_year(anchor: datetime.date, year: int) -> datetime.date:
