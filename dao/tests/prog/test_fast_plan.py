@@ -102,6 +102,11 @@ class TestSerialisation:
         assert restored is not None and len(restored.intervals) == 8
         assert not list(tmp_path.glob(".fast_plan_*"))
 
+    def test_legacy_writer_still_creates_a_missing_data_directory(self, tmp_path):
+        path = tmp_path / "new-data" / "fast_plan.json"
+        write_plan(make_plan(), path)
+        assert load_plan(path).to_dict() == make_plan().to_dict()
+
     def test_unknown_fields_do_not_break_reading(self, tmp_path):
         path = tmp_path / "fast_plan.json"
         payload = make_plan(2).to_dict()
@@ -296,3 +301,16 @@ class TestBuildPlan:
         path = str(tmp_path / "p.json")
         write_plan(plan, path)
         assert load_plan(path).to_dict() == plan.to_dict()
+
+    def test_legacy_builder_never_invents_financial_context(self):
+        plan = self.build()
+        assert plan.format_version == 1
+        assert plan.financial_context is None
+        assert "financial_context" not in plan.to_dict()
+
+
+@pytest.mark.parametrize("payload", [None, [], {"format_version": 0}, {"format_version": True}])
+def test_unusable_envelopes_do_not_crash_the_compatibility_reader(tmp_path, payload):
+    path = tmp_path / "fast_plan.json"
+    path.write_text(json.dumps(payload))
+    assert load_plan(path) is None

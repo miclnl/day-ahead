@@ -13,14 +13,17 @@ the ``prognoses`` table for the backtest.
 
 from __future__ import annotations
 
-import json
-import logging
-import os
-import tempfile
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional
+import math
+import re
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, Optional
 
-# Bump when the on-disk layout changes in a way older readers cannot handle.
+from dao.prog.settlement.types import TerminalValue
+
+# Legacybouwers blijven expliciet v1; alleen de financiële adapter schrijft v2.
 PLAN_FORMAT_VERSION = 1
 
 FAST_PLAN_FILE = "../data/fast_plan.json"
@@ -32,6 +35,168 @@ IDLE_POWER_W = 20.0
 # What the optimizer writes to the "stop inverter" helper when the inverter must
 # keep running for the whole interval.
 NO_STOP_SENTINEL = "2000-01-01 00:00:00"
+
+
+def _integer(value, name, *, positive=False):
+    if type(value) is not int or not -(2**63) <= value < 2**63 or (positive and value <= 0):
+        raise ValueError(f"{name}: expected {'positive ' if positive else ''}integer")
+    return value
+
+
+def _text(value, name, *, nonempty=False):
+    if type(value) is not str or (nonempty and not value.strip()):
+        raise ValueError(f"{name}: expected {'nonempty ' if nonempty else ''}text")
+    return value
+
+
+def _number(value, name):
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError(f"{name}: expected a finite number, not coercion/default")
+    return value
+
+
+def _object(value, required, optional=()):
+    if type(value) is not dict or not set(required) <= value.keys() or value.keys() - set(required) - set(optional):
+        raise ValueError("Expected complete object with known fields")
+    return value
+
+
+def _array(value):
+    if type(value) is not list:
+        raise ValueError("Expected a JSON array")
+    return value
+
+
+def _decimal_text(value: Decimal) -> str:
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError("Expected finite Decimal")
+    if value == 0:
+        return "0"
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _read_decimal(value):
+    if type(value) is not str:
+        raise ValueError("Financial decimals require canonical text")
+    try:
+        result = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError("Invalid decimal text") from exc
+    if _decimal_text(result) != value:
+        raise ValueError("Noncanonical decimal text")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class FinancialBasis:
+    meter_id: str
+    input_revision: int
+    snapshot_hashes: tuple[str, ...]
+    prefix_start_ts: int
+    planning_start_ts: int
+    horizon_end_ts: int
+    captured_ts: int
+    source_watermark_ts: int | None
+
+    def __post_init__(self):
+        _text(self.meter_id, "meter_id", nonempty=True)
+        if len(self.meter_id) > 128:
+            raise ValueError("meter_id: at most 128 characters")
+        _integer(self.input_revision, "input_revision", positive=True)
+        if type(self.snapshot_hashes) not in (tuple, list):
+            raise ValueError("Expected pinned snapshot hashes")
+        hashes = tuple(self.snapshot_hashes)
+        if (not hashes or any(type(value) is not str or not re.fullmatch("[0-9a-f]{64}", value) for value in hashes)
+                or len(hashes) != len(set(hashes))):
+            raise ValueError("Expected unique canonical SHA-256 snapshot hashes")
+        object.__setattr__(self, "snapshot_hashes", hashes)
+        for name in ("prefix_start_ts", "planning_start_ts", "horizon_end_ts", "captured_ts"):
+            _integer(getattr(self, name), name)
+        if self.source_watermark_ts is not None:
+            _integer(self.source_watermark_ts, "source_watermark_ts")
+        if not self.prefix_start_ts <= self.planning_start_ts < self.horizon_end_ts:
+            raise ValueError("Expected prefix <= planning start < horizon end")
+
+
+@dataclass(frozen=True, slots=True)
+class FinancialContext:
+    basis: FinancialBasis
+    not_after_ts: int
+    price_interval_s: int
+    terminal_value: TerminalValue
+    economics_supported: bool
+    issues: tuple[str, ...]
+
+    def __post_init__(self):
+        if type(self.basis) is not FinancialBasis or type(self.terminal_value) is not TerminalValue:
+            raise TypeError("Explicit financial basis and existing TerminalValue DTO required")
+        _integer(self.not_after_ts, "not_after_ts")
+        if not self.basis.planning_start_ts < self.not_after_ts <= self.basis.horizon_end_ts:
+            raise ValueError("Lease must end inside the planning horizon")
+        if type(self.price_interval_s) is not int or self.price_interval_s not in (900, 3600):
+            raise ValueError("Unsupported price interval")
+        if type(self.economics_supported) is not bool:
+            raise TypeError("economics_supported requires bool")
+        if type(self.issues) not in (tuple, list):
+            raise TypeError("issues requires a sequence")
+        object.__setattr__(self, "issues", tuple(_text(value, "issue", nonempty=True) for value in self.issues))
+        _text(self.terminal_value.policy_version, "terminal policy", nonempty=True)
+        names = [name for name, _ in self.terminal_value.reference_efficiency_by_battery]
+        if len(names) != len(set(names)) or any(not name.strip() for name in names):
+            raise ValueError("Terminal reference battery names must be unique and explicit")
+
+    def to_dict(self):
+        return {
+            "basis": {**asdict(self.basis), "snapshot_hashes": list(self.basis.snapshot_hashes)},
+            "not_after_ts": self.not_after_ts, "price_interval_s": self.price_interval_s,
+            "terminal_value": {
+                "policy_version": self.terminal_value.policy_version,
+                "eur_per_ac_kwh": _decimal_text(self.terminal_value.eur_per_ac_kwh),
+                "reference_efficiency_by_battery": [
+                    [name, _decimal_text(value)] for name, value in self.terminal_value.reference_efficiency_by_battery
+                ],
+            },
+            "economics_supported": self.economics_supported, "issues": list(self.issues),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        _object(data, ("basis", "not_after_ts", "price_interval_s", "terminal_value", "economics_supported", "issues"))
+        basis = _object(data["basis"], FinancialBasis.__dataclass_fields__)
+        _array(basis["snapshot_hashes"])
+        terminal = _object(data["terminal_value"], TerminalValue.__dataclass_fields__)
+        references = []
+        for pair in _array(terminal["reference_efficiency_by_battery"]):
+            if len(_array(pair)) != 2:
+                raise ValueError("Expected battery name and reference efficiency")
+            references.append((_text(pair[0], "battery", nonempty=True), _read_decimal(pair[1])))
+        return cls(FinancialBasis(**basis), data["not_after_ts"], data["price_interval_s"],
+                   TerminalValue(terminal["policy_version"], _read_decimal(terminal["eur_per_ac_kwh"]),
+                                 tuple(references)), data["economics_supported"], _array(data["issues"]))
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedPlan:
+    format_version: int
+    created_ts: int
+    reason: str
+
+    def __post_init__(self):
+        if type(self.format_version) is not int or self.format_version != 2:
+            raise ValueError("Blocked plans require format_version=2")
+        _integer(self.created_ts, "created_ts")
+        _text(self.reason, "reason", nonempty=True)
+
+    def to_dict(self):
+        return {"format_version": 2, "status": "blocked", "created_ts": self.created_ts, "reason": self.reason}
+
+    @classmethod
+    def from_dict(cls, data):
+        _object(data, ("format_version", "status", "created_ts", "reason"))
+        if data["status"] != "blocked":
+            raise ValueError("Expected blocked status")
+        return cls(data["format_version"], data["created_ts"], data["reason"])
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -104,7 +269,7 @@ class BatterySpec:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "BatterySpec":
+    def from_dict(cls, data: dict) -> BatterySpec:
         return cls(
             name=str(data.get("name", "battery")),
             capacity_kwh=_f(data.get("capacity_kwh"), 1.0),
@@ -154,7 +319,7 @@ class BatteryPlanStep:
         return data
 
     @classmethod
-    def from_dict(cls, data: dict) -> "BatteryPlanStep":
+    def from_dict(cls, data: dict) -> BatteryPlanStep:
         return cls(
             ac_power_w=_f(data.get("ac_power_w")),
             soc_begin=_f(data.get("soc_begin")),
@@ -210,7 +375,7 @@ class PlanInterval:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "PlanInterval":
+    def from_dict(cls, data: dict) -> PlanInterval:
         return cls(
             start_ts=int(data.get("start_ts", 0)),
             end_ts=int(data.get("end_ts", 0)),
@@ -236,6 +401,7 @@ class FastPlan:
     strategy: str = ""
     price_average: float = 0.0
     format_version: int = PLAN_FORMAT_VERSION
+    financial_context: FinancialContext | None = None
 
     # -- lookups ---------------------------------------------------------
 
@@ -278,6 +444,23 @@ class FastPlan:
     # -- serialisation ---------------------------------------------------
 
     def to_dict(self) -> dict:
+        if type(self.format_version) is not int:
+            raise ValueError("Plan format version requires int without coercion")
+        if self.format_version == 2:
+            if type(self.financial_context) is not FinancialContext:
+                raise ValueError("Ready-v2 requires a complete financial context")
+            data = {
+                "format_version": 2, "status": "ready", "created_ts": self.created_ts,
+                "interval_s": self.interval_s, "strategy": self.strategy, "price_average": self.price_average,
+                "batteries": [asdict(spec) for spec in self.specs],
+                "intervals": [asdict(interval) for interval in self.intervals],
+                "financial_context": self.financial_context.to_dict(),
+            }
+            # Ook in-memory kandidaten gaan door dezelfde strikte wirevalidatie.
+            self.from_dict(data)
+            return data
+        if type(self.format_version) is not int or self.format_version != 1 or self.financial_context is not None:
+            raise ValueError("Legacy plans require explicit v1 without financial context")
         return {
             "format_version": self.format_version,
             "created_ts": self.created_ts,
@@ -289,13 +472,14 @@ class FastPlan:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "FastPlan":
-        version = int(data.get("format_version", 0))
-        if version > PLAN_FORMAT_VERSION:
-            raise ValueError(
-                f"fast_plan.json has format version {version}, this build understands "
-                f"at most {PLAN_FORMAT_VERSION}"
-            )
+    def from_dict(cls, data: dict) -> FastPlan:
+        if type(data) is not dict or type(data.get("format_version")) is not int:
+            raise ValueError("Expected versioned plan object")
+        version = data["format_version"]
+        if version == 2:
+            return _read_ready_v2(data)
+        if version != 1 or "status" in data or "financial_context" in data:
+            raise ValueError("Unknown plan format")
         return cls(
             created_ts=int(data.get("created_ts", 0)),
             interval_s=int(data.get("interval_s", 3600)),
@@ -309,61 +493,94 @@ class FastPlan:
         )
 
 
-def write_plan(plan: FastPlan, path: str = FAST_PLAN_FILE) -> None:
-    """Write the plan atomically so a concurrent reader never sees a partial file."""
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(directory, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        mode="w", dir=directory, prefix=".fast_plan_", suffix=".tmp", delete=False
+def _read_ready_v2(data):
+    _object(data, ("format_version", "status", "created_ts", "interval_s", "strategy", "price_average",
+                   "batteries", "intervals", "financial_context"))
+    if data["status"] != "ready":
+        raise ValueError("Expected ready status")
+    created = _integer(data["created_ts"], "created_ts")
+    step_s = _integer(data["interval_s"], "interval_s", positive=True)
+    context = FinancialContext.from_dict(data["financial_context"])
+    if not context.basis.captured_ts <= created < context.not_after_ts:
+        raise ValueError("Capture/creation/lease ordering is invalid")
+    specs = []
+    optional_text = ("setpoint_entity", "mode_entity", "stop_inverter_entity", "soc_entity")
+    spec_text = ("name", "mode_on", "mode_off")
+    for spec in _array(data["batteries"]):
+        _object(spec, BatterySpec.__dataclass_fields__)
+        for name in spec_text:
+            _text(spec[name], name, nonempty=True)
+        for name in optional_text:
+            if spec[name] is not None:
+                _text(spec[name], name, nonempty=True)
+        for name in spec.keys() - set(spec_text) - set(optional_text):
+            _number(spec[name], name)
+        if (spec["capacity_kwh"] <= 0 or min(spec["max_charge_w"], spec["max_discharge_w"],
+                                            spec["minimum_power_w"], spec["cycle_cost"]) < 0
+                or not 0 <= spec["soc_min"] < spec["soc_max"] <= 100
+                or not 0 < spec["charge_efficiency"] <= 1 or not 0 < spec["discharge_efficiency"] <= 1):
+            raise ValueError("Invalid battery limits/efficiencies")
+        specs.append(BatterySpec(**spec))
+    names = [spec.name for spec in specs]
+    if len(names) != len(set(names)) or set(names) != {
+        name for name, _ in context.terminal_value.reference_efficiency_by_battery
+    }:
+        raise ValueError("Terminal references must identify exactly the plan batteries")
+    intervals, cursor = [], context.basis.planning_start_ts
+    for interval in _array(data["intervals"]):
+        _object(interval, PlanInterval.__dataclass_fields__)
+        start = _integer(interval["start_ts"], "start_ts")
+        end = _integer(interval["end_ts"], "end_ts")
+        if start != cursor or not 0 < end - start <= step_s:
+            raise ValueError("Plan must cover the horizon contiguously without overlap")
+        for name in ("price_import", "price_export", "grid_w", "house_w", "pv_w"):
+            _number(interval[name], name)
+        steps = []
+        for step in _array(interval["batteries"]):
+            _object(step, ("ac_power_w", "soc_begin", "soc_end"), ("mode", "stop_inverter"))
+            for name in ("ac_power_w", "soc_begin", "soc_end"):
+                _number(step[name], name)
+            if not 0 <= step["soc_begin"] <= 100 or not 0 <= step["soc_end"] <= 100:
+                raise ValueError("Invalid planned SOC")
+            for name in ("mode", "stop_inverter"):
+                if step.get(name) is not None:
+                    _text(step[name], name, nonempty=True)
+            steps.append(BatteryPlanStep(**step))
+        if len(steps) != len(specs):
+            raise ValueError("Every interval must specify exactly the declared batteries")
+        intervals.append(PlanInterval(**{**interval, "batteries": steps}))
+        cursor = end
+    if not intervals or cursor != context.basis.horizon_end_ts:
+        raise ValueError("Incomplete planning horizon")
+    return FastPlan(created, step_s, specs, intervals, _text(data["strategy"], "strategy"),
+                    _number(data["price_average"], "price_average"), 2, context)
+
+
+def write_plan(plan: FastPlan, path: str | Path = FAST_PLAN_FILE) -> None:
+    """Legacycompatibiliteit; mag de financiële publicatiegrens nooit herstellen."""
+    from dao.prog.fastctrl.publication import (
+        PublicationError,
+        canonical_plan_path,
+        publication_lock,
+        write_publication,
     )
+
+    plan_path = canonical_plan_path(path)
     try:
-        with handle:
-            json.dump(plan.to_dict(), handle, indent=1)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(handle.name, path)
-        # Ensure the rename is also durable before returning: on Linux the
-        # rename is only persisted to disk when the directory inode is
-        # fsync'd. Without this step a power cut between os.replace and
-        # the next sync can lose the new inode entry and leave the reader
-        # seeing the *old* (or no) file.
-        try:
-            dir_fd = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # Some filesystems (e.g. /proc-like mounts) refuse to open
-            # with O_RDONLY for fsync. Not fatal: the file itself is
-            # already durable, only the rename's directory entry might
-            # not be.
-            pass
-    except BaseException:
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
-        raise
-    logging.debug(
-        f"Fast-control plan geschreven: {path}, {len(plan.intervals)} intervallen"
-    )
+        # Behoud de bestaande v1-eerste-schrijfroute, alleen voor dit vertrouwde pad.
+        plan_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PublicationError("Cannot create legacy plan data directory") from exc
+    with publication_lock(plan_path) as lease:
+        write_publication(plan, lease=lease)
 
 
-def load_plan(path: str = FAST_PLAN_FILE) -> Optional[FastPlan]:
-    """Read the plan, returning None when it is missing or unreadable.
+def load_plan(path: str | Path = FAST_PLAN_FILE) -> Optional[FastPlan]:
+    """Compatibilityread; veiligheidconsumers gebruiken read/verdict, niet deze wrapper."""
+    from dao.prog.fastctrl.publication import read_publication
 
-    A missing or corrupt plan is not fatal: the fast layer simply refuses to
-    override and leaves the battery on whatever the optimizer last wrote.
-    """
-    try:
-        with open(path, "r") as handle:
-            return FastPlan.from_dict(json.load(handle))
-    except FileNotFoundError:
-        return None
-    except (json.JSONDecodeError, ValueError, TypeError, OSError) as exception:
-        logging.warning(f"Fast-control plan {path} kon niet worden gelezen: {exception}")
-        return None
+    read = read_publication(path)
+    return read.plan if read.status == "ready" else None
 
 
 def build_intervals(

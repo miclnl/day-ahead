@@ -8,15 +8,15 @@ HA-/prijsrevisies. Een gedeeltelijke herberekening wist geen vuile staart.
 
 import json
 from collections.abc import Sequence
-from contextlib import contextmanager
-from dataclasses import asdict, is_dataclass
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date
 from decimal import Decimal, localcontext
 from functools import cache
 from hashlib import sha256
 from time import time
 from types import UnionType
-from typing import Union, get_args, get_origin, get_type_hints
+from typing import Protocol, Union, get_args, get_origin, get_type_hints
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -174,6 +174,31 @@ class ConcurrentSettlementError(RuntimeError):
     """De geregistreerde invoer of financiële generatie is inmiddels gewijzigd."""
 
 
+@dataclass(frozen=True, slots=True)
+class InputChange:
+    meter_id: str
+    previous_revision: int
+    next_revision: int
+    changed_intervals: tuple[tuple[int, int], ...]
+    changed_prices: tuple[tuple[int, int], ...]
+    changed_contracts: tuple[tuple[int, int | None], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BookReference:
+    input_revision: int
+    snapshot_hashes: tuple[str, ...]
+    dirty_from_ts: int | None
+
+
+class InputPublicationGuard(Protocol):
+    """File-/threadslot vóór DB-slot; callback mag geen repository terug aanroepen."""
+
+    def hold(self) -> AbstractContextManager[None]: ...
+
+    def before_revision(self, change: InputChange) -> None: ...
+
+
 def _json(value) -> str:
     return json.dumps(asdict(value) if is_dataclass(value) else value,
                       default=_canonical_default, sort_keys=True, separators=(",", ":"))
@@ -283,8 +308,26 @@ def _totals(lines, adjustments, start, end):
 
 
 class SettlementRepository:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, publication: InputPublicationGuard | None = None):
         self.engine = engine
+        # None is uitsluitend voor geïsoleerde tests/offline boeken zonder runner.
+        self._publication = publication
+
+    def read_book_reference(self, meter_id: str) -> BookReference:
+        _meter(meter_id)
+        with self.engine.connect() as connection:
+            row = connection.execute(select(
+                _BOOK.c.input_revision, _BOOK.c.snapshot_hashes_json, _BOOK.c.dirty_from_ts,
+            ).where(_BOOK.c.meter_id == meter_id)).first()
+            return (BookReference(0, (), None) if row is None else
+                    BookReference(row.input_revision, tuple(json.loads(row.snapshot_hashes_json)), row.dirty_from_ts))
+
+    @contextmanager
+    def _registration(self, meter_id):
+        with self._publication.hold() if self._publication is not None else nullcontext():
+            self._ensure_book(meter_id)
+            with self._transaction() as connection:
+                yield connection
 
     def ensure_schema(self) -> None:
         """Maak uitsluitend de zes additieve tabellen, onafhankelijk van legacyversies."""
@@ -353,6 +396,49 @@ class SettlementRepository:
         for offset in range(0, len(records), _BATCH_SIZE):
             connection.execute(statement, records[offset:offset + _BATCH_SIZE])
 
+    def _changed_prices(self, connection, meter_id, revision, changed, by_start, snapshots):
+        """Vergelijk A6-inhoud; spot_source bevat ook de canonieke prijsbronkwaliteit.
+
+        Nieuwe meetkwartieren binnen een al gepind prijsuur voegen geen nieuwe
+        prijsdekking toe. De samengevoegde meetkwaliteit is geen prijswijziging.
+        """
+        ranges, known_prices = set(), {}
+        new_rows = [row for row in changed if row["start_ts"] not in by_start]
+        if new_rows:
+            # Eén bulkread, ook bij historische imports; nooit N+1 SQL onder het fileslot.
+            start = min(row["start_ts"] for row in new_rows) // 3600 * 3600
+            end = (max(row["end_ts"] for row in new_rows) + 3599) // 3600 * 3600
+            known = self._latest_inputs(connection, meter_id, revision, start, end)
+            for item in known:
+                content = json.loads(item["input_json"])
+                signature = content["spot_ex_vat"], content["spot_source"]
+                for duration in {snapshot.price_interval_seconds for snapshot in snapshots}:
+                    key = duration, item["start_ts"] // duration * duration
+                    known_prices.setdefault(key, set()).add(signature)
+        for row in changed:
+            content = json.loads(row["input_json"])
+            signature = content["spot_ex_vat"], content["spot_source"]
+            previous = by_start.get(row["start_ts"])
+            try:
+                snapshot = resolve_snapshot(snapshots, row["start_ts"], row["end_ts"])
+            except ValueError:
+                ranges.add((row["start_ts"], max(row["end_ts"], previous["end_ts"] if previous else row["end_ts"])))
+                continue
+            duration = snapshot.price_interval_seconds
+            start = row["start_ts"] // duration * duration
+            end = max(row["end_ts"], previous["end_ts"] if previous else row["end_ts"])
+            price_end = (end + duration - 1) // duration * duration
+            if previous is not None:
+                old = json.loads(previous["input_json"])
+                old_price_end = (previous["end_ts"] + duration - 1) // duration * duration
+                if signature == (old["spot_ex_vat"], old["spot_source"]) and price_end <= old_price_end:
+                    continue
+            else:
+                if all(signature in known_prices.get((duration, at), ()) for at in range(start, price_end, duration)):
+                    continue
+            ranges.add((start, price_end))
+        return tuple(sorted(ranges))
+
     def register_inputs(
         self, meter_id: str, inputs: Sequence[InputInterval], snapshots: Sequence[TariffSnapshot],
         expected_input_revision: int,
@@ -383,8 +469,7 @@ class SettlementRepository:
                 raise ValueError("Contract snapshots must not overlap")
             tariffs.append({"snapshot_hash": snapshot.snapshot_hash, "snapshot_json": _json(snapshot)})
         hashes_json = _json([item.snapshot_hash for item in ordered])
-        self._ensure_book(meter_id)
-        with self._transaction() as connection:
+        with self._registration(meter_id) as connection:
             book = self._lock_book(connection, meter_id, expected_input_revision)
             current = []
             if prepared:
@@ -405,6 +490,7 @@ class SettlementRepository:
             dirty = [row["start_ts"] for row in changed]
             if book["dirty_from_ts"] is not None:
                 dirty.append(book["dirty_from_ts"])
+            contract_ranges = []
             if contract_changed:
                 old = self._snapshots(connection, book["snapshot_hashes_json"])
                 boundaries = sorted({point for item in (*old, *ordered)
@@ -414,7 +500,18 @@ class SettlementRepository:
                     return next((item.snapshot_hash for item in items if item.valid_from_ts <= at
                                  and (item.valid_to_ts is None or at < item.valid_to_ts)), None)
 
-                dirty.extend(at for at in boundaries if selected(old, at) != selected(ordered, at))
+                for index, at in enumerate(boundaries):
+                    if selected(old, at) != selected(ordered, at):
+                        dirty.append(at)
+                        contract_ranges.append((at, boundaries[index + 1] if index + 1 < len(boundaries) else None))
+            if self._publication is not None:
+                self._publication.before_revision(InputChange(
+                    meter_id, expected_input_revision, expected_input_revision + 1,
+                    tuple((row["start_ts"], max(row["end_ts"], by_start[row["start_ts"]]["end_ts"]
+                           if row["start_ts"] in by_start else row["end_ts"])) for row in changed),
+                    self._changed_prices(connection, meter_id, expected_input_revision, changed, by_start, ordered),
+                    tuple(contract_ranges),
+                ))
             existing = set(connection.scalars(select(_TARIFF.c.snapshot_hash).where(
                 _TARIFF.c.snapshot_hash.in_([item["snapshot_hash"] for item in tariffs]))))
             # Andere meters hebben een eigen boeklock, maar delen dezelfde immutable tarief-PK.

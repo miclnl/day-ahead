@@ -604,3 +604,125 @@ def test_multiple_meters_do_not_share_revisions_or_money(repo, terms, inputs, ca
     assert repo.commit("second-grid", calculate(batch), batch, 0, "other-meter") == 1
     assert repo.read("second-grid", START_TS, START_TS + 1800).net_cost == Decimal("0.20")
     assert repo.read(METER, START_TS, START_TS + 1800).generation == 1
+
+
+def test_book_reference_is_read_only_and_uses_current_validation_revision(repo, terms, inputs, calculate):
+    from dao.prog.settlement.repository import BookReference
+
+    assert repo.read_book_reference(METER) == BookReference(0, (), None)
+    assert not rows(repo, "book")
+    original = terms()
+    revised = terms(contract_id="changed-contract")
+    items = inputs([original])
+    publish(repo, items, [original], calculate)
+    repo.register_inputs(METER, items, [revised], 1)
+    repo.register_inputs(METER, items, [original], 2)
+    batch = repo.read_inputs(METER, START_TS, START_TS + 1800)
+    repo.commit(METER, calculate(batch), batch, 1, "full-ABA-revalidation")
+    assert repo.read_book_reference(METER) == BookReference(3, (original.snapshot_hash,), None)
+    assert rows(repo, "run")[0]["input_revision"] == 1
+
+
+def test_optional_registration_guard_observes_real_changes_and_rolls_back(repo, terms, inputs):
+    from contextlib import contextmanager
+
+    from dao.prog.settlement.repository import SettlementRepository
+
+    changes = []
+    class Guard:
+        held = False
+        fail = False
+
+        @contextmanager
+        def hold(self):
+            assert not self.held
+            self.held = True
+            try:
+                yield
+            finally:
+                self.held = False
+
+        def before_revision(self, change):
+            assert self.held
+            changes.append(change)
+            if self.fail:
+                raise RuntimeError("invalidation failed")
+
+    guard = Guard()
+    writer = SettlementRepository(repo.engine, publication=guard)
+    snapshots = [terms()]
+    original = inputs(snapshots, imports=("1",))
+    assert writer.register_inputs(METER, original, snapshots, 0) == 1
+    assert changes[-1].previous_revision == 0 and changes[-1].next_revision == 1
+    assert changes[-1].changed_intervals == ((START_TS, START_TS + 900),)
+    assert changes[-1].changed_prices == ((START_TS, START_TS + 3600),)
+    assert changes[-1].changed_contracts == ((START_TS, None),)
+    changes.clear()
+    assert writer.register_inputs(METER, original, snapshots, 1) == 1
+    assert changes == []
+    assert writer.register_inputs(METER, inputs(snapshots, start=START_TS + 900, imports=("1",)),
+                                  snapshots, 1) == 2
+    assert changes[-1].changed_prices == ()  # Dezelfde reeds gepinde uurprijs.
+    assert changes[-1].changed_contracts == ()
+    frozen = {name: rows(repo, name) for name in ("book", "input", "tariff")}
+    guard.fail = True
+    with pytest.raises(RuntimeError, match="invalidation failed"):
+        writer.register_inputs(METER, inputs(snapshots, imports=("2",)), snapshots, 2)
+    assert frozen == {name: rows(repo, name) for name in frozen}
+    assert not guard.held
+
+
+def test_guard_distinguishes_meter_quality_from_price_quality(repo, terms, inputs):
+    from contextlib import nullcontext
+
+    from dao.prog.settlement.repository import SettlementRepository
+
+    changes = []
+    class Guard:
+        def hold(self):
+            return nullcontext()
+
+        def before_revision(self, change):
+            changes.append(change)
+
+    writer = SettlementRepository(repo.engine, publication=Guard())
+    snapshots = [terms()]
+    original = inputs(snapshots, imports=("1",))
+    writer.register_inputs(METER, original, snapshots, 0)
+    # End/meetkwaliteit veranderen de bronkwaliteit van de uurprijs niet.
+    revised = [replace(original[0], end_ts=START_TS + 450, quality="estimated")]
+    writer.register_inputs(METER, revised, snapshots, 1)
+    assert changes[-1].changed_intervals == ((START_TS, START_TS + 900),)
+    assert changes[-1].changed_prices == ()
+    priced = [replace(revised[0], spot_source=revised[0].spot_source.replace('"measured"', '"estimated"'))]
+    writer.register_inputs(METER, priced, snapshots, 2)
+    assert changes[-1].changed_prices == ((START_TS, START_TS + 3600),)
+
+
+def test_guard_price_comparison_does_not_do_one_sql_read_per_new_meter_row(repo, terms, inputs):
+    """Historical registration must not expand its short file lease into N+1 DB reads."""
+    from contextlib import nullcontext
+
+    from dao.prog.settlement.repository import SettlementRepository
+
+    changes, reads = [], []
+    class Guard:
+        def hold(self):
+            return nullcontext()
+
+        def before_revision(self, change):
+            changes.append(change)
+
+    snapshots = [terms()]
+    items = inputs(snapshots, imports=("1",) * 96)
+    def observe(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT") and "settlement_input" in statement:
+            reads.append(statement)
+    event.listen(repo.engine, "before_cursor_execute", observe)
+    try:
+        SettlementRepository(repo.engine, publication=Guard()).register_inputs(METER, items, snapshots, 0)
+    finally:
+        event.remove(repo.engine, "before_cursor_execute", observe)
+    assert len(reads) <= 3
+    assert changes[0].changed_prices == tuple((START_TS + hour * 3600, START_TS + (hour + 1) * 3600)
+                                             for hour in range(24))
