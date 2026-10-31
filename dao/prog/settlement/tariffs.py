@@ -1,18 +1,17 @@
 """Pure tariefsnapshots en ongeronde prijzen; geen database, HA of solver."""
 
+import json
 from collections.abc import Sequence
 from dataclasses import asdict, replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, localcontext
 from hashlib import sha256
-import json
 from zoneinfo import ZoneInfo
 
 from dao.prog.config.models.pricing import PricingConfig
 from dao.prog.config.models.production_bonus import ProductionBonusConfig
 from dao.prog.config.models.settlement import SettlementContractConfig
-from dao.prog.settlement.types import BonusRules, PriceQuote, TARIFF_FIELDS, TariffSnapshot
-
+from dao.prog.settlement.types import TARIFF_FIELDS, BonusRules, PriceQuote, TariffSnapshot
 
 RULE_VERSION = "tariffs-v1"
 
@@ -125,7 +124,7 @@ def resolve_snapshot(
     """Eén volledige dekking, nooit alleen de snapshot van de eerste datum."""
     _check_interval(start_ts, end_ts)
     ordered = sorted(snapshots, key=lambda snapshot: snapshot.valid_from_ts)
-    for previous, current in zip(ordered, ordered[1:]):
+    for previous, current in zip(ordered, ordered[1:], strict=False):
         if previous.valid_to_ts is None or previous.valid_to_ts > current.valid_from_ts:
             raise ValueError("Tariff snapshots must not overlap")
     for snapshot in ordered:
@@ -135,19 +134,39 @@ def resolve_snapshot(
     raise ValueError("No single snapshot covers the complete interval; missing terms or split required")
 
 
-def potential_bonus_rate(bonus: BonusRules | None, moment: datetime, spot_ex_vat: Decimal) -> Decimal:
-    """Potentieel tarief; geen bewijs van bron, resterende cap of uitbetaling."""
-    if bonus is None or not bonus.enabled or moment.date() < bonus.start_date or spot_ex_vat <= 0:
+def bonus_in_window(windows: Sequence[tuple[int, tuple[int, int]]], moment: datetime) -> bool:
+    """Halfopen lokaal bonusvenster, gedeeld met de legacy-adapter en kern."""
+    start, end = dict(windows)[moment.month]
+    return start <= moment.hour < end
+
+
+def bonus_rate_at(
+    moment: datetime, spot_ex_vat: Decimal, *, enabled: bool, start_date: date,
+    percentage: Decimal, max_exchange_price: Decimal, cap_basis: str,
+    vat_percent: Decimal | None, windows: Sequence[tuple[int, tuple[int, int]]],
+) -> Decimal:
+    """Eén tariefregel, ook voor legacy-invoer zonder nieuwe DTO-precisie-eisen."""
+    if not enabled or moment.date() < start_date or spot_ex_vat <= 0:
         return Decimal("0")
-    start, end = dict(bonus.windows)[moment.month]
-    if not start <= moment.hour < end or bonus.cap_basis == "unconfirmed" or bonus.vat_percent is None:
+    if not bonus_in_window(windows, moment) or cap_basis == "unconfirmed" or vat_percent is None:
         return Decimal("0")
     with localcontext() as ctx:
         ctx.prec = 36
-        vat_factor = 1 + bonus.vat_percent / 100
-        if bonus.cap_basis == "inc_vat":
-            return min(spot_ex_vat * vat_factor, bonus.max_exchange_price) * bonus.percentage / 100
-        return min(spot_ex_vat, bonus.max_exchange_price) * bonus.percentage / 100 * vat_factor
+        vat_factor = 1 + vat_percent / 100
+        if cap_basis == "inc_vat":
+            return min(spot_ex_vat * vat_factor, max_exchange_price) * percentage / 100
+        return min(spot_ex_vat, max_exchange_price) * percentage / 100 * vat_factor
+
+
+def potential_bonus_rate(bonus: BonusRules | None, moment: datetime, spot_ex_vat: Decimal) -> Decimal:
+    """Potentieel tarief; geen bewijs van bron, resterende cap of uitbetaling."""
+    if bonus is None:
+        return Decimal("0")
+    return bonus_rate_at(
+        moment, spot_ex_vat, enabled=bonus.enabled, start_date=bonus.start_date,
+        percentage=bonus.percentage, max_exchange_price=bonus.max_exchange_price,
+        cap_basis=bonus.cap_basis, vat_percent=bonus.vat_percent, windows=bonus.windows,
+    )
 
 
 def _check_bonus_boundaries(snapshot: TariffSnapshot, start_ts: int, end_ts: int):

@@ -9,7 +9,8 @@ import datetime
 from decimal import Decimal
 
 from dao.prog.config.models.production_bonus import DEFAULT_WINDOWS
-from dao.prog.settlement.tariffs import bonus_rules_from_config, potential_bonus_rate
+from dao.prog.settlement.engine import delivery_year_bounds, remaining_export_cap
+from dao.prog.settlement.tariffs import bonus_in_window, bonus_rate_at
 
 __all__ = [
     "DEFAULT_WINDOWS",
@@ -26,8 +27,11 @@ def in_window(cfg, moment: datetime.datetime) -> bool:
     """True als het interval dat op `moment` begint in het venster van moment.month ligt."""
     if cfg is None or not cfg.enabled:
         return False
-    start, end = cfg.windows[str(moment.month)]
-    return start <= moment.hour < end
+    return bonus_in_window(_windows(cfg), moment)
+
+
+def _windows(cfg):
+    return tuple((int(month), tuple(window)) for month, window in cfg.windows.items())
 
 
 def bonus_per_kwh(
@@ -43,29 +47,22 @@ def bonus_per_kwh(
     """
     if cfg is None or not cfg.enabled:
         return 0.0
-    if cfg.cap_basis == "unconfirmed":
-        # Oude config blijft ongewijzigd bruikbaar, ook zonder nieuwe DTO-precisie.
-        if moment.date() < cfg.start_date or exchange_price <= 0 or not in_window(cfg, moment):
-            return 0.0
-        return cfg.percentage / 100 * min(exchange_price, cfg.max_exchange_price) * (1 + vat_pct / 100)
-    return float(potential_bonus_rate(bonus_rules_from_config(cfg), moment, Decimal(str(exchange_price))))
-
-
-def _same_day_in_year(anchor: datetime.date, year: int) -> datetime.date:
-    try:
-        return datetime.date(year, anchor.month, anchor.day)
-    except ValueError:  # 29 februari in een niet-schrikkeljaar
-        return datetime.date(year, 2, 28)
+    legacy = cfg.cap_basis == "unconfirmed"
+    # Alleen de adapter bevestigt de oude ex-btw-conventie; nieuwe snapshots niet.
+    return float(bonus_rate_at(
+        moment, Decimal(str(exchange_price)), enabled=cfg.enabled, start_date=cfg.start_date,
+        percentage=Decimal(str(cfg.percentage)), max_exchange_price=Decimal(str(cfg.max_exchange_price)),
+        cap_basis="ex_vat" if legacy else cfg.cap_basis,
+        vat_percent=Decimal(str(vat_pct)) if legacy else cfg.vat_percent, windows=_windows(cfg),
+    ))
 
 
 def bonus_period_start(cfg, moment: datetime.datetime) -> datetime.date | None:
     """Eerste dag van het huidige bonusjaar, of None als er geen limiet geldt."""
     if cfg is None or not cfg.enabled or cfg.yearly_cap_kwh is None or cfg.delivery_year_start is None:
         return None
-    today = moment.date()
-    anniversary = _same_day_in_year(cfg.delivery_year_start, today.year)
-    if anniversary > today:
-        anniversary = _same_day_in_year(cfg.delivery_year_start, today.year - 1)
+    # Compatibiliteit: deze oude helper gebruikt alleen maand/dag van het anker.
+    anniversary, _ = delivery_year_bounds(cfg.delivery_year_start, moment.date())
     return max(anniversary, cfg.start_date)
 
 
@@ -73,7 +70,7 @@ def remaining_cap_kwh(cfg, exported_kwh: float) -> float | None:
     """Resterende kWh die nog bonus krijgt, of None als er geen limiet geldt."""
     if cfg is None or cfg.yearly_cap_kwh is None:
         return None
-    return max(0.0, cfg.yearly_cap_kwh - exported_kwh)
+    return float(remaining_export_cap(Decimal(str(cfg.yearly_cap_kwh)), Decimal(str(exported_kwh))))
 
 
 def describe(cfg, moment: datetime.datetime, remaining: float | None) -> str:
