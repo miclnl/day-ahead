@@ -451,7 +451,7 @@ TASK_PAGE_GROUPS = (
     ("Ophalen", ("prices", "meteo", "tibber")),
     (
         "Onderhoud",
-        ("consolidate", "forecast_accuracy", "train_ml_predictions", "clean"),
+        ("consolidate", "settlement_consolidate", "forecast_accuracy", "train_ml_predictions", "clean"),
     ),
     ("Snelle regellaag", ("fast_once", "fast_control_simulate")),
 )

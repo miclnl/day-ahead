@@ -136,6 +136,14 @@ TASKS: dict[str, dict[str, Any]] = {
         "schedulable": True,
         "aliases": (),
     },
+    "settlement_consolidate": {
+        "name": "Berekende afrekening consolideren",
+        "cmd": [_PY, "../prog/da_settlement.py", "reconcile", "--publish", "--reason", "scheduled", "--scheduled"],
+        "function": "consolidate_settlement",
+        "file_name": "settlement",
+        "schedulable": True,
+        "aliases": (),
+    },
     "fast_once": {
         "name": "Snelle regellaag: één regelcyclus",
         "cmd": [_PY, _DA_FAST, "once"],

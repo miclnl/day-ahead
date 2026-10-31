@@ -70,6 +70,15 @@ class TestSchedulerActionsStayInStep:
         hand from the command line."""
         assert "consolidate_data" in tasks.schedulable_functions()
 
+    def test_settlement_is_schedulable_but_not_automatically_scheduled(self):
+        from dao.prog.config.models.scheduler import ScheduleEntry, SchedulerConfig
+        entry = ScheduleEntry(time="xx05", action="consolidate_settlement")
+        assert tasks.task_key_for_function(entry.action) == "settlement_consolidate"
+        assert SchedulerConfig().schedule == []
+        assert tasks.build_cmd("settlement_consolidate") == [
+            "python3", "../prog/da_settlement.py", "reconcile", "--publish", "--reason", "scheduled", "--scheduled",
+        ]
+
     def test_diagnostics_are_not_schedulable(self):
         """fast_once fights the fast control thread the scheduler already
         hosts; fast_control_simulate is a backtest nothing acts on."""

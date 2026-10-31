@@ -31,6 +31,7 @@ SchedulerAction = Literal[
     "clean_data",
     "calc_baseloads",
     "consolidate_data",
+    "consolidate_settlement",
     "train_ml_predictions",
     "forecast_accuracy",
 ]
@@ -128,6 +129,10 @@ Define when automatic tasks run using time patterns.
   forecast archive
 
 ### Maintenance
+- **consolidate_settlement**: Archive closed settlement intervals before recorder
+  retention (for example xx05); refresh the last 48h plus the watermark. Older
+  external corrections require explicit backfill/import. No schedule is added
+  automatically; off does nothing, shadow never replaces legacy cost/profit.
 - **clean_data**: Clean up old data (runs save_days retention)
 
 ## Example Configuration

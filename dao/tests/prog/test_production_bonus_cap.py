@@ -80,7 +80,7 @@ def make_report(db, cfg):
     return report
 
 
-def test_remaining_is_the_cap_minus_feed_in_since_the_period_start(db):
+def test_sparse_legacy_exports_do_not_prove_cap_position(db):
     insert_prod(
         db,
         [
@@ -90,20 +90,20 @@ def test_remaining_is_the_cap_minus_feed_in_since_the_period_start(db):
         ],
     )
     report = make_report(db, ProductionBonusConfig(enabled=True, delivery_year_start=ANCHOR))
-    assert report.production_bonus_remaining_kwh(MOMENT) == pytest.approx(4700.0)
+    assert report.production_bonus_remaining_kwh(MOMENT) == 0.0
 
 
-def test_feed_in_after_the_moment_does_not_count(db):
+def test_future_legacy_exports_do_not_prove_complete_prefix(db):
     insert_prod(db, [(datetime.datetime(2027, 3, 1, 10), 100.0)])
     report = make_report(db, ProductionBonusConfig(enabled=True, delivery_year_start=ANCHOR))
-    assert report.production_bonus_remaining_kwh(MOMENT) == pytest.approx(5000.0)
+    assert report.production_bonus_remaining_kwh(MOMENT) == 0.0
 
 
-def test_no_delivery_year_start_means_no_cap_and_one_warning(db, caplog):
+def test_unknown_state_means_no_positive_bonus_and_one_warning(db, caplog):
     report = make_report(db, ProductionBonusConfig(enabled=True))
-    assert report.production_bonus_remaining_kwh(MOMENT) is None
-    assert report.production_bonus_remaining_kwh(MOMENT) is None
-    assert caplog.text.count("delivery year start") == 1
+    assert report.production_bonus_remaining_kwh(MOMENT) == 0.0
+    assert report.production_bonus_remaining_kwh(MOMENT) == 0.0
+    assert caplog.text.count("afrekenstaat") == 1
 
 
 def test_disabled_absent_or_uncapped_config_means_no_cap_and_no_query(db):
@@ -118,12 +118,24 @@ def test_disabled_absent_or_uncapped_config_means_no_cap_and_no_query(db):
     assert make_report(db, uncapped).production_bonus_remaining_kwh(MOMENT) is None
 
 
-def test_a_database_error_yields_no_cap_and_a_warning(db, caplog):
+def test_a_database_error_disables_positive_bonus_and_warns(db, caplog):
     report = make_report(db, ProductionBonusConfig(enabled=True, delivery_year_start=ANCHOR))
 
     def broken(*args, **kwargs):
         raise RuntimeError("database weg")
 
-    db.get_column_data = broken
-    assert report.production_bonus_remaining_kwh(MOMENT) is None
+    report.settlement_service = broken
+    assert report.production_bonus_remaining_kwh(MOMENT) == 0.0
     assert "database weg" in caplog.text
+
+
+def test_compatibility_wrapper_uses_settlement_state(db):
+    from decimal import Decimal
+    from types import SimpleNamespace
+
+    from dao.prog.settlement.types import BonusState, SettlementState
+    report = make_report(db, ProductionBonusConfig(enabled=True, delivery_year_start=ANCHOR))
+    at = db.epoch(MOMENT)
+    state = SettlementState(at, BonusState(at - 86400, at + 86400, at, Decimal("4999")), None)
+    report.settlement_service = lambda: SimpleNamespace(state_at=lambda moment: state)
+    assert report.production_bonus_remaining_kwh(MOMENT) == 1.0

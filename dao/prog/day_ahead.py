@@ -47,7 +47,7 @@ from dao.prog.fastctrl.publication import (
     publication_lock,
     read_publication,
 )
-from dao.prog.settlement.publication import FinancialPlanBlocked, make_publication
+from dao.prog.settlement.publication import FinancialPlanBlocked
 
 _libc = ctypes.CDLL(None)
 
@@ -5423,15 +5423,9 @@ class DaCalc(DaBase):
 
     def _financial_publication(self):
         self._financial_settings()
-        if not hasattr(self, "_settlement_publication"):
-            if self._financial_pricing is None:
-                raise FinancialPlanBlocked("missing_financial_configuration")
-            # A7 verhuist deze factory naar de gedeelde applicatiebootstrap.
-            _, self._settlement_publication = make_publication(
-                self.db_da.engine, plan_path=self._financial_plan_path,
-                pricing=self._financial_pricing, max_plan_age=self.config.fast_control.max_plan_age,
-            )
-        return self._settlement_publication
+        if self._financial_pricing is None:
+            raise FinancialPlanBlocked("missing_financial_configuration")
+        return self.settlement_components(pricing=self._financial_pricing, plan_path=self._financial_plan_path)[1]
 
     def _refuse_financial_output(self, *, now_ts: int, reason: str) -> None:
         logging.error(f"Financieel plan geblokkeerd: {reason}")

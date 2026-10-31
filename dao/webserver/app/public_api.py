@@ -15,6 +15,7 @@ that is what DOCS.md already tells people.
 """
 
 import logging
+import re
 
 from flask import Blueprint, abort, request
 from markupsafe import escape
@@ -86,8 +87,15 @@ def api_report(fld: str, periode: str):
         except ValueError:
             cumulate = False
 
-    report = Report(app_datapath + "/options.json")
+    generation = request.args.get("generation")
+    if generation is not None:
+        if not re.fullmatch(r"[0-9]+", generation) or len(generation) > 19 or int(generation) >= 2**63 - 1:
+            abort(400)
+        generation = int(generation)
+    path = app_datapath + "/options.json"
+    report = Report.settlement_reader(path) if fld == "settlement" else Report(path)
+    extra = {"generation": generation} if generation is not None else {}
     result = report.get_api_data(
-        str(escape(fld)), str(escape(periode)), cumulate=cumulate
+        str(escape(fld)), str(escape(periode)), cumulate=cumulate, **extra
     )
     return result, {"Content-Type": "application/json"}

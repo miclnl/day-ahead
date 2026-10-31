@@ -2086,6 +2086,10 @@ Define when automatic tasks run using time patterns.
   forecast archive
 
 ### Maintenance
+- **consolidate_settlement**: Archive closed settlement intervals before recorder
+  retention (for example xx05); refresh the last 48h plus the watermark. Older
+  external corrections require explicit backfill/import. No schedule is added
+  automatically; off does nothing, shadow never replaces legacy cost/profit.
 - **clean_data**: Clean up old data (runs save_days retention)
 
 ## Example Configuration
@@ -2673,7 +2677,7 @@ _A single scheduled task entry._
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `time` | string | Yes | — | Time pattern in HHMM format _Format: HHMM (24-hour, e.g., '0435', 'xx15', '02xx')_ |
-| `action` | string | Yes | — | Action to execute at this time. Options: `get_meteo_data`, `get_tibber_data`, `get_day_ahead_prices`, `calc_optimum`, `calc_optimum_met_debug`, `clean_data`, `calc_baseloads`, `consolidate_data`, `train_ml_predictions`, `forecast_accuracy` |
+| `action` | string | Yes | — | Action to execute at this time. Options: `get_meteo_data`, `get_tibber_data`, `get_day_ahead_prices`, `calc_optimum`, `calc_optimum_met_debug`, `clean_data`, `calc_baseloads`, `consolidate_data`, `consolidate_settlement`, `train_ml_predictions`, `forecast_accuracy` |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>

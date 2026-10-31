@@ -218,3 +218,17 @@ def test_consolidation_pays_the_production_bonus_on_profit(db):
         (t0 + HOUR, round(1.0 * 0.24, 6)),
         (t0 + 2 * HOUR, round(1.0 * 0.36, 6)),
     ]
+
+
+@pytest.mark.parametrize("objective,receipt", [(-0.20, 0.20), (0.20, -0.20)])
+def test_legacy_profit_sign_conventions(db, objective, receipt):
+    from sqlalchemy import text
+    start = datetime.datetime(2026, 6, 15)
+    with db.engine.begin() as connection:
+        connection.execute(text('CREATE TABLE prognoses (id INTEGER PRIMARY KEY, variabel INTEGER, time BIGINT, value FLOAT)'))
+        connection.execute(text('INSERT INTO prognoses (variabel,time,value) VALUES (4,:at,:value)'),
+                           {"at": int(start.timestamp()), "value": objective})
+    report = Report.__new__(Report)
+    report.db_da = db
+    result = report.get_da_data("profit", start, start + datetime.timedelta(hours=1), "uur", "uur", "prognoses")
+    assert result.profit.iloc[0] == pytest.approx(receipt)

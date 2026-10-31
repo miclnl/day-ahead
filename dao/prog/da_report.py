@@ -1,9 +1,12 @@
 import base64
 import calendar
 import datetime
+import json
 import logging
 import math
+from decimal import Decimal, localcontext
 from io import BytesIO
+from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
 
@@ -30,6 +33,25 @@ from dao.lib.da_graph import GraphBuilder
 from dao.prog import production_bonus
 from dao.prog.da_base import DaBase
 from dao.prog.utils import get_value_from_dict
+
+
+def legacy_prognosis_revenue(objective_profit):
+    """prognoses.profit bewaart de negatieve objectivebijdrage, niet ontvangst.
+
+    Alleen deze benoemde adapter keert het teken om; negatieve exportprijzen
+    blijven negatieve opbrengsten. Historische values.profit is al ontvangst.
+    """
+    return -objective_profit
+
+
+def _amount_sum(values):
+    values = tuple(values)
+    if not values or any(value is None or pd.isna(value) for value in values):
+        return None
+    with localcontext() as context:
+        context.prec = 36
+        # Alleen aan deze rapportgrens komen historische legacyfloats binnen.
+        return sum((value if isinstance(value, Decimal) else Decimal(str(value)) for value in values), Decimal("0"))
 
 
 def calc_r2(serie_x: pd.Series, serie_y: pd.Series) -> float:
@@ -61,6 +83,16 @@ def localize_hour_buckets(timestamps, time_zone):
 
 
 class Report(DaBase):
+    @classmethod
+    def settlement_reader(cls, file_name):
+        report = cls.local_settlement_app(file_name)
+        if report.time_zone is None:
+            raise ValueError("Settlementrapport vereist een expliciete contracttijdzone")
+        report.prices_options = report.config.prices
+        report.periodes = {}
+        report.make_periodes(_now=datetime.datetime.now(ZoneInfo(report.time_zone)).replace(tzinfo=None))
+        return report
+
     def __init__(
             self, file_name: str = "../data/options.json", _now: datetime.datetime = None
     ):
@@ -1368,9 +1400,160 @@ class Report(DaBase):
 
     CONSOLIDATE_COLUMNS = ["time", "code", "value", "tijd"]
 
+    def _settlement_epoch(self, value):
+        if type(value) is int:
+            return value
+        moment = pd.Timestamp(value).to_pydatetime()
+        return self.db_da.epoch(moment) if hasattr(self, "db_da") else int(moment.timestamp())
+
+    def _financial_ranges(self, start, end):
+        """Kies één bedragenbron per halfopen deelbereik; onbekende historie legacy."""
+        pricing = getattr(self, "prices_options", None)
+        cfg = getattr(pricing, "settlement", None)
+        lower, upper = self._settlement_epoch(start), self._settlement_epoch(end)
+        if cfg is None or cfg.mode != "active":
+            return [(False, lower, upper)]
+        contracts = getattr(cfg, "contracts", None)
+        if contracts is None:
+            raise ValueError("Actieve afrekening vereist expliciete contractdekking")
+        windows, points = [], {lower, upper}
+        for contract in contracts:
+            zone = ZoneInfo(contract.timezone)
+            left = int(datetime.datetime.combine(contract.valid_from, datetime.time.min, zone).timestamp())
+            right = upper if contract.valid_to is None else int(datetime.datetime.combine(
+                contract.valid_to, datetime.time.min, zone).timestamp())
+            if left < upper and lower < right:
+                windows.append((left, right))
+                points.update((max(lower, left), min(upper, right)))
+        ordered = sorted(points)
+        return [(any(left <= at < right for left, right in windows), at, stop)
+                for at, stop in zip(ordered, ordered[1:], strict=False) if at < stop]
+
+    def _local_datetime(self, at):
+        zone = ZoneInfo(self.time_zone) if hasattr(self, "time_zone") else getattr(self.db_da, "tzinfo", None)
+        return datetime.datetime.fromtimestamp(at, zone).replace(tzinfo=None)
+
+    def get_settlement_data(self, start, end, *, generation=None) -> pd.DataFrame:
+        service = self.settlement_service()
+        view = service.repository.read(service.meter_id, self._settlement_epoch(start), self._settlement_epoch(end),
+                                       generation=generation)
+        metadata = {"generation": view.generation, "input_revision": view.input_revision,
+                    "current_input_revision": view.current_input_revision, "freshness": view.freshness,
+                    "bonus_kind": "calculated"}
+        rows = []
+        for line in view.lines:
+            amounts = (line.import_cost, line.base_export_revenue, line.bonus_revenue)
+            with localcontext() as context:
+                context.prec = 36
+                net = None if any(value is None for value in amounts) else amounts[0] - amounts[1] - amounts[2]
+            rows.append({**metadata, "kind": "interval", "time": line.start_ts, "end_ts": line.end_ts,
+                         "import_cost": line.import_cost, "base_export_revenue": line.base_export_revenue,
+                         "bonus_revenue": line.bonus_revenue, "bonus_kwh": line.bonus_kwh,
+                         "credit_total": None, "net_cost": net, "snapshot_hash": line.snapshot_hash,
+                         "input_hash": line.input_hash, "line_input_revision": line.input_revision,
+                         "quality": line.quality, "issues": line.issues})
+        for adjustment in view.adjustments:
+            rows.append({**metadata, "kind": adjustment.kind, "time": adjustment.period_end_ts - 1,
+                         "end_ts": adjustment.period_end_ts, "period_start_ts": adjustment.period_start_ts,
+                         "period_end_ts": adjustment.period_end_ts, "import_cost": None,
+                         "base_export_revenue": None, "bonus_revenue": None, "bonus_kwh": None,
+                         "credit_total": adjustment.credit_total, "credit_ex_vat": adjustment.credit_ex_vat,
+                         "credit_vat": adjustment.credit_vat, "basis_ex_vat": adjustment.basis_ex_vat,
+                         "net_cost": adjustment.credit_total.copy_negate(), "quality": adjustment.quality, "issues": ()})
+        columns = ["generation", "input_revision", "current_input_revision", "freshness", "bonus_kind", "kind",
+                   "time", "end_ts", "import_cost", "base_export_revenue", "bonus_revenue", "bonus_kwh",
+                   "credit_total", "net_cost", "quality", "issues"]
+        frame = pd.DataFrame(rows) if rows else pd.DataFrame(columns=columns)
+        frame["quality_label"] = frame.quality.map({"measured": "berekend", "estimated": "geschat",
+                                                   "incomplete": "onvolledig"})
+        frame.attrs["view"] = view
+        return frame
+
+    def _book_grid(self, start, end, interval, *, generation=None):
+        frame = self.get_settlement_data(start, end, generation=generation)
+        service = self.settlement_service()
+        view = frame.attrs["view"]
+        batch = service.repository.read_inputs(service.meter_id, start, end,
+                                               expected_input_revision=view.current_input_revision)
+        inputs = {(item.start_ts, item.input_revision, item.input_hash): item for item in batch.items}
+        rows = []
+        for row in frame.to_dict("records"):
+            if row["kind"] == "interval" and row["end_ts"] > end:
+                continue  # Geen heel intervalbedrag aan een gedeeltelijk bereik toerekenen.
+            at = row["time"]
+            moment = datetime.datetime.fromtimestamp(at, ZoneInfo(self.time_zone))
+            label = moment.strftime("%Y-%m-%d %H:00%z" if interval == "uur" else
+                                    "%Y-%m-%d" if interval == "dag" else "%Y-%m")
+            is_line = row["kind"] == "interval"
+            item = inputs.get((at, row.get("line_input_revision"), row.get("input_hash"))) if is_line else None
+            profit = _amount_sum((row["base_export_revenue"], row["bonus_revenue"])) if is_line else row["credit_total"]
+            rows.append({interval: label, "vanaf": self._local_datetime(at),
+                         "tot": self._local_datetime(row["end_ts"]),
+                         "consumption": item.import_kwh if item is not None else None if is_line else Decimal("0"),
+                         "production": item.export_kwh if item is not None else None if is_line else Decimal("0"),
+                         "cost": row["import_cost"] if is_line else Decimal("0"), "profit": profit,
+                         "datasoort": "calculated", "quality": row["quality"], "freshness": view.freshness,
+                         "generation": view.generation})
+        cursor = start
+        covered = [(line.start_ts, line.end_ts) for line in view.lines if line.end_ts <= end]
+        for left, right in [*covered, (end, end)]:
+            while cursor < left:
+                stop = min(left, (cursor // 3600 + 1) * 3600)
+                moment = datetime.datetime.fromtimestamp(cursor, ZoneInfo(self.time_zone))
+                label = moment.strftime("%Y-%m-%d %H:00%z" if interval == "uur" else
+                                        "%Y-%m-%d" if interval == "dag" else "%Y-%m")
+                rows.append({interval: label, "vanaf": self._local_datetime(cursor),
+                             "tot": self._local_datetime(stop), "consumption": None, "production": None,
+                             "cost": None, "profit": None, "datasoort": "calculated", "quality": "incomplete",
+                             "freshness": view.freshness, "generation": view.generation})
+                cursor = stop
+            cursor = max(cursor, right)
+        columns = [interval, "vanaf", "tot", "consumption", "production", "cost", "profit", "datasoort",
+                   "quality", "freshness", "generation"]
+        result = pd.DataFrame(rows, columns=columns)
+        if not result.empty:
+            result = result.groupby(interval, as_index=False).agg({
+                "vanaf": "min", "tot": "max", "consumption": _amount_sum, "production": _amount_sum,
+                "cost": _amount_sum, "profit": _amount_sum, "datasoort": "first", "freshness": "first",
+                "generation": "first", "quality": lambda values: "incomplete" if "incomplete" in set(values)
+                else "estimated" if "estimated" in set(values) else "measured",
+            })
+        with localcontext() as context:
+            context.prec = 36
+            result["netto_consumption"] = result["consumption"] - result["production"]
+            result["netto_cost"] = result["cost"] - result["profit"]
+        result["bonus_kind"] = "calculated"
+        result["quality_label"] = result.quality.map({"measured": "berekend", "estimated": "geschat",
+                                                      "incomplete": "onvolledig"})
+        result.attrs["view"] = view
+        return result
+
     def calc_cost(
             self, vanaf: datetime.datetime, tot: datetime.datetime, code: str
     ) -> pd.DataFrame | None:
+        frames = []
+        for active, start, end in self._financial_ranges(vanaf, tot):
+            if active:
+                data = self.get_settlement_data(start, end)
+                rows = []
+                for row in data.to_dict("records"):
+                    value = row["import_cost"] if code == "cost" else (
+                        _amount_sum((row["base_export_revenue"], row["bonus_revenue"]))
+                        if row["kind"] == "interval" else row["credit_total"])
+                    if value is not None:
+                        rows.append({"time": str(row["time"]), "code": code, "value": value,
+                                     "tijd": self._local_datetime(row["time"])})
+                frames.append(pd.DataFrame(rows, columns=self.CONSOLIDATE_COLUMNS))
+            else:
+                # De ongewijzigde legacygrens blijft float-/rapportcompatibel.
+                frame = self._calc_legacy_cost(vanaf if start == self._settlement_epoch(vanaf) else
+                                               self._local_datetime(start), tot if end == self._settlement_epoch(tot)
+                                               else self._local_datetime(end), code)
+                if frame is not None:
+                    frames.append(frame)
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    def _calc_legacy_cost(self, vanaf, tot, code):
         """Hourly cost ("cost") or revenue ("profit") from the grid sensors and
         the tariff of that hour, as rows ready for savedata()."""
         if code == "cost":
@@ -1385,7 +1568,7 @@ class Report(DaBase):
             logging.warning(f"Geen tarieven tussen {vanaf} en {tot}, {code} niet berekend")
             return None
         if "da_bonus" in prices.columns:
-            # De uitbetaalde terugleverprijs is inclusief de bonus op teruglevering.
+            # Legacyraming: potentiële bonus is geen bewijs van leveranciersbetaling.
             prices["da_prod"] = prices["da_prod"] + prices["da_bonus"]
         energy = energy.reset_index(drop=True)
         energy["tijd"] = pd.to_datetime(energy["tijd"])
@@ -1427,7 +1610,13 @@ class Report(DaBase):
                 logging.info(f"Consolideren {code}: al bijgewerkt tot {start}")
                 continue
             if categorie["sensors"] == "calc":
-                df_db = getattr(self, categorie["function"])(start, tot, code)
+                # Grootboekbedragen worden nooit naar historische values.cost/profit gekopieerd.
+                ranges = self._financial_ranges(start, tot)
+                frames = ([self._calc_legacy_cost(start, tot, code)] if not any(use for use, _, _ in ranges) else
+                          [self._calc_legacy_cost(self._local_datetime(left), self._local_datetime(right), code)
+                           for active, left, right in ranges if not active])
+                frames = [frame for frame in frames if frame is not None]
+                df_db = pd.concat(frames, ignore_index=True) if frames else None
             else:
                 data = self.get_sensor_sum(categorie["sensors"], start, tot, code)
                 if data is None or len(data) == 0:
@@ -1492,16 +1681,21 @@ class Report(DaBase):
                 tijd_str = str(row.tijd)[0:7]  # jaar maand
             col_1 = row.consumption
             col_2 = row.production
-            if is_number(row.consumption) and is_number(row.da_cons):
+            end = getattr(row, "tot", row.tijd + datetime.timedelta(hours=1))
+            active = any(use for use, _, _ in self._financial_ranges(row.tijd, end))
+            if active:
+                data = self._book_grid(self._settlement_epoch(row.tijd), self._settlement_epoch(end), "uur")
+                col_3, col_4 = (_amount_sum(data.cost), _amount_sum(data.profit))
+            elif is_number(row.consumption) and is_number(row.da_cons):
                 col_3 = row.consumption * row.da_cons
             else:
                 col_3 = 0
-            if is_number(row.production) and is_number(row.da_prod):
+            if not active and is_number(row.production) and is_number(row.da_prod):
                 bonus = getattr(row, "da_bonus", 0.0)
                 if not is_number(bonus) or pd.isna(bonus):
                     bonus = 0.0
                 col_4 = row.production * (row.da_prod + bonus)
-            else:
+            elif not active:
                 col_4 = 0
             col_5 = row.datasoort
             rows.append(
@@ -1524,8 +1718,8 @@ class Report(DaBase):
                 "tot": "max",
                 "consumption": "sum",
                 "production": "sum",
-                "cost": "sum",
-                "profit": "sum",
+                "cost": lambda values: None if values.isna().any() else values.sum(),
+                "profit": lambda values: None if values.isna().any() else values.sum(),
                 "datasoort": get_datasoort,
             }
         )
@@ -2046,6 +2240,8 @@ class Report(DaBase):
         code_result["tijd"] = pd.to_datetime(code_result["tijd"])
         code_result["tot"] = pd.to_datetime(code_result["tot"])
         code_result.index = code_result["tijd"]
+        if table == "prognoses" and key == "profit":
+            code_result[key] = legacy_prognosis_revenue(code_result[key])
         return code_result
 
     def get_columns(
@@ -2134,7 +2330,19 @@ class Report(DaBase):
                     result.index = result["tijd"]
         return result
 
-    def get_grid_data(
+    def get_grid_data(self, periode, _vanaf=None, _tot=None, _interval=None, _source="all"):
+        period = self.periodes[periode] if periode else {}
+        start, end = _vanaf if _vanaf is not None else period["vanaf"], _tot if _tot is not None else period["tot"]
+        interval = _interval or period.get("interval", "uur")
+        ranges = self._financial_ranges(start, end)
+        if not any(use for use, _, _ in ranges):
+            return self._get_legacy_grid_data(periode, _vanaf, _tot, _interval, _source)
+        frames = [self._book_grid(left, right, interval) if active else self._get_legacy_grid_data(
+            "", self._local_datetime(left), self._local_datetime(right), interval, _source)
+                  for active, left, right in ranges]
+        return pd.concat(frames, ignore_index=True)
+
+    def _get_legacy_grid_data(
             self,
             periode: str,
             _vanaf=None,
@@ -2426,9 +2634,13 @@ class Report(DaBase):
         for column in rep_columns:
             df_result[column] = df_input[column]
             # df_result[rep_columns] = df_input[rep_columns]
-        df_result = self.agg_interval(calc_dict, df_result, rep_interval)
+        financial = df_input.attrs.get("settlement_amounts", False)
+        df_result = (df_result.groupby(rep_interval, as_index=False).agg(dict.fromkeys(rep_columns, _amount_sum))
+                     if financial and rep_interval != "uur" else
+                     df_result if financial else self.agg_interval(calc_dict, df_result, rep_interval))
         if active_view == "tabel":
-            df_result.loc["Total"] = df_result.sum(axis=0, numeric_only=True)
+            df_result.loc["Total"] = ([None, *(_amount_sum(df_result[key]) for key in rep_columns)]
+                                      if financial else df_result.sum(axis=0, numeric_only=True))
             df_result[rep_interval] = df_result[rep_interval].astype(object)
             df_result.at[df_result.index[-1], rep_interval] = "Totaal"
             for key in calc_dict["series"]:
@@ -2452,10 +2664,13 @@ class Report(DaBase):
                     header_col += [calc_dict["series"][key]["header"]]
                 name_col += [calc_dict["series"][key]["name"]]
                 dim_col += [calc_dict["series"][key]["dim"]]
+            labels = df_result[rep_columns].isna().any(axis=1).map({True: "onvolledig", False: "geschat"})
             if with_header:
                 df_result.columns = [header_col, name_col, dim_col]
             else:
                 df_result.columns = [name_col, dim_col]
+            if financial:
+                df_result[("Kwaliteit", *("",) * (df_result.columns.nlevels - 1))] = labels
         return df_result
 
     def calc_report(
@@ -2541,6 +2756,10 @@ class Report(DaBase):
         """
         calc_dict = self.saving_cost_dict
         df = self.get_columns(calc_dict, active_period, _tot)
+        period = self.periodes[active_period]
+        if "vanaf" in period and any(active for active, _, _ in self._financial_ranges(
+                period["vanaf"], _tot or period["tot"])):
+            return self._settlement_saving_cost(df, active_period, active_view, _tot)
         paid_prod_price = (
             df["da_prod"] + df["da_bonus"] if "da_bonus" in df.columns else df["da_prod"]
         )
@@ -2569,6 +2788,79 @@ class Report(DaBase):
             self.periodes[active_period]["interval"],
         )
         return df_result
+
+    def _settlement_saving_cost(self, df, period, view, end):
+        """Eigen chronologie voor de referentie; uurenergie wordt geen PV-kwartierbewijs."""
+        from dao.prog.settlement.engine import settle_series
+        from dao.prog.settlement.metering import merge_inputs
+        from dao.prog.settlement.types import MeterInterval
+
+        service = self.settlement_service()
+        stop_ts = self._settlement_epoch(end or self.periodes[period]["tot"])
+        pinned = service.repository.read(service.meter_id, self._settlement_epoch(self.periodes[period]["vanaf"]), stop_ts)
+        result = df.copy()
+        fields = ("cost", "profit", "netto_cost", "cost_zonder", "profit_zonder", "netto_cost_zonder", "saving")
+        for field in fields:
+            result[field] = pd.Series([None] * len(result), index=result.index, dtype=object)
+        reference_state = None
+        for position, (index, row) in enumerate(df.iterrows()):
+            at = self._settlement_epoch(row["tijd"])
+            stop = min(stop_ts, self._settlement_epoch(df.iloc[position + 1]["tijd"]) if position + 1 < len(df)
+                       else at + 3600)
+            if stop <= at:
+                continue
+            active = any(use for use, _, _ in self._financial_ranges(at, stop))
+            if not active:
+                bonus = row.get("da_bonus", 0)
+                price = row.da_prod + bonus
+                actual = row.cons * row.da_cons - row.prod * price
+                net = row.cons - row.prod - row.bat_in + row.bat_out
+                reference = max(0, net) * row.da_cons - max(0, -net) * price
+                values = (row.cons * row.da_cons, row.prod * price, actual,
+                          max(0, net) * row.da_cons, max(0, -net) * price, reference, reference - actual)
+                reference_state = None
+            else:
+                actual = self._book_grid(at, stop, "uur", generation=pinned.generation)
+                cost, profit = _amount_sum(actual.cost), _amount_sum(actual.profit)
+                actual_view = actual.attrs["view"]
+                if actual_view.current_input_revision != pinned.current_input_revision:
+                    from dao.prog.settlement.repository import ConcurrentSettlementError
+
+                    raise ConcurrentSettlementError("Invoer wijzigde tijdens het besparingsrapport")
+                revision = actual_view.current_input_revision
+                prices = service.repository.read_prices(service.meter_id, at, stop,
+                                                         expected_input_revision=revision)
+                if reference_state is None or reference_state.asof_ts != at:
+                    reference_state = service._pinned_state(at, revision)
+                with localcontext() as context:
+                    context.prec = 36
+                    quantities = [None if pd.isna(row[key]) else Decimal(str(row[key]))
+                                  for key in ("cons", "prod", "bat_in", "bat_out")]
+                    net = None if any(value is None for value in quantities) else (
+                        quantities[0] - quantities[1] - quantities[2] + quantities[3])
+                    meter = MeterInterval(at, stop, None if net is None else max(Decimal("0"), net).normalize(),
+                                          None if net is None else max(Decimal("0"), -net).normalize(), Decimal("0"),
+                                          "unknown", "estimated", ("counterfactual:without-battery",))
+                    inputs = merge_inputs((meter,), tuple(row.spot for row in prices.items), prices.snapshots,
+                                          meter_id=service.meter_id)
+                    reference = settle_series(inputs, prices.snapshots, reference_state)
+                    reference_state = reference.end_state
+                    ref_cost = _amount_sum(line.import_cost for line in reference.lines)
+                    ref_profit = _amount_sum([_amount_sum((line.base_export_revenue, line.bonus_revenue))
+                                              for line in reference.lines])
+                    if actual_view.freshness != "current":
+                        ref_cost = ref_profit = None
+                    if ref_profit is not None:
+                        ref_profit += sum((credit.credit_total for credit in reference.adjustments), Decimal("0"))
+                    net_actual = None if cost is None or profit is None else cost - profit
+                    net_reference = None if ref_cost is None or ref_profit is None else ref_cost - ref_profit
+                    saving = None if net_actual is None or net_reference is None else net_reference - net_actual
+                    values = (cost, profit, net_actual, ref_cost, ref_profit, net_reference, saving)
+            for field, value in zip(fields, values, strict=True):
+                result.at[index, field] = value
+        result.attrs["settlement_amounts"] = True
+        return self.clean_df(self.saving_cost_dict, result, list(fields[3:6]) + list(fields[:3]) + ["saving"],
+                             view, self.periodes[period]["interval"])
 
     def calc_saving_co2(
             self,
@@ -2646,6 +2938,8 @@ class Report(DaBase):
         return res[1]
 
     def calc_grid_columns(self, report_df, active_interval, active_view):
+        if "bonus_kind" in report_df and (report_df.bonus_kind == "calculated").any():
+            return self._settlement_grid_columns(report_df, active_interval, active_view)
         first_col = active_interval.capitalize()
         # if active_subject == "verbruik":
         #    columns.extend(["Verbruik", "Productie", "Netto"])
@@ -2736,6 +3030,35 @@ class Report(DaBase):
             ]
         fi_df = fi_df.round(3)
         return fi_df
+
+    def _settlement_grid_columns(self, frame, interval, view):
+        """Bedragcompatibiliteit zonder Decimal→float of onbekend→nul in totalen."""
+        first = interval.capitalize()
+        fields = {"consumption": "Verbruik", "production": "Productie", "netto_consumption": "Netto verbr.",
+                  "cost": "Kosten", "profit": "Opbrengst", "netto_cost": "Netto kosten"}
+        result = frame[list(fields)].rename(columns=fields).copy()
+        result.insert(0, first, frame[interval].astype(str))
+        result["Kwaliteit"] = frame.quality_label.fillna("geschat")
+
+        def quality(labels):
+            return "onvolledig" if "onvolledig" in set(labels) else "geschat" if "geschat" in set(labels) else "berekend"
+
+        result = result.groupby(first, as_index=False).agg({**dict.fromkeys(fields.values(), _amount_sum),
+                                                          "Kwaliteit": quality})
+        if view == "tabel":
+            result.loc["Total"] = {first: "Totaal", **{key: _amount_sum(result[key]) for key in fields.values()},
+                                    "Kwaliteit": quality(result.Kwaliteit)}
+        with localcontext() as context:
+            context.prec = 36
+            for amount, energy, name in (("Kosten", "Verbruik", "Tarief verbr."),
+                                          ("Opbrengst", "Productie", "Tarief prod.")):
+                result[name] = [None if pd.isna(value) or pd.isna(kwh) else value / kwh if kwh else Decimal("0")
+                                for value, kwh in zip(result[amount], result[energy], strict=True)]
+        columns = [first, *fields.values(), "Tarief verbr.", "Tarief prod.", "Kwaliteit"]
+        result = result[columns]
+        if view == "tabel":
+            result.columns = [columns, ["", "kWh", "kWh", "kWh", "eur", "eur", "eur", "eur/kWh", "eur/kWh", ""]]
+        return result
 
     def calc_balance_columns(self, report_df, active_interval, active_view):
         first_col = active_interval.capitalize()
@@ -3042,8 +3365,57 @@ class Report(DaBase):
         return df, last_moment
 
     def get_price_data(self, start, end, interval: str = "1hour"):
+        pricing = getattr(self, "prices_options", None)
+        cfg = getattr(pricing, "settlement", None)
+        if cfg is None and not getattr(self, "_legacy_settlement_warned", False):
+            logging.warning("Geen settlementconfiguratie: legacyraming, geen bewijs van 2027-gereedheid")
+            self._legacy_settlement_warned = True
+        if cfg is None or cfg.mode != "active":
+            frame = self._legacy_price_data(start, end, interval)
+            frame["bonus_kind"] = "potential"
+            return frame
+        if not getattr(cfg, "contracts", None):
+            raise ValueError("Actieve afrekening vereist expliciete contractdekking")
+        if end is None:
+            last = self.db_da.get_time_border_record("da")
+            if last is None:
+                raise ValueError("Geen basistariefdekking")
+            end = last + datetime.timedelta(hours=1)
+        rows = []
+        for active, lower, upper in self._financial_ranges(start, end):
+            if not active:
+                # Historische legacydekking gebruikt zijn eigen bestaande gedateerde adapter.
+                frame = self._legacy_price_data(self._local_datetime(lower), self._local_datetime(upper), interval,
+                                                 historical=True)
+                rows.extend(frame.to_dict("records"))
+                continue
+            service = self.settlement_service()
+            raw = service.price_adapter(lower // 3600 * 3600, (upper + 3599) // 3600 * 3600)
+            for at in range(lower, upper, 900):
+                stop = min(upper, (at // 900 + 1) * 900)
+                try:
+                    price = service._quotes(at, stop, service.snapshots, raw)[0]
+                    amounts = (price.spot_ex_vat, price.import_rate, price.export_rate, price.bonus_rate)
+                except ValueError:
+                    amounts = (None,) * 4
+                rows.append(dict(zip(("da_ex", "da_cons", "da_prod", "da_bonus"), amounts, strict=True),
+                                 time=self._local_datetime(at), datasoort="potential"))
+        frame = pd.DataFrame(rows, columns=["time", "da_ex", "da_cons", "da_prod", "da_bonus", "datasoort"])
+        if interval == "1hour" and not frame.empty:
+            frame["time"] = pd.to_datetime(frame.time).dt.floor("h")
+            def mean_rate(values):
+                with localcontext() as context:
+                    context.prec = 36
+                    total = _amount_sum(values)
+                    return None if total is None else total / len(values)
+            frame = frame.groupby("time", as_index=False).agg({**{name: mean_rate for name in
+                ("da_ex", "da_cons", "da_prod", "da_bonus")}, "datasoort": "first"})
+        frame["bonus_kind"] = "potential"
+        return frame
+
+    def _legacy_price_data(self, start, end, interval="1hour", *, historical=False):
         settlement = getattr(self.prices_options, "settlement", None)
-        if settlement is not None and settlement.mode == "active":
+        if settlement is not None and settlement.mode == "active" and not historical:
             raise ValueError("Actieve afrekening mag de legacy-prijsfunctie niet gebruiken")
         if interval == "1hour":
             agg_func = "avg"
@@ -3317,11 +3689,27 @@ class Report(DaBase):
         df_result.index = df_result["time"]
         return df_result
 
-    def get_api_data(self, field: str, _periode: str, cumulate: bool = False):
+    def get_api_data(self, field: str, _periode: str, cumulate: bool = False, *, generation=None):
         periode = _periode.replace("_", " ")
         if periode not in self.periodes.keys():
             result = f'{{"message": "Failed", "reason": "Periode: \'{_periode}\' is not allowed"}}'
             return result
+
+        if generation is not None and (type(generation) is not int or not 0 <= generation < 2**63 - 1):
+            raise ValueError("Generatie moet een niet-negatief integer zijn")
+        if field == "settlement":
+            from dao.prog.settlement.tariffs import _canonical_default
+            frame = self.get_settlement_data(self.periodes[periode]["vanaf"], self.periodes[periode]["tot"],
+                                             generation=generation)
+            view = frame.attrs["view"]
+            rows = [{key: None if isinstance(value, float) and math.isnan(value) else value
+                     for key, value in row.items()} for row in frame.to_dict("records")]
+            return json.dumps({"message": "Success", "generation": view.generation,
+                               "input_revision": view.input_revision, "freshness": view.freshness,
+                               "complete": view.complete, "captured_ts": view.captured_ts,
+                               "source_watermark_ts": view.source_watermark_ts,
+                               "known_subtotal": view.known_subtotal, "net_cost": view.net_cost, "data": rows},
+                              default=_canonical_default, allow_nan=False)
 
         grid_fields = [
             "consumption",

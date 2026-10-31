@@ -230,7 +230,8 @@ class TestGetPriceData:
             datetime.datetime(2026, 6, 1, 12, 0),
         )
 
-        assert list(result.columns) == ["time", "da_ex", "da_cons", "da_prod", "da_bonus", "datasoort"]
+        assert list(result.columns) == ["time", "da_ex", "da_cons", "da_prod", "da_bonus", "datasoort", "bonus_kind"]
+        assert set(result.bonus_kind) == {"potential"}
         assert len(result) == 2
         assert list(result["da_ex"]) == [0.10, 0.20]
         expected_cons_0 = (0.10 * 1.0 + 0.10 + 0.0) * (1 + 21.0 / 100)

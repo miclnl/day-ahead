@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 import os
 import re
@@ -30,9 +31,8 @@ from tenacity import (
 from dao.lib.da_meteo import Meteo
 from dao.lib.da_prices import DaPrices
 from dao.lib.db_connections import make_db_da, make_db_ha
-from dao.prog import production_bonus
 from dao.prog import tasks as task_registry
-from dao.prog.config.loader import ConfigurationLoader
+from dao.prog.config.loader import ConfigurationLoader, validate_config_data
 from dao.prog.config.models.base import UNUSABLE_STATES
 
 # from dao.prog.solar_predictor import SolarPredictor
@@ -629,42 +629,109 @@ class DaBase:
                 return
         report.consolidate_data(start_dt)
 
-    def production_bonus_remaining_kwh(self, moment: datetime.datetime) -> float | None:
-        """kWh teruglevering die in het lopende leveringsjaar nog bonus krijgt,
-        of None als er geen limiet geldt of die niet bijgehouden kan worden.
+    @classmethod
+    def local_settlement_app(cls, file_name):
+        """Read-only bootstrap zonder configmigratie, HA-client of notificaties."""
+        path = Path(file_name)
+        loader = ConfigurationLoader(path)
+        with path.open(encoding="utf-8") as handle:
+            config = validate_config_data(json.load(handle))
+        app = cls.__new__(cls)
+        app.config, app.loader = config, loader
+        app.db_da = make_db_da(config, loader.secrets)
+        app.db_ha = make_db_ha(config, loader.secrets)
+        if app.db_da is None or app.db_ha is None:
+            raise ValueError("Afrekening vereist bereikbare lokale databases")
+        cfg = config.prices.settlement if config.prices else None
+        app.time_zone = config.time_zone or (cfg.contracts[0].timezone if cfg and cfg.contracts else None)
+        if app.time_zone is not None:
+            for manager in (app.db_da, app.db_ha):
+                manager.TARGET_TIMEZONE = app.time_zone
+        return app
 
-        Somt de geconsolideerde teruglevering ("prod" in de tabel "values")
-        vanaf het begin van de bonusperiode tot `moment`. Een databasefout
-        wordt gelogd en levert None op: de berekening gaat dan zonder limiet
-        door in plaats van af te breken.
+    def settlement_components(self, *, pricing=None, plan_path=None):
+        """Eén bewaakte writer/publicatiefacade voor planner, scheduler en lokale CLI.
+
+        Constructie doet geen schema-, filesystem- of HA-I/O. CheckDB blijft
+        eigenaar van de additieve tabellen; alleen expliciete publicatie schrijft.
+        """
+        if not hasattr(self, "_settlement_repository"):
+            from dao.prog.fastctrl.plan import FAST_PLAN_FILE
+            from dao.prog.settlement.publication import make_publication
+
+            selected = pricing if pricing is not None else self.config.prices
+            if selected is None or selected.settlement is None:
+                raise ValueError("Geen expliciete settlementconfiguratie beschikbaar")
+            self._settlement_repository, self._settlement_publication = make_publication(
+                self.db_da.engine, plan_path=Path(plan_path or FAST_PLAN_FILE), pricing=selected,
+                max_plan_age=self.config.fast_control.max_plan_age,
+            )
+        return self._settlement_repository, self._settlement_publication
+
+    def settlement_service(self):
+        if not hasattr(self, "_settlement_service"):
+            from dao.prog.settlement.service import (
+                DatabasePriceAdapter,
+                HAMeteringAdapter,
+                SettlementService,
+            )
+            from dao.prog.settlement.tariffs import make_snapshot
+            from dao.prog.settlement.types import MeterSelection
+
+            repository, publication = self.settlement_components()
+            pricing = getattr(self, "_financial_pricing", self.config.prices)
+            cfg = pricing.settlement
+            report = self.config.report
+            if not cfg.meter_id:
+                raise ValueError("Afrekening vereist een expliciete meter id")
+            selection = MeterSelection(
+                cfg.meter_id, tuple(str(entity) for entity in report.entities_grid_consumption) if report else (),
+                tuple(str(entity) for entity in report.entities_grid_production) if report else (),
+                tuple(str(entity) for entity in report.entities_battery_production) if report else (), None,
+            )
+            # Geen batterijconfiguratie bewijst geen nulontlading of PV-herkomst.
+            snapshots = tuple(make_snapshot(pricing, contract) for contract in cfg.contracts)
+            self._settlement_service = SettlementService(
+                repository, HAMeteringAdapter(self.db_ha, selection), DatabasePriceAdapter(self.db_da, snapshots),
+                snapshots, publication=publication,
+            )
+        return self._settlement_service
+
+    def consolidate_settlement(self) -> None:
+        cfg = self.config.prices.settlement if self.config.prices is not None else None
+        if cfg is None or cfg.mode == "off":
+            return
+        service = self.settlement_service()
+        start, end = service.scheduled_range()
+        if start < end:
+            service.consolidate(start, end, publish=True, reason="scheduled")
+
+    def production_bonus_remaining_kwh(self, moment: datetime.datetime) -> float | None:
+        """Compatibilitygrens: onbekende afrekenstaat geeft géén positieve prikkel.
+
+        None blijft alleen de expliciet uitgeschakelde/onbegrensde legacyoptie;
+        een fout of onvolledige historie wordt nooit onbeperkte financiering.
         """
         cfg = getattr(self, "production_bonus", None)
         if cfg is None or not cfg.enabled or cfg.yearly_cap_kwh is None:
             return None
-        period_start = production_bonus.bonus_period_start(cfg, moment)
-        if period_start is None:
-            if not getattr(self, "_production_bonus_cap_warned", False):
-                logging.warning(
-                    "Bonus teruglevering: 'yearly cap kwh' is ingesteld maar "
-                    "'delivery year start' ontbreekt; de limiet wordt niet bijgehouden"
-                )
-                self._production_bonus_cap_warned = True
-            return None
         try:
-            df = self.db_da.get_column_data(
-                "values",
-                "prod",
-                start=datetime.datetime.combine(period_start, datetime.time()),
-                end=moment,
-            )
-            exported = float(df["value"].sum()) if df is not None and len(df) > 0 else 0.0
+            from decimal import Decimal
+
+            from dao.prog.settlement.engine import remaining_export_cap
+
+            at = self.db_da.epoch(moment)
+            state = self.settlement_service().state_at(at)
+            exported = None if state.bonus is None else state.bonus.total_export_kwh
+            remaining = remaining_export_cap(Decimal(str(cfg.yearly_cap_kwh)), exported)
+            if remaining is None:
+                raise ValueError("onbekende bonusprefix")
+            return float(remaining)
         except Exception as ex:
-            logging.warning(
-                f"Bonus teruglevering: teruglevering sinds {period_start} kon niet "
-                f"worden opgehaald ({ex}); de limiet wordt niet toegepast"
-            )
-            return None
-        return production_bonus.remaining_cap_kwh(cfg, exported)
+            if not getattr(self, "_production_bonus_cap_warned", False):
+                logging.warning(f"Bonus teruglevering: onbekende afrekenstaat ({ex}); geen positieve bonusprikkel")
+                self._production_bonus_cap_warned = True
+            return 0.0
 
     def get_day_ahead_prices(self):
         """Fetch day-ahead prices; ``day_ahead.py prices [start [end]]`` backfills.
