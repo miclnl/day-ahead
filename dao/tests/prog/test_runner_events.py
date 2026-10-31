@@ -12,6 +12,7 @@ from dao.prog.fastctrl.plan import (
     BatterySpec,
     FastPlan,
     PlanInterval,
+    write_plan,
 )
 from dao.prog.fastctrl.policy import (
     BatteryDecision,
@@ -114,14 +115,14 @@ class _StubHass:
         return "[]"
 
 
-def _make_runner(mode: str, state_path: str) -> FastControlRunner:
+def _make_runner(mode: str, state_path: str, plan_path: str = "/nonexistent.json") -> FastControlRunner:
     config = FastControlConfig.model_validate(
         {
             "mode": mode,
             "grid power": {"entity": "sensor.p1_power"},
         }
     )
-    return FastControlRunner(_StubHass(), config, plan_path="/nonexistent.json", state_path=state_path)
+    return FastControlRunner(_StubHass(), config, plan_path=plan_path, state_path=state_path)
 
 
 def test_record_events_detects_a_mode_change(workspace):
@@ -274,25 +275,20 @@ def test_tick_refreshes_budget_aggregates(workspace, monkeypatch):
     not only on tests that call refresh_budget_aggregates directly. Removing
     the call in runner.tick would leave the web UI gauges stale.
     """
-    runner = _make_runner(mode="active", state_path=workspace["state_path"])
+    runner = _make_runner(mode="active", **workspace)
+    write_plan(_stub_plan(), workspace["plan_path"])
+    runner.state.day_key = "2023-11-14"
+    runner.state.plan_created_ts = runner.state.interval_start_ts = T0
+    runner.state.battery(0).daily_deviation_kwh = 1.5
+    runner.state.battery(0).interval_deviation_kwh = 0.2
 
-    # Skip disk I/O and the hass-facing side-effects so the test exercises
-    # only the aggregation call site.
-    monkeypatch.setattr(runner, "plan", _stub_plan)
+    # De echte lokale publicatiecontrole behouden; alleen HA-I/O isoleren.
     monkeypatch.setattr(runner.gateway, "read", lambda ids: {})
     monkeypatch.setattr(runner, "_actuate", lambda *a, **kw: None)
     monkeypatch.setattr(runner, "_publish", lambda *a, **kw: None)
     monkeypatch.setattr(runner, "_persist_state", lambda *a, **kw: None)
 
-    calls = []
-    original = runner.state.refresh_budget_aggregates
-
-    def recording() -> None:
-        calls.append(1)
-        original()
-
-    monkeypatch.setattr(runner.state, "refresh_budget_aggregates", recording)
-
     runner.tick(T0 + 60)
 
-    assert calls, "tick() must call refresh_budget_aggregates on the controller state"
+    assert runner.state.daily_extra_throughput_used == pytest.approx(1.5)
+    assert runner.state.energy_budget_used == pytest.approx(0.2)

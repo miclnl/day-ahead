@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
+from inspect import getattr_static
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -28,14 +29,25 @@ from utils import (
 )
 
 from dao.prog import production_bonus
+from dao.prog.config.models.pricing import PricingConfig
 from dao.prog.da_base import DaBase
 from dao.prog.da_report import Report
 from dao.prog.fastctrl.plan import (
     FAST_PLAN_FILE,
     BatterySpec,
+    FinancialBasis,
+    FinancialContext,
+    _integer,
     build_plan,
     write_plan,
 )
+from dao.prog.fastctrl.publication import (
+    canonical_plan_path,
+    gate_policy,
+    publication_lock,
+    read_publication,
+)
+from dao.prog.settlement.publication import FinancialPlanBlocked, make_publication
 
 _libc = ctypes.CDLL(None)
 
@@ -191,6 +203,12 @@ class DaCalc(DaBase):
             self.interval_s * math.floor(start_ts / self.interval_s)
         )
         start_interval_dt = datetime.datetime.fromtimestamp(start_interval_ts)
+        # A7/A10b leveren later een echte gepinde context; nooit een v2-default verzinnen.
+        financial_context: FinancialContext | None = None
+        self._financial_preflight(
+            planning_start_ts=start_interval_ts,
+            horizon_end_ts=start_interval_ts + self.interval_s,
+        )
         # loopt af van 1 (starts_ds == start_interval) naar
         # 0 (start_interval is bijna bij begin volgend interval)
         interval_fraction_first_interval = (
@@ -477,6 +495,10 @@ class DaCalc(DaBase):
             logging.info(f"pv_ac: {len(pv_org_ac)}")
             logging.info(f"pv_dc: {len(pv_org_dc)}")
 
+        self._financial_preflight(
+            planning_start_ts=interval_ts[0],
+            horizon_end_ts=interval_ts[U - 1] + self.interval_s,
+        )
         model = Model()
 
         ##############################################################
@@ -2391,7 +2413,11 @@ class DaCalc(DaBase):
                         logging.warning(
                             f"Geen entity om gem. temperatuur te exporteren"
                         )
-                    else:
+                    elif not self.debug:
+                        self._check_financial_output(
+                            basis=financial_context.basis if financial_context is not None else None,
+                            now_ts=int(time.time()),
+                        )
                         self.set_value(entity_avg_temp, round(avg_temp, 1))
                     logging.info(
                         f"Voorspelde gemiddelde buiten temperatuur: {avg_temp:.1f} °C"
@@ -3954,6 +3980,11 @@ class DaCalc(DaBase):
 
         # doorzetten van alle settings naar HA
         if not self.debug:
+            # Buiten alle devicecatches: een weigering beëindigt de volledige uitvoerroute.
+            self._check_financial_output(
+                basis=financial_context.basis if financial_context is not None else None,
+                now_ts=int(time.time()),
+            )
             logging.info("Doorzetten van alle settings naar HA")
         else:
             logging.info(
@@ -4713,6 +4744,11 @@ class DaCalc(DaBase):
         #############################################
         # hand-off naar de snelle regellaag
         #############################################
+        if not self.debug:
+            self._check_financial_output(
+                basis=financial_context.basis if financial_context is not None else None,
+                now_ts=int(time.time()),
+            )
         try:
             # interval_ts, not tijd: the fast layer compares its boundaries
             # against time.time(), and tijd holds naive pandas Timestamps,
@@ -4739,7 +4775,10 @@ class DaCalc(DaBase):
                 p_avg=p_avg,
                 U=U,
                 B=B,
+                financial_context=financial_context,
             )
+        except FinancialPlanBlocked:
+            raise
         except Exception as ex:
             error_handling(ex)
             logging.error(f"Plan voor de snelle regellaag kon niet worden weggeschreven: {ex}")
@@ -5370,6 +5409,74 @@ class DaCalc(DaBase):
         self.notify("DAO calc afgerond", self.notification_berekening)
         return None
 
+    def _financial_settings(self):
+        """Processtartsnapshot, geen tweede options-lezing of impliciete modefallback."""
+        if not hasattr(self, "_financial_pricing"):
+            if self.config is None:
+                raise ValueError("Financiële gate: configuratie is niet geladen")
+            missing = object()
+            pricing = None if getattr_static(self.config, "prices", missing) is missing else self.config.prices
+            self._financial_pricing = None if pricing is None else PricingConfig.model_validate(pricing.model_dump())
+            self._financial_policy = gate_policy(self._financial_pricing)
+            self._financial_plan_path = canonical_plan_path(FAST_PLAN_FILE)
+        return self._financial_policy
+
+    def _financial_publication(self):
+        self._financial_settings()
+        if not hasattr(self, "_settlement_publication"):
+            if self._financial_pricing is None:
+                raise FinancialPlanBlocked("missing_financial_configuration")
+            # A7 verhuist deze factory naar de gedeelde applicatiebootstrap.
+            _, self._settlement_publication = make_publication(
+                self.db_da.engine, plan_path=self._financial_plan_path,
+                pricing=self._financial_pricing, max_plan_age=self.config.fast_control.max_plan_age,
+            )
+        return self._settlement_publication
+
+    def _refuse_financial_output(self, *, now_ts: int, reason: str) -> None:
+        logging.error(f"Financieel plan geblokkeerd: {reason}")
+        if not self.debug:
+            self._financial_publication().block(now_ts=now_ts, reason=reason)
+        raise FinancialPlanBlocked(reason)
+
+    def _financial_preflight(self, *, planning_start_ts: int, horizon_end_ts: int) -> None:
+        _integer(planning_start_ts, "planning_start_ts")
+        _integer(horizon_end_ts, "horizon_end_ts")
+        if horizon_end_ts <= planning_start_ts:
+            raise ValueError("Expected a nonempty planning horizon")
+        self._financial_horizon = planning_start_ts, horizon_end_ts
+        self._check_legacy_financial_gate(now_ts=int(time.time()))
+        if not self.debug:
+            self._check_legacy_publication()
+
+    def _check_legacy_publication(self) -> None:
+        # Ook vóór de datum mag een lokale invalidatie niet via directe writes worden omzeild.
+        with publication_lock(self._financial_plan_path):
+            read = read_publication(self._financial_plan_path)
+        if read.status in ("blocked", "invalid") or (read.plan is not None and read.plan.format_version != 1):
+            raise FinancialPlanBlocked(read.reason if read.status != "ready" else "explicit_financial_context_required")
+
+    def _check_legacy_financial_gate(self, *, now_ts: int) -> None:
+        policy = self._financial_settings()
+        required = policy.required_from_ts
+        start, end = getattr(self, "_financial_horizon", (now_ts, now_ts + 1))
+        if required is not None:
+            if now_ts >= required or start >= required:
+                self._refuse_financial_output(now_ts=now_ts, reason="financial_plan_required")
+            if end > required:
+                self._refuse_financial_output(now_ts=now_ts, reason="legacy_horizon_crosses_contract_start")
+
+    def _check_financial_output(self, *, basis: FinancialBasis | None, now_ts: int) -> None:
+        _integer(now_ts, "now_ts")
+        if basis is not None:
+            if not self.debug:
+                self._financial_publication().check_basis(basis, now_ts=now_ts)
+            # Een verse basis is geen eigendom, gatewayrespons of G1–G3-bewijs.
+            self._refuse_financial_output(now_ts=now_ts, reason="actuation_gates_unproven")
+        self._check_legacy_financial_gate(now_ts=now_ts)
+        if not self.debug:
+            self._check_legacy_publication()
+
     def export_fast_plan(
         self,
         interval_ts: list,
@@ -5394,6 +5501,8 @@ class DaCalc(DaBase):
         U: int,
         B: int,
         path: str = FAST_PLAN_FILE,
+        *,
+        financial_context: FinancialContext | None = None,
     ) -> None:
         """Serialise the solution for the fast control layer.
 
@@ -5418,6 +5527,11 @@ class DaCalc(DaBase):
         if self.debug:
             logging.info("Plan voor de snelle regellaag is niet opgeslagen (debug)")
             return
+        if financial_context is None:
+            self._financial_preflight(
+                planning_start_ts=int(interval_ts[0]) if U > 0 else int(time.time()),
+                horizon_end_ts=int(interval_ts[U - 1]) + self.interval_s if U > 0 else int(time.time()) + 1,
+            )
         if U <= 0:
             # Used to return without a word, so a run that produced no
             # intervals left the fast layer on its previous plan with nothing
@@ -5476,7 +5590,17 @@ class DaCalc(DaBase):
             strategy=str(self.strategy),
             price_average=float(p_avg),
         )
-        write_plan(plan, path)
+        if financial_context is None:
+            # write_plan neemt hetzelfde slot en kan blocked/v2 niet herstellen.
+            self._check_financial_output(basis=None, now_ts=int(time.time()))
+            write_plan(plan, path)
+        else:
+            self._financial_settings()
+            if canonical_plan_path(path) != self._financial_plan_path:
+                raise FinancialPlanBlocked("financial_publication_path_mismatch")
+            plan.format_version = 2
+            plan.financial_context = financial_context
+            self._financial_publication().publish(plan, now_ts=int(time.time()))
         logging.info(
             f"Plan voor de snelle regellaag opgeslagen: {len(plan.intervals)} "
             f"intervallen, {len(specs)} batterij(en)"

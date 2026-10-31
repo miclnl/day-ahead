@@ -9,6 +9,8 @@ use.
 import json
 import logging
 import time
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +18,13 @@ pytest.importorskip("mip", reason="the optimizer stack is not installed")
 pytest.importorskip("matplotlib", reason="the optimizer stack is not installed")
 
 from day_ahead import DaCalc  # noqa: E402
+
+from dao.prog.config.models.fastcontrol import FastControlConfig  # noqa: E402
 from dao.prog.fastctrl.plan import load_plan  # noqa: E402
+from dao.prog.fastctrl.publication import PublicationError, read_publication  # noqa: E402
+from dao.prog.settlement.publication import FinancialPlanBlocked  # noqa: E402
+from dao.tests.settlement.test_publication import NOW, START_TS, item  # noqa: E402
+from dao.tests.settlement.test_publication import system as system  # noqa: E402
 
 
 class Var:
@@ -42,13 +50,15 @@ class Battery:
 
 
 @pytest.fixture
-def exporter():
+def exporter(tmp_path, monkeypatch):
     """A DaCalc with only the attributes the exporter touches."""
     instance = DaCalc.__new__(DaCalc)
     instance.debug = False
     instance.interval_s = 3600
     instance.strategy = "minimize cost"
     instance.battery_options = [Battery()]
+    instance.config = SimpleNamespace(prices=None, fast_control=FastControlConfig())
+    monkeypatch.setattr("day_ahead.FAST_PLAN_FILE", str(tmp_path / "fast_plan.json"))
     return instance
 
 
@@ -266,6 +276,119 @@ class TestExport:
         payload = json.loads(path.read_text())
         assert payload["batteries"][0]["name"] == "Accu1"
         assert len(payload["intervals"]) == 4
+
+
+@pytest.fixture
+def financial_exporter(exporter, system, monkeypatch):
+    import day_ahead
+
+    exporter.config.prices = system.pricing
+    exporter.db_da = SimpleNamespace(engine=system.engine)
+    exporter.interval_s = 900
+    monkeypatch.setattr(day_ahead, "FAST_PLAN_FILE", str(system.path))
+    monkeypatch.setattr(day_ahead.time, "time", lambda: NOW)
+    context = system.plan.financial_context
+    context = replace(context, terminal_value=replace(
+        context.terminal_value, reference_efficiency_by_battery=(("Accu1", context.terminal_value.reference_efficiency_by_battery[0][1]),),
+    ))
+    return exporter, context
+
+
+def financial_call(exporter, system, context):
+    return call(exporter, str(system.path), steps=3,
+                interval_ts=[NOW, NOW + 900, NOW + 1800], hour_fraction=[0.25] * 3,
+                financial_context=context)
+
+
+def test_explicit_v2_context_is_published_through_real_adapter(financial_exporter, system):
+    exporter, context = financial_exporter
+    plan = financial_call(exporter, system, context)
+    assert plan.format_version == 2
+    assert plan.financial_context == context
+
+
+def test_changed_basis_before_export_is_blocked_not_relabelled(financial_exporter, system):
+    exporter, context = financial_exporter
+    system.repo.register_inputs("synthetic-grid", [item(NOW)], [system.snapshot], 1)
+    with pytest.raises(FinancialPlanBlocked, match="input_revision_changed"):
+        financial_call(exporter, system, context)
+    assert read_publication(system.path).status == "blocked"
+    assert load_plan(system.path) is None
+
+
+def test_even_a_fresh_basis_cannot_authorize_hardware_output(financial_exporter, system):
+    exporter, context = financial_exporter
+    with pytest.raises(FinancialPlanBlocked, match="actuation_gates_unproven"):
+        exporter._check_financial_output(basis=context.basis, now_ts=NOW)
+    assert read_publication(system.path).status == "blocked"
+
+
+@pytest.mark.parametrize("artifact", ["ready", "blocked"])
+def test_omitting_context_cannot_escape_to_v1(financial_exporter, system, artifact):
+    exporter, _ = financial_exporter
+    if artifact == "blocked":
+        system.adapter.block(now_ts=NOW, reason="correction")
+    with pytest.raises((FinancialPlanBlocked, PublicationError)):
+        call(exporter, str(system.path))
+    assert load_plan(system.path) is None
+
+
+def test_legacy_export_cannot_publish_a_mixed_contract_horizon(exporter, tmp_path, monkeypatch):
+    import day_ahead
+    from sqlalchemy import create_engine
+
+    from dao.tests.settlement.test_publication import pricing_config
+
+    path = tmp_path / "fast_plan.json"
+    engine = create_engine("sqlite://")
+    exporter.db_da = SimpleNamespace(engine=engine)
+    exporter.config.prices = pricing_config()
+    monkeypatch.setattr(day_ahead, "FAST_PLAN_FILE", str(path))
+    monkeypatch.setattr(day_ahead.time, "time", lambda: START_TS - 1)
+    with pytest.raises(FinancialPlanBlocked):
+        call(exporter, str(path), interval_ts=[START_TS - 3600, START_TS, START_TS + 3600, START_TS + 7200])
+    assert read_publication(path).status == "blocked"
+    engine.dispose()
+
+
+def test_financial_debug_export_preserves_existing_plan(financial_exporter, system):
+    exporter, context = financial_exporter
+    exporter.debug = True
+    before = system.path.read_bytes()
+    financial_call(exporter, system, context)
+    assert system.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("crosses_during_build", [False, True])
+def test_legacy_export_rechecks_wall_clock_after_building_the_payload(exporter, tmp_path, monkeypatch, crosses_during_build):
+    import day_ahead
+    from sqlalchemy import create_engine
+
+    from dao.tests.settlement.test_publication import pricing_config
+
+    path = tmp_path / "fast_plan.json"
+    gate = 1798758000
+    clock = [gate - 1]
+    engine = create_engine("sqlite://")
+    exporter.config.prices = pricing_config()
+    exporter.db_da = SimpleNamespace(engine=engine)
+    monkeypatch.setattr(day_ahead.time, "time", lambda: clock[0])
+    class CrossingVar:
+        @property
+        def x(self):
+            if crosses_during_build:
+                clock[0] = gate
+            return 0.0
+    def export():
+        return call(exporter, str(path), interval_ts=[gate - 14400, gate - 10800, gate - 7200, gate - 3600],
+                    c_l=[CrossingVar(), Var(0), Var(0), Var(0)])
+    if crosses_during_build:
+        with pytest.raises(FinancialPlanBlocked):
+            export()
+        assert read_publication(path).status == "blocked"
+    else:
+        assert export().format_version == 1  # Half-open horizon ends exactly at the boundary.
+    engine.dispose()
 
 
 class TestSignatureContract:

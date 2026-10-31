@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from dao.prog.fastctrl.plan import BlockedPlan, FastPlan, _integer
@@ -48,6 +48,40 @@ class PlanRead:
 class GateVerdict:
     allowed: bool
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackRequest:
+    reason: str
+    requested_ts: int
+    power_w: int = 0
+    mode: Literal["configured_off"] = "configured_off"
+    inhibit_restart: bool = True
+
+    def __post_init__(self):
+        _integer(self.requested_ts, "requested_ts")
+        if type(self.reason) is not str or not self.reason.strip():
+            raise ValueError("Fallback requires an explicit reason")
+        if type(self.power_w) is not int or self.power_w != 0 or self.mode != "configured_off" or self.inhibit_restart is not True:
+            raise ValueError("Fallback can only request configured off with restart inhibited")
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackReceipt:
+    """Gatewayacceptatie is nooit bewijs van gemeten stilstand."""
+
+    status: Literal["unconfirmed", "requested", "acknowledged"]
+    reason: str
+
+    def __post_init__(self):
+        if type(self.status) is not str or self.status not in ("unconfirmed", "requested", "acknowledged"):
+            raise ValueError("Unknown fallback receipt status")
+        if type(self.reason) is not str or not self.reason.strip():
+            raise ValueError("Fallback receipt requires an explicit reason")
+
+
+class FallbackSink(Protocol):
+    def request(self, request: FallbackRequest) -> FallbackReceipt: ...
 
 
 class PublicationLockBusy(Exception):

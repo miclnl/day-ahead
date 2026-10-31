@@ -7,10 +7,14 @@ when things go wrong.
 
 import datetime
 import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from dao.prog.config.models.fastcontrol import FastControlConfig
+from dao.prog.fastctrl import publication
 from dao.prog.fastctrl.plan import (
     BatteryPlanStep,
     BatterySpec,
@@ -18,13 +22,15 @@ from dao.prog.fastctrl.plan import (
     PlanInterval,
     write_plan,
 )
+from dao.prog.fastctrl.policy import ControllerState
 from dao.prog.fastctrl.runner import (
     FastControlRunner,
     HomeAssistantGateway,
     load_state,
     save_state,
 )
-from dao.prog.fastctrl.policy import ControllerState
+from dao.tests.settlement.test_fast_contract import ready_plan
+from dao.tests.settlement.test_publication import pricing_config
 
 T0 = 1_700_000_000
 
@@ -541,6 +547,201 @@ class TestStatePersistence:
 
     def test_a_missing_file_starts_fresh(self, tmp_path):
         assert load_state(str(tmp_path / "absent.json")).saved_today_eur == 0.0
+
+
+class RecordingFallback:
+    def __init__(self, result="requested", path=None):
+        self.requests = []
+        self.result = result
+        self.path = path
+
+    def request(self, request):
+        # Sink-I/O gebeurt na vrijgave van het publicatieslot.
+        if self.path is not None:
+            with publication.publication_lock(self.path):
+                pass
+        self.requests.append(request)
+        if isinstance(self.result, Exception):
+            raise self.result
+        if isinstance(self.result, str):
+            return publication.FallbackReceipt(self.result, "synthetic gateway acceptance only")
+        return self.result
+
+
+@pytest.mark.parametrize("artifact", ["blocked", "missing", "corrupt", "expired_v1", "expired_v2", "ready_v2", "v1_at_gate"])
+@pytest.mark.parametrize("mode", ["off", "shadow", "active"])
+def test_denial_never_restores_old_power_or_accounts_benefit(workspace, artifact, mode):
+    path = Path(workspace["plan_path"])
+    make_plan(path, battery_w=-2300)
+    hass = FakeHass()
+    sink = RecordingFallback(path=path)
+    runner = FastControlRunner(hass, make_config(mode=mode, **{"grid power": {}}),
+                               gate_policy=publication.GatePolicy(T0 + (60 if artifact == "v1_at_gate" else 100000)),
+                               fallback=sink, **workspace)
+    runner.plan()  # Cache the old non-zero plan, including its entity names.
+    runner.state.battery(0).override_active = True
+    runner.state.battery(0).stop_inverter_cleared = True
+    runner.state.battery(0).last_command_w = -3500
+    runner.state.saved_today_eur = 1.25
+    runner.state.last_tick_ts = T0
+    runner.state.last_decision = {"benefit_eur_h": 99}
+    now = T0 + 60
+    if artifact == "blocked":
+        with publication.publication_lock(path) as lease:
+            publication.invalidate_plan(lease=lease, now_ts=now, reason="correction")
+    elif artifact == "missing":
+        path.unlink()
+    elif artifact == "corrupt":
+        path.write_text("null")
+    elif artifact == "expired_v1":
+        now = T0 + 8 * 900
+    elif artifact in ("expired_v2", "ready_v2"):
+        plan = ready_plan()
+        path.write_text(json.dumps(plan.to_dict()))
+        now = plan.financial_context.not_after_ts if artifact == "expired_v2" else plan.created_ts
+
+    assert runner.tick(now) is None
+    request, = sink.requests
+    assert (request.power_w, request.mode, request.inhibit_restart, request.requested_ts) == (
+        0, "configured_off", True, now,
+    )
+    if artifact == "ready_v2":
+        assert request.reason == "actuation_gates_unproven"
+    elif artifact == "expired_v1":
+        assert request.reason == "plan_outside_horizon"
+    assert runner.last_fallback.status == "requested"
+    assert runner.fallback_pending is True
+    assert runner.state.last_decision is None
+    assert runner.state.saved_today_eur == 1.25
+    assert hass.values == hass.options == hass.switches == hass.published == {}
+    assert hass.services == []
+    assert hass.template_calls == hass.state_calls == 0
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "active"])
+@pytest.mark.parametrize("status", ["draft", "confirmed"])
+def test_bootstrap_date_gate_is_independent_of_settlement_mode_and_status(workspace, mode, status):
+    if mode == "active" and status == "draft":
+        with pytest.raises(ValueError, match="draft"):
+            pricing_config(mode=mode, status=status)
+        return
+    gate = 1798758000  # 2027-01-01 00:00 Europe/Amsterdam.
+    plan = make_plan(workspace["plan_path"], created_ts=gate - 900)
+    for i, interval in enumerate(plan.intervals):
+        interval.start_ts = gate - 900 + i * 900
+        interval.end_ts = interval.start_ts + 900
+    write_plan(plan, workspace["plan_path"])
+    hass = FakeHass({"sensor.p1_power": "500", "sensor.soc": "60"})
+    hass.config.prices = pricing_config(mode=mode, status=status)
+    runner = FastControlRunner(hass, make_config(**{"max sensor age": 999999999}), **workspace)
+    assert runner.tick(gate - 1) is not None
+    hass.values.clear()
+    hass.options.clear()
+    hass.published.clear()
+    assert runner.tick(gate) is None
+    assert runner.last_fallback.status == "unconfirmed"
+    assert hass.values == hass.options == hass.published == {}
+    # Neither deleting nor restoring v1 after the date recovers legacy rights.
+    Path(workspace["plan_path"]).unlink()
+    assert runner.tick(gate + 1) is None
+    write_plan(plan, workspace["plan_path"])
+    assert runner.tick(gate + 2) is None
+    assert hass.values == {}
+
+
+@pytest.mark.parametrize("result", [None, False, {"status": "acknowledged"}, RuntimeError("offline"), "acknowledged"])
+def test_fallback_failure_and_gateway_acceptance_do_not_claim_stopping(workspace, result, caplog):
+    hass = FakeHass()
+    sink = None if result is None else RecordingFallback(result)
+    runner = FastControlRunner(hass, make_config(mode="off"), fallback=sink, **workspace)
+    assert runner.tick(T0) is None
+    assert runner.last_fallback.status == ("acknowledged" if result == "acknowledged" else "unconfirmed")
+    assert runner.fallback_pending is True
+    assert hass.values == hass.options == hass.published == {}
+    if result != "acknowledged":
+        assert "unconfirmed" in caplog.text
+
+
+def test_fallback_retry_uses_monotonic_time_not_wall_clock(workspace, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("dao.prog.fastctrl.runner.time.monotonic", lambda: clock[0])
+    sink = RecordingFallback(RuntimeError("offline"))
+    runner = FastControlRunner(FakeHass(), make_config(interval=15), fallback=sink, **workspace)
+    runner.tick(T0)
+    for wall in (T0 + 99999, T0 - 99999, T0):
+        runner.tick(wall)
+    assert len(sink.requests) == 1
+    clock[0] = 114.999
+    runner.tick(T0)
+    assert len(sink.requests) == 1
+    clock[0] = 115.0
+    runner.tick(T0)
+    assert len(sink.requests) == 2
+
+
+def test_restart_and_same_mtime_cannot_reuse_cached_authority(workspace):
+    path = Path(workspace["plan_path"])
+    make_plan(path, battery_w=-2300)
+    hass = FakeHass({"sensor.p1_power": "500", "sensor.soc": "60"})
+    runner = FastControlRunner(hass, make_config(), **workspace)
+    assert runner.tick(T0 + 1) is not None
+    previous = path.stat()
+    replacement = path.with_suffix(".replacement")
+    replacement.write_text("[]")
+    os.utime(replacement, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    os.replace(replacement, path)
+    hass.values.clear()
+    hass.options.clear()
+    hass.published.clear()
+    assert runner.tick(T0 + 2) is None
+    restarted = FastControlRunner(hass, make_config(), **workspace)
+    assert restarted.tick(T0 + 3) is None
+    assert restarted.last_fallback.status == "unconfirmed"
+    assert hass.values == hass.options == hass.published == {}
+
+
+def test_lockbusy_and_read_exception_use_no_cached_plan(workspace, monkeypatch):
+    make_plan(workspace["plan_path"], battery_w=-2300)
+    sink = RecordingFallback()
+    runner = FastControlRunner(FakeHass(), make_config(), fallback=sink, **workspace)
+    runner.plan()
+    with publication.publication_lock(workspace["plan_path"]):
+        assert runner.tick(T0) is None
+    assert len(sink.requests) == 1
+    assert runner.state.last_decision is None
+    monkeypatch.setattr("dao.prog.fastctrl.runner.read_publication", lambda path: (_ for _ in ()).throw(OSError("read")))
+    assert runner.tick(T0 + 15) is None
+    assert runner.last_fallback is not None
+
+
+def test_missing_configuration_is_not_a_broken_configuration(workspace):
+    # No settlement/prices is ordinary legacy; an invalid loaded config is not.
+    runner = FastControlRunner(FakeHass(), make_config(), **workspace)
+    assert runner.tick(T0) is None
+    assert runner.last_fallback.status == "unconfirmed"
+    for config in (None, SimpleNamespace(prices="unreadable"), SimpleNamespace(prices={"settlement": "broken"})):
+        hass = FakeHass()
+        hass.config = config
+        with pytest.raises((ValueError, TypeError, AttributeError)):
+            FastControlRunner(hass, make_config(), **workspace)
+
+
+def test_missing_plan_and_default_sensorless_configuration_are_explicitly_unconfirmed(workspace):
+    runner = FastControlRunner(FakeHass(), **workspace)
+    assert runner.tick(T0) is None
+    assert runner.last_fallback.status == "unconfirmed"
+    assert runner.fallback_pending is True
+
+
+def test_unreadable_prices_property_is_not_treated_as_missing_configuration(workspace):
+    class BrokenConfig:
+        @property
+        def prices(self):
+            raise AttributeError("pricing load failed")
+    hass = FakeHass()
+    hass.config = BrokenConfig()
+    with pytest.raises((ValueError, AttributeError)):
+        FastControlRunner(hass, make_config(), **workspace)
 
 
 class TestFlashWear:

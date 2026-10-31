@@ -18,18 +18,20 @@ import os
 import tempfile
 import threading
 import time
+from inspect import getattr_static
+from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from typing import Any, Callable, Iterable, Optional
 
 from dao.prog.config.models.fastcontrol import (
     FastBatteryLink,
     FastControlConfig,
     PowerSensor,
 )
+from dao.prog.config.models.pricing import PricingConfig
 
-from .plan import FAST_PLAN_FILE, FastPlan, NO_STOP_SENTINEL, load_plan
+from .plan import FAST_PLAN_FILE, NO_STOP_SENTINEL, FastPlan, load_plan
 from .policy import (
     BatteryMeasurement,
     ControllerState,
@@ -37,6 +39,20 @@ from .policy import (
     FastControlPolicy,
     Measurement,
     PolicyLimits,
+)
+from .publication import (
+    FallbackReceipt,
+    FallbackRequest,
+    FallbackSink,
+    GatePolicy,
+    GateVerdict,
+    canonical_plan_path,
+    following_verdict,
+    publication_lock,
+    read_publication,
+)
+from .publication import (
+    gate_policy as configured_gate_policy,
 )
 
 FAST_STATE_FILE = "../data/fast_state.json"
@@ -268,12 +284,32 @@ class FastControlRunner:
         plan_path: str = FAST_PLAN_FILE,
         state_path: str = FAST_STATE_FILE,
         gateway: Optional[HomeAssistantGateway] = None,
+        *,
+        gate_policy: GatePolicy | None = None,
+        fallback: FallbackSink | None = None,
     ):
         self.hass = hass
+        if gate_policy is None:
+            if hass.config is None:
+                raise ValueError("Fast control: configuratie is niet geladen")
+            missing = object()
+            pricing = None if getattr_static(hass.config, "prices", missing) is missing else hass.config.prices
+            if pricing is not None:
+                # Afwezig is legacy; onleesbaar/ongeldig mag dat nooit worden.
+                pricing = PricingConfig.model_validate(pricing.model_dump())
+            gate_policy = configured_gate_policy(pricing)
+        if type(gate_policy) is not GatePolicy:
+            raise TypeError("Expected explicit GatePolicy")
+        self.gate_policy = gate_policy
+        self.fallback = fallback
+        self.last_gate: GateVerdict | None = None
+        self.last_fallback: FallbackReceipt | None = None
+        self.fallback_pending = False
+        self._last_fallback_at: float | None = None
         self.config: FastControlConfig = config or getattr(
-            hass.config, "fast_control", FastControlConfig()
-        )
-        self.plan_path = plan_path
+            hass.config, "fast_control", None
+        ) or FastControlConfig()
+        self.plan_path = canonical_plan_path(plan_path)
         self.state_path = state_path
         self.gateway = gateway or HomeAssistantGateway(hass)
         self.state = load_state(state_path)
@@ -471,11 +507,56 @@ class FastControlRunner:
 
     # -- one iteration ---------------------------------------------------
 
+    def _consume_block(self, verdict: GateVerdict, *, now_ts: int) -> FallbackReceipt:
+        """Trek lokale bevoegdheid in; vraag stop aan zonder zelf HA te bedienen."""
+        self.last_gate = verdict
+        self._plan = None
+        self.state.last_decision = None
+        self.state.last_tick_ts = 0.0  # Geen uitvoering/benefit over een geblokkeerde periode boeken.
+        self._last_overrides = self._last_setpoints = ()
+        for battery in self.state.batteries:
+            # Alleen lokale eigendom intrekken, geen nulvermogen of fysieke stop claimen.
+            battery.override_active = False
+            battery.stop_inverter_cleared = False
+        self.fallback_pending = True
+        monotonic_now = time.monotonic()
+        if (self._last_fallback_at is not None
+                and monotonic_now - self._last_fallback_at < max(1, self.config.interval)):
+            return self.last_fallback
+        self._last_fallback_at = monotonic_now
+        request = FallbackRequest(reason=verdict.reason, requested_ts=now_ts)
+        receipt = FallbackReceipt("unconfirmed", "no_fallback_sink")
+        if self.fallback is not None:
+            try:
+                receipt = self.fallback.request(request)
+                if type(receipt) is not FallbackReceipt:
+                    raise ValueError("Expected explicit FallbackReceipt")
+                # Ook een handmatig geconstrueerd/veranderd DTO is geen impliciete ack.
+                receipt = FallbackReceipt(receipt.status, receipt.reason)
+            except Exception as exc:  # noqa: BLE001 - een kapotte sink verleent nooit rechten
+                receipt = FallbackReceipt("unconfirmed", f"fallback_failed: {exc}")
+        self.last_fallback = receipt
+        if receipt.status == "unconfirmed":
+            logging.error(f"Fast control: fallback unconfirmed ({verdict.reason}): {receipt.reason}; fysieke stop niet bewezen")
+        return receipt
+
     def tick(self, now: Optional[float] = None) -> Optional[Decision]:
         """Run one control cycle. Returns the decision, or None when idle."""
         now = time.time() if now is None else now
 
-        plan = self.plan()
+        # Geen mtime-/inodescache als autorisatie. Geen sensor-/sink-I/O onder dit slot.
+        try:
+            with publication_lock(self.plan_path):
+                read = read_publication(self.plan_path)
+                verdict = following_verdict(read, policy=self.gate_policy, now_ts=int(now))
+        except Exception as exc:  # noqa: BLE001 - lock/readfout is geen permissieve herstart
+            verdict = GateVerdict(False, f"publication_unavailable: {exc}")
+        self.last_gate = verdict
+        if not verdict.allowed:
+            self._consume_block(verdict, now_ts=int(now))
+            return None
+        plan = read.plan
+        self._plan = plan
         if plan is None:
             if not self._warned_stale_plan:
                 logging.warning(
