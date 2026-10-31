@@ -84,6 +84,8 @@ class SettlementPublication:
         now_ts = int(time())
         read = read_publication(lease.path)
         if read.status == "blocked":
+            # Zichtbaar blocked kan van een mislukte directory-fsync komen; bewijs duurzaamheid opnieuw.
+            invalidate_plan(lease=lease, now_ts=now_ts, reason=read.reason)
             return
         reason = None
         if read.status in ("missing", "invalid"):

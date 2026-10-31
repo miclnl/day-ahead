@@ -328,6 +328,52 @@ def test_invalidation_fsync_failure_cannot_commit_input_or_tariff(system, local,
     assert local.read_publication(system.path).status == ("ready" if fault == "file" else "blocked")
 
 
+def test_blocked_retry_requires_successful_directory_fsync_before_registration(system, local, monkeypatch):
+    before = reference_rows(system.repo)
+    pricing = system.pricing.model_copy(deep=True)
+    pricing.cost_supplier_consumption = {"2020-01-01": 0.2}
+    snapshot = make_snapshot(pricing, pricing.settlement.contracts[0])
+    original = os.fsync
+
+    def broken(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("injected-retry-directory-fsync-failure")
+        return original(fd)
+
+    monkeypatch.setattr(os, "fsync", broken)
+    for _ in range(3):
+        with pytest.raises(local.PublicationError, match="fsync"):
+            system.repo.register_inputs(METER, [item(amount="2")], [snapshot], 1)
+        # Replace is al zichtbaar, maar geen enkele mislukte poging mag DB-inhoud publiceren.
+        assert local.read_publication(system.path).status == "blocked"
+        assert system.repo.read_book_reference(METER).input_revision == 1
+        assert reference_rows(system.repo) == before
+        assert not list(system.path.parent.glob(".fast_plan_*.tmp"))
+
+    durable = []
+    def restored(fd):
+        original(fd)
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            durable.append(True)
+
+    def require_durable_before_insert(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith(("INSERT INTO settlement_input", "INSERT INTO settlement_tariff",
+                                 "UPDATE settlement_book SET input_revision=?, snapshot_hashes_json=")):
+            assert durable == [True]
+
+    monkeypatch.setattr(os, "fsync", restored)
+    event.listen(system.engine, "before_cursor_execute", require_durable_before_insert)
+    try:
+        assert system.repo.register_inputs(METER, [item(amount="2")], [snapshot], 1) == 2
+    finally:
+        event.remove(system.engine, "before_cursor_execute", require_durable_before_insert)
+    assert durable == [True]
+    reference = system.repo.read_book_reference(METER)
+    assert reference.input_revision == 2 and reference.snapshot_hashes == (snapshot.snapshot_hash,)
+    assert system.repo.read_inputs(METER, START_TS, NOW).items[0].import_kwh == Decimal("2")
+    assert local.read_publication(system.path).status == "blocked"
+
+
 @pytest.mark.parametrize("fault", ["revision", "hashes", "meter", "future-capture", "dirty"])
 def test_basis_rejections_replace_old_ready_with_blocked(system, local, fault):
     from dao.prog.settlement.publication import FinancialPlanBlocked
