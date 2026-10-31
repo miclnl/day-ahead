@@ -34,6 +34,24 @@ def report(system):
     return instance
 
 
+@pytest.fixture
+def reference_energy(db, report):
+    """Stored components, independent of the report's presentation frame."""
+    from sqlalchemy import text
+
+    db.TARGET_TIMEZONE = report.time_zone
+    report.db_da = db
+    with db.engine.begin() as connection:
+        connection.execute(text("INSERT INTO variabel (id,code,name,dim,aggregate) VALUES (6,'bat_in','Charge','kWh','sum'),(7,'bat_out','Discharge','kWh','sum')"))
+
+    def store(cons, prod, charge, discharge):
+        with db.engine.begin() as connection:
+            connection.execute(text('INSERT INTO "values" (variabel,time,value) VALUES (:code,:at,:amount)'), [
+                {"code": code, "at": START_TS, "amount": amount}
+                for code, amount in zip((1, 2, 6, 7), (cons, prod, charge, discharge), strict=True)])
+    return store
+
+
 def test_report_cost_not_energy_times_mean_price(system, report):
     system.meter.items = [system.meter.items[0], system.meter.items[4]]
     system.service.consolidate(START_TS, START_TS + 4500, publish=True, reason="prices")
@@ -83,7 +101,8 @@ def test_legacy_profit_sign_conventions(system, report):
     assert legacy_prognosis_revenue(Decimal("0.20")) == Decimal("-0.20")
 
 
-def test_saving_settles_reference_independently_not_at_mean_or_bonus_price(system, report):
+def test_saving_settles_reference_independently_not_at_mean_or_bonus_price(system, report, reference_energy):
+    reference_energy(1.0, 0.0, 1.0, 0.0)
     system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="actual")
     start = dt.datetime.fromtimestamp(START_TS, ZoneInfo("Europe/Amsterdam"))
     report.periodes = {"synthetic": {"vanaf": start, "tot": start + dt.timedelta(minutes=15), "interval": "uur"}}
@@ -106,8 +125,9 @@ def test_unpublished_part_of_report_bucket_stays_unknown(system, report):
     assert set(frame.quality_label) == {"onvolledig"}
 
 
-def test_savings_reference_uses_registered_prices_after_source_or_config_edit(system, report):
+def test_savings_reference_uses_registered_prices_after_source_or_config_edit(system, report, reference_energy):
     from dataclasses import replace
+    reference_energy(2.0, 0.0, 1.0, 0.0)
     system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="frozen-reference")
     start = dt.datetime.fromtimestamp(START_TS, ZoneInfo("Europe/Amsterdam"))
     report.periodes = {"synthetic": {"vanaf": start, "tot": start + dt.timedelta(minutes=15), "interval": "uur"}}
@@ -146,7 +166,8 @@ def test_active_grid_presentation_keeps_unknown_buckets_and_decimal_totals(syste
     assert complete[("Kosten", "eur")].iloc[-1] == Decimal("0.40")
 
 
-def test_active_savings_presentation_sums_decimal_amounts(system, report):
+def test_active_savings_presentation_sums_decimal_amounts(system, report, reference_energy):
+    reference_energy(1.0, 0.0, 1.0, 0.0)
     system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="savings-table")
     start = dt.datetime.fromtimestamp(START_TS, ZoneInfo("Europe/Amsterdam"))
     report.periodes = {"synthetic": {"vanaf": start, "tot": start + dt.timedelta(minutes=15), "interval": "uur"}}
@@ -392,10 +413,24 @@ def test_reference_month_matches_adjacent_reports_after_negative_battery_export(
     assert month.saving.sum() == before.saving.sum() + after.saving.sum() == Decimal("-0.10")
 
 
-def test_missing_reference_prefix_is_unknown_not_actual_month_state(reference_month):
+@pytest.mark.parametrize("component", ["cons", "prod", "bat_in", "bat_out"])
+@pytest.mark.parametrize("missing", ["absent", "null"])
+def test_missing_reference_prefix_is_unknown_not_actual_month_state(reference_month, component, missing):
     from sqlalchemy import text
 
     with reference_month.db_da.engine.begin() as connection:
-        connection.execute(text('DELETE FROM "values" WHERE variabel=7 AND time=:at'), {"at": START_TS})
-    after = reference_month.calc_saving_cost("after")
-    assert pd.isna(after.netto_cost_zonder.iloc[0]) and pd.isna(after.saving.iloc[0])
+        change = 'DELETE FROM "values"' if missing == "absent" else 'UPDATE "values" SET value=NULL'
+        connection.execute(text(change + ' WHERE variabel=(SELECT id FROM variabel WHERE code=:component) AND time=:at'),
+                           {"component": component, "at": START_TS})
+    frames = {period: reference_month.calc_saving_cost(period) for period in ("month", "before", "after")}
+    assert pd.isna(frames["after"].netto_cost_zonder.iloc[0]) and pd.isna(frames["after"].saving.iloc[0])
+    reference_fields = ["cost_zonder", "profit_zonder", "netto_cost_zonder", "saving"]
+    for period, net_cost in (("month", "0"), ("before", "0.40"), ("after", "-0.40")):
+        frame = frames[period]
+        # The closed actual book stays known, including its separate month credit.
+        assert frame[["cost", "profit", "netto_cost"]].notna().all().all()
+        assert frame.cost.sum() == Decimal("0")
+        assert frame.netto_cost.sum() == Decimal(net_cost)
+        assert frame[reference_fields].isna().all().all(), period
+    fields = ["cost", "profit", "netto_cost", *reference_fields]
+    pd.testing.assert_frame_equal(frames["month"][fields], pd.concat([frames["before"], frames["after"]])[fields])

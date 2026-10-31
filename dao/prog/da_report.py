@@ -2847,6 +2847,22 @@ class Report(DaBase):
                                  "unknown", "incomplete" if net is None else "estimated",
                                  ("counterfactual:without-battery",))
 
+    def _reference_energy(self, start, end):
+        """Dezelfde opgeslagen componenten voor prefix en rapport, zonder nulvulling."""
+        if not hasattr(self.db_da, "engine"):
+            return {}
+        stored = Table("values", self.db_da.metadata, autoload_with=self.db_da.engine)
+        variables = Table("variabel", self.db_da.metadata, autoload_with=self.db_da.engine)
+        with self.db_da.engine.connect() as connection:
+            rows = connection.execute(select(stored.c.time, variables.c.code, stored.c.value).where(
+                stored.c.variabel == variables.c.id, variables.c.code.in_(("cons", "prod", "bat_in", "bat_out")),
+                stored.c.time >= start, stored.c.time < end,
+            )).all()
+        energy = {}
+        for moment, key, value in rows:
+            energy.setdefault(int(moment), {})[key] = value
+        return energy
+
     def _reference_opening(self, service, at, prices):
         """Eigen periodeprefix uit opgeslagen uurenergie, nooit werkelijke geldstaat.
 
@@ -2860,21 +2876,12 @@ class Report(DaBase):
         start = service._prefix_start(at, prices.snapshots)
         if start == at or not hasattr(self.db_da, "engine"):
             return SettlementState(at, None, None)
-        stored = Table("values", self.db_da.metadata, autoload_with=self.db_da.engine)
-        variables = Table("variabel", self.db_da.metadata, autoload_with=self.db_da.engine)
-        keys = ("cons", "prod", "bat_in", "bat_out")
-        with self.db_da.engine.connect() as connection:
-            rows = connection.execute(select(stored.c.time, variables.c.code, stored.c.value).where(
-                stored.c.variabel == variables.c.id, variables.c.code.in_(keys),
-                stored.c.time >= start, stored.c.time < at,
-            )).all()
-        energy = {(int(moment), key): value for moment, key, value in rows}
+        energy = self._reference_energy(start, at)
         meters = []
         for moment in range(start, at, 3600):
             stop = min(at, moment + 3600)
             # Een gedeeltelijk uur is geen proportioneel deel van een uurmeting.
-            row = {key: energy.get((moment, key)) if moment % 3600 == 0 and stop - moment == 3600 else None
-                   for key in keys}
+            row = energy.get(moment, {}) if moment % 3600 == 0 and stop - moment == 3600 else {}
             meters.append(self._reference_meter(moment, stop, row))
         history = service.repository.read_prices(service.meter_id, start, at,
                                                   expected_input_revision=prices.input_revision)
@@ -2889,7 +2896,9 @@ class Report(DaBase):
 
         service = self.settlement_service()
         stop_ts = self._settlement_epoch(end or self.periodes[period]["tot"])
-        pinned = service.repository.read(service.meter_id, self._settlement_epoch(self.periodes[period]["vanaf"]), stop_ts)
+        start_ts = self._settlement_epoch(self.periodes[period]["vanaf"])
+        pinned = service.repository.read(service.meter_id, start_ts, stop_ts)
+        energy = self._reference_energy(start_ts, stop_ts)
         result = df.copy()
         fields = ("cost", "profit", "netto_cost", "cost_zonder", "profit_zonder", "netto_cost_zonder", "saving")
         for field in fields:
@@ -2916,7 +2925,7 @@ class Report(DaBase):
                     reference_state = self._reference_opening(service, at, prices)
                 with localcontext() as context:
                     context.prec = 36
-                    meter = self._reference_meter(at, stop, row)
+                    meter = self._reference_meter(at, stop, energy.get(at, {}))
                     inputs = merge_inputs((meter,), tuple(row.spot for row in prices.items), prices.snapshots,
                                           meter_id=service.meter_id)
                     reference = settle_series(inputs, prices.snapshots, reference_state)
