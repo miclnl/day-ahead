@@ -197,13 +197,26 @@ class SettlementService:
                              meter_id=self.meter_id)
         for item in fresh:
             old = candidates.get(item.start_ts)
-            if old is not None and all(getattr(item, key) is None for key in
-                                       ("import_kwh", "export_kwh")):
-                continue
             overlaps = [value for value in candidates.values()
                         if value.start_ts < item.end_ts and item.start_ts < value.end_ts]
             if overlaps and any((value.start_ts, value.end_ts) != (item.start_ts, item.end_ts) for value in overlaps):
                 continue  # Geen oude uurenergie in kwartieren verdelen of intervalidentiteit herschrijven.
+            # De bestaande CSV-adapter verklaart expliciete grenzen/inhoud: een
+            # lege component daarin is een correctie, niet recorderretentie.
+            explicit = any(source.startswith("csv:") and source.endswith(":explicit_bounds") for source in item.sources)
+            retained = {} if old is None or explicit else {
+                key: getattr(old, key) for key in ("import_kwh", "export_kwh")
+                if getattr(item, key) is None and getattr(old, key) is not None}
+            if retained:
+                if (item.import_kwh is None and item.export_kwh is None
+                    and item.battery_discharge_kwh in (None, old.battery_discharge_kwh)):
+                    continue  # Geen nieuw meetbewijs; de archiefkwaliteit blijft ongewijzigd.
+                reading = MeterInterval(**{key: getattr(item, key) for key in MeterInterval.__dataclass_fields__})
+                reading = replace(reading, **retained, quality="incomplete",
+                                  origin=old.origin if old.origin == item.origin else "unknown",
+                                  sources=tuple(dict.fromkeys((*old.sources, *item.sources))))
+                item, = merge_inputs((reading,), tuple(row.spot for row in prices.items), prices.snapshots,
+                                     meter_id=self.meter_id)
             candidates[item.start_ts] = item
         ordered = tuple(sorted(candidates.values(), key=lambda item: item.start_ts))
         if ordered:

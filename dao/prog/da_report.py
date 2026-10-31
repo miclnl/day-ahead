@@ -1433,6 +1433,18 @@ class Report(DaBase):
         zone = ZoneInfo(self.time_zone) if hasattr(self, "time_zone") else getattr(self.db_da, "tzinfo", None)
         return datetime.datetime.fromtimestamp(at, zone).replace(tzinfo=None)
 
+    def _pin_settlement_report(self, start, end):
+        service = self.settlement_service()
+        return service.repository.read(service.meter_id, self._settlement_epoch(start), self._settlement_epoch(end))
+
+    @staticmethod
+    def _check_report_basis(view, basis):
+        if (view.generation, view.input_revision, view.current_input_revision) != (
+                basis.generation, basis.input_revision, basis.current_input_revision):
+            from dao.prog.settlement.repository import ConcurrentSettlementError
+
+            raise ConcurrentSettlementError("Afrekenbasis wijzigde tijdens het samengestelde rapport")
+
     def get_settlement_data(self, start, end, *, generation=None) -> pd.DataFrame:
         service = self.settlement_service()
         view = service.repository.read(service.meter_id, self._settlement_epoch(start), self._settlement_epoch(end),
@@ -1469,10 +1481,12 @@ class Report(DaBase):
         frame.attrs["view"] = view
         return frame
 
-    def _book_grid(self, start, end, interval, *, generation=None):
-        frame = self.get_settlement_data(start, end, generation=generation)
+    def _book_grid(self, start, end, interval, *, generation=None, basis=None):
+        frame = self.get_settlement_data(start, end, generation=basis.generation if basis is not None else generation)
         service = self.settlement_service()
         view = frame.attrs["view"]
+        if basis is not None:
+            self._check_report_basis(view, basis)
         batch = service.repository.read_inputs(service.meter_id, start, end,
                                                expected_input_revision=view.current_input_revision)
         inputs = {(item.start_ts, item.input_revision, item.input_hash): item for item in batch.items}
@@ -1532,9 +1546,12 @@ class Report(DaBase):
             self, vanaf: datetime.datetime, tot: datetime.datetime, code: str
     ) -> pd.DataFrame | None:
         frames = []
-        for active, start, end in self._financial_ranges(vanaf, tot):
+        ranges = self._financial_ranges(vanaf, tot)
+        basis = self._pin_settlement_report(vanaf, tot) if any(use for use, _, _ in ranges) else None
+        for active, start, end in ranges:
             if active:
-                data = self.get_settlement_data(start, end)
+                data = self.get_settlement_data(start, end, generation=basis.generation)
+                self._check_report_basis(data.attrs["view"], basis)
                 rows = []
                 for row in data.to_dict("records"):
                     value = row["import_cost"] if code == "cost" else (
@@ -1668,6 +1685,7 @@ class Report(DaBase):
         # fi_df.loc[fi_df.shape[0]] = row per source row: that copies the
         # whole (growing) frame on every append.
         rows = []
+        basis = None
         for row in org_data_df.itertuples():
             if pd.isnull(row.tijd):
                 continue
@@ -1684,7 +1702,9 @@ class Report(DaBase):
             end = getattr(row, "tot", row.tijd + datetime.timedelta(hours=1))
             active = any(use for use, _, _ in self._financial_ranges(row.tijd, end))
             if active:
-                data = self._book_grid(self._settlement_epoch(row.tijd), self._settlement_epoch(end), "uur")
+                if basis is None:
+                    basis = self._pin_settlement_report(row.tijd, end)
+                data = self._book_grid(self._settlement_epoch(row.tijd), self._settlement_epoch(end), "uur", basis=basis)
                 col_3, col_4 = (_amount_sum(data.cost), _amount_sum(data.profit))
             elif is_number(row.consumption) and is_number(row.da_cons):
                 col_3 = row.consumption * row.da_cons
@@ -1723,6 +1743,8 @@ class Report(DaBase):
                 "datasoort": get_datasoort,
             }
         )
+        if basis is not None:
+            fi_df.attrs["view"] = basis
         return fi_df
 
     def aggregate_balance_df(self, df: pd.DataFrame, interval: str):
@@ -2203,8 +2225,9 @@ class Report(DaBase):
             column = self.db_da.hour(t1.c.time).label("uur")
             column2 = func.min(self.db_da.hour_start(t1.c.time)).label("tijd")
 
-        if get_interval == "uur" and rep_interval != "uur":
+        if get_interval == "uur":
             column = self.db_da.hour_start(t1.c.time).label("uur")
+            column2 = func.min(self.db_da.hour_start(t1.c.time)).label("tijd")
             groupby_str = "uur"
         else:
             groupby_str = rep_interval
@@ -2337,10 +2360,13 @@ class Report(DaBase):
         ranges = self._financial_ranges(start, end)
         if not any(use for use, _, _ in ranges):
             return self._get_legacy_grid_data(periode, _vanaf, _tot, _interval, _source)
-        frames = [self._book_grid(left, right, interval) if active else self._get_legacy_grid_data(
+        basis = self._pin_settlement_report(start, end)
+        frames = [self._book_grid(left, right, interval, basis=basis) if active else self._get_legacy_grid_data(
             "", self._local_datetime(left), self._local_datetime(right), interval, _source)
                   for active, left, right in ranges]
-        return pd.concat(frames, ignore_index=True)
+        result = pd.concat(frames, ignore_index=True)
+        result.attrs["view"] = basis
+        return result
 
     def _get_legacy_grid_data(
             self,
@@ -2789,11 +2815,77 @@ class Report(DaBase):
         )
         return df_result
 
+    @staticmethod
+    def _legacy_saving_amounts(row):
+        """Benoemde legacygrens: energie en tarieven eenmaal via decimale tekst."""
+        raw = [row[key] for key in ("cons", "prod", "bat_in", "bat_out", "da_cons", "da_prod")]
+        raw.append(row.get("da_bonus", 0))
+        if any(pd.isna(value) for value in raw):
+            return (None,) * 7
+        with localcontext() as context:
+            context.prec = 36
+            cons, prod, charge, discharge, import_rate, export_rate, bonus = (Decimal(str(value)) for value in raw)
+            export_rate += bonus
+            cost, profit = cons * import_rate, prod * export_rate
+            net = cons - prod - charge + discharge
+            ref_cost, ref_profit = max(Decimal("0"), net) * import_rate, max(Decimal("0"), -net) * export_rate
+            actual, reference = cost - profit, ref_cost - ref_profit
+            return cost, profit, actual, ref_cost, ref_profit, reference, reference - actual
+
+    @staticmethod
+    def _reference_meter(at, stop, row):
+        from dao.prog.settlement.types import MeterInterval
+
+        with localcontext() as context:
+            context.prec = 36
+            quantities = [None if pd.isna(row.get(key)) else Decimal(str(row[key]))
+                          for key in ("cons", "prod", "bat_in", "bat_out")]
+            net = None if any(value is None for value in quantities) else (
+                quantities[0] - quantities[1] - quantities[2] + quantities[3])
+            return MeterInterval(at, stop, None if net is None else max(Decimal("0"), net).normalize(),
+                                 None if net is None else max(Decimal("0"), -net).normalize(), Decimal("0"),
+                                 "unknown", "incomplete" if net is None else "estimated",
+                                 ("counterfactual:without-battery",))
+
+    def _reference_opening(self, service, at, prices):
+        """Eigen periodeprefix uit opgeslagen uurenergie, nooit werkelijke geldstaat.
+
+        Alle vier energiecomponenten zijn vereist. Geen zero-filled rapportframe,
+        prognose of verdwenen recorderdata als bewijs voor de referentie gebruiken.
+        """
+        from dao.prog.settlement.engine import settle_series
+        from dao.prog.settlement.metering import merge_inputs
+        from dao.prog.settlement.types import SettlementState
+
+        start = service._prefix_start(at, prices.snapshots)
+        if start == at or not hasattr(self.db_da, "engine"):
+            return SettlementState(at, None, None)
+        stored = Table("values", self.db_da.metadata, autoload_with=self.db_da.engine)
+        variables = Table("variabel", self.db_da.metadata, autoload_with=self.db_da.engine)
+        keys = ("cons", "prod", "bat_in", "bat_out")
+        with self.db_da.engine.connect() as connection:
+            rows = connection.execute(select(stored.c.time, variables.c.code, stored.c.value).where(
+                stored.c.variabel == variables.c.id, variables.c.code.in_(keys),
+                stored.c.time >= start, stored.c.time < at,
+            )).all()
+        energy = {(int(moment), key): value for moment, key, value in rows}
+        meters = []
+        for moment in range(start, at, 3600):
+            stop = min(at, moment + 3600)
+            # Een gedeeltelijk uur is geen proportioneel deel van een uurmeting.
+            row = {key: energy.get((moment, key)) if moment % 3600 == 0 and stop - moment == 3600 else None
+                   for key in keys}
+            meters.append(self._reference_meter(moment, stop, row))
+        history = service.repository.read_prices(service.meter_id, start, at,
+                                                  expected_input_revision=prices.input_revision)
+        inputs = merge_inputs(meters, tuple(row.spot for row in history.items), history.snapshots,
+                              meter_id=service.meter_id)
+        return settle_series(inputs, history.snapshots, SettlementState(start, None, None)).end_state
+
     def _settlement_saving_cost(self, df, period, view, end):
         """Eigen chronologie voor de referentie; uurenergie wordt geen PV-kwartierbewijs."""
         from dao.prog.settlement.engine import settle_series
         from dao.prog.settlement.metering import merge_inputs
-        from dao.prog.settlement.types import MeterInterval
 
         service = self.settlement_service()
         stop_ts = self._settlement_epoch(end or self.periodes[period]["tot"])
@@ -2811,36 +2903,20 @@ class Report(DaBase):
                 continue
             active = any(use for use, _, _ in self._financial_ranges(at, stop))
             if not active:
-                bonus = row.get("da_bonus", 0)
-                price = row.da_prod + bonus
-                actual = row.cons * row.da_cons - row.prod * price
-                net = row.cons - row.prod - row.bat_in + row.bat_out
-                reference = max(0, net) * row.da_cons - max(0, -net) * price
-                values = (row.cons * row.da_cons, row.prod * price, actual,
-                          max(0, net) * row.da_cons, max(0, -net) * price, reference, reference - actual)
+                values = self._legacy_saving_amounts(row)
                 reference_state = None
             else:
-                actual = self._book_grid(at, stop, "uur", generation=pinned.generation)
+                actual = self._book_grid(at, stop, "uur", basis=pinned)
                 cost, profit = _amount_sum(actual.cost), _amount_sum(actual.profit)
                 actual_view = actual.attrs["view"]
-                if actual_view.current_input_revision != pinned.current_input_revision:
-                    from dao.prog.settlement.repository import ConcurrentSettlementError
-
-                    raise ConcurrentSettlementError("Invoer wijzigde tijdens het besparingsrapport")
                 revision = actual_view.current_input_revision
                 prices = service.repository.read_prices(service.meter_id, at, stop,
                                                          expected_input_revision=revision)
                 if reference_state is None or reference_state.asof_ts != at:
-                    reference_state = service._pinned_state(at, revision)
+                    reference_state = self._reference_opening(service, at, prices)
                 with localcontext() as context:
                     context.prec = 36
-                    quantities = [None if pd.isna(row[key]) else Decimal(str(row[key]))
-                                  for key in ("cons", "prod", "bat_in", "bat_out")]
-                    net = None if any(value is None for value in quantities) else (
-                        quantities[0] - quantities[1] - quantities[2] + quantities[3])
-                    meter = MeterInterval(at, stop, None if net is None else max(Decimal("0"), net).normalize(),
-                                          None if net is None else max(Decimal("0"), -net).normalize(), Decimal("0"),
-                                          "unknown", "estimated", ("counterfactual:without-battery",))
+                    meter = self._reference_meter(at, stop, row)
                     inputs = merge_inputs((meter,), tuple(row.spot for row in prices.items), prices.snapshots,
                                           meter_id=service.meter_id)
                     reference = settle_series(inputs, prices.snapshots, reference_state)
@@ -2848,7 +2924,7 @@ class Report(DaBase):
                     ref_cost = _amount_sum(line.import_cost for line in reference.lines)
                     ref_profit = _amount_sum([_amount_sum((line.base_export_revenue, line.bonus_revenue))
                                               for line in reference.lines])
-                    if actual_view.freshness != "current":
+                    if actual_view.freshness != "current" or not reference.complete:
                         ref_cost = ref_profit = None
                     if ref_profit is not None:
                         ref_profit += sum((credit.credit_total for credit in reference.adjustments), Decimal("0"))

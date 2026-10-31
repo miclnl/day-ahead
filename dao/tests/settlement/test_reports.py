@@ -2,6 +2,7 @@
 
 import datetime as dt
 import json
+import time
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
@@ -251,3 +252,150 @@ def test_savings_report_aborts_instead_of_mixing_generations(system, report, mon
     monkeypatch.setattr(report, "_book_grid", interleaved)
     with pytest.raises(ConcurrentSettlementError):
         report.calc_saving_cost("synthetic")
+
+
+@pytest.mark.parametrize("consumer", ["grid", "recalc", "cost"])
+def test_composite_report_pins_one_basis_across_contract_ranges(system, report, monkeypatch, consumer):
+    from datetime import date
+
+    from dao.prog.settlement.repository import ConcurrentSettlementError
+    from dao.prog.settlement.tariffs import make_snapshot
+
+    first = system.pricing.settlement.contracts[0].model_copy(update={"valid_to": date(2027, 1, 2)})
+    second = first.model_copy(update={"id": "synthetic-second", "valid_from": date(2027, 1, 2), "valid_to": None})
+    config = system.pricing.settlement.model_copy(update={"contracts": [first, second]})
+    report.prices_options = system.pricing.model_copy(update={"settlement": config})
+    system.service.snapshots = tuple(make_snapshot(report.prices_options, contract) for contract in config.contracts)
+    later = START_TS + 86400
+    system.clock[0] = later + 86400
+    system.meter.items = [system.meter.items[0], replace(system.meter.items[0], start_ts=later, end_ts=later + 900)]
+    system.spots[:] = [system.spots[0], replace(system.spots[0], start_ts=later, end_ts=later + 3600)]
+    system.service.consolidate(START_TS, later + 900, publish=True, reason="two-contracts")
+    entry = "get_settlement_data" if consumer == "cost" else "_book_grid"
+    read = getattr(report, entry)
+    changed = []
+
+    def interleaved(*args, **kwargs):
+        result = read(*args, **kwargs)
+        if not changed:
+            changed.append(True)
+            system.spots[1] = replace(system.spots[1], price_ex_vat="0.30")
+            system.service.consolidate(later, later + 900, publish=True, reason="interleaved-contract")
+        return result
+
+    monkeypatch.setattr(report, entry, interleaved)
+    with pytest.raises(ConcurrentSettlementError):
+        if consumer == "grid":
+            report.get_grid_data("", START_TS, later + 900)
+        elif consumer == "cost":
+            report.calc_cost(START_TS, later + 900, "cost")
+        else:
+            moments = [dt.datetime.fromtimestamp(at, ZoneInfo(report.time_zone)) for at in (START_TS, later)]
+            report.recalc_df_ha(pd.DataFrame({"tijd": moments,
+                "tot": [at + dt.timedelta(minutes=15) for at in moments], "consumption": [1.0, 1.0],
+                "production": [0.0, 0.0], "datasoort": ["recorded", "recorded"]}), "dag")
+
+
+def stored_savings_report(db, service, pricing):
+    """Real DB energy/price adapters; expose unrounded amounts before presentation."""
+    instance = make_report_with_prices(db)
+    instance.prices_options = pricing
+    instance.time_zone = "Europe/Amsterdam"
+    db.TARGET_TIMEZONE = instance.time_zone
+    instance.settlement_service = lambda: service
+    instance.saving_cost_dict = {"calc_interval": "uur", "series": {
+        **{key: {"source": "db", "sensors": []} for key in ("cons", "prod", "bat_in", "bat_out")},
+        **{key: {"source": "prices"} for key in ("da_cons", "da_prod")},
+    }}
+    instance.clean_df = lambda config, frame, *args: frame
+    return instance
+
+
+@pytest.fixture
+def amsterdam_time(monkeypatch):
+    # SQLite's legacy localtime adapter follows the container timezone.
+    with monkeypatch.context() as local:
+        local.setenv("TZ", "Europe/Amsterdam")
+        time.tzset()
+        yield
+    time.tzset()
+
+
+def test_savings_crossing_contract_start_normalizes_legacy_energy_and_prices(local_config, amsterdam_time):
+    from sqlalchemy import text
+
+    from dao.prog.da_settlement import load_service
+
+    service = load_service(local_config.path)
+    service.consolidate(START_TS, START_TS + 900, publish=True, reason="mixed-savings")
+    with local_config.db.engine.begin() as connection:
+        connection.execute(text('CREATE TABLE prognoses AS SELECT * FROM "values" WHERE 0'))
+        connection.execute(text("INSERT INTO variabel (id,code,name,dim,aggregate) VALUES (6,'bat_in','Charge','kWh','sum'),(7,'bat_out','Discharge','kWh','sum')"))
+        connection.execute(text('INSERT INTO "values" (variabel,time,value) VALUES (5,:at,0.1)'), {"at": START_TS - 3600})
+        connection.execute(text('INSERT INTO "values" (variabel,time,value) VALUES (:code,:at,:amount)'), [
+            {"code": code, "at": at, "amount": amount}
+            for at, quantities in ((START_TS - 3600, (2.0, 0.5, 1.0, 0.0)), (START_TS, (0.3, 0.3, 0.1, 0.0)))
+            for code, amount in zip((1, 2, 6, 7), quantities, strict=True)])
+    report = stored_savings_report(local_config.db, service, pricing_config())
+    report.btw_l_def = report.btw_t_def = report.taxes_t_def = {"2026-01-01": 0.0}
+    report.periodes = {"transition": {"vanaf": dt.datetime(2026, 12, 31, 23),
+                                      "tot": dt.datetime(2027, 1, 1, 0, 15), "interval": "uur"}}
+    frame = report.calc_saving_cost("transition")
+    assert list(frame.netto_cost) == [Decimal("0.35"), Decimal("0.00")]
+    assert list(frame.netto_cost_zonder) == [Decimal("0.10"), Decimal("-0.01")]
+    assert list(frame.saving) == [Decimal("-0.25"), Decimal("-0.01")]
+
+
+@pytest.fixture
+def reference_month(system, db, terms, amsterdam_time):
+    from datetime import date
+
+    from sqlalchemy import text
+
+    from dao.prog.settlement.types import MeterInterval, SpotInterval
+    from dao.tests.settlement.conftest import MONTH_END_TS
+
+    system.clock[0] = MONTH_END_TS + 86400
+    system.service.snapshots = (terms(monthly_export_floor="spot_zero", supply_start=date(2027, 1, 1)),)
+    system.meter.items, system.spots[:] = [], []
+    energy = []
+    for at in range(START_TS, MONTH_END_TS, 3600):
+        production, discharge, spot = ("2", "2", "-0.2") if at == START_TS else (
+            ("1", "0", "0.1") if at == MONTH_END_TS - 3600 else ("0", "0", "0"))
+        system.meter.items.append(MeterInterval(at, at + 3600, "0", production, discharge,
+                                               "unknown", "estimated", ("synthetic-month",)))
+        system.spots.append(SpotInterval(at, at + 3600, spot, "synthetic-month-market", "measured"))
+        energy.extend({"code": code, "at": at, "amount": amount}
+                      for code, amount in ((1, 0.0), (2, float(production)), (6, 0.0), (7, float(discharge))))
+    system.service.consolidate(START_TS, MONTH_END_TS, publish=True, reason="complete-reference-month")
+    with db.engine.begin() as connection:
+        connection.execute(text('CREATE TABLE prognoses AS SELECT * FROM "values" WHERE 0'))
+        connection.execute(text("INSERT INTO variabel (id,code,name,dim,aggregate) VALUES (6,'bat_in','Charge','kWh','sum'),(7,'bat_out','Discharge','kWh','sum')"))
+        connection.execute(text('INSERT INTO "values" (variabel,time,value) VALUES (:code,:at,:amount)'), energy)
+    report = stored_savings_report(db, system.service, system.pricing)
+    opening, closing = dt.datetime(2027, 1, 1), dt.datetime(2027, 2, 1)
+    split = closing - dt.timedelta(hours=1)
+    report.periodes = {key: {"vanaf": start, "tot": end, "interval": "dag"}
+                      for key, start, end in (("month", opening, closing), ("before", opening, split), ("after", split, closing))}
+    return report
+
+
+def test_reference_month_matches_adjacent_reports_after_negative_battery_export(reference_month):
+    month = reference_month.calc_saving_cost("month")
+    before = reference_month.calc_saving_cost("before")
+    after = reference_month.calc_saving_cost("after")
+    assert month[["cons", "prod", "bat_in", "bat_out"]].iloc[[0, -1]].values.tolist() == [
+        [0.0, 2.0, 0.0, 2.0], [0.0, 1.0, 0.0, 0.0]]
+    assert month.netto_cost_zonder.sum() == Decimal("-0.10")
+    assert after.netto_cost_zonder.iloc[0] == Decimal("-0.10")
+    assert before.saving.sum() == Decimal("-0.40") and after.saving.iloc[0] == Decimal("0.30")
+    assert month.saving.sum() == before.saving.sum() + after.saving.sum() == Decimal("-0.10")
+
+
+def test_missing_reference_prefix_is_unknown_not_actual_month_state(reference_month):
+    from sqlalchemy import text
+
+    with reference_month.db_da.engine.begin() as connection:
+        connection.execute(text('DELETE FROM "values" WHERE variabel=7 AND time=:at'), {"at": START_TS})
+    after = reference_month.calc_saving_cost("after")
+    assert pd.isna(after.netto_cost_zonder.iloc[0]) and pd.isna(after.saving.iloc[0])

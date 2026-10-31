@@ -309,3 +309,41 @@ def test_planning_before_bonus_start_has_no_invalid_future_prefix(system, terms)
     system.service.snapshots = (terms(bonus=bonus, supply_start=date(2027, 1, 1)),)
     state = system.service.state_at(START_TS + 900)
     assert state.bonus is None and state.asof_ts == START_TS + 900
+
+
+@pytest.mark.parametrize("missing", ["import_kwh", "export_kwh"])
+def test_single_recorder_component_retention_preserves_archive_and_applies_updates(system, missing):
+    original = replace(system.meter.items[0], import_kwh="2", export_kwh="3", quality="estimated", sources=(
+        "ha:statistics_short_term:sensor.import:kWh:300s:bucket_end_estimate",
+        "ha:statistics_short_term:sensor.export:kWh:300s:bucket_end_estimate"))
+    system.meter.items = [original]
+    before = system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="archive-components")
+    other = "export_kwh" if missing == "import_kwh" else "import_kwh"
+    system.meter.items = [replace(original, **{missing: None, other: "4"}, quality="incomplete",
+                                  sources=(*original.sources, "issue:missing-or-invalid-buckets:sensor.expired"))]
+    view = system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="single-retention")
+    item = system.repo.read_inputs(system.meter.meter_id, START_TS, START_TS + 900).items[0]
+    assert getattr(item, missing) == getattr(original, missing)
+    assert getattr(item, other) == Decimal("4")
+    assert item.quality == view.lines[0].quality == "incomplete"
+    assert view.lines[0].import_cost == (Decimal("0.2") if missing == "import_kwh" else Decimal("0.4"))
+    assert view.lines[0].base_export_revenue == (Decimal("0.4") if missing == "import_kwh" else Decimal("0.3"))
+    assert system.repo.read(system.meter.meter_id, START_TS, START_TS + 900, before.generation).lines == before.lines
+
+
+@pytest.mark.parametrize("withdrawn", ["import", "export", "both"])
+def test_explicit_csv_correction_can_withdraw_archived_grid_components(system, tmp_path, withdrawn):
+    from dao.prog.settlement.metering import read_meter_csv
+
+    system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="before-withdrawal")
+    imported = "" if withdrawn in ("import", "both") else "4"
+    exported = "" if withdrawn in ("export", "both") else "5"
+    path = tmp_path / "corrected.csv"
+    path.write_text("start_ts,end_ts,import_kwh,export_kwh,battery_discharge_kwh,unit,quality,source\n"
+                    f"{START_TS},{START_TS + 900},{imported},{exported},0,kWh,incomplete,explicit-correction\n")
+    system.meter.items = list(read_meter_csv(path, system.meter.meter_id))
+    view = system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="explicit-withdrawal")
+    item = system.repo.read_inputs(system.meter.meter_id, START_TS, START_TS + 900).items[0]
+    assert item.import_kwh == (None if not imported else Decimal("4"))
+    assert item.export_kwh == (None if not exported else Decimal("5"))
+    assert view.freshness == "current" and item.quality == "incomplete"
