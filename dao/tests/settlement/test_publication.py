@@ -852,3 +852,211 @@ def test_ready_rename_crash_never_exposes_half_json(system, local, phase, status
     assert read.status == status
     assert reference_rows(system.repo) == before
     assert not local.following_verdict(read, policy=system.adapter.policy(), now_ts=NOW).allowed
+
+
+def test_closed_prefix_future_prices_late_energy_correction_cleans_without_future_financial_rows(
+    system, local, monkeypatch,
+):
+    from dao.tests.settlement.test_price_repository import price
+    from dao.tests.settlement.test_repository import rows
+
+    monkeypatch.setattr("dao.prog.settlement.repository.time", lambda: NOW)
+    money = {name: rows(system.repo, name) for name in ("run", "interval", "adjustment")}
+    assert system.repo.register_prices(METER, [price(START_TS + 3600), price(START_TS + 7200)], 1) == 2
+    assert rows(system.repo, "book")[0]["source_watermark_ts"] == NOW
+    assert {name: rows(system.repo, name) for name in money} == money
+    assert rows(system.repo, "book")[0]["dirty_from_ts"] is None
+    prices = system.repo.read_prices(METER, START_TS, NOW, expected_input_revision=2)
+    assert system.repo.register_inputs(METER, [item(amount="2")], [system.snapshot], 2,
+                                       price_batch=prices, closed_before_ts=NOW) == 3
+    assert local.read_publication(system.path).status == "blocked"
+    batch = system.repo.read_inputs(METER, START_TS, NOW, expected_input_revision=3)
+    result = settle_series(batch.items, batch.snapshots, SettlementState(START_TS, None, None))
+    assert system.repo.commit(METER, result, batch, 1, "closed-only-correction") == 2
+    current = system.repo.read(METER, START_TS, NOW)
+    assert current.net_cost == Decimal("0.2") and current.dirty_from_ts is None
+    assert current.source_watermark_ts == NOW and current.input_revision == 3
+    basis = replace(system.plan.financial_context.basis, input_revision=3)
+    system.adapter.check_basis(basis, now_ts=NOW)
+    for name in ("input", "interval"):
+        assert all(row["end_ts"] <= NOW for row in rows(system.repo, name))
+    assert rows(system.repo, "adjustment") == []
+
+
+def raw_ready(system, *, rule="native"):
+    from dao.prog.settlement.metering import reprice_inputs
+    from dao.tests.settlement.test_price_repository import price
+
+    revision, snapshot = 1, system.snapshot
+    if rule != "native":
+        pricing = system.pricing.model_copy(deep=True)
+        pricing.settlement.contracts[0].hour_price_rule = rule
+        snapshot = make_snapshot(pricing, pricing.settlement.contracts[0])
+        revision = system.repo.register_inputs(METER, (), [snapshot], revision)
+    supplied = ([price()] if rule == "native" else [price(START_TS + i * 900, step=900) for i in range(4)])
+    revision = system.repo.register_prices(METER, supplied, revision)
+    prices = system.repo.read_prices(METER, START_TS, NOW)
+    batch = system.repo.read_inputs(METER, START_TS, NOW)
+    revision = system.repo.register_inputs(METER, reprice_inputs(batch, prices), [snapshot], revision,
+                                           price_batch=prices, closed_before_ts=NOW)
+    batch = system.repo.read_inputs(METER, START_TS, NOW)
+    result = settle_series(batch.items, batch.snapshots, SettlementState(START_TS, None, None))
+    generation = system.repo.read(METER, START_TS, NOW).generation
+    system.repo.commit(METER, result, batch, generation, "raw-ready-prefix")
+    basis = replace(system.plan.financial_context.basis, input_revision=revision,
+                    snapshot_hashes=(snapshot.snapshot_hash,))
+    plan = replace(system.plan, financial_context=replace(system.plan.financial_context, basis=basis))
+    system.adapter.publish(plan, now_ts=NOW)
+    return snapshot, plan
+
+
+@pytest.mark.parametrize("new_hour", [False, True])
+def test_equal_registered_hour_price_new_measurement_does_not_invalidate_prognosis(system, local, monkeypatch, new_hour):
+    from dao.prog.fastctrl.plan import BatteryPlanStep, PlanInterval
+    from dao.prog.settlement.metering import merge_inputs
+    from dao.prog.settlement.types import MeterInterval
+    from dao.tests.settlement.test_price_repository import price
+
+    at = START_TS + 3600 if new_hour else NOW
+    monkeypatch.setattr("dao.prog.settlement.repository.time", lambda: at + 900)
+    snapshot, plan = raw_ready(system)
+    if new_hour:
+        revision = plan.financial_context.basis.input_revision
+        system.repo.register_prices(METER, [price(at)], revision)
+        basis = replace(plan.financial_context.basis, input_revision=revision + 1,
+                        horizon_end_ts=START_TS + 7200)
+        plan = replace(plan, financial_context=replace(plan.financial_context, basis=basis), intervals=[
+            *plan.intervals, *[PlanInterval(start, start + 900, 0.1, 0.1,
+                                           batteries=[BatteryPlanStep(0, 50, 50)])
+                              for start in range(at, START_TS + 7200, 900)],
+        ])
+        system.adapter.publish(plan, now_ts=NOW)
+    before = system.path.read_bytes()
+    revision = plan.financial_context.basis.input_revision
+    assert system.repo.register_prices(METER, [price(value="0.100000000000")], revision) == revision
+    assert system.path.read_bytes() == before
+    measurement = MeterInterval(at, at + 900, "1", "0", "0", "verified_pv", "measured", ("new-quarter",))
+    candidate = merge_inputs([measurement], [price(at // 3600 * 3600)], [snapshot], meter_id=METER)
+    prices = system.repo.read_prices(METER, at, at + 900)
+    system.repo.register_inputs(METER, candidate, [snapshot], revision, price_batch=prices,
+                                closed_before_ts=at + 900)
+    assert system.path.read_bytes() == before and local.read_publication(system.path).status == "ready"
+    from dao.prog.settlement.publication import FinancialPlanBlocked
+    with pytest.raises(FinancialPlanBlocked):
+        system.adapter.publish(plan, now_ts=NOW)
+
+
+def test_first_market_quarter_correction_invalidates_plan_starting_later_same_hour(system, local, monkeypatch):
+    from dao.tests.settlement.test_price_repository import price
+
+    monkeypatch.setattr("dao.prog.settlement.repository.time", lambda: NOW)
+    _, plan = raw_ready(system, rule="mean_quarters")
+    basis = replace(plan.financial_context.basis, prefix_start_ts=NOW)
+    plan = replace(plan, financial_context=replace(plan.financial_context, basis=basis))
+    system.adapter.publish(plan, now_ts=NOW)
+    observations = []
+
+    def observe(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith("INSERT INTO settlement_spot"):
+            observations.append(local.read_publication(system.path).status)
+
+    event.listen(system.engine, "before_cursor_execute", observe)
+    try:
+        system.repo.register_prices(METER, [price(value="0.5", step=900)], basis.input_revision)
+    finally:
+        event.remove(system.engine, "before_cursor_execute", observe)
+    assert observations == ["blocked"] and local.read_publication(system.path).status == "blocked"
+
+
+def test_raw_price_aba_rejects_old_planning_token_after_no_money_version_revalidation(system, local, monkeypatch):
+    from dao.prog.settlement.publication import FinancialPlanBlocked
+    from dao.tests.settlement.test_price_repository import price
+    from dao.tests.settlement.test_repository import rows
+
+    monkeypatch.setattr("dao.prog.settlement.repository.time", lambda: NOW)
+    _, plan = raw_ready(system)
+    revision = plan.financial_context.basis.input_revision
+    history = {name: rows(system.repo, name) for name in ("input", "run", "interval", "adjustment")}
+    generation = rows(system.repo, "book")[0]["generation"]
+    system.repo.register_prices(METER, [price(value="0.2")], revision)
+    system.repo.register_prices(METER, [price()], revision + 1)
+    assert local.read_publication(system.path).status == "blocked"
+    batch = system.repo.read_inputs(METER, START_TS, NOW)
+    result = settle_series(batch.items, batch.snapshots, SettlementState(START_TS, None, None))
+    assert system.repo.commit(METER, result, batch, generation, "raw-price-ABA") == generation
+    assert {name: rows(system.repo, name) for name in history} == history
+    with pytest.raises(FinancialPlanBlocked):
+        system.adapter.publish(plan, now_ts=NOW)
+    basis = replace(plan.financial_context.basis, input_revision=revision + 2)
+    system.adapter.publish(replace(plan, financial_context=replace(plan.financial_context, basis=basis)), now_ts=NOW)
+    assert local.read_publication(system.path).plan.financial_context.basis.input_revision == revision + 2
+
+
+@pytest.mark.parametrize("fault", ["file", "directory"])
+def test_price_invalidation_fsync_failure_rolls_back_raw_revision_dirty_and_money(system, local, monkeypatch, fault):
+    from dao.tests.settlement.test_price_repository import frozen, price
+
+    before = frozen(system.repo)
+    original = os.fsync
+
+    def broken(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode) == (fault == "directory"):
+            raise OSError("injected-price-fsync-failure")
+        return original(fd)
+
+    monkeypatch.setattr(os, "fsync", broken)
+    with pytest.raises(local.PublicationError, match="fsync"):
+        system.repo.register_prices(METER, [price(value="0.2")], 1)
+    assert frozen(system.repo) == before
+    assert local.read_publication(system.path).status == ("ready" if fault == "file" else "blocked")
+
+
+def price_crash_worker(url, path, pricing, phase, barrier):
+    import dao.prog.settlement.publication as publication
+    from dao.tests.settlement.test_price_repository import price
+
+    engine, repo, _ = connect_publication(url, path, pricing)
+    original = publication.invalidate_plan
+
+    def invalidation(**kwargs):
+        if phase == "before-invalidation":
+            os._exit(44)
+        original(**kwargs)
+        if phase == "after-invalidation":
+            os._exit(44)
+
+    publication.invalidate_plan = invalidation
+    if phase == "before-commit":
+        @event.listens_for(engine, "after_cursor_execute")
+        def crash(connection, cursor, statement, parameters, context, executemany):
+            if statement.startswith("UPDATE settlement_book SET input_revision=?, dirty_from_ts="):
+                os._exit(44)
+    barrier.wait(timeout=10)
+    repo.register_prices(METER, [price(value="0.2")], 1)
+    os._exit(44 if phase == "after-commit" else 45)
+
+
+@pytest.mark.parametrize("phase,revision,status", [
+    ("before-invalidation", 1, "ready"), ("after-invalidation", 1, "blocked"),
+    ("before-commit", 1, "blocked"), ("after-commit", 2, "blocked"),
+])
+def test_price_process_crash_keeps_conservative_file_db_order_and_recoverable_kwh(system, local, phase, revision, status):
+    from dao.tests.settlement.test_price_repository import frozen
+    from dao.tests.settlement.test_repository import rows
+
+    before = frozen(system.repo)
+    barrier = CTX.Barrier(2)
+    process = CTX.Process(target=price_crash_worker, args=(system.url, str(system.path), system.pricing, phase, barrier))
+    process.start()
+    barrier.wait(timeout=10)
+    join(process)
+    assert process.exitcode == 44
+    assert system.repo.read_book_reference(METER).input_revision == revision
+    assert local.read_publication(system.path).status == status
+    if revision == 1:
+        assert frozen(system.repo) == before
+    else:
+        assert rows(system.repo, "book")[0]["dirty_from_ts"] == START_TS
+        assert rows(system.repo, "book")[0]["source_watermark_ts"] == NOW
+        assert rows(system.repo, "input") == before["input"]
+        assert rows(system.repo, "run") == before["run"]

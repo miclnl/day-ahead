@@ -20,7 +20,7 @@ Overlap, ongesorteerde regels en onverklaarde bronwissels worden afgewezen.
 import csv
 import json
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, localcontext
 from hashlib import sha256
@@ -32,9 +32,12 @@ from sqlalchemy import MetaData, Table, inspect, select
 from dao.lib.db_manager import DBmanagerObj
 from dao.prog.settlement.tariffs import quote, resolve_snapshot
 from dao.prog.settlement.types import (
+    InputBatch,
     InputInterval,
     MeterInterval,
     MeterSelection,
+    PriceBatch,
+    ResolvedSpot,
     SpotInterval,
     TariffSnapshot,
 )
@@ -273,17 +276,35 @@ def read_meter_csv(path: Path, meter_id: str) -> tuple[MeterInterval, ...]:
     return tuple(result)
 
 
-def _price_for_interval(item: MeterInterval, snapshot: TariffSnapshot, spots: dict[int, SpotInterval]):
+def _spot_index(spots: Sequence[SpotInterval]) -> dict[int, dict[int, SpotInterval]]:
+    """Overlap alleen binnen dezelfde bronresolutie; geen laatste-wintselectie."""
+    grouped = {}
+    for spot in spots:
+        grouped.setdefault(spot.end_ts - spot.start_ts, []).append(spot)
+    for items in grouped.values():
+        _check_order(items, "Spot")
+    return {step: {spot.start_ts: spot for spot in items} for step, items in grouped.items()}
+
+
+def _spot_window(snapshot: TariffSnapshot, start_ts: int, end_ts: int) -> tuple[int, int, int]:
+    """Volledige contractprijsvensters en uitsluitend hun gekozen bronresolutie."""
     duration = snapshot.price_interval_seconds
-    local = datetime.fromtimestamp(item.start_ts, ZoneInfo(snapshot.timezone))
+    local = datetime.fromtimestamp(start_ts, ZoneInfo(snapshot.timezone))
     minute = 0 if duration == 3600 else local.minute // 15 * 15
     start = int(local.replace(minute=minute, second=0, microsecond=0).timestamp())
-    end = start + duration
-    if item.end_ts > end:
-        return None, None, "incomplete"
-    if duration == 3600 and snapshot.hour_price_rule == "unconfirmed":
-        return None, None, "incomplete"
+    end = start + ((end_ts - start + duration - 1) // duration) * duration
     step = 900 if duration == 3600 and snapshot.hour_price_rule == "mean_quarters" else duration
+    return start, end, step
+
+
+def _resolve_spot(snapshot, start_ts, end_ts, index) -> ResolvedSpot:
+    duration = snapshot.price_interval_seconds
+    start, end, step = _spot_window(snapshot, start_ts, end_ts)
+    if end_ts > start + duration:
+        return ResolvedSpot(None, None, "incomplete")
+    if duration == 3600 and snapshot.hour_price_rule == "unconfirmed":
+        return ResolvedSpot(None, None, "incomplete")
+    spots = index.get(step, {})
     prices = [spots.get(ts) for ts in range(start, end, step)]
     rule = "mean_quarters" if step != duration else "native"
     source = f"{rule}:{duration}s:" + json.dumps([
@@ -294,7 +315,8 @@ def _price_for_interval(item: MeterInterval, snapshot: TariffSnapshot, spots: di
     ], sort_keys=True, separators=(",", ":"))
     if any(price is None or price.end_ts != ts + step or price.price_ex_vat is None
            or price.quality == "incomplete" for ts, price in zip(range(start, end, step), prices, strict=True)):
-        return None, "unresolved:" + source if any(price is not None for price in prices) else None, "incomplete"
+        return ResolvedSpot(None, "unresolved:" + source if any(price is not None for price in prices) else None,
+                            "incomplete")
     # Tijdgewogen, nooit met import/export gewogen; rekenen onder precisie 36.
     value = sum((price.price_ex_vat * (price.end_ts - price.start_ts) for price in prices), Decimal("0")) / duration
     if value.as_tuple().exponent < -12:
@@ -304,10 +326,45 @@ def _price_for_interval(item: MeterInterval, snapshot: TariffSnapshot, spots: di
     quality = "estimated" if any(price.quality == "estimated" for price in prices) else "measured"
     # Bestaande tarieflaag bewaakt ook bonus-/leverings-/venstergrenzen.
     try:
-        quote(snapshot, item.start_ts, item.end_ts, value)
+        quote(snapshot, start_ts, end_ts, value)
     except ValueError:
-        return None, "unresolved:" + source, "incomplete"
-    return value, source, quality
+        return ResolvedSpot(None, "unresolved:" + source, "incomplete")
+    return ResolvedSpot(value, source, quality)
+
+
+def resolve_spot(
+    snapshot: TariffSnapshot, start_ts: int, end_ts: int, spots: Sequence[SpotInterval],
+) -> ResolvedSpot:
+    """Resolveer dezelfde prijs als merge_inputs, zonder gefingeerde meetenergie."""
+    if type(start_ts) is not int or type(end_ts) is not int or end_ts <= start_ts:
+        raise ValueError("Price resolution requires half-open integer UTC bounds")
+    with localcontext() as context:
+        context.prec = 36
+        return _resolve_spot(snapshot, start_ts, end_ts, _spot_index(spots))
+
+
+def _registered_spot(item, snapshots, index) -> ResolvedSpot | None:
+    """None betekent géén raw archief voor de geselecteerde prijsafhankelijkheid."""
+    try:
+        snapshot = resolve_snapshot(snapshots, item.start_ts, item.end_ts)
+    except ValueError:
+        return None
+    start, end, step = _spot_window(snapshot, item.start_ts, item.end_ts)
+    spots = tuple(index.get(step, {}).get(at) for at in range(start, end, step))
+    present = tuple(spot for spot in spots if spot is not None)
+    if not present:
+        return None
+    return resolve_spot(snapshot, item.start_ts, item.end_ts, present)
+
+
+def _merged_quality(item, resolved):
+    quality = item.quality
+    if resolved.quality == "incomplete" or any(value is None for value in
+                                              (item.import_kwh, item.export_kwh, item.battery_discharge_kwh)):
+        return "incomplete"
+    if quality != "incomplete" and (resolved.quality == "estimated" or item.end_ts - item.start_ts > 900):
+        return "estimated"
+    return quality
 
 
 def _canonical_decimal(value: Decimal) -> str:
@@ -317,6 +374,55 @@ def _canonical_decimal(value: Decimal) -> str:
         return "0"
     text = format(value, "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _compose_input(item, resolved, snapshot, meter_id):
+    content = {
+        **asdict(item), "quality": _merged_quality(item, resolved), "spot_ex_vat": resolved.price_ex_vat,
+        "spot_source": resolved.source, "meter_id": meter_id,
+    }
+    canonical = json.dumps({
+        **content, "adapter_version": "metering-v1",
+        "snapshot_hash": None if snapshot is None else snapshot.snapshot_hash,
+    }, default=_canonical_decimal, sort_keys=True, separators=(",", ":"))
+    return InputInterval(**content, input_hash=sha256(canonical.encode("utf-8")).hexdigest(), input_revision=0)
+
+
+def _check_price_envelope(item, snapshots, prices):
+    start, end = item.start_ts, item.end_ts
+    try:
+        snapshot = resolve_snapshot(snapshots, start, end)
+    except ValueError:
+        pass
+    else:
+        start, end, _ = _spot_window(snapshot, start, end)
+    if start < prices.start_ts // 3600 * 3600 or end > (prices.end_ts + 3599) // 3600 * 3600:
+        raise ValueError("Required full price windows fall outside the price batch envelope")
+
+
+def reprice_inputs(batch: InputBatch, prices: PriceBatch) -> tuple[InputInterval, ...]:
+    """Herprijs uitsluitend gearchiveerde meetrijen, zonder kwaliteitsopwaardering."""
+    if batch.input_revision != prices.input_revision or batch.snapshots != prices.snapshots:
+        raise ValueError("Repricing requires the same pinned revision and snapshot selection")
+    index = _spot_index(tuple(row.spot for row in prices.items))
+    result = []
+    for item in batch.items:
+        if item.meter_id != prices.meter_id:
+            raise ValueError("Repricing cannot mix meter identities")
+        _check_price_envelope(item, batch.snapshots, prices)
+        resolved = _registered_spot(item, batch.snapshots, index)
+        if resolved is None:
+            result.append(replace(item, input_revision=0))
+            continue
+        reading = MeterInterval(**{field: getattr(item, field) for field in MeterInterval.__dataclass_fields__})
+        candidate = _compose_input(reading, resolved, resolve_snapshot(batch.snapshots, item.start_ts, item.end_ts),
+                                   item.meter_id)
+        if (candidate.spot_ex_vat, candidate.spot_source, candidate.quality) == (
+            item.spot_ex_vat, item.spot_source, item.quality,
+        ):
+            candidate = replace(candidate, input_hash=item.input_hash)
+        result.append(candidate)
+    return tuple(result)
 
 
 def merge_inputs(
@@ -334,8 +440,7 @@ def merge_inputs(
     """
     _check_meter_id(meter_id)
     _check_order(meter, "Meter")
-    _check_order(spots, "Spot")
-    by_start = {price.start_ts: price for price in spots}
+    index = _spot_index(spots)
     readings = []
     for item in meter:
         if readings and readings[-1].end_ts < item.start_ts:
@@ -348,28 +453,12 @@ def merge_inputs(
     with localcontext() as ctx:
         ctx.prec = 36
         for item in readings:
-            snapshot, price, source, price_quality = None, None, None, "incomplete"
+            snapshot, resolved = None, ResolvedSpot(None, None, "incomplete")
             try:
                 snapshot = resolve_snapshot(snapshots, item.start_ts, item.end_ts)
             except ValueError:
                 pass  # Geen enkele geldige dekking: niet splitsen met verzonnen energie.
             if snapshot is not None:
-                price, source, price_quality = _price_for_interval(item, snapshot, by_start)
-            quality = item.quality
-            if price_quality == "incomplete" or any(value is None for value in
-                                                     (item.import_kwh, item.export_kwh, item.battery_discharge_kwh)):
-                quality = "incomplete"
-            elif quality != "incomplete" and (price_quality == "estimated" or item.end_ts - item.start_ts > 900):
-                quality = "estimated"
-            content = {
-                **asdict(item), "quality": quality, "spot_ex_vat": price,
-                "spot_source": source, "meter_id": meter_id,
-            }
-            canonical = json.dumps({
-                **content, "adapter_version": "metering-v1",
-                "snapshot_hash": None if snapshot is None else snapshot.snapshot_hash,
-            }, default=_canonical_decimal, sort_keys=True, separators=(",", ":"))
-            result.append(InputInterval(
-                **content, input_hash=sha256(canonical.encode("utf-8")).hexdigest(), input_revision=0,
-            ))
+                resolved = _resolve_spot(snapshot, item.start_ts, item.end_ts, index)
+            result.append(_compose_input(item, resolved, snapshot, meter_id))
     return tuple(result)

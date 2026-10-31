@@ -242,6 +242,50 @@ class SpotInterval(_FrozenDTO):
 
 
 @dataclass(frozen=True, slots=True)
+class RegisteredSpot(_FrozenDTO):
+    """Immutable bronprijs met eigen rijrevisie binnen het globale boek."""
+
+    spot: SpotInterval
+    input_revision: int
+    content_hash: str
+
+    def __post_init__(self):
+        _FrozenDTO.__post_init__(self)
+        if self.input_revision <= 0:
+            raise ValueError("Registered prices require a positive row revision")
+
+
+@dataclass(frozen=True, slots=True)
+class PriceBatch(_FrozenDTO):
+    """Gepinde raw prijzen; het vraagbereik is geen gesloten meetdekking."""
+
+    meter_id: str
+    input_revision: int
+    start_ts: int
+    end_ts: int
+    items: tuple[RegisteredSpot, ...]
+    snapshots: tuple[TariffSnapshot, ...]
+    captured_ts: int
+    source_watermark_ts: int | None
+
+    def __post_init__(self):
+        _FrozenDTO.__post_init__(self)
+        if not self.meter_id.strip() or len(self.meter_id) > 128:
+            raise ValueError("Price batch requires an explicit meter identifier")
+        if any(item.input_revision > self.input_revision for item in self.items):
+            raise ValueError("Price row revision exceeds the pinned book revision")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSpot(_FrozenDTO):
+    """Pure geselecteerde contractprijs, zonder meet- of publicatierechten."""
+
+    price_ex_vat: Decimal | None
+    source: str | None
+    quality: Quality
+
+
+@dataclass(frozen=True, slots=True)
 class PriceQuote(_FrozenDTO):
     """Known rates and full immutable rules; missing spot means no quote."""
 

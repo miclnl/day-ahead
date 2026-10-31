@@ -22,7 +22,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.schema import CreateIndex, CreateTable
 
-NAMES = {f"settlement_{name}" for name in ("tariff", "input", "run", "interval", "adjustment", "book")}
+NAMES = {f"settlement_{name}" for name in ("tariff", "input", "run", "interval", "adjustment", "book", "spot")}
 
 
 def test_schema_repeat_does_not_touch_values(tmp_path):
@@ -54,7 +54,7 @@ def test_schema_repeat_does_not_touch_values(tmp_path):
 
 
 @pytest.mark.parametrize("dialect", [sqlite.dialect(), postgresql.dialect(), MariaDBDialect()])
-def test_all_six_tables_and_indexes_compile_with_matching_foreign_keys(dialect):
+def test_all_seven_tables_and_indexes_compile_with_matching_foreign_keys(dialect):
     from dao.prog.settlement.repository import _METADATA
 
     metadata = _METADATA

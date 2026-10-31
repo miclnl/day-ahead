@@ -44,14 +44,24 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 
+from dao.prog.settlement.metering import (
+    _check_price_envelope,
+    _merged_quality,
+    _registered_spot,
+    _spot_index,
+    _spot_window,
+)
 from dao.prog.settlement.tariffs import _canonical_default, resolve_snapshot
 from dao.prog.settlement.types import (
     InputBatch,
     InputInterval,
     PeriodAdjustment,
+    PriceBatch,
+    RegisteredSpot,
     SettlementLine,
     SettlementResult,
     SettlementView,
+    SpotInterval,
     TariffSnapshot,
 )
 
@@ -80,6 +90,24 @@ _INPUT = Table(
     Column("input_json", _TEXT, nullable=False),
     CheckConstraint("input_revision > 0", name="ck_settlement_input_revision"),
     CheckConstraint("end_ts > start_ts", name="ck_settlement_input_bounds"),
+    **_TABLE_OPTIONS,
+)
+_SPOT = Table(
+    "settlement_spot", _METADATA,
+    Column("meter_id", String(128), primary_key=True),
+    Column("interval_s", BigInteger, primary_key=True),
+    Column("start_ts", BigInteger, primary_key=True),
+    Column("input_revision", BigInteger, primary_key=True),
+    Column("end_ts", BigInteger, nullable=False),
+    Column("price_ex_vat", _TEXT),
+    Column("source", _TEXT, nullable=False),
+    Column("quality", String(16), nullable=False),
+    Column("content_hash", String(64), nullable=False),
+    CheckConstraint("input_revision > 0", name="ck_settlement_spot_revision"),
+    CheckConstraint("interval_s IN (900, 3600)", name="ck_settlement_spot_resolution"),
+    CheckConstraint("end_ts = start_ts + interval_s", name="ck_settlement_spot_bounds"),
+    CheckConstraint("quality IN ('measured', 'estimated', 'incomplete')", name="ck_settlement_spot_quality"),
+    CheckConstraint("length(source) > 0", name="ck_settlement_spot_source"),
     **_TABLE_OPTIONS,
 )
 _RUN = Table(
@@ -174,6 +202,10 @@ class ConcurrentSettlementError(RuntimeError):
     """De geregistreerde invoer of financiële generatie is inmiddels gewijzigd."""
 
 
+class PriceInputMismatch(ValueError):
+    """Gesloten samengestelde invoer stemt niet overeen met de raw prijsgrondslag."""
+
+
 @dataclass(frozen=True, slots=True)
 class InputChange:
     meter_id: str
@@ -261,6 +293,10 @@ def _input_content(item: InputInterval) -> str:
     return _json(content)
 
 
+def _row_input(row) -> InputInterval:
+    return _restore({**json.loads(row["input_json"]), "input_revision": row["input_revision"]}, InputInterval)
+
+
 def _valid(table, generation):
     return and_(table.c.valid_from_generation <= generation,
                 or_(table.c.valid_to_generation.is_(None), generation < table.c.valid_to_generation))
@@ -330,7 +366,7 @@ class SettlementRepository:
                 yield connection
 
     def ensure_schema(self) -> None:
-        """Maak uitsluitend de zes additieve tabellen, onafhankelijk van legacyversies."""
+        """Maak uitsluitend de zeven additieve tabellen, zonder backfill van prijzen."""
         _METADATA.create_all(self.engine, checkfirst=True)
 
     @contextmanager
@@ -381,6 +417,35 @@ class SettlementRepository:
         return connection.execute(query).mappings().all()
 
     @staticmethod
+    def _latest_spots(connection, meter_id, revision, start, end):
+        lower, upper = start // 3600 * 3600, (end + 3599) // 3600 * 3600
+        latest = select(_SPOT.c.interval_s, _SPOT.c.start_ts,
+                        func.max(_SPOT.c.input_revision).label("revision")).where(
+            _SPOT.c.meter_id == meter_id, _SPOT.c.input_revision <= revision,
+            _SPOT.c.start_ts >= lower, _SPOT.c.start_ts < upper,
+        ).group_by(_SPOT.c.interval_s, _SPOT.c.start_ts).subquery()
+        return connection.execute(select(_SPOT).join(latest, and_(
+            _SPOT.c.interval_s == latest.c.interval_s, _SPOT.c.start_ts == latest.c.start_ts,
+            _SPOT.c.input_revision == latest.c.revision,
+        )).where(_SPOT.c.meter_id == meter_id).order_by(_SPOT.c.interval_s, _SPOT.c.start_ts)).mappings().all()
+
+    @staticmethod
+    def _price_items(rows):
+        return tuple(RegisteredSpot(
+            SpotInterval(row["start_ts"], row["end_ts"], row["price_ex_vat"], row["source"], row["quality"]),
+            row["input_revision"], row["content_hash"],
+        ) for row in rows)
+
+    @staticmethod
+    def _read_revision(book, expected):
+        revision = 0 if book is None else book["input_revision"]
+        if expected is not None:
+            _revision(expected)
+            if expected != revision:
+                raise ConcurrentSettlementError("Registered input revision changed before the pinned read")
+        return revision
+
+    @staticmethod
     def _snapshots(connection, hashes_json):
         hashes = json.loads(hashes_json)
         if not hashes:
@@ -395,6 +460,123 @@ class SettlementRepository:
                      _insert_if_absent(table, connection.dialect.name, immutable_key))
         for offset in range(0, len(records), _BATCH_SIZE):
             connection.execute(statement, records[offset:offset + _BATCH_SIZE])
+
+    def register_prices(
+        self, meter_id: str, prices: Sequence[SpotInterval], expected_input_revision: int,
+    ) -> int:
+        """Registreer alleen aangeleverde bronprijzen onder dezelfde boek-CAS/guard."""
+        _meter(meter_id)
+        _revision(expected_input_revision)
+        prepared, keys = [], set()
+        for spot in prices:
+            _bounds(spot.start_ts, spot.end_ts)
+            step = spot.end_ts - spot.start_ts
+            if step not in (900, 3600) or spot.start_ts % step or not spot.source.strip():
+                raise ValueError("Prices require aligned 900s/3600s bounds and a nonempty source")
+            key = step, spot.start_ts
+            if key in keys:
+                raise ValueError("Duplicate or conflicting price intervals within one resolution")
+            keys.add(key)
+            prepared.append({
+                "meter_id": meter_id, "interval_s": step, "start_ts": spot.start_ts, "end_ts": spot.end_ts,
+                "input_revision": expected_input_revision + 1, "price_ex_vat": _decimal(spot.price_ex_vat),
+                "source": spot.source, "quality": spot.quality, "content_hash": _hash(_json(spot)),
+            })
+        prepared.sort(key=lambda row: (row["interval_s"], row["start_ts"]))
+        with self._registration(meter_id) as connection:
+            book = self._lock_book(connection, meter_id, expected_input_revision)
+            if not prepared:
+                return expected_input_revision
+            current = self._latest_spots(connection, meter_id, expected_input_revision,
+                                         min(row["start_ts"] for row in prepared), max(row["end_ts"] for row in prepared))
+            by_key = {(row["interval_s"], row["start_ts"]): row for row in current}
+            changed = [row for row in prepared if (row["interval_s"], row["start_ts"]) not in by_key
+                       or by_key[row["interval_s"], row["start_ts"]]["content_hash"] != row["content_hash"]]
+            if not changed:
+                return expected_input_revision
+            snapshots = self._snapshots(connection, book["snapshot_hashes_json"])
+            ranges = {(row["start_ts"], row["end_ts"]) for row in changed}
+            changed_by_step = {}
+            for row in changed:
+                changed_by_step.setdefault(row["interval_s"], set()).add(row["start_ts"])
+                for snapshot in snapshots:
+                    start, end, step = _spot_window(snapshot, row["start_ts"], row["end_ts"])
+                    if (step == row["interval_s"] and snapshot.valid_from_ts < end
+                        and (snapshot.valid_to_ts is None or start < snapshot.valid_to_ts)):
+                        ranges.add((start, end))
+            dirty = [] if book["dirty_from_ts"] is None else [book["dirty_from_ts"]]
+            # Eén bulkread van geselecteerde metingen; geen financiële replay onder het slot.
+            for row in self._latest_inputs(connection, meter_id, expected_input_revision):
+                try:
+                    snapshot = resolve_snapshot(snapshots, row["start_ts"], row["end_ts"])
+                except ValueError:
+                    continue
+                start, end, step = _spot_window(snapshot, row["start_ts"], row["end_ts"])
+                if any(at in changed_by_step.get(step, ()) for at in range(start, end, step)):
+                    dirty.append(row["start_ts"])
+            if self._publication is not None:
+                self._publication.before_revision(InputChange(
+                    meter_id, expected_input_revision, expected_input_revision + 1, (), tuple(sorted(ranges)), (),
+                ))
+            self._insert_many(connection, _SPOT, changed)
+            connection.execute(update(_BOOK).where(_BOOK.c.meter_id == meter_id).values(
+                input_revision=expected_input_revision + 1, dirty_from_ts=min(dirty, default=None),
+            ))
+            return expected_input_revision + 1
+
+    def read_prices(
+        self, meter_id: str, start_ts: int, end_ts: int, *, expected_input_revision: int | None = None,
+    ) -> PriceBatch:
+        _meter(meter_id)
+        _bounds(start_ts, end_ts)
+        with self.engine.connect() as connection:
+            book = connection.execute(select(_BOOK).where(_BOOK.c.meter_id == meter_id)).mappings().first()
+            revision = self._read_revision(book, expected_input_revision)
+            if book is None:
+                return PriceBatch(meter_id, 0, start_ts, end_ts, (), (), int(time()), None)
+            rows = self._latest_spots(connection, meter_id, revision, start_ts, end_ts)
+            return PriceBatch(meter_id, revision, start_ts, end_ts, self._price_items(rows),
+                              self._snapshots(connection, book["snapshot_hashes_json"]), int(time()),
+                              book["source_watermark_ts"])
+
+    @staticmethod
+    def _validate_input_prices(inputs, snapshots, index, *, legacy=None):
+        ranks = {"measured": 0, "estimated": 1, "incomplete": 2}
+        for item in inputs:
+            resolved = _registered_spot(item, snapshots, index)
+            if resolved is not None:
+                if ((item.spot_ex_vat, item.spot_source) != (resolved.price_ex_vat, resolved.source)
+                    or ranks[item.quality] < ranks[_merged_quality(item, resolved)]):
+                    raise PriceInputMismatch("Closed input does not match registered price/source/quality")
+            elif legacy is not None:
+                previous = legacy.get(item.start_ts)
+                if previous is not None and (previous.end_ts, previous.spot_ex_vat, previous.spot_source) == (
+                    item.end_ts, item.spot_ex_vat, item.spot_source,
+                ):
+                    if (ranks[item.quality] < ranks[previous.quality]
+                        or (any(value is None for value in (item.import_kwh, item.export_kwh,
+                                                           item.battery_discharge_kwh, item.spot_ex_vat))
+                            and item.quality != "incomplete")
+                        or (item.end_ts - item.start_ts > 900 and item.quality == "measured")):
+                        raise PriceInputMismatch("Absent raw evidence cannot upgrade archived quality")
+                elif item.spot_ex_vat is not None or item.spot_source is not None or item.quality != "incomplete":
+                    raise PriceInputMismatch("New or changed known prices require register_prices first")
+
+    def _validate_price_batch(self, connection, meter_id, inputs, snapshots, book, prices):
+        if (prices.meter_id != meter_id or prices.input_revision != book["input_revision"]
+            or prices.snapshots != tuple(snapshots)
+            or prices.snapshots != self._snapshots(connection, book["snapshot_hashes_json"])
+            or prices.source_watermark_ts != book["source_watermark_ts"]):
+            raise PriceInputMismatch("Price batch must match the registered meter/revision/snapshot basis")
+        rows = self._latest_spots(connection, meter_id, book["input_revision"], prices.start_ts, prices.end_ts)
+        if prices.items != self._price_items(rows):
+            raise PriceInputMismatch("Price batch does not match immutable registered price rows")
+        for item in inputs:
+            try:
+                _check_price_envelope(item, snapshots, prices)
+            except ValueError as exc:
+                raise PriceInputMismatch(str(exc)) from exc
+        return _spot_index(tuple(row.spot for row in prices.items))
 
     def _changed_prices(self, connection, meter_id, revision, changed, by_start, snapshots):
         """Vergelijk A6-inhoud; spot_source bevat ook de canonieke prijsbronkwaliteit.
@@ -441,13 +623,20 @@ class SettlementRepository:
 
     def register_inputs(
         self, meter_id: str, inputs: Sequence[InputInterval], snapshots: Sequence[TariffSnapshot],
-        expected_input_revision: int,
+        expected_input_revision: int, *, price_batch: PriceBatch | None = None,
+        closed_before_ts: int | None = None,
     ) -> int:
         _meter(meter_id)
         _revision(expected_input_revision)
+        if (price_batch is None) != (closed_before_ts is None):
+            raise PriceInputMismatch("Closed registration requires both price_batch and closed_before_ts")
+        if closed_before_ts is not None and (type(closed_before_ts) is not int or closed_before_ts > int(time())):
+            raise PriceInputMismatch("Closed registration boundary cannot be in the future")
         prepared, end = [], None
         for item in inputs:
             _bounds(item.start_ts, item.end_ts)
+            if closed_before_ts is not None and item.end_ts > closed_before_ts:
+                raise PriceInputMismatch("Input extends beyond the closed measurement boundary")
             if item.meter_id != meter_id or (end is not None and item.start_ts < end):
                 raise ValueError("Registered input must belong to one meter and be ordered without overlap")
             content = _input_content(item)
@@ -478,6 +667,15 @@ class SettlementRepository:
                 current += self._latest_inputs(connection, meter_id, expected_input_revision,
                                                end=prepared[0]["start_ts"], previous=True)
             by_start = {row["start_ts"]: row for row in current}
+            price_index = {}
+            if prepared:
+                if price_batch is None:
+                    if connection.scalar(select(_SPOT.c.start_ts).where(_SPOT.c.meter_id == meter_id).limit(1)) is not None:
+                        raise PriceInputMismatch("A raw-price meter requires explicit closed price registration")
+                else:
+                    price_index = self._validate_price_batch(connection, meter_id, inputs, ordered, book, price_batch)
+                    legacy = {at: _row_input(row) for at, row in by_start.items()}
+                    self._validate_input_prices(inputs, ordered, price_index, legacy=legacy)
             changed = [row for row in prepared if row["start_ts"] not in by_start
                        or by_start[row["start_ts"]]["content_hash"] != row["content_hash"]]
             combined = {**by_start, **{row["start_ts"]: row for row in prepared}}
@@ -509,7 +707,10 @@ class SettlementRepository:
                     meter_id, expected_input_revision, expected_input_revision + 1,
                     tuple((row["start_ts"], max(row["end_ts"], by_start[row["start_ts"]]["end_ts"]
                            if row["start_ts"] in by_start else row["end_ts"])) for row in changed),
-                    self._changed_prices(connection, meter_id, expected_input_revision, changed, by_start, ordered),
+                    self._changed_prices(connection, meter_id, expected_input_revision,
+                                         [row for row in changed if _registered_spot(
+                                             _row_input(row), ordered, price_index) is None],
+                                         by_start, ordered),
                     tuple(contract_ranges),
                 ))
             existing = set(connection.scalars(select(_TARIFF.c.snapshot_hash).where(
@@ -525,11 +726,14 @@ class SettlementRepository:
             ))
             return expected_input_revision + 1
 
-    def read_inputs(self, meter_id: str, start_ts: int, end_ts: int) -> InputBatch:
+    def read_inputs(
+        self, meter_id: str, start_ts: int, end_ts: int, *, expected_input_revision: int | None = None,
+    ) -> InputBatch:
         _meter(meter_id)
         _bounds(start_ts, end_ts)
         with self.engine.connect() as connection:
             book = connection.execute(select(_BOOK).where(_BOOK.c.meter_id == meter_id)).mappings().first()
+            self._read_revision(book, expected_input_revision)
             if book is None:
                 return InputBatch(0, (), (), int(time()), None)
             # Eenmaal gepinde revisie; latere registraties veranderen deze immutable rijen niet.
@@ -632,6 +836,10 @@ class SettlementRepository:
                 or self._snapshots(connection, hashes_json) != tuple(sorted(batch.snapshots, key=lambda item: item.valid_from_ts))
                 or batch.source_watermark_ts != book["source_watermark_ts"]):
                 raise ValueError("Batch does not match registered input/contract references")
+            prices = self._latest_spots(connection, meter_id, batch.input_revision,
+                                        batch.items[0].start_ts, batch.items[-1].end_ts)
+            self._validate_input_prices(batch.items, batch.snapshots,
+                                        _spot_index(tuple(row.spot for row in self._price_items(prices))))
             old_lines = connection.execute(select(_INTERVAL).where(
                 _INTERVAL.c.meter_id == meter_id, _INTERVAL.c.start_ts >= result.coverage_start_ts,
                 _INTERVAL.c.start_ts < result.coverage_end_ts, _valid(_INTERVAL, expected_generation),

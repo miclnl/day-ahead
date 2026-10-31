@@ -519,6 +519,24 @@ def test_overprecise_mean_is_rejected_not_silently_rounded(meter, snapshot):
         merge_inputs([meter()], prices, [snapshot(hour_price_rule="mean_quarters")], meter_id="grid")
 
 
+def test_shared_resolver_selects_only_confirmed_source_resolution(meter, snapshot):
+    from dao.prog.settlement.metering import resolve_spot
+
+    mixed = [spot(price="0.9"), *[spot(START + i * 900, START + (i + 1) * 900, value)
+                               for i, value in enumerate(("0.1", "0.2", "0.3", "0.4"))]]
+    for snap, expected in ((snapshot(), Decimal("0.9")),
+                           (snapshot(hour_price_rule="mean_quarters"), Decimal("0.25")),
+                           (snapshot(price_interval_seconds=900), Decimal("0.2"))):
+        reading = meter(start_ts=START + 900, end_ts=START + 1800)
+        resolved = resolve_spot(snap, reading.start_ts, reading.end_ts, mixed)
+        merged = merge_inputs([reading], mixed, [snap], meter_id="grid")[0]
+        assert resolved.price_ex_vat == merged.spot_ex_vat == expected
+        assert resolved.source == merged.spot_source and resolved.quality == merged.quality == "measured"
+    for duplicate in (mixed + [spot()], mixed + [mixed[1]]):
+        with pytest.raises(ValueError, match="overlap|duplicate"):
+            resolve_spot(snapshot(), START, START + 900, duplicate)
+
+
 @pytest.mark.parametrize("meter_id", ["", " ", None])
 def test_meter_identity_must_be_explicit_nonempty(tmp_path, meter, snapshot, meter_id):
     with pytest.raises((TypeError, ValueError)):
