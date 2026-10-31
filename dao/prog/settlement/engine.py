@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from dao.prog.settlement.tariffs import (
     _check_bonus_boundaries,
+    _effective_value,
     bonus_in_window,
     quote,
     resolve_snapshot,
@@ -15,6 +16,8 @@ from dao.prog.settlement.tariffs import (
 from dao.prog.settlement.types import (
     BonusState,
     InputInterval,
+    MonthState,
+    PeriodAdjustment,
     PriceQuote,
     SettlementLine,
     SettlementResult,
@@ -154,9 +157,118 @@ def _bonus_amounts(
     return first, first * price.bonus_rate
 
 
+def close_month(state: MonthState) -> PeriodAdjustment | None:
+    """Sluit een gedekte periode; de aanroeper bewaakt het bereiken van het einde.
+
+    De positieve negatieve-grondslaggewichten verdelen uitsluitend de credit-btw.
+    Deze toerekening blijft een modelraming, geen bevestigde leveranciersnota.
+    Ook een bekende nulcredit is een expliciet sluitresultaat. Er wordt niet
+    afgerond; presentatie selecteert deze correctie op period_end_ts - 1.
+    """
+    if not state.complete or state.spot_export_eur is None:
+        return None
+    with localcontext() as context:
+        context.prec = 36
+        credit = max(ZERO, -state.spot_export_eur)
+        vat = ZERO
+        if credit > 0:
+            negative_basis = sum((basis for _, basis in state.negative_basis_by_vat), ZERO)
+            if negative_basis <= 0:
+                return None  # Zonder btwgrondslag geen verzonnen nul-btw.
+            vat = sum((credit * basis / negative_basis * rate / 100
+                       for rate, basis in state.negative_basis_by_vat), ZERO)
+        return PeriodAdjustment(
+            kind="spot_zero", period_start_ts=state.period_start_ts, period_end_ts=state.period_end_ts,
+            credit_ex_vat=credit, credit_vat=vat, credit_total=credit + vat,
+            basis_ex_vat=state.spot_export_eur, quality="estimated",
+        )
+
+
+def _contract_periods(snapshots: Sequence[TariffSnapshot]) -> dict[int, tuple[int | None, int | None]]:
+    """Alleen een andere contract-id bewijst een wissel; een nieuwe hash niet."""
+    periods = {}
+    first = 0
+    while first < len(snapshots):
+        last = first
+        while last + 1 < len(snapshots) and snapshots[last + 1].contract_id == snapshots[first].contract_id:
+            last += 1
+        start = snapshots[first].valid_from_ts if first > 0 else None
+        end = snapshots[last].valid_to_ts if last + 1 < len(snapshots) else None
+        for snapshot in snapshots[first:last + 1]:
+            periods[snapshot.valid_from_ts] = (start, end)
+        first = last + 1
+    return periods
+
+
+def _month_period(
+    snapshot: TariffSnapshot, at: int, previous: MonthState | None,
+    contract_bounds: tuple[int | None, int | None],
+) -> tuple[int, int]:
+    zone = ZoneInfo(snapshot.timezone)
+    day = datetime.fromtimestamp(at, zone).date()
+    first = day.replace(day=1)
+    following = date(first.year + 1, 1, 1) if first.month == 12 else date(first.year, first.month + 1, 1)
+    start = int(datetime.combine(first, time.min, zone).timestamp())
+    end = int(datetime.combine(following, time.min, zone).timestamp())
+    contract_start, contract_end = contract_bounds
+    if contract_start is not None:
+        start = max(start, contract_start)
+    if contract_end is not None:
+        end = min(end, contract_end)
+    if snapshot.supply_start is not None:
+        supply_start = int(datetime.combine(snapshot.supply_start, time.min, zone).timestamp())
+        if supply_start <= at:
+            start = max(start, supply_start)
+    if previous is not None:
+        if previous.contract_id != snapshot.contract_id:
+            start = max(start, snapshot.valid_from_ts)
+        elif start <= previous.period_start_ts <= at < previous.period_end_ts:
+            # Behoud een eerder bewezen contractdeel, ook bij hervatten met minder snapshots.
+            start = previous.period_start_ts
+            end = min(end, previous.period_end_ts)
+    return start, end
+
+
+def _advance_month(
+    item: InputInterval, snapshot: TariffSnapshot | None, state: SettlementState,
+    issues: list[str], contract_bounds: tuple[int | None, int | None],
+) -> MonthState | None:
+    """Complete bewaakt de gedekte prefix tot asof; alleen het periode-einde sluit."""
+    if snapshot is None:
+        return None if state.month is None else replace(state.month, spot_export_eur=None, complete=False)
+    if snapshot.monthly_export_floor == "none":
+        return None
+    start, end = _month_period(snapshot, item.start_ts, state.month, contract_bounds)
+    if item.end_ts > end:
+        issues.append("month_boundary_requires_split")
+        start, end = _month_period(snapshot, item.end_ts - 1, None, contract_bounds)
+        return MonthState(snapshot.contract_id, start, end, None, (), False)
+    previous = state.month
+    if item.start_ts == start:
+        month = MonthState(snapshot.contract_id, start, end, ZERO, (), True)
+    elif (state.asof_ts == item.start_ts and previous is not None
+          and previous.contract_id == snapshot.contract_id and previous.period_start_ts == start
+          and item.start_ts < previous.period_end_ts):
+        month = replace(previous, period_end_ts=end)
+    else:
+        month = MonthState(snapshot.contract_id, start, end, None, (), False)
+    amount = None if item.export_kwh is None or item.spot_ex_vat is None else item.export_kwh * item.spot_ex_vat
+    total = None if month.spot_export_eur is None or amount is None else month.spot_export_eur + amount
+    groups = dict(month.negative_basis_by_vat)
+    if amount is not None and amount < 0:
+        day = datetime.fromtimestamp(item.start_ts, ZoneInfo(snapshot.timezone)).date()
+        vat = _effective_value(snapshot.vat_production, day)
+        groups[vat] = groups.get(vat, ZERO) - amount
+    complete = month.complete and total is not None and item.quality != "incomplete"
+    if not complete:
+        issues.append("incomplete_month")
+    return MonthState(snapshot.contract_id, start, end, total, tuple(sorted(groups.items())), complete)
+
+
 def _settle(
     item: InputInterval, snapshot: TariffSnapshot | None, price: PriceQuote | None,
     state: SettlementState, issues: list[str],
+    contract_bounds: tuple[int | None, int | None] = (None, None),
 ) -> tuple[SettlementLine, SettlementState]:
     with localcontext() as context:
         context.prec = 36
@@ -171,8 +283,8 @@ def _settle(
         bonus_kwh, bonus_revenue = _bonus_amounts(item, snapshot, price, before, issues)
         import_cost = None if price is None or item.import_kwh is None else item.import_kwh * price.import_rate
         export_revenue = None if price is None or item.export_kwh is None else item.export_kwh * price.export_rate
-        # Maandaccumulatie/-afsluiting volgt in A5; hier geen verborgen maandcorrectie.
-        after = SettlementState(item.end_ts, after_bonus, state.month)
+        after_month = _advance_month(item, snapshot, state, issues, contract_bounds)
+        after = SettlementState(item.end_ts, after_bonus, after_month)
         quality = item.quality
         if issues or any(amount is None for amount in (import_cost, export_revenue, bonus_revenue)):
             quality = "incomplete"
@@ -218,13 +330,17 @@ def settle_series(
 
     Onbekende prijzen worden geen nultarief. Revisie 0 uit merge_inputs blijft
     ongeregistreerde invoer; deze pure berekening registreert/publiceert niets.
+    Dezelfde snapshotselectie blijft bij het opsplitsen van een serie gepind:
+    aangrenzende contract-id's bepalen de afzonderlijke leveringsperioden.
+    Een open maand blijft uitsluitend in de maandstaat, niet in de correcties.
     """
     _check_chronology(items, opening)
     ordered = sorted(snapshots, key=lambda snapshot: snapshot.valid_from_ts)
     for previous, current in zip(ordered, ordered[1:], strict=False):
         if previous.valid_to_ts is None or previous.valid_to_ts > current.valid_from_ts:
             raise ValueError("Tariff snapshots must not overlap")
-    lines, state = [], opening
+    periods = _contract_periods(ordered)
+    lines, adjustments, state = [], [], opening
     with localcontext() as context:
         context.prec = 36
         subtotal = ZERO
@@ -242,14 +358,23 @@ def settle_series(
                     price = quote(snapshot, item.start_ts, item.end_ts, item.spot_ex_vat)
                 except ValueError as exc:
                     issues.append(f"unavailable_quote: {exc}")
-            line, state = _settle(item, snapshot, price, state, issues)
+            bounds = (None, None) if snapshot is None else periods[snapshot.valid_from_ts]
+            line, state = _settle(item, snapshot, price, state, issues, bounds)
             lines.append(line)
             complete &= line.quality != "incomplete"
             for amount, sign in ((line.import_cost, 1), (line.base_export_revenue, -1), (line.bonus_revenue, -1)):
                 if amount is not None:
                     subtotal += sign * amount
+            month = state.month
+            if month is not None and item.end_ts == month.period_end_ts:
+                adjustment = close_month(month)
+                if adjustment is None:
+                    complete = False
+                else:
+                    adjustments.append(adjustment)
+                    subtotal -= adjustment.credit_total
         return SettlementResult(
-            lines=tuple(lines), adjustments=(), end_state=state, engine_version=ENGINE_VERSION,
+            lines=tuple(lines), adjustments=tuple(adjustments), end_state=state, engine_version=ENGINE_VERSION,
             coverage_start_ts=opening.asof_ts, coverage_end_ts=state.asof_ts,
             complete=complete, known_subtotal=subtotal, net_cost=subtotal if complete else None,
         )
