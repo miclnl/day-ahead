@@ -367,6 +367,7 @@ class CheckDB:
         self.ensure_time_indexes()
         self.ensure_forecast_table()
         self.db_da.ensure_forecasts_source_column()
+        self.ensure_settlement_tables()
 
         # timezone in postgresql could be wrong, check and report
         if self.db_da.db_dialect == "postgresql":
@@ -394,6 +395,12 @@ class CheckDB:
                 connection.execute(insert_query)
                 connection.commit()
 
+
+    def ensure_settlement_tables(self) -> None:
+        """Voeg het afrekenboek idempotent toe zonder legacybedragen te wijzigen."""
+        from dao.prog.settlement.repository import SettlementRepository
+
+        SettlementRepository(self.engine).ensure_schema()
 
     def ensure_forecast_table(self) -> None:
         """Create the forecast archive if it is not there yet.
