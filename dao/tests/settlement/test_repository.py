@@ -304,6 +304,70 @@ def test_contract_selection_is_explicit_pinned_and_revisioned(repo, terms, input
     assert repo.read(METER, START_TS, START_TS + 1800, 1).net_cost == Decimal("0.20")
 
 
+@pytest.mark.parametrize("partial_window", [None, (0, 900), (900, 1800)],
+                         ids=["full", "prefix-first", "tail-first"])
+def test_contract_roundtrip_revalidation_preserves_financial_generation(repo, terms, inputs, calculate,
+                                                                      partial_window):
+    """A restored contract is current only after full CAS-checked revalidation."""
+    from dao.prog.settlement.repository import ConcurrentSettlementError
+
+    original = terms()
+    revised = terms(cost_supplier_consumption=((original.cost_supplier_consumption[0][0], Decimal("0.20")),))
+    items = inputs([original])
+    generation, old_batch, old_result = publish(repo, items, [original], calculate)
+    original_view = repo.read(METER, START_TS, START_TS + 1800)
+    frozen = {name: rows(repo, name) for name in ("input", "run", "interval", "adjustment")}
+    assert repo.register_inputs(METER, items, [revised], 1) == 2
+    assert repo.register_inputs(METER, items, [original], 2) == 3
+    restored = repo.read_inputs(METER, START_TS, START_TS + 1800)
+    assert restored.input_revision == 3 and restored.snapshots == (original,)
+    stale = repo.read(METER, START_TS, START_TS + 1800)
+    assert stale.input_revision == 1 and stale.current_input_revision == 3
+    assert stale.dirty_from_ts == START_TS and stale.freshness == "outdated"
+
+    if partial_window is not None:
+        left, right = partial_window
+        partial = repo.read_inputs(METER, START_TS + left, START_TS + right)
+        partial_result = settle_series(partial.items, partial.snapshots, old_result.lines[left // 900].before_state)
+        assert repo.commit(METER, partial_result, partial, generation, "partial-revalidation") == generation
+        still_dirty = repo.read(METER, START_TS, START_TS + 1800)
+        assert still_dirty.dirty_from_ts == START_TS and still_dirty.freshness == "outdated"
+        assert still_dirty.input_revision == 1 and still_dirty.current_input_revision == 3
+        assert frozen == {name: rows(repo, name) for name in frozen}
+
+    assert repo.commit(METER, calculate(restored), restored, generation, "full-revalidation") == generation
+    current = repo.read(METER, START_TS, START_TS + 1800)
+    assert current.generation == generation == 1
+    assert current.dirty_from_ts is None and current.freshness == "current"
+    assert current.input_revision == current.current_input_revision == 3
+    assert current.net_cost == Decimal("0.20") and current.complete
+    assert [line.input_revision for line in current.lines] == [1, 1]
+    assert frozen == {name: rows(repo, name) for name in frozen}
+    assert rows(repo, "run")[0]["input_revision"] == 1
+    assert old_batch.input_revision == original_view.input_revision == 1
+
+    validated_book = rows(repo, "book")
+    with pytest.raises(ConcurrentSettlementError):
+        repo.commit(METER, old_result, old_batch, generation, "stale-before-revalidation")
+    assert rows(repo, "book") == validated_book
+    assert frozen == {name: rows(repo, name) for name in frozen}
+
+    # Na een echte volgende financiële generatie blijft de oude auditmetadata gepind.
+    assert repo.register_inputs(METER, items, [revised], 3) == 4
+    next_batch = repo.read_inputs(METER, START_TS, START_TS + 1800)
+    assert repo.commit(METER, calculate(next_batch), next_batch, generation, "changed-contract") == 2
+    pinned = repo.read(METER, START_TS, START_TS + 1800, generation=1)
+    assert pinned.input_revision == 1 and pinned.current_input_revision == 4
+    assert pinned.freshness == "outdated" and pinned.dirty_from_ts is None
+    assert pinned.lines == original_view.lines and pinned.adjustments == original_view.adjustments
+    assert pinned.captured_ts == original_view.captured_ts
+    assert pinned.source_watermark_ts == original_view.source_watermark_ts
+    assert pinned.net_cost == original_view.net_cost == Decimal("0.20")
+    assert next(row for row in rows(repo, "run") if row["generation"] == 1) == frozen["run"][0]
+    latest = repo.read(METER, START_TS, START_TS + 1800)
+    assert latest.input_revision == 4 and latest.freshness == "current" and latest.net_cost == Decimal("0.60")
+
+
 def test_draft_is_never_silently_confirmed(repo, terms, inputs):
     draft = terms(status="draft")
     with pytest.raises(ValueError, match="confirmed"):

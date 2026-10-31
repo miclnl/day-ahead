@@ -562,6 +562,8 @@ class SettlementRepository:
                 and (watermark is None or result.coverage_end_ts >= watermark)):
                 dirty = None
             if not changed_lines and not changed_adjustments:
+                # Onder de dual-CAS legt dirty=None ook een volledige hervalidatie
+                # tegen book.input_revision vast; de oorspronkelijke run blijft immutable.
                 connection.execute(update(_BOOK).where(_BOOK.c.meter_id == meter_id).values(dirty_from_ts=dirty))
                 return expected_generation
             generation, run_id = expected_generation + 1, str(uuid4())
@@ -623,9 +625,12 @@ class SettlementRepository:
             adjustments = tuple(_load(PeriodAdjustment, row.adjustment_json)
                                 for partition in adjustment_rows.partitions(_BATCH_SIZE) for row in partition)
             subtotal, complete = _totals(lines, adjustments, start_ts, end_ts)
-            fresh = (pinned == current_generation and run["input_revision"] == revision and book["dirty_from_ts"] is None)
+            # Een schone actuele boekpointer omvat ook financiële no-op-hervalidatie.
+            # Historische/vuile generaties behouden de oorspronkelijke auditrevisie.
+            fresh = pinned == current_generation and book["dirty_from_ts"] is None
+            validated_revision = revision if fresh else run["input_revision"]
             return SettlementView(
-                meter_id, pinned, run["input_revision"], revision, "current" if fresh else "outdated", lines, adjustments,
+                meter_id, pinned, validated_revision, revision, "current" if fresh else "outdated", lines, adjustments,
                 subtotal, subtotal if complete else None, start_ts, end_ts, complete, run["captured_ts"],
                 run["source_watermark_ts"], book["dirty_from_ts"],
             )
