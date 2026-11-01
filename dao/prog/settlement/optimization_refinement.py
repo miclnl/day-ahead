@@ -46,7 +46,7 @@ class BoundFix:
     lower_before: Decimal
     upper_before: Decimal
     fixed_value: Decimal
-    reason: Literal["integer_choice", "source_zero", "active_cell_bound"]
+    reason: Literal["integer_choice", "source_zero", "active_cell_bound", "normalization_zero"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +59,7 @@ class SourceRefinement:
 
 @dataclass(frozen=True, slots=True)
 class SourceRefinementReport:
-    policy_version: Literal["fixed_choice_refine_v1"]
+    policy_version: Literal["fixed_choice_refine_v2"]
     initial_evidence: SolverEvidence
     final_evidence: SolverEvidence
     recipe: SourceRefinement
@@ -247,6 +247,23 @@ def prepare_source_refinement(terms: FinancialModelTerms, *, evidence: SolverEvi
         elif z is not None:
             raise PlanningSolutionRejected(_INVALID)
         statuses.append(on)
+    raw = tuple(tuple(values[var.idx] for var in row) for row in cell.bus_power_vars)
+    raw_valid = _physical_valid(cell, raw, statuses)
+    normalization_zero = set()
+    if raw_valid:
+        for i, on in enumerate(statuses):
+            total = sum((Fraction(row[i]) * cell.cell_coefficients[b][i]
+                         for b, row in enumerate(raw)), Fraction(0))
+            engine = _normalize_energy(total)
+            if ((total > 0 and engine == 0) or Fraction(engine) > cell.upper_bounds_kwh[i]
+                or (on == 1 and engine < Decimal("0.001"))):
+                if on is not None or not total > 0 or engine != 0:
+                    raise PlanningSolutionRejected(_INVALID)
+                normalization_zero.add(i)
+        if not normalization_zero:
+            # Een geldige bron is geen aanleiding voor een optimaliserende extra solve.
+            raise PlanningSolutionRejected(_INVALID)
+    for i, on in enumerate(statuses):
         for row in cell.bus_power_vars:
             var = row[i]
             value = values[var.idx]
@@ -259,16 +276,17 @@ def prepare_source_refinement(terms: FinancialModelTerms, *, evidence: SolverEvi
                              if abs(Fraction(value) - Fraction(bound)) <= Fraction(evidence.infeas_tol)}
                 if len(endpoints) > 1:
                     raise PlanningSolutionRejected(_INVALID)
-                if endpoints:
+                if i in normalization_zero:
+                    if endpoints != {Decimal(0)}:
+                        raise PlanningSolutionRejected(_INVALID)
+                    _add_fix(fixes, var, value, Decimal(0), "normalization_zero")
+                elif endpoints:
                     _add_fix(fixes, var, value, endpoints.pop(), "active_cell_bound")
-    raw = tuple(tuple(values[var.idx] for var in row) for row in cell.bus_power_vars)
-    if _physical_valid(cell, raw, statuses):
-        # Geldige bronnen, normalization-only en hulpveld-/financiële fouten zijn geen aanleiding.
-        raise PlanningSolutionRejected(_INVALID)
     try:
         validate_source_solution(terms.bonus, evidence=evidence)
     except PlanningSolutionRejected as exc:
-        if exc.code != "source_domain_solution_invalid":
+        expected = "source_domain_normalization_invalid" if normalization_zero else "source_domain_solution_invalid"
+        if exc.code != expected:
             raise
     else:
         # De bestaande audit toetst positieve cel-lb pas in N2; alleen dat gat verklaart succes.

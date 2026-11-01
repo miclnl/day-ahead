@@ -80,7 +80,7 @@ def test_debug_presents_finalization_and_only_canonical_money(monkeypatch):
     assert final["solution_digest"] == selected.solution_digest
     assert final["evidence"]["cbc_version"] is None
     refinement = final["refinement"]
-    assert refinement["policy_version"] == "fixed_choice_refine_v1"
+    assert refinement["policy_version"] == "fixed_choice_refine_v2"
     assert refinement["initial_evidence"]["cbc_version"] == "2.10.12"
     assert refinement["final_evidence"] == final["evidence"]
     assert Decimal(refinement["objective_delta"]) == 0

@@ -127,13 +127,13 @@ def test_cbc_source_domain_scaling(battery_count, interval_count, upper_ratio, r
         if item["additional_solves"]:
             refinement = item["refinement"]
             assert refinement is not None, item
-            assert refinement["policy_version"] == "fixed_choice_refine_v1"
+            assert refinement["policy_version"] == "fixed_choice_refine_v2"
             assert refinement["initial_evidence"] == initial["evidence"]
             assert refinement["final_evidence"] == final["evidence"]
             assert refinement["objective_delta"] == item["objective_delta"]
             assert refinement["fixes"]
             assert {fix["reason"] for fix in refinement["fixes"]} <= {
-                "integer_choice", "source_zero", "active_cell_bound"}
+                "integer_choice", "source_zero", "active_cell_bound", "normalization_zero"}
             for fix in refinement["fixes"]:
                 assert D(fix["lower_before"]) <= D(fix["fixed_value"]) <= D(fix["upper_before"])
             if final["accepted"]:

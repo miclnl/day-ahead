@@ -285,7 +285,7 @@ def finalize_day_ahead_finance(
     try:
         validate_source_solution(terms.bonus, evidence=initial)
     except PlanningSolutionRejected as exc:
-        if exc.code != "source_domain_solution_invalid":
+        if exc.code not in ("source_domain_solution_invalid", "source_domain_normalization_invalid"):
             raise
         recipe = prepare_source_refinement(terms, evidence=initial)
         logging.info("A8 finalisatie begin: evidence=%s; boundrecept=%s", initial,
@@ -322,7 +322,7 @@ def finalize_day_ahead_finance(
                 or (on == 0 and any(row[i] != 0 for row in source.bus_values_kw))
                 or (on == 1 and (raw < Fraction(1, 1000) or source.engine_cell_kwh[i] < Decimal("0.001")))):
                 raise PlanningSolutionRejected("source_domain_solution_invalid", interval_index=i) from None
-        refinement = SourceRefinementReport("fixed_choice_refine_v1", initial, evidence, recipe, delta)
+        refinement = SourceRefinementReport("fixed_choice_refine_v2", initial, evidence, recipe, delta)
     _check_solution_version(model, structure, solution)
     return FinalizedPlanningSolution(terms, evidence, structure, solution, refinement)
 
@@ -350,7 +350,7 @@ def finish_day_ahead_finance(
     _check_solution_version(model, selected.model_digest, selected.solution_digest)
     if selected.refinement is not None:
         result = replace(result, issues=tuple(dict.fromkeys((*result.issues,
-            "fixed_choice_refine_v1", "refined_original_optimality_unproven"))))
+            selected.refinement.policy_version, "refined_original_optimality_unproven"))))
     return result
 
 

@@ -5,6 +5,7 @@ import math
 import os
 from dataclasses import FrozenInstanceError, fields, replace
 from decimal import Decimal
+from fractions import Fraction
 
 import mip
 import pytest
@@ -271,12 +272,10 @@ def test_refinement_includes_near_but_not_overshot_active_upper_bound(snapshot, 
 
 
 @pytest.mark.parametrize("case", ["far_zero", "positive_lower_zero", "no_endpoint", "valid",
-                                  "normalization_only", "auxiliary_only", "context", "stale_evidence"])
+                                  "auxiliary_only", "context", "stale_evidence"])
 def test_refinement_refuses_unrepairable_or_non_source_failures(snapshot, bonus_rules, monkeypatch, case):
     """Neither arbitrary domain gaps nor unrelated audit failures authorize a recipe."""
     kwargs = {"cells": ("0.0015",)} if case == "no_endpoint" else {}
-    if case == "normalization_only":
-        kwargs = {"spots": ("-0.10",)}
     model, terms = financial_case(snapshot, bonus_rules, **kwargs)
     cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
     proof = evidence(model)
@@ -481,7 +480,7 @@ def test_finalization_retries_at_most_once(snapshot, bonus_rules, monkeypatch, c
         assert selected.solution_digest == api().solution_digest(model)
         if outcome == "refined":
             report = selected.refinement
-            assert report.policy_version == "fixed_choice_refine_v1"
+            assert report.policy_version == "fixed_choice_refine_v2"
             assert report.initial_evidence.cbc_version == "2.10.12"
             # The second solve's own empty log, not the first solve's version.
             assert report.final_evidence.cbc_version is None
@@ -508,10 +507,10 @@ def test_finalization_retries_at_most_once(snapshot, bonus_rules, monkeypatch, c
         assert "objectiveverschil" in caplog.text
 
 
-@pytest.mark.parametrize("case", ["normalization", "far_zero", "missing_incumbent", "nonfinite", "context"])
+@pytest.mark.parametrize("case", ["far_zero", "missing_incumbent", "nonfinite", "context"])
 def test_finalization_never_retries_other_failures(snapshot, bonus_rules, monkeypatch, case):
     """Bad context/evidence and nonrepairable source faults never become retries."""
-    model, terms = financial_case(snapshot, bonus_rules, **({"spots": ("-0.10",)} if case == "normalization" else {}))
+    model, terms = financial_case(snapshot, bonus_rules)
     assert hasattr(da, "finalize_day_ahead_finance")
     cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
     if case == "missing_incumbent":
@@ -521,12 +520,126 @@ def test_finalization_never_retries_other_failures(snapshot, bonus_rules, monkey
             basis=replace(terms.context.basis, meter_id="other-meter")))
         override_solution(monkeypatch, model, {cell.idx: 1e-13})
     else:
-        override_solution(monkeypatch, model, {cell.idx: {"normalization": 1e-12,
-            "far_zero": 0.001, "nonfinite": math.nan}[case]})
+        override_solution(monkeypatch, model, {cell.idx: {"far_zero": 0.001, "nonfinite": math.nan}[case]})
     monkeypatch.setattr(model, "optimize", lambda: pytest.fail("Unrelated failure retried"))
     with pytest.raises(PlanningSolutionRejected):
         selected = da.finalize_day_ahead_finance(terms, cbc_log="")
         da.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,))
+
+
+@pytest.mark.parametrize("outcome", ["valid", "new_residual", "infeasible", "missing_evidence"])
+def test_nonrequired_normalization_zero_gets_one_new_candidate(snapshot, bonus_rules, monkeypatch, outcome):
+    """A rejected positive group is replaced only by one newly solved, fully audited candidate."""
+    model, terms = financial_case(snapshot, bonus_rules, cells=(("0", "0"), ("0", "0")),
+        exports=("1", "1"), spots=("-0.10", "-0.10"), efficiencies=(D("0.8"), D("1")),
+        durations=(900, 1800))
+    cell = terms.bonus.source.cell_discharge
+    device = model.add_var(ub=1)
+    model += device == terms.grid_import[0]
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    raw_get, optimize = model.solver.var_get_x, model.optimize
+    override_solution(monkeypatch, model, {v.idx: 1e-12 for row in cell.bus_power_vars for v in row})
+    with pytest.raises(PlanningSolutionRejected, match="source_domain_normalization_invalid"):
+        da.validate_source_solution(terms.bonus, evidence=evidence(model))
+    before = api().model_digest(model)
+    recipe = api().prepare_source_refinement(terms, evidence=evidence(model))
+    assert api().model_digest(model) == before
+    fixes = [f for f in recipe.fixes if f.reason == "normalization_zero"]
+    assert {f.var_index for f in fixes} == {v.idx for row in cell.bus_power_vars for v in row}
+    assert all(f.original_value == D("1e-12") and f.fixed_value == 0 and f.lower_before == 0 for f in fixes)
+    # A forged new reason cannot authorize a write, even for the same target.
+    with pytest.raises(PlanningSolutionRejected):
+        api().apply_source_refinement(terms, recipe=replace(recipe,
+            fixes=tuple(replace(f, reason="active_cell_bound") for f in recipe.fixes)))
+    assert api().model_digest(model) == before
+    calls, outputs = [], []
+
+    def solve():
+        calls.append(True)
+        assert len(calls) == 1
+        monkeypatch.setattr(model.solver, "var_get_x", raw_get)
+        status = optimize()
+        if outcome == "new_residual":
+            override_solution(monkeypatch, model, {cell.bus_power_vars[0][0].idx: 1e-12})
+        elif outcome == "infeasible":
+            monkeypatch.setattr(model, "_status", mip.OptimizationStatus.INFEASIBLE)
+            monkeypatch.setattr(model.solver, "get_num_solutions", lambda: 0)
+        elif outcome == "missing_evidence":
+            monkeypatch.setattr(model, "solver_name", "UNKNOWN")
+        return status
+
+    monkeypatch.setattr(model, "optimize", solve)
+    if outcome == "valid":
+        selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+        result = da.finish_day_ahead_finance(selected, org_l=(0.0, 0.0), org_t=(-1.0, -1.0))
+        outputs.append(result)
+        assert all(v.x == 0 for row in cell.bus_power_vars for v in row)
+        assert device.x == 0
+        assert result.source.engine_cell_kwh == (D("0"), D("0"))
+        assert result.parity_complete
+        assert result.savings_energy_eur == 0
+        assert "fixed_choice_refine_v2" in result.issues
+        assert "refined_original_optimality_unproven" in result.issues
+        assert selected.refinement.final_evidence is selected.evidence
+        assert selected.refinement.policy_version == "fixed_choice_refine_v2"
+        assert selected.model_digest == api().model_digest(model)
+        assert selected.solution_digest == api().solution_digest(model)
+    else:
+        with pytest.raises(PlanningSolutionRejected):
+            selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+            outputs.append(da.finish_day_ahead_finance(selected, org_l=(0.0, 0.0), org_t=(-1.0, -1.0)))
+        assert outputs == []
+    assert calls == [True]
+
+
+@pytest.mark.parametrize("power,rows", [("0.000000002", 1), ("0.0000000012", 2)])
+def test_normalization_recovery_checks_all_groups_and_preserves_positive_energy(
+        snapshot, bonus_rules, monkeypatch, power, rows):
+    """Half a quantum and a representable sum of subquantum cells are not zero candidates."""
+    model, terms = financial_case(snapshot, bonus_rules, cells=tuple((None,) for _ in range(rows)),
+                                  spots=("-0.10",))
+    matrix = terms.bonus.source.cell_discharge.bus_power_vars
+    override_solution(monkeypatch, model, {row[0].idx: D(power) for row in matrix})
+    source = da.validate_source_solution(terms.bonus, evidence=evidence(model))
+    assert source.raw_cell_kwh == (Fraction(D("0.0000000005" if rows == 1 else "0.0000000006")),)
+    assert source.engine_cell_kwh == (D("0.000000001"),)
+    before = api().model_digest(model)
+    with pytest.raises(PlanningSolutionRejected):
+        api().prepare_source_refinement(terms, evidence=evidence(model))
+    assert api().model_digest(model) == before
+
+
+@pytest.mark.parametrize("case", ["positive_lb", "ambiguous", "far_kw", "upper_rounding", "mixed_faults"])
+def test_normalization_recovery_refuses_other_failures(snapshot, bonus_rules, monkeypatch, case):
+    """The entire horizon must qualify; a first zero-normalization error cannot hide another fault."""
+    durations = (1, 1) if case == "far_kw" else (900, 900)
+    from dao.tests.settlement.test_optimization_bonus import ts
+    starts = (ts(), ts() + durations[0])
+    kwargs = {"bounds": (D("0.000000004"),) * 2} if case == "ambiguous" else {}
+    model, terms = financial_case(snapshot, bonus_rules, cells=((None, None),),
+        exports=("1", "1"), spots=("-0.10",) * 2, durations=durations, starts=starts, **kwargs)
+    old = terms.bonus.source.cell_discharge
+    first, second = old.bus_power_vars[0]
+    if case == "positive_lb":
+        first.lb = 1e-14
+    if case in ("upper_rounding", "mixed_faults"):
+        second.ub = 0.000000006  # Exact U=1.5e-9; rounds to2e-9, above U.
+    cell = make_cell_discharge_input(model, old.bus_power_vars, meter_id=old.meter_id,
+        installation_battery_count=1, battery_indices=(0,), no_battery_evidence=None,
+        hour_fractions=old.hour_fractions, discharge_efficiencies=old.discharge_efficiencies)
+    terms = replace(terms, bonus=replace(terms.bonus, source=replace(terms.bonus.source, cell_discharge=cell)))
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    values = {first.idx: 1.5e-6 if case == "far_kw" else 1e-12, second.idx: 0}
+    if case in ("upper_rounding", "mixed_faults"):
+        values[second.idx] = 0.000000006
+        if case == "upper_rounding":
+            values[first.idx] = 0
+    override_solution(monkeypatch, model, values)
+    before = api().model_digest(model)
+    monkeypatch.setattr(model, "optimize", lambda: pytest.fail("Ineligible normalization retried"))
+    with pytest.raises(PlanningSolutionRejected):
+        da.finalize_day_ahead_finance(terms, cbc_log="")
+    assert api().model_digest(model) == before
 
 
 @pytest.mark.parametrize("mutation", ["lower", "coefficient", "same_objective_solution", "new_solve"])
