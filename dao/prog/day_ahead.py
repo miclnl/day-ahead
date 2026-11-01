@@ -15,7 +15,9 @@ import tempfile
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
-from decimal import Decimal
+from dataclasses import replace
+from decimal import Decimal, localcontext
+from fractions import Fraction
 from inspect import getattr_static
 from zoneinfo import ZoneInfo
 
@@ -60,8 +62,18 @@ from dao.prog.settlement.optimization_audit import (
     PlanningAuditResult,
     PlanningSolutionRejected,
     _check_context,
+    _check_evidence,
     audit_planning_solution,
     read_solver_evidence,
+    validate_source_solution,
+)
+from dao.prog.settlement.optimization_refinement import (
+    FinalizedPlanningSolution,
+    SourceRefinementReport,
+    apply_source_refinement,
+    model_digest,
+    prepare_source_refinement,
+    solution_digest,
 )
 from dao.prog.settlement.publication import FinancialPlanBlocked
 from dao.prog.settlement.service import PlanningContext
@@ -193,10 +205,77 @@ def bind_day_ahead_cost(
     model += cost == energy + other_cost
 
 
+def _check_solution_version(model: Model, structure: str, solution: str) -> None:
+    if model_digest(model) != structure or solution_digest(model) != solution:
+        raise PlanningSolutionRejected("planning_solution_stale")
+
+
+def finalize_day_ahead_finance(
+    terms: FinancialModelTerms, *, cbc_log: str,
+) -> FinalizedPlanningSolution:
+    """Bezit het model exclusief: hoogstens één vaste-keuzeherberekening, geen consumers."""
+    model = terms.bonus.source.cell_discharge.model
+    initial = read_solver_evidence(model, cbc_log=cbc_log)
+    _check_context(terms.context, terms.quotes, terms.bonus.opening,
+                   terms.bonus.source.cell_discharge.meter_id)
+    structure, solution = model_digest(model), solution_digest(model)
+    refinement = None
+    evidence = initial
+    try:
+        validate_source_solution(terms.bonus, evidence=initial)
+    except PlanningSolutionRejected as exc:
+        if exc.code != "source_domain_solution_invalid":
+            raise
+        recipe = prepare_source_refinement(terms, evidence=initial)
+        logging.info("A8 finalisatie begin: evidence=%s; boundrecept=%s", initial,
+                     tuple((fix.var_index, fix.var_type, fix.original_value, fix.lower_before,
+                            fix.upper_before, fix.fixed_value, fix.reason) for fix in recipe.fixes))
+        # Het recept bindt vaste keuzes; de eigenaar bewaakt óók alle vrije waarden.
+        _check_solution_version(model, structure, solution)
+        terms = apply_source_refinement(terms, recipe=recipe)
+        structure = model_digest(model)
+        _check_solution_version(model, structure, solution)
+        with _capture_native_stdout() as native:
+            model.optimize()
+        _log_native_output(native["cbc_log"])
+        logging.info("A8 finalisatie solve-status: %s, incumbents=%s", model.status.name, model.num_solutions)
+        evidence = read_solver_evidence(model, cbc_log=native["cbc_log"])
+        with localcontext() as context:
+            context.prec = 36
+            delta = evidence.objective_value - initial.objective_value
+        logging.info("A8 finalisatie evidence: %s; objectiveverschil %s; refined_original_optimality_unproven",
+                     evidence, delta)
+        solution = solution_digest(model)
+        _check_solution_version(model, structure, solution)
+        source = validate_source_solution(terms.bonus, evidence=evidence)
+        # De oude DTO is bewust geen actuele binding meer. Toets zijn bewaarde
+        # fysieke envelop apart, zonder _validate_cell_binding te versoepelen.
+        original = recipe.original_cell
+        for i, on in enumerate(source.discharge_on):
+            raw = sum((Fraction(row[i]) * original.cell_coefficients[b][i]
+                       for b, row in enumerate(source.bus_values_kw)), Fraction(0))
+            if (any(not original.bus_lower_bounds_kw[b][i] <= row[i] <= original.bus_upper_bounds_kw[b][i]
+                    for b, row in enumerate(source.bus_values_kw))
+                or raw > original.upper_bounds_kwh[i]
+                or Fraction(source.engine_cell_kwh[i]) > original.upper_bounds_kwh[i]
+                or (on == 0 and any(row[i] != 0 for row in source.bus_values_kw))
+                or (on == 1 and (raw < Fraction(1, 1000) or source.engine_cell_kwh[i] < Decimal("0.001")))):
+                raise PlanningSolutionRejected("source_domain_solution_invalid", interval_index=i) from None
+        refinement = SourceRefinementReport("fixed_choice_refine_v1", initial, evidence, recipe, delta)
+    _check_solution_version(model, structure, solution)
+    return FinalizedPlanningSolution(terms, evidence, structure, solution, refinement)
+
+
 def finish_day_ahead_finance(
-    terms: FinancialModelTerms, *, org_l: Sequence[float], org_t: Sequence[float], cbc_log: str,
+    selected: FinalizedPlanningSolution, *, org_l: Sequence[float], org_t: Sequence[float],
 ) -> PlanningAuditResult:
-    """Controleer de laatst geselecteerde oplossing; baseline-export is negatief."""
+    """Solve-vrije finale engine-/baselineaudit; baseline-export is negatief."""
+    if not isinstance(selected, FinalizedPlanningSolution):
+        raise PlanningSolutionRejected("planning_solution_stale")
+    terms = selected.terms
+    model = terms.bonus.source.cell_discharge.model
+    _check_solution_version(model, selected.model_digest, selected.solution_digest)
+    _check_evidence(model, selected.evidence)
     try:
         imports = tuple(Decimal(str(value)) for value in org_l)
         signed_exports = tuple(Decimal(str(value)) for value in org_t)
@@ -205,9 +284,13 @@ def finish_day_ahead_finance(
             raise ValueError("Invalid baseline sign")
     except (ArithmeticError, TypeError, ValueError) as exc:
         raise PlanningSolutionRejected("planning_forecast_invalid") from exc
-    evidence = read_solver_evidence(terms.bonus.source.cell_discharge.model, cbc_log=cbc_log)
-    return audit_planning_solution(terms, baseline_import_kwh=imports,
-        baseline_export_kwh=tuple(-v for v in signed_exports), evidence=evidence)
+    result = audit_planning_solution(terms, baseline_import_kwh=imports,
+        baseline_export_kwh=tuple(-v for v in signed_exports), evidence=selected.evidence)
+    _check_solution_version(model, selected.model_digest, selected.solution_digest)
+    if selected.refinement is not None:
+        result = replace(result, issues=tuple(dict.fromkeys((*result.issues,
+            "fixed_choice_refine_v1", "refined_original_optimality_unproven"))))
+    return result
 
 
 class DaCalc(DaBase):
@@ -3568,6 +3651,7 @@ class DaCalc(DaBase):
         if getattr(self, "_debug_capture_vars", False):
             self._debug_financial_terms = financial_terms
             self._debug_planning_audit = None
+            self._debug_finalized_solution = None
             try:
                 from da_debug import build_var_registry
 
@@ -3645,6 +3729,16 @@ class DaCalc(DaBase):
             )
             return None
 
+        # Finaliseer vóór iedere .x-afgeleide resultaatarray en baseline.
+        # Deze lokale stap bezit het model; na selectie volgen geen solves meer.
+        finalized_solution = None
+        if financial_terms is not None:
+            finalized_solution = finalize_day_ahead_finance(financial_terms, cbc_log=native["cbc_log"])
+            financial_terms = finalized_solution.terms
+            if getattr(self, "_debug_capture_vars", False):
+                self._debug_finalized_solution = finalized_solution
+                self._debug_financial_terms = financial_terms
+
         # er is een oplossing
         # afdrukken van de resultaten
         old_cost_da = 0
@@ -3706,7 +3800,7 @@ class DaCalc(DaBase):
         financial_audit = None
         if financial_terms is not None:
             financial_audit = finish_day_ahead_finance(
-                financial_terms, org_l=org_l, org_t=org_t, cbc_log=native["cbc_log"],
+                finalized_solution, org_l=org_l, org_t=org_t,
             )
             if getattr(self, "_debug_capture_vars", False):
                 self._debug_planning_audit = financial_audit

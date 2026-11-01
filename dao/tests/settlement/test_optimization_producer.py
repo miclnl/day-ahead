@@ -1,9 +1,12 @@
 """Real producer capture stays offline; an A8 audit never grants output rights."""
 
+import ast
 import datetime as dt
+import inspect
 import logging
 import socket
 import sys
+import textwrap
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
@@ -17,7 +20,10 @@ from dao.prog.config.models.base import FlexFloat
 from dao.prog.config.models.devices.battery import BatteryConfig
 from dao.prog.config.models.production_bonus import ProductionBonusConfig
 from dao.prog.fastctrl.plan import FinancialBasis
-from dao.prog.settlement.optimization_audit import PlanningSolutionRejected
+from dao.prog.settlement.optimization_audit import (
+    PlanningSolutionRejected,
+    validate_source_solution,
+)
 from dao.prog.settlement.publication import FinancialPlanBlocked
 from dao.prog.settlement.service import PlanningContext
 from dao.prog.settlement.tariffs import quote
@@ -69,12 +75,15 @@ def capture(monkeypatch, tmp_path, request):
     instance.interval, instance.interval_s, instance.steps_day = "15min", 900, 96
     instance.interval_name, instance.time_zone = "kwartier", "Europe/Amsterdam"
     instance.log_level = logging.INFO
-    instance.config = SimpleNamespace(prices=None, baseload=[getattr(request, "param", 0.0)] * 24,
+    settings = getattr(request, "param", {})
+    if isinstance(settings, (int, float)):
+        settings = {"baseload": settings}
+    instance.config = SimpleNamespace(prices=None, baseload=[settings.get("baseload", 0.0)] * 24,
                                      max_gap=FlexFloat(value=0.005))
     instance.battery_options = [BatteryConfig.model_validate({
         "name": f"synthetic-{b}", "entity actual level": f"sensor.synthetic_{b}", "capacity": 100,
-        "charge stages": [{"power": 4000, "efficiency": 1}],
-        "discharge stages": [{"power": 4000, "efficiency": 1}],
+        "charge stages": [{"power": 2000, "efficiency": 1}, {"power": 4000, "efficiency": 1}],
+        "discharge stages": [{"power": 2000, "efficiency": 1}, {"power": 4000, "efficiency": 1}],
         "bat_to_dc efficiency": efficiency, "dc_to_bat efficiency": 1,
         "cycle cost": 0.01,
         "solar": [{"name": f"pv-{b}", "max power": 4, "tilt": 30, "orientation": 0, "capacity": 4}],
@@ -93,7 +102,7 @@ def capture(monkeypatch, tmp_path, request):
     for name in ("set_value", "call_service", "turn_on", "turn_off", "set_entity_value",
                  "set_entity_state", "set_entity_option", "select_option", "save_df", "export_fast_plan"):
         monkeypatch.setattr(instance, name, forbidden)
-    start = ts()
+    start = settings.get("start", ts())
     stamps = [start + 900 * i for i in range(12)]
     dates = [dt.datetime.fromtimestamp(at) for at in stamps]
     prices = pd.DataFrame({"time": dates, "da_ex": [0.1] * 12,
@@ -103,6 +112,11 @@ def capture(monkeypatch, tmp_path, request):
     instance.db_da = SimpleNamespace(get_prognose_data=lambda **kwargs: forecast.copy())
     instance.calc_solar_predictions = lambda *args: pd.DataFrame({"prediction": [0.5] * 12})
     found = {}
+    add_sos = mip.Model.add_sos
+
+    def record_sos(model, members, sos_type):
+        found.setdefault("sos", []).append((model, tuple((var.idx, weight) for var, weight in members), sos_type))
+        return add_sos(model, members, sos_type)
 
     class Captured(Exception):
         pass
@@ -121,6 +135,7 @@ def capture(monkeypatch, tmp_path, request):
     assert hasattr(da, "bind_day_ahead_finance")
     assert hasattr(da, "bind_day_ahead_cost")
     with monkeypatch.context() as spies:
+        spies.setattr(mip.Model, "add_sos", record_sos)
         spies.setattr(da, "bind_day_ahead_finance", finance)
         spies.setattr(da, "bind_day_ahead_cost", cost)
         with pytest.raises(Captured):
@@ -133,14 +148,24 @@ def signature(expr):
     return expr.const, {v.idx: c for v, c in expr.expr.items()}
 
 
-@pytest.mark.parametrize("capture,cell_power", [(0.0, 0.0), (0.4, 0.0), (0.0, 0.0048)], indirect=["capture"])
-def test_real_producer_matrix_and_cost_binding(capture, snapshot, bonus_rules, cell_power):
+@pytest.mark.parametrize("capture,cell_power,residual", [
+    (0.0, 0.0, False), (0.4, 0.0, False), (0.0, 0.0048, False),
+    (0.0, 0.0, True),
+    ({"start": ts("2027-12-31", 23, 45)}, 0.0, True),
+    ({"start": ts("2027-12-31", 23, 45)}, 0.0048, False),
+], indirect=["capture"])
+def test_real_producer_refinement_and_positive_bonus(capture, snapshot, bonus_rules, monkeypatch,
+                                                    cell_power, residual):
     model, args, local = capture["model"], capture["finance"], capture["locals"]
     assert args["context"] is None
     assert args["installation_battery_count"] == len(capture["instance"].battery_options) == 2
     assert args["battery_indices"] == (0, 1)
     assert args["hour_fractions"] == (D("0.25"),) * 12
     assert args["discharge_efficiencies"] == (D("0.8"), D("1.0"))
+    # Native, nontrivial SOS2 constraints really went into the captured model.
+    assert len(capture["sos"]) == 48
+    assert all(owner is model and len(members) == 3 and kind == 2
+               for owner, members, kind in capture["sos"])
     indices = [v.idx for row in args["dc_from_bat"] for v in row]
     assert len(indices) == len(set(indices)) == 24
     assert indices == [v.idx for row in local["dc_from_bat"] for v in row]
@@ -182,18 +207,40 @@ def test_real_producer_matrix_and_cost_binding(capture, snapshot, bonus_rules, c
     model.verbose = 0
     model.objective = mip.minimize(cost_args["cost"])
     assert model.optimize() == mip.OptimizationStatus.OPTIMAL
-    if cell_power == 0:
-        # Real producer export exposes CBC first/eligible residuals, even at 1 kWh.
-        # Keep this availability failure visible; do not clamp the candidate.
-        assert terms.bonus.eligible_kwh[0].x == pytest.approx(terms.bonus.grid_export[0].x)
-        with pytest.raises(PlanningSolutionRejected, match="source_domain_solution_invalid"):
-            da.finish_day_ahead_finance(terms, org_l=[0.0]*12, org_t=[-0.9]*12, cbc_log="")
-        return
-    result = da.finish_day_ahead_finance(terms, org_l=[0.0]*12, org_t=[-1.0]*12, cbc_log="")
+    optimize, raw_get = model.optimize, model.solver.var_get_x
+    solves = []
+    if residual:
+        # Controlled initial read defect, not a claim about this CBC invocation.
+        override_solution(monkeypatch, model, {args["dc_from_bat"][0][0].idx: 1e-13})
+
+    def resolve():
+        solves.append(True)
+        monkeypatch.setattr(model.solver, "var_get_x", raw_get)
+        return optimize()
+
+    monkeypatch.setattr(model, "optimize", resolve)
+    selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+    result = da.finish_day_ahead_finance(selected, org_l=[0.0]*12, org_t=[-1.0]*12)
+    assert len(solves) == int(residual)
+    assert (selected.refinement is not None) == residual
+    assert signature(cost_args["other_cost"]) == old_other
+    validate_source_solution(selected.terms.bonus, evidence=selected.evidence)
+    assert result.evidence is selected.evidence
     assert result.parity_complete
-    assert result.forecast[0].export_kwh == D("1.0012")  # DC PV plus 0.0048 * 0.25 bus energy.
-    assert result.forecast[0].battery_discharge_kwh == D("0.0015")  # Gross, with eta=0.8.
-    assert result.forecast_result.lines[0].bonus_revenue == 0
+    assert result.parity_error_eur <= D("0.000001")
+    assert result.forecast[0].battery_discharge_kwh == (D("0.0015") if cell_power else D("0"))
+    if cell_power:
+        assert result.forecast[0].export_kwh == D("1.0012")  # DC PV plus bus energy.
+        assert all(line.bonus_revenue == 0 for line in result.forecast_result.lines)
+    else:
+        assert terms.bonus.eligible_kwh[0].x == pytest.approx(terms.bonus.grid_export[0].x)
+        assert result.forecast[0].export_kwh == (D("0.9") if capture["instance"].config.baseload[0] else D("1"))
+        assert all(line.bonus_kwh == item.export_kwh for line, item in zip(
+            result.forecast_result.lines, result.forecast, strict=True))
+        assert all(line.bonus_revenue > 0 for line in result.forecast_result.lines)
+    if args["intervals"][0][0] == ts("2027-12-31", 23, 45):
+        assert result.forecast_result.lines[0].after_state.bonus.total_export_kwh == D("0")
+        assert result.forecast_result.lines[1].after_state.bonus.total_export_kwh == result.forecast[1].export_kwh
     assert float(result.model_energy_cost_eur) == pytest.approx(terms.energy_cost.x)
 
 
@@ -213,7 +260,8 @@ def test_baseline_sign_and_independent_cap_state(snapshot, bonus_rules):
         export_bounds_kwh=(D("1"),)*2, origins=("verified_pv",)*2, source_policy=POLICY)
     model.objective = terms.energy_cost
     assert model.optimize() == mip.OptimizationStatus.OPTIMAL
-    result = da.finish_day_ahead_finance(terms, org_l=(0.0, 0.0), org_t=(0.0, -1.0), cbc_log="")
+    selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+    result = da.finish_day_ahead_finance(selected, org_l=(0.0, 0.0), org_t=(0.0, -1.0))
     assert result.forecast_result.lines[1].bonus_kwh == D("0")
     assert result.baseline_result.lines[1].bonus_kwh == D("1")
     assert result.baseline[1].export_kwh == D("1")
@@ -221,7 +269,7 @@ def test_baseline_sign_and_independent_cap_state(snapshot, bonus_rules):
     assert result.forecast_result.end_state.month != result.baseline_result.end_state.month
     assert result.savings_energy_eur == result.baseline_energy_cost_eur - result.engine_energy_cost_eur
     with pytest.raises(PlanningSolutionRejected, match="planning_forecast_invalid"):
-        da.finish_day_ahead_finance(terms, org_l=(0.0, 0.0), org_t=(0.0, 1.0), cbc_log="")
+        da.finish_day_ahead_finance(selected, org_l=(0.0, 0.0), org_t=(0.0, 1.0))
 
 
 def test_final_selected_solution_audited_before_consumers(snapshot, bonus_rules, monkeypatch):
@@ -229,17 +277,17 @@ def test_final_selected_solution_audited_before_consumers(snapshot, bonus_rules,
     cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
     model.objective = cell
     model.optimize()
-    first = da.finish_day_ahead_finance(terms, org_l=(0.0,), org_t=(-1.0,), cbc_log="")
+    first = da.finish_day_ahead_finance(da.finalize_day_ahead_finance(terms, cbc_log=""), org_l=(0.0,), org_t=(-1.0,))
     assert first.forecast[0].battery_discharge_kwh == 0
     model += cell >= 0.006
     model.optimize()
-    second = da.finish_day_ahead_finance(terms, org_l=(0.0,), org_t=(-1.0,), cbc_log="")
+    second = da.finish_day_ahead_finance(da.finalize_day_ahead_finance(terms, cbc_log=""), org_l=(0.0,), org_t=(-1.0,))
     assert second.forecast[0].battery_discharge_kwh == D("0.0015")
     assert second.forecast_result.lines[0].bonus_kwh == 0
     preview_calls, prognosis_writes, plan_writes, ha_writes = [], [], [], []
-    override_solution(monkeypatch, model, {cell.idx: -1e-12})
+    override_solution(monkeypatch, model, {cell.idx: -0.001})
     with pytest.raises(PlanningSolutionRejected):
-        audited = da.finish_day_ahead_finance(terms, org_l=(0.0,), org_t=(-1.0,), cbc_log="")
+        audited = da.finish_day_ahead_finance(da.finalize_day_ahead_finance(terms, cbc_log=""), org_l=(0.0,), org_t=(-1.0,))
         preview_calls.append(audited)
         prognosis_writes.append(audited)
         plan_writes.append(audited)
@@ -249,7 +297,7 @@ def test_final_selected_solution_audited_before_consumers(snapshot, bonus_rules,
 
 def test_new_regime_denied_even_debug_and_valid_offline_audit(capture, snapshot, bonus_rules, monkeypatch):
     _, terms = financial_case(snapshot, bonus_rules)
-    assert da.finish_day_ahead_finance(terms, org_l=(0.0,), org_t=(-1.0,), cbc_log="").parity_complete
+    assert da.finish_day_ahead_finance(da.finalize_day_ahead_finance(terms, cbc_log=""), org_l=(0.0,), org_t=(-1.0,)).parity_complete
     instance = capture["instance"]
     instance.config.prices = pricing_config()
     for attr in ("_financial_pricing", "_financial_policy", "_financial_plan_path"):
@@ -300,3 +348,85 @@ def test_context_quote_alignment_and_no_legacy_fallback(snapshot, bonus_rules, m
     cols, rows = model.num_cols, model.num_rows
     assert da.bind_day_ahead_finance(model, **{**args, "context": None}) is None
     assert (model.num_cols, model.num_rows) == (cols, rows)
+
+
+def post_strategy_consumers():
+    """Execute the real calc consumer block offline, without adding a context bypass.
+
+    The capture fixture independently covers construction. Here real source code
+    is compiled, not reimplemented, to exercise extraction and preview without
+    running any of the later HA/DB/plan writers or supplying calc a live context.
+    """
+    body = ast.parse(textwrap.dedent(inspect.getsource(da.DaCalc.calc_optimum))).body[0].body
+    arrays = next(i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == "old_cost_da" for target in node.targets))
+    start = max(i for i, node in enumerate(body[:arrays]) if isinstance(node, ast.If)
+                and isinstance(node.test, ast.Compare) and isinstance(node.test.left, ast.Attribute)
+                and node.test.left.attr == "num_solutions") + 1
+    end = next(i for i, node in enumerate(body[arrays:], arrays) if isinstance(node, ast.If)
+               and isinstance(node.test, ast.Attribute) and node.test.attr == "boiler_present")
+    return compile(ast.Module(body=body[start:end], type_ignores=[]), da.__file__, "exec")
+
+
+@pytest.mark.parametrize("outcome", ["success", "new_residual", "missing_evidence", "infeasible"])
+def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rules, monkeypatch, caplog, outcome):
+    """Moving finalization after any array extraction must expose stale device/PV data."""
+    model, terms = financial_case(snapshot, bonus_rules)
+    device = model.add_var(ub=1, name="continuous_device_flow")
+    cost = model.add_var(lb=-10, ub=10)
+    model += cost == terms.energy_cost
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    raw_get, optimize = model.solver.var_get_x, model.optimize
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    override_solution(monkeypatch, model, {cell.idx: 1e-13, device.idx: 0})
+    calls = []
+
+    def resolve():
+        calls.append(True)
+        monkeypatch.setattr(model.solver, "var_get_x", raw_get)
+        result = optimize()
+        # Another feasible degenerate device value, deliberately independent of
+        # objective/status. The real new source solution is not modified.
+        override_solution(monkeypatch, model, {device.idx: 0.25})
+        if outcome == "new_residual":
+            override_solution(monkeypatch, model, {cell.idx: 1e-13})
+        elif outcome == "missing_evidence":
+            monkeypatch.setattr(model, "solver_name", "UNKNOWN")
+        elif outcome == "infeasible":
+            monkeypatch.setattr(model, "_status", mip.OptimizationStatus.INFEASIBLE)
+            monkeypatch.setattr(model.solver, "get_num_solutions", lambda: 0)
+        return result
+
+    monkeypatch.setattr(model, "optimize", resolve)
+    instance = SimpleNamespace(_debug_capture_vars=True)
+    namespace = dict(self=instance, model=model, financial_terms=terms, cost=cost,
+        native={"cbc_log": "Welcome to the CBC MILP Solver Version: 2.10.12"},
+        B=1, U=1, EV=1, M=1, solar_num=1, pv_dc_num=[0], hour_fraction=[0.25],
+        ac_to_dc=[[device]], ac_from_dc=[[device]], c_ev=[[device]], c_ma_u=[[device]],
+        pv_ac=[[device]], solar_prod=[[0.5]], b_l=[0.0], c_b=[device], c_hp=[device], pl=[0.1], pt=[0.1])
+    if outcome != "success":
+        with pytest.raises(PlanningSolutionRejected):
+            exec(post_strategy_consumers(), da.__dict__, namespace)
+        assert calls == [True]
+        assert not {"accu_in_sum", "c_ev_sum", "c_ma_sum", "org_l", "org_t", "financial_audit"} & namespace.keys()
+        assert not hasattr(instance, "_debug_planning_audit")
+        return
+    with caplog.at_level(logging.INFO):
+        exec(post_strategy_consumers(), da.__dict__, namespace)
+    assert calls == [True]
+    assert namespace["accu_in_sum"] == namespace["accu_out_sum"] == [0.0625]
+    assert namespace["c_ev_sum"] == namespace["c_ma_sum"] == [0.25]
+    assert namespace["solar_hour_sum_opt"] == [0.25]
+    assert namespace["org_l"] == [0.5]
+    assert namespace["org_t"] == [0]
+    result = namespace["financial_audit"]
+    assert result.baseline[0].import_kwh == D("0.5")
+    assert result.engine_energy_cost_eur == D("-0.13")
+    assert result.baseline_energy_cost_eur == D("0.05")
+    assert result.savings_energy_eur == D("0.18")
+    assert instance._debug_planning_audit is result
+    assert instance._debug_finalized_solution.evidence is result.evidence
+    assert instance._debug_financial_terms is instance._debug_finalized_solution.terms
+    assert "A8 energiecomponent: -0.13" in caplog.text
+    assert "A8 referentie-energiecomponent: 0.05" in caplog.text
+    assert "A8 besparing energiecomponent: 0.18" in caplog.text

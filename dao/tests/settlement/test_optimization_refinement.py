@@ -1,12 +1,15 @@
 """Bound refinement selects a new restricted problem, never accepts cell residuals."""
 
+import logging
 import math
+import os
 from dataclasses import FrozenInstanceError, fields, replace
 from decimal import Decimal
 
 import mip
 import pytest
 
+from dao.prog import day_ahead as da
 from dao.prog.settlement.optimization import _validate_cell_binding, make_cell_discharge_input
 from dao.prog.settlement.optimization_audit import PlanningSolutionRejected
 from dao.tests.settlement.test_optimization_audit import (
@@ -437,3 +440,234 @@ def test_model_digest_uses_canonical_integrality_not_bound_dependent_binary_labe
     assert fixed != before
     var.var_type = mip.CONTINUOUS
     assert api().model_digest(model) != fixed
+
+
+@pytest.mark.parametrize("outcome", ["valid", "refined", "new_residual", "infeasible", "missing_evidence"])
+def test_finalization_retries_at_most_once(snapshot, bonus_rules, monkeypatch, caplog, outcome):
+    """Only a repairable source fault authorizes one new, separately logged solve."""
+    model, terms = financial_case(snapshot, bonus_rules)
+    assert hasattr(da, "finalize_day_ahead_finance")
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    raw_get = model.solver.var_get_x
+    optimize = model.optimize
+    calls, logs = [], []
+    if outcome != "valid":
+        override_solution(monkeypatch, model, {cell.idx: 1e-13})
+
+    def solve_once():
+        calls.append(True)
+        assert len(calls) == 1
+        monkeypatch.setattr(model.solver, "var_get_x", raw_get)
+        status = optimize()
+        if outcome == "new_residual":
+            override_solution(monkeypatch, model, {cell.idx: 1e-13})
+        elif outcome == "infeasible":
+            monkeypatch.setattr(model, "_status", mip.OptimizationStatus.INFEASIBLE)
+            monkeypatch.setattr(model.solver, "get_num_solutions", lambda: 0)
+        elif outcome == "missing_evidence":
+            monkeypatch.setattr(model, "solver_name", "UNKNOWN")
+        return status
+
+    monkeypatch.setattr(model, "optimize", solve_once)
+    monkeypatch.setattr(da, "_log_native_output", logs.append)
+    caplog.set_level(logging.INFO)
+    outputs = []
+    if outcome in ("valid", "refined"):
+        selected = da.finalize_day_ahead_finance(terms, cbc_log="Welcome to the CBC MILP Solver Version: 2.10.12")
+        outputs.append(da.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,)))
+        assert outputs[0].forecast_result.lines[0].bonus_revenue == D("0.03")
+        assert len(calls) == (outcome == "refined")
+        assert selected.model_digest == api().model_digest(model)
+        assert selected.solution_digest == api().solution_digest(model)
+        if outcome == "refined":
+            report = selected.refinement
+            assert report.policy_version == "fixed_choice_refine_v1"
+            assert report.initial_evidence.cbc_version == "2.10.12"
+            # The second solve's own empty log, not the first solve's version.
+            assert report.final_evidence.cbc_version is None
+            assert report.final_evidence is selected.evidence
+            assert report.objective_delta == selected.evidence.objective_value - report.initial_evidence.objective_value
+            assert "refined_original_optimality_unproven" in outputs[0].issues
+            assert len(logs) == 1
+        else:
+            assert selected.refinement is None
+            assert logs == []
+    else:
+        with pytest.raises(PlanningSolutionRejected):
+            selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+            outputs.append(da.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,)))
+        assert len(calls) == 1
+        assert outputs == []
+    if outcome != "valid":
+        # Diagnostics survive even if the new candidate has no usable evidence.
+        assert "A8 finalisatie begin:" in caplog.text
+        assert "source_zero" in caplog.text
+        assert "A8 finalisatie solve-status:" in caplog.text
+    if outcome in ("refined", "new_residual"):
+        assert "A8 finalisatie evidence:" in caplog.text
+        assert "objectiveverschil" in caplog.text
+
+
+@pytest.mark.parametrize("case", ["normalization", "far_zero", "missing_incumbent", "nonfinite", "context"])
+def test_finalization_never_retries_other_failures(snapshot, bonus_rules, monkeypatch, case):
+    """Bad context/evidence and nonrepairable source faults never become retries."""
+    model, terms = financial_case(snapshot, bonus_rules, **({"spots": ("-0.10",)} if case == "normalization" else {}))
+    assert hasattr(da, "finalize_day_ahead_finance")
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    if case == "missing_incumbent":
+        monkeypatch.setattr(model.solver, "get_num_solutions", lambda: 0)
+    elif case == "context":
+        terms = replace(terms, context=replace(terms.context,
+            basis=replace(terms.context.basis, meter_id="other-meter")))
+        override_solution(monkeypatch, model, {cell.idx: 1e-13})
+    else:
+        override_solution(monkeypatch, model, {cell.idx: {"normalization": 1e-12,
+            "far_zero": 0.001, "nonfinite": math.nan}[case]})
+    monkeypatch.setattr(model, "optimize", lambda: pytest.fail("Unrelated failure retried"))
+    with pytest.raises(PlanningSolutionRejected):
+        selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+        da.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,))
+
+
+@pytest.mark.parametrize("mutation", ["lower", "coefficient", "same_objective_solution", "new_solve"])
+def test_finalization_rejects_same_objective_stale_solution(snapshot, bonus_rules, monkeypatch, mutation):
+    """A model or any unfixed value changing invalidates a previously selected plan."""
+    model, terms = financial_case(snapshot, bonus_rules)
+    device = model.add_var(ub=1, name="independent_device")
+    model.objective = terms.energy_cost + 0 * device
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    assert hasattr(da, "finalize_day_ahead_finance")
+    selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+    status, objective = model.status, model.objective_value
+    if mutation == "lower":
+        device.lb = 0.25
+    elif mutation == "coefficient":
+        model.remove(model.constrs[-1])
+        model += 2 * terms.grid_import[0] == 0
+    elif mutation == "same_objective_solution":
+        override_solution(monkeypatch, model, {device.idx: 0.25})
+    else:
+        # A real solve of the unchanged visible algebra with another optimum.
+        # Select the other degenerate optimum using a temporary bound only.
+        device.lb = 0.5
+        assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+        device.lb = 0
+        assert device.x == pytest.approx(0.5)
+        assert api().model_digest(model) == selected.model_digest
+    assert model.status == status
+    assert model.objective_value == objective
+    monkeypatch.setattr(model, "optimize", lambda: pytest.fail("finish must be solve-free"))
+    with pytest.raises(PlanningSolutionRejected, match="planning_solution_stale"):
+        da.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,))
+
+
+@pytest.mark.parametrize("phase", ["prepare", "apply"])
+def test_finalizer_owns_complete_preparation_solution(snapshot, bonus_rules, monkeypatch, phase):
+    """Unfixed values cannot change between recipe preparation, application and solve."""
+    model, terms = financial_case(snapshot, bonus_rules)
+    assert hasattr(da, "finalize_day_ahead_finance")
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    override_solution(monkeypatch, model, {cell.idx: 1e-13})
+    function = getattr(da, f"{phase}_source_refinement")
+
+    def mutate(*args, **kwargs):
+        result = function(*args, **kwargs)
+        override_solution(monkeypatch, model, {terms.grid_import[0].idx: 1e-10})
+        return result
+
+    monkeypatch.setattr(da, f"{phase}_source_refinement", mutate)
+    monkeypatch.setattr(model, "optimize", lambda: pytest.fail("Changed preparation solution used"))
+    with pytest.raises(PlanningSolutionRejected, match="planning_solution_stale"):
+        da.finalize_day_ahead_finance(terms, cbc_log="")
+
+
+@pytest.mark.parametrize("refine", [False, True])
+@pytest.mark.parametrize("fault", ["auxiliary", "finance"])
+def test_full_audit_failure_never_starts_another_solve(snapshot, bonus_rules, monkeypatch, refine, fault):
+    """Source finalization cannot retry a failed auxiliary or monetary audit."""
+    model, terms = financial_case(snapshot, bonus_rules)
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    raw_get, optimize = model.solver.var_get_x, model.optimize
+    calls = []
+    if fault == "finance":
+        terms = replace(terms, energy_cost=terms.energy_cost + 1)
+    if refine:
+        override_solution(monkeypatch, model, {cell.idx: 1e-13})
+    elif fault == "auxiliary":
+        override_solution(monkeypatch, model, {terms.bonus.eligible_kwh[0].idx: 0.999999998})
+
+    def resolve():
+        calls.append(True)
+        assert len(calls) == 1
+        monkeypatch.setattr(model.solver, "var_get_x", raw_get)
+        status = optimize()
+        if fault == "auxiliary":
+            override_solution(monkeypatch, model, {terms.bonus.eligible_kwh[0].idx: 0.999999998})
+        return status
+
+    monkeypatch.setattr(model, "optimize", resolve)
+    selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+    with pytest.raises(PlanningSolutionRejected, match={"auxiliary": "planning_auxiliary_mismatch",
+                                                      "finance": "planning_parity_failed"}[fault]):
+        da.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,))
+    assert len(calls) == int(refine)
+
+
+@pytest.mark.parametrize("endpoint", ["lower", "upper"])
+def test_finalization_checks_current_and_original_cell_envelopes(snapshot, bonus_rules, monkeypatch, endpoint):
+    """Rebinding must retain original bounds and exact raw/normalized domain checks."""
+    if endpoint == "lower":
+        model, terms, _ = positive_lower_case(snapshot, bonus_rules, monkeypatch)
+    else:
+        model, terms = financial_case(snapshot, bonus_rules, cells=("0.001",), bounds=(D("0.001"),))
+    # Recover the native getter underneath the deliberately noisy initial read.
+    from mip.cbc import SolverCbc
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    if endpoint == "upper":
+        override_solution(monkeypatch, model, {cell.idx: 0.004000000000000001})
+    optimize = model.optimize
+
+    def resolve():
+        monkeypatch.setattr(model.solver, "var_get_x", lambda var: SolverCbc.var_get_x(model.solver, var))
+        return optimize()
+
+    monkeypatch.setattr(model, "optimize", resolve)
+    original = terms.bonus.source.cell_discharge
+    selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+    final = selected.terms.bonus.source.cell_discharge
+    result = da.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,))
+    assert selected.refinement.recipe.original_cell is original
+    assert final.bus_power_vars[0][0] is cell
+    assert final.bus_lower_bounds_kw[0][0] == final.bus_upper_bounds_kw[0][0] == D("0.005" if endpoint == "lower" else "0.004")
+    assert original.bus_lower_bounds_kw[0][0] <= D(str(cell.x)) <= original.bus_upper_bounds_kw[0][0]
+    assert D("0.001") <= result.forecast[0].battery_discharge_kwh <= original.upper_bounds_kwh[0]
+    assert result.source.raw_cell_kwh[0] <= original.upper_bounds_kwh[0]
+    assert result.forecast_result.lines[0].bonus_kwh == 0
+    with pytest.raises(ValueError, match="cell_conversion_invalid"):
+        _validate_cell_binding(original, model)
+
+
+def test_refinement_uses_its_own_native_log(snapshot, bonus_rules, monkeypatch):
+    """Evidence must come from the refinement's fd-level capture, not the strategy log."""
+    model, terms = financial_case(snapshot, bonus_rules)
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    raw_get, optimize = model.solver.var_get_x, model.optimize
+    override_solution(monkeypatch, model, {cell.idx: 1e-13})
+    logs = []
+    marker = "Welcome to the CBC MILP Solver Version: 7.6.5\n"
+
+    def resolve():
+        monkeypatch.setattr(model.solver, "var_get_x", raw_get)
+        status = optimize()
+        # A controlled native log marker, explicitly not the real CBC version.
+        os.write(1, marker.encode())
+        return status
+
+    monkeypatch.setattr(model, "optimize", resolve)
+    monkeypatch.setattr(da, "_log_native_output", logs.append)
+    selected = da.finalize_day_ahead_finance(terms,
+        cbc_log="Welcome to the CBC MILP Solver Version: 8.8.8")
+    assert selected.refinement.initial_evidence.cbc_version == "8.8.8"
+    assert selected.refinement.final_evidence.cbc_version == "7.6.5"
+    assert len(logs) == 1 and marker in logs[0]
+    assert da.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,)).evidence.cbc_version == "7.6.5"

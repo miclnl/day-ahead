@@ -448,8 +448,39 @@ def _install_model_capture(patches: "_PatchList", target) -> None:
 
 
 # Zet een opgelost model om naar een result-dict, gedeeld door RecordingIO en ReplayIO zodat beide dezelfde vorm opleveren om te diffen.
+def _evidence_dict(evidence):
+    return {
+        name: (list(value) if isinstance(value, tuple) else
+               value if isinstance(value, (int, str)) or value is None else str(value))
+        for name in evidence.__dataclass_fields__
+        for value in (getattr(evidence, name),)
+    }
+
+
+def _finalization_dict(selected):
+    if selected is None:
+        return None
+    report = selected.refinement
+    refinement = None
+    if report is not None:
+        refinement = {
+            "policy_version": report.policy_version,
+            "initial_evidence": _evidence_dict(report.initial_evidence),
+            "final_evidence": _evidence_dict(report.final_evidence),
+            "objective_delta": str(report.objective_delta),
+            # Alleen idx/numerieke diagnose, geen modelrepr, meter of config.
+            "fixes": [{name: value if isinstance(value, (int, str)) else str(value)
+                       for name in ("var_index", "var_type", "original_value", "lower_before",
+                                    "upper_before", "fixed_value", "reason")
+                       for value in (getattr(fix, name),)} for fix in report.recipe.fixes],
+            "issues": ["refined_original_optimality_unproven"],
+        }
+    return {"model_digest": selected.model_digest, "solution_digest": selected.solution_digest,
+            "evidence": _evidence_dict(selected.evidence), "refinement": refinement}
+
+
 def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict, *,
-                       financial_terms=None, planning_audit=None) -> Optional[dict]:
+                       financial_terms=None, planning_audit=None, finalized_solution=None) -> Optional[dict]:
     if model is None:
         return None
     try:
@@ -489,11 +520,21 @@ def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict, *,
                 "gross_cell_kwh": [value.x for value in cell.total_kwh],
                 "parity_complete": None if planning_audit is None else planning_audit.parity_complete,
                 "parity_error_eur": None if planning_audit is None else str(planning_audit.parity_error_eur),
-                "evidence": None if planning_audit is None else {
-                    name: (list(value) if isinstance(value, tuple) else value if isinstance(value, (int, str)) or value is None else str(value))
-                    for name in planning_audit.evidence.__dataclass_fields__
-                    for value in (getattr(planning_audit.evidence, name),)
-                },
+                "evidence": None if planning_audit is None else _evidence_dict(planning_audit.evidence),
+                "finalization": _finalization_dict(finalized_solution),
+                # Financiële uitkomst uitsluitend uit de finale canonieke engineaudit.
+                "energy_cost_eur": None if planning_audit is None or planning_audit.engine_energy_cost_eur is None
+                    else str(planning_audit.engine_energy_cost_eur),
+                "baseline_energy_cost_eur": None if planning_audit is None or planning_audit.baseline_energy_cost_eur is None
+                    else str(planning_audit.baseline_energy_cost_eur),
+                "savings_energy_eur": None if planning_audit is None or planning_audit.savings_energy_eur is None
+                    else str(planning_audit.savings_energy_eur),
+                "bonus_kwh": None if planning_audit is None else [
+                    None if line.bonus_kwh is None else str(line.bonus_kwh)
+                    for line in planning_audit.forecast_result.lines],
+                "bonus_revenue_eur": None if planning_audit is None else [
+                    None if line.bonus_revenue is None else str(line.bonus_revenue)
+                    for line in planning_audit.forecast_result.lines],
                 "issues": list(financial_terms.bonus.issues if planning_audit is None else planning_audit.issues),
             }
         return result
@@ -828,6 +869,7 @@ class RecordingIO:
             {"captured_at": self._captured_at.isoformat()},
             financial_terms=getattr(self._primary, "_debug_financial_terms", None),
             planning_audit=getattr(self._primary, "_debug_planning_audit", None),
+            finalized_solution=getattr(self._primary, "_debug_finalized_solution", None),
         )
         if result is None:
             return
@@ -1003,6 +1045,7 @@ class ReplayIO:
             },
             financial_terms=getattr(self._primary, "_debug_financial_terms", None),
             planning_audit=getattr(self._primary, "_debug_planning_audit", None),
+            finalized_solution=getattr(self._primary, "_debug_finalized_solution", None),
         )
 
     # -- context manager -----------------------------------------------

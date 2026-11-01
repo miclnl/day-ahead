@@ -1,12 +1,17 @@
 """Explicit settlement handles must not disappear behind frozen dataclasses."""
 
 import json
+from decimal import Decimal
 
 import mip
 
-from dao.prog import da_debug
+from dao.prog import da_debug, day_ahead
 from dao.tests.settlement import conftest as settlement_fixtures
-from dao.tests.settlement.test_optimization_audit import financial_case, run_audit
+from dao.tests.settlement.test_optimization_audit import (
+    financial_case,
+    override_solution,
+    run_audit,
+)
 
 
 def test_debug_registers_source_and_cap_without_var_equality(monkeypatch):
@@ -41,3 +46,48 @@ def test_debug_registers_source_and_cap_without_var_equality(monkeypatch):
     assert "synthetic-meter" not in json.dumps(diag)
     # Unknown cap has None helpers, not fake Vars or a fabricated state.
     assert da_debug.build_var_registry({"financial_terms": unknown})
+
+
+def test_debug_presents_finalization_and_only_canonical_money(monkeypatch):
+    """The initial evidence and raw eligible residue cannot masquerade as final earnings."""
+    snapshot = settlement_fixtures.snapshot.__wrapped__()
+    bonus_rules = settlement_fixtures.bonus_rules.__wrapped__()
+    model, terms = financial_case(snapshot, bonus_rules)
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    raw_get, optimize = model.solver.var_get_x, model.optimize
+    override_solution(monkeypatch, model, {cell.idx: 1e-13})
+
+    def resolve():
+        monkeypatch.setattr(model.solver, "var_get_x", raw_get)
+        status = optimize()
+        override_solution(monkeypatch, model, {terms.bonus.eligible_kwh[0].idx: 1.0000000005})
+        return status
+
+    monkeypatch.setattr(model, "optimize", resolve)
+    assert hasattr(day_ahead, "finalize_day_ahead_finance")
+    selected = day_ahead.finalize_day_ahead_finance(terms,
+        cbc_log="Welcome to the CBC MILP Solver Version: 2.10.12")
+    result = day_ahead.finish_day_ahead_finance(selected, org_l=(0.0,), org_t=(-1.0,))
+    assert terms.bonus.eligible_kwh[0].x == 1.0000000005
+    payload = da_debug._build_result_dict(model, [], {}, financial_terms=selected.terms,
+        planning_audit=result, finalized_solution=selected)
+    diag = payload["settlement"]
+    final = diag["finalization"]
+    assert final["model_digest"] == selected.model_digest
+    assert final["solution_digest"] == selected.solution_digest
+    assert final["evidence"]["cbc_version"] is None
+    refinement = final["refinement"]
+    assert refinement["policy_version"] == "fixed_choice_refine_v1"
+    assert refinement["initial_evidence"]["cbc_version"] == "2.10.12"
+    assert refinement["final_evidence"] == final["evidence"]
+    assert Decimal(refinement["objective_delta"]) == 0
+    fix = next(item for item in refinement["fixes"] if item["var_index"] == cell.idx)
+    assert fix["original_value"] == "1E-13"
+    assert fix["fixed_value"] == "0"
+    assert fix["reason"] == "source_zero"
+    assert diag["bonus_kwh"] == ["1.000000000"]
+    assert Decimal(diag["bonus_revenue_eur"][0]) == Decimal("0.03")
+    assert Decimal(diag["energy_cost_eur"]) == Decimal("-0.13")
+    assert any(issue.startswith("planning_auxiliary_residual:") for issue in diag["issues"])
+    assert "refined_original_optimality_unproven" in diag["issues"]
+    assert "synthetic-meter" not in json.dumps(diag)
