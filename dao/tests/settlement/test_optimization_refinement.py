@@ -7,7 +7,7 @@ from decimal import Decimal
 import mip
 import pytest
 
-from dao.prog.settlement.optimization import _validate_cell_binding
+from dao.prog.settlement.optimization import _validate_cell_binding, make_cell_discharge_input
 from dao.prog.settlement.optimization_audit import PlanningSolutionRejected
 from dao.tests.settlement.test_optimization_audit import (
     evidence,
@@ -43,6 +43,79 @@ def prepare_noisy_zero(snapshot, bonus_rules, monkeypatch, **kwargs):
     override_solution(monkeypatch, model, {cell.idx: 1e-13})
     proof = evidence(model)
     return model, terms, api().prepare_source_refinement(terms, evidence=proof)
+
+
+def positive_lower_case(snapshot, bonus_rules, monkeypatch):
+    model, terms = financial_case(snapshot, bonus_rules, cells=("0.00125",))
+    old = terms.bonus.source.cell_discharge
+    old.bus_power_vars[0][0].lb = 0.005
+    cell = make_cell_discharge_input(model, old.bus_power_vars, meter_id=old.meter_id,
+        installation_battery_count=old.installation_battery_count,
+        battery_indices=old.battery_indices, no_battery_evidence=old.no_battery_evidence,
+        hour_fractions=old.hour_fractions, discharge_efficiencies=old.discharge_efficiencies)
+    terms = replace(terms, bonus=replace(terms.bonus, source=replace(terms.bonus.source,
+                                                                 cell_discharge=cell)))
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    proof = evidence(model)
+    override_solution(monkeypatch, model, {cell.bus_power_vars[0][0].idx: 0.004999999999999999})
+    return model, terms, proof
+
+
+def test_refinement_repairs_positive_lower_bound_without_crossing_minimum(snapshot, bonus_rules, monkeypatch):
+    """An original positive-lb breach above L must not require a second domain fault."""
+    model, terms, proof = positive_lower_case(snapshot, bonus_rules, monkeypatch)
+    cell = terms.bonus.source.cell_discharge
+    var = cell.bus_power_vars[0][0]
+    assert cell.bus_lower_bounds_kw == ((D("0.005"),),)
+    assert cell.hour_fractions == (D("0.25"),)
+    assert cell.discharge_efficiencies == (D("1"),)
+    assert terms.bonus.source.discharge_on[0].x == 1
+    assert D(str(var.x)) == D("0.004999999999999999")
+    assert D(str(var.x)) * D("0.25") > D("0.001")
+    before = api().model_digest(model)
+    recipe = api().prepare_source_refinement(terms, evidence=proof)
+    assert api().model_digest(model) == before
+    fix = next(f for f in recipe.fixes if f.var is var)
+    assert fix.original_value == D("0.004999999999999999")
+    assert fix.lower_before == fix.fixed_value == D("0.005")
+    assert fix.reason == "active_cell_bound"
+    rebound = api().apply_source_refinement(terms, recipe=recipe)
+    assert var.lb == var.ub == 0.005
+    _validate_cell_binding(rebound.bonus.source.cell_discharge, model)
+    with pytest.raises(ValueError, match="cell_conversion_invalid"):
+        _validate_cell_binding(cell, model)
+
+
+@pytest.mark.parametrize("code", ["solver_evidence_unavailable", "source_domain_normalization_invalid"])
+def test_positive_lower_bound_repair_keeps_audit_rejection_gate(snapshot, bonus_rules, monkeypatch, code):
+    """The lower-bound exception must not skip or swallow non-source audit failures."""
+    model, terms, proof = positive_lower_case(snapshot, bonus_rules, monkeypatch)
+
+    def rejected_audit(*args, **kwargs):
+        raise PlanningSolutionRejected(code)
+
+    monkeypatch.setattr(api(), "validate_source_solution", rejected_audit)
+    before = tuple((v.lb, v.ub) for v in model.vars)
+    with pytest.raises(PlanningSolutionRejected, match=code):
+        api().prepare_source_refinement(terms, evidence=proof)
+    assert tuple((v.lb, v.ub) for v in model.vars) == before
+
+
+@pytest.mark.parametrize("case", ["zero", "upper"])
+def test_successful_audit_does_not_authorize_non_lower_bound_fault(snapshot, bonus_rules, monkeypatch, case):
+    """A controlled successful audit return is not a generic source-error bypass."""
+    kwargs = {"cells": ("0.001",), "bounds": (D("0.001"),)} if case == "upper" else {}
+    model, terms = financial_case(snapshot, bonus_rules, **kwargs)
+    proof = evidence(model)
+    audit = api().validate_source_solution(terms.bonus, evidence=proof)
+    var = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    override_solution(monkeypatch, model, {var.idx: 0.004000000000000001 if case == "upper" else 1e-13})
+    # Return the previously real audit only to exercise the successful-return gate.
+    monkeypatch.setattr(api(), "validate_source_solution", lambda *args, **kwargs: audit)
+    before = tuple((v.lb, v.ub) for v in model.vars)
+    with pytest.raises(PlanningSolutionRejected, match="source_refinement_invalid"):
+        api().prepare_source_refinement(terms, evidence=proof)
+    assert tuple((v.lb, v.ub) for v in model.vars) == before
 
 
 @pytest.mark.parametrize("case,value,target,reason", [

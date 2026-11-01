@@ -271,7 +271,10 @@ def prepare_source_refinement(terms: FinancialModelTerms, *, evidence: SolverEvi
         if exc.code != "source_domain_solution_invalid":
             raise
     else:
-        raise PlanningSolutionRejected(_INVALID)
+        # De bestaande audit toetst positieve cel-lb pas in N2; alleen dat gat verklaart succes.
+        if not any(value < cell.bus_lower_bounds_kw[b][i]
+                   for b, row in enumerate(raw) for i, value in enumerate(row)):
+            raise PlanningSolutionRejected(_INVALID)
     projected = tuple(tuple(fixes[var.idx].fixed_value if var.idx in fixes else values[var.idx]
                             for var in row) for row in cell.bus_power_vars)
     if not _physical_valid(cell, projected, statuses, normalized=True):
