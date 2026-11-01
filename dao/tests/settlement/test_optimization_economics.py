@@ -184,6 +184,8 @@ def test_actual_post_finalization_wear_audit_precedes_preview(snapshot, bonus_ru
     discharge = terms.bonus.source.cell_discharge.bus_power_vars
     # This wear-only case uses one interval; charge 5 kW for 0.25 h, no discharge.
     charges = [[model.add_var(lb=5, ub=5)]]
+    cell_charge_on = da._bind_battery_cell_direction(model, dc_to_bat=charges, dc_from_bat=discharge,
+        installation_battery_count=1, interval_count=1)
     rate = 0 if outcome == "zero" else 0.01
     costs = [model.add_var(lb=0)]
     model += costs[0] == (charges[0][0] + discharge[0][0]) * rate * 0.25
@@ -203,7 +205,7 @@ def test_actual_post_finalization_wear_audit_precedes_preview(snapshot, bonus_ru
     instance = SimpleNamespace(_debug_capture_vars=True)
     namespace = dict(self=instance, model=model, financial_terms=terms, period_terms=None, cost=cost,
         native={"cbc_log": ""}, B=1, U=1, EV=0, M=0, solar_num=0, pv_dc_num=[0], hour_fraction=[0.25],
-        dc_to_bat=charges, dc_from_bat=discharge,
+        dc_to_bat=charges, dc_from_bat=discharge, cell_charge_on=cell_charge_on,
         kwh_cycle_cost=[0.02 if outcome == "mismatch" else rate], cycle_cost=costs,
         ac_to_dc=charges, ac_from_dc=discharge, c_ev=[], c_ma_u=[], pv_ac=[], solar_prod=[],
         b_l=[0.0], c_b=terms.grid_import, c_hp=terms.grid_import, pl=[0.1], pt=[0.1])
