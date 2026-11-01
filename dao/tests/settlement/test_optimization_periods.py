@@ -521,6 +521,21 @@ def audited_period_case(snapshot, **kwargs):
     return model, terms, periods, selected, audit
 
 
+def test_net_economics_uses_each_canonical_credit_not_planner_credit(snapshot):
+    """Mixed-VAT planner credit cannot be reused for either actual engine ledger."""
+    from dao.prog.settlement.optimization_economics import planning_cost_breakdown
+    _, _, periods, _, audit = audited_period_case(snapshot)
+    assert periods.credit.x == pytest.approx(0.109)
+    assert audit.forecast_result.adjustments[0].credit_total == D("0.1186")
+    assert audit.baseline_result.adjustments[0].credit_total == D("0.0605")
+    result = planning_cost_breakdown(forecast=audit.forecast_result, baseline=audit.baseline_result,
+        battery_wear_eur=D("0"), battery_terminal_cost_eur=D("0"),
+        preference_cost_eur=D("0"), other_terminal_cost_eur=D("0"))
+    assert result["forecast_invoice_energy_eur"] == D("-0.2276")
+    assert result["baseline_invoice_energy_eur"] == D("-0.2240")
+    assert result["net_model_advantage_eur"] == D("0.0036")
+
+
 def period_audit(terms, periods, audit):
     assert hasattr(optimization_audit, "audit_period_solution")
     return optimization_audit.audit_period_solution(terms, periods, planning_audit=audit)

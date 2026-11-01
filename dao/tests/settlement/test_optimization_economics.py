@@ -14,7 +14,11 @@ import dao.prog.day_ahead as da
 from dao.prog.config.models.devices.battery import BatteryConfig
 from dao.prog.settlement.optimization_audit import PlanningSolutionRejected
 from dao.tests.config.test_battery_stages import BASE
-from dao.tests.settlement.test_optimization_audit import financial_case, override_solution
+from dao.tests.settlement.test_optimization_audit import (
+    financial_case,
+    override_solution,
+    run_audit,
+)
 from dao.tests.settlement.test_optimization_producer import (
     capture as capture,
 )
@@ -206,6 +210,8 @@ def test_actual_post_finalization_wear_audit_precedes_preview(snapshot, bonus_ru
     namespace = dict(self=instance, model=model, financial_terms=terms, period_terms=None, cost=cost,
         native={"cbc_log": ""}, B=1, U=1, EV=0, M=0, solar_num=0, pv_dc_num=[0], hour_fraction=[0.25],
         dc_to_bat=charges, dc_from_bat=discharge, cell_charge_on=cell_charge_on,
+        battery_terminal_cost=mip.xsum([]), preference_cost=mip.xsum([]), other_terminal_cost=mip.xsum([]),
+        planning_constraints=None,
         kwh_cycle_cost=[0.02 if outcome == "mismatch" else rate], cycle_cost=costs,
         ac_to_dc=charges, ac_from_dc=discharge, c_ev=[], c_ma_u=[], pv_ac=[], solar_prod=[],
         b_l=[0.0], c_b=terms.grid_import, c_hp=terms.grid_import, pl=[0.1], pt=[0.1])
@@ -223,3 +229,48 @@ def test_actual_post_finalization_wear_audit_precedes_preview(snapshot, bonus_ru
             assert "Batterijslijtage DC-busdoorzet EUR" in caplog.text
             assert (da.model_digest(model), da.solution_digest(model)) == (
                 instance._debug_finalized_solution.model_digest, instance._debug_finalized_solution.solution_digest)
+
+
+@pytest.mark.parametrize("forecast,baseline,wear,terminal,preference,other,net", [
+    ("0.125", "0.40", "0.0225", "0", "0", "0", "0.2525"),
+    ("0.125", "0.40", "0.0225", "0.02", "0.03", "-0.01", "0.2125"),
+    ("0.125", "0.40", "0.5", "0", "0", "0", "-0.225"),
+    (None, "0.40", "0.0225", "0", "0", "0", None),
+    ("0.125", None, "0.0225", "0", "0", "0", None),
+])
+def test_net_economics_keeps_every_component_and_unknowns(snapshot, bonus_rules,
+        forecast, baseline, wear, terminal, preference, other, net):
+    """Invoice savings are not full benefit until wear, both terminal terms and preferences are paid."""
+    from dataclasses import replace
+    module = importlib.import_module("dao.prog.settlement.optimization_economics")
+    model, terms = financial_case(snapshot, bonus_rules)
+    audit = run_audit(model, terms)
+    forward = replace(audit.forecast_result, net_cost=None if forecast is None else D(forecast))
+    reference = replace(audit.baseline_result, net_cost=None if baseline is None else D(baseline))
+    with localcontext() as context:
+        context.prec = 3
+        result = module.planning_cost_breakdown(forecast=forward, baseline=reference,
+            battery_wear_eur=D(wear), battery_terminal_cost_eur=D(terminal),
+            preference_cost_eur=D(preference), other_terminal_cost_eur=D(other))
+    assert result["net_model_advantage_eur"] == (None if net is None else D(net))
+    assert result["battery_wear_eur"] == D(wear)
+    assert result["battery_terminal_cost_eur"] == D(terminal)
+    assert result["preference_cost_eur"] == D(preference)
+    assert result["other_terminal_cost_eur"] == D(other)
+    assert result["forecast_invoice_energy_eur"] == forward.net_cost
+    assert result["baseline_invoice_energy_eur"] == reference.net_cost
+
+
+@pytest.mark.parametrize("field", ["battery_wear_eur", "battery_terminal_cost_eur",
+                                   "preference_cost_eur", "other_terminal_cost_eur"])
+@pytest.mark.parametrize("invalid", [D("NaN"), D("Infinity"), 0.01])
+def test_net_economics_rejects_non_decimal_or_nonfinite_component(snapshot, bonus_rules, field, invalid):
+    module = importlib.import_module("dao.prog.settlement.optimization_economics")
+    model, terms = financial_case(snapshot, bonus_rules)
+    audit = run_audit(model, terms)
+    args = dict(forecast=audit.forecast_result, baseline=audit.baseline_result,
+        battery_wear_eur=D("0"), battery_terminal_cost_eur=D("0"),
+        preference_cost_eur=D("0"), other_terminal_cost_eur=D("0"))
+    args[field] = invalid
+    with pytest.raises(ValueError):
+        module.planning_cost_breakdown(**args)

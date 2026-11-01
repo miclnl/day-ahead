@@ -423,6 +423,8 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
         native={"cbc_log": "Welcome to the CBC MILP Solver Version: 2.10.12"},
         B=1, U=1, EV=1, M=1, solar_num=1, pv_dc_num=[0], hour_fraction=[0.25],
         dc_to_bat=[[device]], dc_from_bat=[[cell]], cell_charge_on=cell_charge_on,
+        battery_terminal_cost=mip.xsum([]), preference_cost=mip.xsum([]), other_terminal_cost=mip.xsum([]),
+        planning_constraints=None,
         kwh_cycle_cost=[0.01], cycle_cost=[wear_cost],
         ac_to_dc=[[device]], ac_from_dc=[[device]], c_ev=[[device]], c_ma_u=[[device]],
         pv_ac=[[device]], solar_prod=[[0.5]], b_l=[0.0], c_b=[device], c_hp=[device], pl=[0.1], pt=[0.1])
@@ -603,6 +605,8 @@ def test_period_consumer_audit_precedes_preview_and_guards_digests(snapshot, mon
         native={"cbc_log": ""}, B=0, U=2, EV=0, M=0, solar_num=1, pv_dc_num=[],
         hour_fraction=[1.0, 1.0], ac_to_dc=[], ac_from_dc=[], c_ev=[], c_ma_u=[],
         dc_to_bat=[], dc_from_bat=[], cell_charge_on=(), kwh_cycle_cost=[], cycle_cost=[],
+        battery_terminal_cost=mip.xsum([]), preference_cost=mip.xsum([]), other_terminal_cost=mip.xsum([]),
+        planning_constraints=None,
         pv_ac=[[terms.grid_import[0], terms.grid_import[1]]], solar_prod=[[0.0, 1.0]],
         b_l=[0.0, 0.0], c_b=terms.grid_import, c_hp=terms.grid_import, pl=[0.1, 0.1], pt=[0.1, 0.1])
     with caplog.at_level(logging.INFO):

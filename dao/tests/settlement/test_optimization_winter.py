@@ -18,6 +18,7 @@ import pytest
 import dao.prog.day_ahead as da
 from dao.prog.config.models.devices.battery import BatteryConfig
 from dao.prog.settlement.tariffs import quote
+from dao.prog.settlement.types import MonthState
 from dao.tests.settlement.test_optimization_bonus import ts
 from dao.tests.settlement.test_optimization_producer import (
     capture as capture,
@@ -52,7 +53,8 @@ def strategy_source():
 def winter_plan(captured, monkeypatch, snapshot, bonus_rules, *, quarters=96,
                 peak="0.40", cheap="0.10", wear="0.01", efficiency="0.8",
                 pv_per_day="0", demand_per_day="1", grid_charge=True,
-                reserve=50, strategy="minimize cost", check_exclusivity_before_audit=False, battery_count=1):
+                reserve=50, strategy="minimize cost", check_exclusivity_before_audit=False, battery_count=1,
+                start_soc=50, start_day="2027-01-16", closed_month=False, mixed_vat=False, known_month=True):
     """Only synthetic read boundaries and explicit scenario limits are replaced."""
     instance = captured["instance"]
     instance._debug_capture_vars = True
@@ -63,7 +65,7 @@ def winter_plan(captured, monkeypatch, snapshot, bonus_rules, *, quarters=96,
                    bat_to_dc_efficiency=float(efficiency))
     instance.battery_options = [BatteryConfig.model_validate({**battery, "name": f"synthetic-winter-{b}"})
                                 for b in range(battery_count)]
-    start = ts("2027-01-16", 0)
+    start = ts(start_day, 0)
     stamps = [start + 900 * i for i in range(quarters)]
     dates = [dt.datetime.fromtimestamp(at) for at in stamps]
     spots = tuple(D(cheap if i % 96 < 4 else peak) for i in range(quarters))
@@ -94,7 +96,7 @@ def winter_plan(captured, monkeypatch, snapshot, bonus_rules, *, quarters=96,
     with monkeypatch.context() as spies:
         spies.setattr(da, "bind_day_ahead_cost", capture_cost)
         with pytest.raises(Captured):
-            instance.calc_optimum(_start_dt=dates[0], _start_soc=50)
+            instance.calc_optimum(_start_dt=dates[0], _start_soc=start_soc)
     model = found["model"]
     assert found["settlement_context"] is None
     assert found["financial_terms"] is None
@@ -113,6 +115,14 @@ def winter_plan(captured, monkeypatch, snapshot, bonus_rules, *, quarters=96,
     intervals = tuple((at, at + 900) for at in stamps)
     context = context_for(snapshot, bonus_rules, intervals, meter="legacy")
     snap = context.quotes[0].snapshot
+    if closed_month:
+        groups = ((D("9"), D("0.1")), (D("21"), D("0.1"))) if mixed_vat else ((D("21"), D("0.1")),)
+        context = replace(context, state=replace(context.state, month=MonthState(snap.contract_id,
+            ts("2027-01-01", 0), ts("2027-02-01", 0), D("-0.1"), groups, True)))
+    elif known_month:
+        # Explicit synthetic complete zero prefix: no unknown amount may be filled with zero by production code.
+        context = replace(context, state=replace(context.state, month=MonthState(snap.contract_id,
+            ts("2027-01-01", 0), ts("2027-02-01", 0), D("0"), (), True)))
     context = replace(context,
         quotes=tuple(quote(snap, a, b, price) for (a, b), price in zip(intervals, spots, strict=True)),
         price_batch=replace(context.price_batch, items=tuple(
@@ -123,7 +133,8 @@ def winter_plan(captured, monkeypatch, snapshot, bonus_rules, *, quarters=96,
     # seams receive the immutable synthetic context, without any gate bypass.
     exec(pre_strategy_cost_binding(), namespace)
     assert namespace["terminal_terms"].policy_version == "export_mean_v1"
-    assert namespace["period_terms"].issues == ("monthly_credit_omitted_open_or_unknown",)
+    assert namespace["period_terms"].issues == (("monthly_credit_conservative_mixed_vat",) if mixed_vat else
+        () if closed_month else ("monthly_credit_omitted_open_or_unknown",))
     optimize, solves = model.optimize, []
 
     def timed_solve(*args, **kwargs):
@@ -169,8 +180,9 @@ def winter_plan(captured, monkeypatch, snapshot, bonus_rules, *, quarters=96,
     assert (da.model_digest(model), da.solution_digest(model)) == (selected.model_digest, selected.solution_digest)
     audit = namespace["financial_audit"]
     assert audit.parity_complete and audit.parity_error_eur <= EUR_AUDIT
-    assert namespace["period_audit"].model_credit_eur == 0
-    assert namespace["period_audit"].engine_closed_credit_eur == 0
+    if not closed_month:
+        assert namespace["period_audit"].model_credit_eur == 0
+        assert namespace["period_audit"].engine_closed_credit_eur == 0
     assert all(line.bonus_revenue == 0 for line in audit.forecast_result.lines)
     assert all(var.x == 0 for var in found["c_t"])
     assert all(var.x == 0 for key in ("c_b", "c_hp") for var in found[key])
@@ -230,6 +242,7 @@ def test_no_pv_profitable_grid_charge_avoids_peak_import(capture, snapshot, bonu
     assert D("0.40") - D("1.25") * D("0.10") == D("0.275")
     assert (D("1.25") + D("1")) * D("0.01") == D("0.0225")
     assert D("0.275") - D("0.0225") == D("0.2525")
+    assert result["planning_economics"]["net_model_advantage_eur"] == pytest.approx(D(net) * days, abs=EUR_AUDIT)
 
 
 @pytest.mark.parametrize("quarters", [96, 192])
@@ -246,6 +259,66 @@ def test_small_spread_or_high_wear_does_not_force_cycles(capture, snapshot, bonu
     assert result["winter_evidence"]["discharge_bus_kwh"] == 0
     assert result["financial_audit"].savings_energy_eur == 0
     assert result["battery_wear_eur"] == 0
+
+
+@pytest.mark.parametrize("restriction", ["grid_charge", "reserve", "consumption_strategy"])
+def test_reserve_or_grid_charge_prohibition_blocks_opportunity(capture, snapshot, bonus_rules, monkeypatch, restriction):
+    """Explicit user restrictions are reported, not silently replaced to manufacture a cycle."""
+    kwargs = {"grid_charge": False} if restriction == "grid_charge" else (
+        {"reserve": 100, "start_soc": 100} if restriction == "reserve" else {"strategy": "minimize consumption"})
+    result = winter_plan(capture, monkeypatch, snapshot, bonus_rules, **kwargs)
+    assert result["winter_evidence"]["charge_bus_kwh"] == 0
+    assert result["winter_evidence"]["discharge_bus_kwh"] == 0
+    constraints = result["planning_economics"]["constraints"]
+    if restriction == "grid_charge":
+        assert constraints["grid_charge_possible_by_battery"] == (False,)
+    elif restriction == "reserve":
+        assert constraints["reserve_soc_percent"] == (100,)
+    else:
+        assert constraints["strategy"] == "minimize consumption"
+        assert capture["instance"].strategy == "minimize consumption"
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_winter_floor_and_terminal_are_not_double_counted(capture, snapshot, bonus_rules, monkeypatch, closed):
+    """Each trajectory gets its own credit; unchanged physical end energy gets no terminal gain."""
+    result = winter_plan(capture, monkeypatch, snapshot, bonus_rules,
+        start_day="2027-01-31" if closed else "2027-01-16", closed_month=closed)
+    audit, economics = result["financial_audit"], result["planning_economics"]
+    assert audit.forecast_result.adjustments == audit.baseline_result.adjustments
+    assert sum((a.credit_total for a in audit.forecast_result.adjustments), D("0")) == (D("0.121") if closed else 0)
+    assert economics["battery_terminal_cost_eur"] == pytest.approx(D("0"), abs=EUR_AUDIT)
+    assert economics["net_model_advantage_eur"] == pytest.approx(D("0.2525"), abs=EUR_AUDIT)
+    assert economics["economics_supported"] is False
+    assert economics["estimated"] is True
+
+
+def test_winter_planning_survives_mixed_vat_month(capture, snapshot, bonus_rules, monkeypatch):
+    """Mixed VAT is conservatively planned, then independently replayed for both trajectories."""
+    result = winter_plan(capture, monkeypatch, snapshot, bonus_rules,
+        start_day="2027-01-31", closed_month=True, mixed_vat=True)
+    assert result["period_audit"].exact is False
+    assert result["period_audit"].model_credit_eur == pytest.approx(D("0.109"), abs=EUR_AUDIT)
+    assert result["period_audit"].engine_closed_credit_eur == D("0.115")
+    assert result["financial_audit"].baseline_result.adjustments[0].credit_total == D("0.115")
+    assert "monthly_credit_conservative_mixed_vat" in result["planning_economics"]["issues"]
+    assert result["planning_economics"]["net_model_advantage_eur"] == pytest.approx(D("0.2525"), abs=EUR_AUDIT)
+
+
+def test_unknown_month_does_not_become_full_net_savings(capture, snapshot, bonus_rules, monkeypatch):
+    """Known A8 components can show a saving without certifying an incomplete invoice ledger."""
+    result = winter_plan(capture, monkeypatch, snapshot, bonus_rules, known_month=False)
+    assert result["financial_audit"].savings_energy_eur == pytest.approx(D("0.275"), abs=EUR_AUDIT)
+    assert result["planning_economics"]["net_model_advantage_eur"] is None
+    assert "planning_economics_incomplete" in result["planning_economics"]["issues"]
+
+
+@pytest.mark.parametrize("quarters", [96, 192])
+def test_winter_gain_not_from_terminal_depletion(capture, snapshot, bonus_rules, monkeypatch, quarters):
+    result = winter_plan(capture, monkeypatch, snapshot, bonus_rules, quarters=quarters)
+    assert result["winter_evidence"]["start_cell_kwh"] == result["winter_evidence"]["end_cell_kwh"] == 50
+    assert result["planning_economics"]["battery_terminal_cost_eur"] == pytest.approx(D("0"), abs=EUR_AUDIT)
+    assert result["planning_economics"]["net_model_advantage_eur"] == pytest.approx(D("0.2525") * (quarters // 96), abs=EUR_AUDIT)
 
 
 def test_negative_prices_do_not_create_artificial_energy_loops(capture, snapshot, bonus_rules, monkeypatch):

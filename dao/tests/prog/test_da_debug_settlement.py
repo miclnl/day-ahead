@@ -64,6 +64,24 @@ def test_debug_registers_physical_cell_direction_separately():
     assert da_debug.SHAPES["cell_charge_on"][:2] == (("b", "u"), "bool")
 
 
+def test_debug_keeps_net_economics_separate_and_unknown_amounts_null():
+    snapshot = settlement_fixtures.snapshot.__wrapped__()
+    bonus_rules = settlement_fixtures.bonus_rules.__wrapped__()
+    model, terms = financial_case(snapshot, bonus_rules)
+    audit = run_audit(model, terms)
+    economics = {"net_model_advantage_eur": None, "battery_wear_eur": Decimal("0.0225"),
+                 "estimated": True, "economics_supported": False,
+                 "issues": ("planning_economics_incomplete",), "constraints": None}
+    payload = da_debug._build_result_dict(model, [], {}, financial_terms=terms, planning_audit=audit,
+                                         planning_economics=economics)
+    assert payload["settlement"]["savings_energy_eur"] == str(audit.savings_energy_eur)
+    shown = payload["settlement"]["economics"]
+    assert shown["net_model_advantage_eur"] is None
+    assert shown["battery_wear_eur"] == "0.0225"
+    assert shown["estimated"] is True and shown["economics_supported"] is False
+    assert "NaN" not in json.dumps(payload)
+
+
 def test_debug_presents_finalization_and_only_canonical_money(monkeypatch):
     """The initial evidence and raw eligible residue cannot masquerade as final earnings."""
     snapshot = settlement_fixtures.snapshot.__wrapped__()

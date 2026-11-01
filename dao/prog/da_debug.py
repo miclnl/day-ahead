@@ -482,7 +482,7 @@ def _finalization_dict(selected):
 
 def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict, *,
                        financial_terms=None, planning_audit=None, finalized_solution=None,
-                       period_terms=None, period_audit=None) -> Optional[dict]:
+                       period_terms=None, period_audit=None, planning_economics=None) -> Optional[dict]:
     if model is None:
         return None
     try:
@@ -541,6 +541,11 @@ def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict, *,
             }
             if period_terms is not None:
                 result["settlement"]["periods"] = _period_result_dict(period_terms, period_audit, planning_audit)
+            if planning_economics is not None:
+                result["settlement"]["economics"] = {
+                    key: str(value) if isinstance(value, Decimal) else list(value) if isinstance(value, tuple) else value
+                    for key, value in planning_economics.items()
+                }
         return result
     except Exception:
         logger.exception("Kon solve-resultaat niet opbouwen")
@@ -923,6 +928,7 @@ class RecordingIO:
             finalized_solution=getattr(self._primary, "_debug_finalized_solution", None),
             period_terms=getattr(self._primary, "_debug_period_terms", None),
             period_audit=getattr(self._primary, "_debug_period_audit", None),
+            planning_economics=getattr(self._primary, "_debug_planning_economics", None),
         )
         if result is None:
             return
@@ -1101,6 +1107,7 @@ class ReplayIO:
             finalized_solution=getattr(self._primary, "_debug_finalized_solution", None),
             period_terms=getattr(self._primary, "_debug_period_terms", None),
             period_audit=getattr(self._primary, "_debug_period_audit", None),
+            planning_economics=getattr(self._primary, "_debug_planning_economics", None),
         )
 
     # -- context manager -----------------------------------------------

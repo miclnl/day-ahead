@@ -71,7 +71,7 @@ from dao.prog.settlement.optimization_audit import (
     read_solver_evidence,
     validate_source_solution,
 )
-from dao.prog.settlement.optimization_economics import battery_wear_cost
+from dao.prog.settlement.optimization_economics import battery_wear_cost, planning_cost_breakdown
 from dao.prog.settlement.optimization_refinement import (
     FinalizedPlanningSolution,
     SourceRefinementReport,
@@ -533,6 +533,7 @@ class DaCalc(DaBase):
             self._debug_finalized_solution = None
             self._debug_period_terms = None
             self._debug_period_audit = None
+            self._debug_planning_economics = None
         # _start_dt = datetime.datetime(year=2026, month=5, day=24, hour=11, minute=0)
         # _start_soc = 78.0
         # _start_ev_soc = 67.0
@@ -3800,18 +3801,27 @@ class DaCalc(DaBase):
                     for b, (_, efficiency) in enumerate(terminal_terms.reference_efficiency_by_battery)
                 )
 
-        # alles in kWh * prijs = kosten in euro
+        preference_cost = xsum(penalty_cost[b] for b in range(B)) + xsum(
+            switch_cost[e] + low_soc_penalty[e] for e in range(EV)
+        )
+        other_terminal_cost = -(boiler_temp[U] - boiler_temp[0]) * (spec_heat_boiler / (3600 * cop_boiler)) * p_avg
+        planning_constraints = {
+            "strategy": self.strategy,
+            "reserve_soc_percent": tuple(lower_limit),
+            "optimal_lower_soc_percent": tuple(opt_low_level),
+            "grid_charge_possible_by_battery": tuple(any(var.ub > 0 for var in row) for row in ac_to_dc),
+            "cell_charge_bounds_kw": tuple(tuple((var.lb, var.ub) for var in row) for row in dc_to_bat),
+            "cell_discharge_bounds_kw": tuple(tuple((var.lb, var.ub) for var in row) for row in dc_from_bat),
+            "start_soc_percent": tuple(start_soc),
+            "discharge_efficiency": tuple(eff_bat_to_dc),
+        }
+        # alles in kWh * prijs = kosten in euro; componenten afzonderlijk voor diagnose
         bind_day_ahead_cost(model, cost=cost,
             legacy_energy_cost=xsum(c_l[u] * pl[u] - c_t[u] * pt[u] for u in range(U)) - bonus_revenue,
             financial_terms=financial_terms,
             period_terms=period_terms,
-            other_cost=xsum(cycle_cost[b] + penalty_cost[b] for b in range(B))
-            + xsum(switch_cost[e] + low_soc_penalty[e] for e in range(EV))
-            + battery_terminal_cost
-            # waarde energie boiler
-            - (boiler_temp[U] - boiler_temp[0])
-            * (spec_heat_boiler / (3600 * cop_boiler))
-            * p_avg
+            other_cost=xsum(cycle_cost[b] for b in range(B)) + preference_cost
+            + battery_terminal_cost + other_terminal_cost
         )
 
         #####################################################
@@ -3989,6 +3999,7 @@ class DaCalc(DaBase):
         period_audit = None
         battery_wear_eur = None
         battery_wear_issues = ()
+        planning_economics = None
         if financial_terms is not None:
             financial_audit = finish_day_ahead_finance(
                 finalized_solution, org_l=org_l, org_t=org_t,
@@ -4005,10 +4016,25 @@ class DaCalc(DaBase):
             )
             _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
             _check_evidence(model, finalized_solution.evidence)
+            planning_economics = planning_cost_breakdown(
+                forecast=financial_audit.forecast_result, baseline=financial_audit.baseline_result,
+                battery_wear_eur=battery_wear_eur,
+                battery_terminal_cost_eur=Decimal(str(battery_terminal_cost.x)),
+                preference_cost_eur=Decimal(str(preference_cost.x)),
+                other_terminal_cost_eur=Decimal(str(other_terminal_cost.x)),
+            )
+            economics_issues = (*financial_audit.issues, *battery_wear_issues,
+                *(() if period_audit is None else period_audit.issues), "terminal_export_mean_v1_heuristic")
+            if planning_economics["net_model_advantage_eur"] is None:
+                economics_issues += ("planning_economics_incomplete",)
+            planning_economics.update(estimated=True, economics_supported=False,
+                constraints=planning_constraints, issues=tuple(dict.fromkeys(economics_issues)))
+            _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
             if getattr(self, "_debug_capture_vars", False):
                 self._debug_planning_audit = financial_audit
                 self._debug_period_terms = period_terms
                 self._debug_period_audit = period_audit
+                self._debug_planning_economics = planning_economics
             logging.info(f"A8 energiecomponent: {financial_audit.engine_energy_cost_eur}")
             logging.info(f"A8 referentie-energiecomponent: {financial_audit.baseline_energy_cost_eur}")
             logging.info(f"A8 besparing energiecomponent: {financial_audit.savings_energy_eur}")
@@ -4025,6 +4051,7 @@ class DaCalc(DaBase):
                     "export_mean_v1 is een eindwaardeheuristiek; enginebedragen zijn estimated, "
                     "geen leveranciersgarantie; economics_supported=false.")
             logging.info("Totale modelobjective (inclusief niet-A8-termen): %s", cost.x)
+            logging.info("W2 nettomodelvergelijking (estimated, geen gerealiseerde kaswinst): %s", planning_economics)
         else:
             logging.info("Het programma heeft een optimale oplossing gevonden.")
         if self.boiler_present:
