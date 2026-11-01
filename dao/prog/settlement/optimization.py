@@ -4,15 +4,24 @@ import math
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, localcontext
 from fractions import Fraction
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import mip
 
-from dao.prog.settlement.engine import _bonus_period
-from dao.prog.settlement.tariffs import quote
-from dao.prog.settlement.types import Origin, PriceQuote, SettlementState
+from dao.prog.settlement.engine import _bonus_period, _contract_periods, _month_period
+from dao.prog.settlement.tariffs import _effective_value, quote, resolve_snapshot
+from dao.prog.settlement.types import (
+    MonthState,
+    Origin,
+    PriceQuote,
+    SettlementState,
+    TariffSnapshot,
+    TerminalValue,
+)
 
 SourcePolicy = Literal["aggregate_cell_min_1wh_v1"]
 
@@ -354,3 +363,220 @@ def _build_bonus_terms(model, quotes, exports, cell, bounds, opening, origins, p
         tuple(opening_saturated), tuple(first_vars), tuple(first_bounds), tuple(eligible_vars),
         revenue, SourceDomainTerms(policy, tuple(required_flags), tuple(source_vars), cell),
         tuple(dict.fromkeys(issues)))
+
+
+@dataclass(frozen=True, slots=True)
+class MonthFloorTerms:
+    """Contractmaand met ex-btw C en bruto EUR-creditondergrens/bovengrens."""
+
+    period_start_ts: int
+    period_end_ts: int
+    contract_id: str
+    interval_indices: tuple[int, ...]
+    credit_ex_vat: mip.LinExpr
+    credit: mip.LinExpr
+    credit_upper: mip.LinExpr
+    vat_bounds_percent: tuple[Decimal, Decimal] | None
+    exact: bool
+    issues: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodModelTerms:
+    """Bruto EUR-horizonsommen; de bovengrens is diagnostiek, geen extra opbrengst."""
+
+    credit: mip.LinExpr
+    credit_upper: mip.LinExpr
+    exact: bool
+    policy_version: Literal["vat_lower_bound_v1"]
+    periods: tuple[MonthFloorTerms, ...]
+    issues: tuple[str, ...]
+
+
+def _validate_period_binding(model, prices, exports, bounds, opening, snapshots):
+    if (not prices or len(exports) != len(prices) or len(bounds) != len(prices)
+        or not isinstance(opening, SettlementState)):
+        raise OptimizationInputError("planning_grid_invalid")
+    if (any(not isinstance(price, PriceQuote) for price in prices)
+        or any(not isinstance(snapshot, TariffSnapshot) for snapshot in snapshots)):
+        raise OptimizationInputError("planning_quote_invalid")
+    if opening.asof_ts != prices[0].start_ts:
+        raise OptimizationInputError("planning_grid_invalid")
+    seen = set()
+    for i, (price, var, bound) in enumerate(zip(prices, exports, bounds, strict=True)):
+        try:
+            snapshot = resolve_snapshot(snapshots, price.start_ts, price.end_ts)
+            checked = quote(snapshot, price.start_ts, price.end_ts, price.spot_ex_vat)
+        except (TypeError, ValueError) as exc:
+            raise OptimizationInputError("planning_quote_invalid", interval_index=i) from exc
+        if checked != price:
+            raise OptimizationInputError("planning_quote_invalid", interval_index=i)
+        if (i and prices[i - 1].end_ts != price.start_ts):
+            raise OptimizationInputError("planning_grid_invalid", interval_index=i)
+        if (not isinstance(var, mip.Var) or var.model is not model or var.idx in seen
+            or var.idx < 0 or var.idx >= len(model.vars) or model.vars[var.idx] is not var
+            or not math.isfinite(var.lb) or var.lb < 0 or not math.isfinite(var.ub)
+            or var.ub >= sys.float_info.max or var.ub < var.lb
+            or not isinstance(bound, Decimal) or not bound.is_finite()
+            or bound < Decimal(str(var.ub))):
+            raise OptimizationInputError("planning_grid_invalid", interval_index=i)
+        _outward_float(Fraction(bound), code="planning_grid_invalid", interval_index=i)
+        seen.add(var.idx)
+
+
+def _validate_month_prefix(opening, price, period):
+    month = opening.month
+    if month is None:
+        return
+    rates = set()
+    negative = Fraction(0)
+    for rate, basis in month.negative_basis_by_vat:
+        if (not rate.is_finite() or rate < 0 or not basis.is_finite() or basis < 0
+            or rate in rates):
+            raise OptimizationInputError("planning_month_state_invalid")
+        rates.add(rate)
+        negative += Fraction(basis)
+    if (month.complete and month.spot_export_eur is not None
+        and negative < max(Fraction(0), -Fraction(month.spot_export_eur))):
+        raise OptimizationInputError("planning_month_state_invalid")
+    natural_end = _month_period(price.snapshot, price.start_ts, None, (None, None))[1]
+    if (price.snapshot.monthly_export_floor != "none" and price.start_ts != period[0]
+        and (month.contract_id != price.snapshot.contract_id or month.period_start_ts != period[0]
+             or not month.period_start_ts <= opening.asof_ts < month.period_end_ts
+             or month.period_end_ts > natural_end)):
+        raise OptimizationInputError("planning_month_state_invalid")
+
+
+def _month_floor_period(model, prices, exports, bounds, opening, key, indices):
+    start, end, contract, floor = key
+    indices = tuple(indices)
+    zero = mip.xsum([])
+
+    def result(ex_vat=zero, credit=zero, upper=zero, vat=None, exact=True, issues=()):
+        return MonthFloorTerms(start, end, contract, indices, ex_vat, credit, upper, vat, exact, issues)
+
+    if floor == "none":
+        return result()
+    initial = None
+    rates = set()
+    if prices[indices[0]].start_ts == start:
+        initial = Decimal(0)
+    elif indices[0] == 0 and opening.month is not None and opening.month.complete:
+        initial = opening.month.spot_export_eur
+        rates.update(rate for rate, basis in opening.month.negative_basis_by_vat if basis > 0)
+    for i in indices:
+        price = prices[i]
+        if price.spot_ex_vat < 0 and bounds[i] > 0:
+            day = datetime.fromtimestamp(price.start_ts, ZoneInfo(price.snapshot.timezone)).date()
+            rate = _effective_value(price.snapshot.vat_production, day)
+            if not rate.is_finite() or rate < 0:
+                raise OptimizationInputError("planning_month_state_invalid", interval_index=i)
+            rates.add(rate)
+    if initial is None or prices[indices[-1]].end_ts != end:
+        # Nul is hier alleen een weggelaten prikkel, geen bovengrens op de maandnota.
+        return result(exact=False, issues=("monthly_credit_omitted_open_or_unknown",))
+
+    initial_float = float(initial)
+    if not math.isfinite(initial_float) or (initial != 0 and initial_float == 0):
+        raise OptimizationInputError("planning_month_state_invalid")
+    lower = upper = Fraction(initial)
+    model_lower = model_upper = Fraction.from_float(initial_float)
+    components = []
+    for i in indices:
+        spot, var = prices[i].spot_ex_vat, exports[i]
+        coefficient = float(spot)
+        if not math.isfinite(coefficient):
+            raise OptimizationInputError("planning_quote_invalid", interval_index=i)
+        lo = min(Fraction(Decimal(str(var.lb))), Fraction.from_float(var.lb))
+        hi = max(Fraction(bounds[i]), Fraction.from_float(var.ub))
+        a, b = Fraction(spot) * lo, Fraction(spot) * hi
+        lower += min(a, b)
+        upper += max(a, b)
+        a = Fraction.from_float(coefficient) * Fraction.from_float(var.lb)
+        b = Fraction.from_float(coefficient) * Fraction.from_float(var.ub)
+        model_lower += min(a, b)
+        model_upper += max(a, b)
+        components.append(var * coefficient)
+    lower, upper = min(lower, model_lower), max(upper, model_upper)
+    if lower >= 0:
+        return result()  # Structureel bewezen C=0; btwweging is dan niet nodig.
+    if not rates:
+        raise OptimizationInputError("planning_month_state_invalid")
+
+    # C=max(0,-R), in beide richtingen begrensd zonder hulp van de objective.
+    negative_bound = _outward_float(-lower, code="planning_grid_invalid")
+    positive_bound = _outward_float(max(Fraction(0), upper), code="planning_grid_invalid")
+    revenue = mip.xsum(components) + initial_float
+    credit = model.add_var(ub=negative_bound, name=f"settlement_month_credit_{indices[0]}")
+    active = model.add_var(var_type=mip.BINARY, name=f"settlement_month_negative_{indices[0]}")
+    model += credit >= -revenue
+    model += credit <= negative_bound * active
+    model += credit <= -revenue + positive_bound * (1 - active)
+    vat_bounds = min(rates), max(rates)
+    factors = tuple(float(1 + rate / 100) for rate in vat_bounds)
+    if any(not math.isfinite(factor) for factor in factors):
+        raise OptimizationInputError("planning_month_state_invalid")
+    exact = vat_bounds[0] == vat_bounds[1]
+    return result(credit * 1, credit * factors[0], credit * factors[1], vat_bounds, exact,
+                  () if exact else ("monthly_credit_conservative_mixed_vat",))
+
+
+def build_month_floor_terms(
+    model: mip.Model, quotes: Sequence[PriceQuote], grid_export: Sequence[mip.Var],
+    export_bounds_kwh: Sequence[Decimal], opening: SettlementState, *,
+    snapshots: Sequence[TariffSnapshot],
+) -> PeriodModelTerms:
+    """Bouw bruto creditgrenzen met dezelfde gepinde contractkalender als de engine."""
+    prices, exports, bounds, snapshots = tuple(quotes), tuple(grid_export), tuple(export_bounds_kwh), tuple(snapshots)
+    with localcontext() as context:
+        context.prec = 36
+        _validate_period_binding(model, prices, exports, bounds, opening, snapshots)
+        contract_bounds = _contract_periods(sorted(snapshots, key=lambda snapshot: snapshot.valid_from_ts))
+        previous = opening.month
+        segments = []
+        for i, price in enumerate(prices):
+            start, end = _month_period(price.snapshot, price.start_ts, previous,
+                                       contract_bounds[price.snapshot.valid_from_ts])
+            if i == 0:
+                _validate_month_prefix(opening, price, (start, end))
+            if price.start_ts < start or price.end_ts > end:
+                raise OptimizationInputError("planning_grid_invalid", interval_index=i)
+            floor = price.snapshot.monthly_export_floor
+            key = start, end, price.snapshot.contract_id, floor
+            if not segments or segments[-1][0] != key:
+                segments.append((key, []))
+            segments[-1][1].append(i)
+            # Alleen de kalender doorgeven; financiële afrekening blijft in de engine.
+            previous = None if floor == "none" else MonthState(key[2], start, end, None, (), False)
+        periods = tuple(_month_floor_period(model, prices, exports, bounds, opening, key, indices)
+                        for key, indices in segments)
+        return PeriodModelTerms(
+            mip.xsum(period.credit for period in periods), mip.xsum(period.credit_upper for period in periods),
+            all(period.exact for period in periods), "vat_lower_bound_v1", periods,
+            tuple(dict.fromkeys(issue for period in periods for issue in period.issues)),
+        )
+
+
+def terminal_value(quotes: Sequence[PriceQuote], discharge_efficiencies: Sequence[float]) -> TerminalValue:
+    """Exportgemiddelde als heuristiek; de cel/DC→AC-conversie blijft expliciet apart."""
+    prices = tuple(quotes)
+    if not prices:
+        raise OptimizationInputError("planning_quote_invalid")
+    with localcontext() as context:
+        context.prec = 36
+        weighted, duration = Decimal(0), 0
+        for i, price in enumerate(prices):
+            if not isinstance(price, PriceQuote):
+                raise OptimizationInputError("planning_quote_invalid", interval_index=i)
+            try:
+                checked = quote(price.snapshot, price.start_ts, price.end_ts, price.spot_ex_vat)
+            except (TypeError, ValueError) as exc:
+                raise OptimizationInputError("planning_quote_invalid", interval_index=i) from exc
+            if price != checked:
+                raise OptimizationInputError("planning_quote_invalid", interval_index=i)
+            seconds = price.end_ts - price.start_ts
+            weighted += price.export_rate * seconds
+            duration += seconds
+        return TerminalValue("export_mean_v1", max(Decimal(0), weighted / duration),
+                             tuple((str(i), Decimal(str(efficiency)))
+                                   for i, efficiency in enumerate(discharge_efficiencies)))
