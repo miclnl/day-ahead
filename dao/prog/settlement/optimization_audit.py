@@ -3,14 +3,16 @@
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import mip
 import mip.cbc as cbc
 
-from dao.prog.settlement.engine import settle_series
+from dao.prog.settlement.engine import _bonus_period, settle_series
 from dao.prog.settlement.metering import resolve_spot
 from dao.prog.settlement.optimization import (
     BonusModelTerms,
@@ -18,8 +20,11 @@ from dao.prog.settlement.optimization import (
     _validate_cell_binding,
 )
 from dao.prog.settlement.service import PlanningContext
-from dao.prog.settlement.tariffs import quote, resolve_snapshot
+from dao.prog.settlement.tariffs import bonus_in_window, quote, resolve_snapshot
 from dao.prog.settlement.types import InputInterval, PriceQuote, SettlementResult
+
+_AUXILIARY_CODE = "planning_auxiliary_mismatch"
+_AUXILIARY_BUDGET = Fraction(Decimal("0.000000001"))
 
 
 class PlanningSolutionRejected(RuntimeError):
@@ -157,7 +162,28 @@ def _normalize_energy(value: Fraction) -> Decimal:
     return Decimal(f"{units}e-9")
 
 
-def validate_source_solution(terms: BonusModelTerms, *, evidence: SolverEvidence) -> SourceAudit:
+def _handle(var, model, code, index=None):
+    if (not isinstance(var, mip.Var) or var.model is not model or var.idx < 0
+        or var.idx >= len(model.vars) or model.vars[var.idx] is not var):
+        raise PlanningSolutionRejected(code, interval_index=index)
+    return var.idx
+
+
+def _binary_choice(var, model, evidence, code, index):
+    _handle(var, model, code, index)
+    lower, upper = _number(var.lb, code, index), _number(var.ub, code, index)
+    if not ((var.var_type == mip.BINARY and lower == 0 and upper == 1)
+            or (var.var_type == mip.INTEGER and lower == upper and lower in (0, 1))):
+        raise PlanningSolutionRejected(code, interval_index=index)
+    value = Fraction(_number(var.x, code, index))
+    choices = [candidate for candidate in (0, 1) if lower <= candidate <= upper
+               and abs(value - candidate) <= Fraction(evidence.integer_tol)]
+    if len(choices) != 1:
+        raise PlanningSolutionRejected(code, interval_index=index)
+    return choices[0]
+
+
+def _validate_physical_source(terms, evidence):
     model = terms.source.cell_discharge.model
     _check_evidence(model, evidence)
     code = "source_domain_solution_invalid"
@@ -168,20 +194,25 @@ def validate_source_solution(terms: BonusModelTerms, *, evidence: SolverEvidence
         raise PlanningSolutionRejected(code) from exc
     n = len(terms.quotes)
     if any(len(values) != n for values in (terms.source.required, terms.source.discharge_on,
-                                           terms.eligible_kwh, terms.first_kwh)):
+                                          cell.hour_fractions)):
         raise PlanningSolutionRejected(code)
     values = tuple(tuple(_number(var.x, code, i) for i, var in enumerate(row))
                    for row in cell.bus_power_vars)
     totals, normalized, statuses, issues = [], [], [], []
+    used = {var.idx for row in cell.bus_power_vars for var in row}
     for i in range(n):
         for b, row in enumerate(values):
-            if row[i] < 0 or row[i] > cell.bus_upper_bounds_kw[b][i]:
+            if not cell.bus_lower_bounds_kw[b][i] <= row[i] <= cell.bus_upper_bounds_kw[b][i]:
                 raise PlanningSolutionRejected(code, interval_index=i)
         total = sum((Fraction(row[i]) * cell.cell_coefficients[b][i]
                      for b, row in enumerate(values)), Fraction(0))
         if total > cell.upper_bounds_kwh[i]:
             raise PlanningSolutionRejected(code, interval_index=i)
         on = None
+        if (type(terms.source.required[i]) is not bool
+            or (terms.source.required[i] and terms.source.policy_version != "aggregate_cell_min_1wh_v1")
+            or (not terms.source.required[i] and terms.source.discharge_on[i] is not None)):
+            raise PlanningSolutionRejected(code, interval_index=i)
         if terms.source.required[i]:
             var = terms.source.discharge_on[i]
             if var is None:
@@ -189,13 +220,11 @@ def validate_source_solution(terms: BonusModelTerms, *, evidence: SolverEvidence
                     raise PlanningSolutionRejected(code, interval_index=i)
                 on = 0
             else:
-                if var.model is not model or var.var_type != mip.BINARY:
+                index = _handle(var, model, code, i)
+                if index in used:
                     raise PlanningSolutionRejected(code, interval_index=i)
-                binary = _number(var.x, code, i)
-                choices = [candidate for candidate in (0, 1) if abs(binary - candidate) <= evidence.integer_tol]
-                if len(choices) != 1:
-                    raise PlanningSolutionRejected(code, interval_index=i)
-                on = choices[0]
+                used.add(index)
+                on = _binary_choice(var, model, evidence, code, i)
             if ((on == 0 and any(row[i] != 0 for row in values))
                 or (on == 1 and total < Fraction(1, 1000))):
                 raise PlanningSolutionRejected(code, interval_index=i)
@@ -205,23 +234,23 @@ def validate_source_solution(terms: BonusModelTerms, *, evidence: SolverEvidence
             raise PlanningSolutionRejected("source_domain_normalization_invalid", interval_index=i)
         if Fraction(engine) != total:
             issues.append("forecast_energy_normalized")
-        eligible = _number(terms.eligible_kwh[i].x, code, i)
-        if eligible < 0:
-            raise PlanningSolutionRejected(code, interval_index=i)
-        if terms.source.required[i] and on == 0:
-            first = _number(terms.first_kwh[i].x, code, i)
-            if first != eligible:
-                raise PlanningSolutionRejected(code, interval_index=i)
-        elif eligible != 0:
-            raise PlanningSolutionRejected(code, interval_index=i)
         totals.append(total)
         normalized.append(engine)
         statuses.append(on)
+    return SourceAudit(values, tuple(totals), tuple(normalized), tuple(statuses), tuple(dict.fromkeys(issues)))
+
+
+def _check_model_solution(model):
     try:
         model.check_optimization_results()
     except (AssertionError, mip.InfeasibleSolution) as exc:
-        raise PlanningSolutionRejected(code) from exc
-    return SourceAudit(values, tuple(totals), tuple(normalized), tuple(statuses), tuple(dict.fromkeys(issues)))
+        raise PlanningSolutionRejected("source_domain_solution_invalid") from exc
+
+
+def validate_source_solution(terms: BonusModelTerms, *, evidence: SolverEvidence) -> SourceAudit:
+    source = _validate_physical_source(terms, evidence)
+    _check_model_solution(terms.source.cell_discharge.model)
+    return source
 
 
 def _check_context(context, prices, opening, meter_id):
@@ -280,6 +309,155 @@ def _energy_total(result):
     return sum((imp - base - bonus for imp, base, bonus in components), Decimal(0))
 
 
+def _opening_total(period, start, state):
+    if period is None:
+        return None
+    if start == period[0]:
+        return Fraction(0)
+    previous = state.bonus
+    if (state.asof_ts == start and previous is not None and previous.asof_ts == start
+        and (previous.period_start_ts, previous.period_end_ts) == period):
+        return None if previous.total_export_kwh is None else Fraction(previous.total_export_kwh)
+    return None
+
+
+def _check_quantity(actual, reference, budget, index):
+    """Onbekend blijft onbekend; geen generieke marge naast het benoemde budget."""
+    if actual is None or reference is None:
+        if actual is not None or reference is not None:
+            raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=index)
+        return
+    value = actual if isinstance(actual, Fraction) else Fraction(_number(actual, _AUXILIARY_CODE, index))
+    if abs(value - reference) > budget:
+        raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=index)
+
+
+def _auxiliary_handle(var, present, model, used, index):
+    if not present:
+        if var is not None:
+            raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=index)
+        return
+    identity = _handle(var, model, _AUXILIARY_CODE, index)
+    if identity in used:
+        raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=index)
+    used.add(identity)
+
+
+def _auxiliary_quantity(var, reference, model, used, index, field, issues):
+    _auxiliary_handle(var, reference is not None, model, used, index)
+    if reference is None:
+        return
+    raw = Fraction(_number(var.x, _AUXILIARY_CODE, index))
+    _check_quantity(raw, reference, _AUXILIARY_BUDGET, index)
+    residual = raw - reference
+    if residual:
+        issues.append(f"planning_auxiliary_residual:interval={index}:field={field}:"
+                      f"raw_kwh={raw}:reference_kwh={reference}:residual_kwh={residual}")
+
+
+def _bonus_quantity(price, origin, cell, export, cumulative, first):
+    """Onafhankelijke hoeveelheid; een nultarief bewijst geen nulhoeveelheid."""
+    rules = price.snapshot.bonus
+    if rules is None or not rules.enabled or price.spot_ex_vat <= 0 or export == 0 or cell > 0:
+        return Fraction(0)
+    if (cumulative is not None and rules.yearly_cap_kwh is not None
+        and cumulative >= Fraction(rules.yearly_cap_kwh)):
+        return Fraction(0)
+    moment = datetime.fromtimestamp(price.start_ts, ZoneInfo(price.snapshot.timezone))
+    supply = price.snapshot.supply_start
+    if (moment.date() < rules.start_date or (supply is not None and moment.date() < supply)
+        or not bonus_in_window(rules.windows, moment)):
+        return Fraction(0)
+    if (supply is None or cumulative is None or rules.cap_basis == "unconfirmed"
+        or rules.vat_percent is None or origin != "verified_pv"
+        or price.end_ts - price.start_ts != 900 or price.start_ts % 900):
+        return None
+    return first
+
+
+def _check_engine_cap(line, price, period, begin, end, budget_before, budget_after, index):
+    if line.before_state.asof_ts != price.start_ts or line.after_state.asof_ts != price.end_ts:
+        raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=index)
+    _check_quantity(_opening_total(period, price.start_ts, line.before_state), begin, budget_before, index)
+    after_period = _bonus_period(price.snapshot, price.end_ts)
+    after = line.after_state.bonus
+    if after_period is None:
+        if after is not None:
+            raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=index)
+        return
+    if (after is None or after.asof_ts != price.end_ts
+        or (after.period_start_ts, after.period_end_ts) != after_period):
+        raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=index)
+    reset = price.end_ts == after_period[0]
+    _check_quantity(after.total_export_kwh, Fraction(0) if reset else end,
+                    Fraction(0) if reset else budget_after, index)
+
+
+def _audit_auxiliary_quantities(bonus, source, raw_exports, forecast, result, evidence, used, issues):
+    """Reconstrueer C/Q/first/eligible exact uit raw export, niet uit solverhulpen."""
+    fields = ("cumulative_export_kwh", "capped_opening_kwh", "capped_export_kwh", "first_kwh",
+              "eligible_kwh", "opening_cap_saturated", "cap_saturated", "cap_known", "origins")
+    n = len(bonus.quotes)
+    if len(result.lines) != n or any(len(getattr(bonus, name)) != n for name in fields):
+        raise PlanningSolutionRejected(_AUXILIARY_CODE)
+    model = bonus.source.cell_discharge.model
+    previous_period = cumulative = normalized_cumulative = None
+    budget = Fraction(0)
+    for i, (price, raw_export, item, line) in enumerate(zip(bonus.quotes, raw_exports, forecast, result.lines, strict=True)):
+        period = _bonus_period(price.snapshot, price.start_ts)
+        if i == 0 or period != previous_period:
+            cumulative = _opening_total(period, price.start_ts, bonus.opening) if i == 0 else (
+                Fraction(0) if period is not None and price.start_ts == period[0] else None)
+            normalized_cumulative = cumulative
+            budget = Fraction(0)
+        known = period is not None and cumulative is not None
+        if bonus.cap_known[i] is not known:
+            raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=i)
+        begin, normalized_begin = cumulative, normalized_cumulative
+        export = Fraction(_number(raw_export, "planning_forecast_invalid", i))
+        normalized_export = Fraction(item.export_kwh)
+        delta = normalized_export - export
+        budget_before, budget = budget, budget + abs(delta)
+        first_budget = budget_before + budget
+        cumulative = None if begin is None else begin + export
+        normalized_cumulative = None if normalized_begin is None else normalized_begin + normalized_export
+        rules = price.snapshot.bonus
+        cap = None if rules is None or rules.yearly_cap_kwh is None else Fraction(rules.yearly_cap_kwh)
+        q_begin = None if not known or cap is None else min(cap, begin)
+        q_end = None if not known or cap is None else min(cap, cumulative)
+        normalized_q_begin = None if not known or cap is None else min(cap, normalized_begin)
+        normalized_q_end = None if not known or cap is None else min(cap, normalized_cumulative)
+        first = None if not known else export if cap is None else q_end - q_begin
+        normalized_first = None if not known else normalized_export if cap is None else normalized_q_end - normalized_q_begin
+        eligible = first if bonus.source.required[i] and source.discharge_on[i] == 0 else Fraction(0)
+        if eligible is None:
+            raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=i)
+        for field, reference in (("cumulative_export_kwh", cumulative), ("capped_opening_kwh", q_begin),
+                                 ("capped_export_kwh", q_end), ("first_kwh", first), ("eligible_kwh", eligible)):
+            _auxiliary_quantity(getattr(bonus, field)[i], reference, model, used, i, field, issues)
+        for field, present in (("opening_cap_saturated", q_begin is not None), ("cap_saturated", q_end is not None)):
+            var = getattr(bonus, field)[i]
+            _auxiliary_handle(var, present, model, used, i)
+            if present:
+                _binary_choice(var, model, evidence, _AUXILIARY_CODE, i)
+        if delta:
+            issues.append(f"planning_export_normalization:interval={i}:delta_kwh={delta}:"
+                          f"cumulative_budget_kwh={budget}:first_budget_kwh={first_budget}")
+        _check_engine_cap(line, price, period, begin, cumulative, budget_before, budget, i)
+        # Q is 1-Lipschitz; first heeft de som van het begin- en eindbudget.
+        _check_quantity(normalized_q_begin, q_begin, budget_before, i)
+        _check_quantity(normalized_q_end, q_end, budget, i)
+        _check_quantity(normalized_first, first, first_budget, i)
+        canonical = _bonus_quantity(price, bonus.origins[i], source.raw_cell_kwh[i], normalized_export,
+                                    normalized_begin, normalized_first)
+        _check_quantity(line.bonus_kwh, canonical, Fraction(0), i)
+        if bonus.source.required[i]:
+            _check_quantity(line.bonus_kwh, eligible, Fraction(0) if source.raw_cell_kwh[i] > 0 else first_budget, i)
+        if source.raw_cell_kwh[i] > 0 and line.bonus_revenue != 0:
+            raise PlanningSolutionRejected(_AUXILIARY_CODE, interval_index=i)
+        previous_period = period
+
+
 def audit_planning_solution(
     terms: FinancialModelTerms, *, baseline_import_kwh: Sequence[Decimal],
     baseline_export_kwh: Sequence[Decimal], evidence: SolverEvidence,
@@ -292,24 +470,31 @@ def audit_planning_solution(
 def _audit_planning_solution(terms, baseline_import, baseline_export, evidence):
     bonus = terms.bonus
     model = bonus.source.cell_discharge.model
-    source = validate_source_solution(bonus, evidence=evidence)
+    source = _validate_physical_source(bonus, evidence)
     if terms.quotes != bonus.quotes or len(terms.grid_import) != len(terms.quotes):
         raise PlanningSolutionRejected("planning_forecast_invalid")
     _check_context(terms.context, terms.quotes, bonus.opening, bonus.source.cell_discharge.meter_id)
     used = {v.idx for row in bonus.source.cell_discharge.bus_power_vars for v in row}
-    used.update(var.idx for var in bonus.grid_export)
-    for var in terms.grid_import:
-        if var.model is not model or var.idx in used or var.idx < 0 or model.vars[var.idx] is not var:
+    used.update(var.idx for var in bonus.source.discharge_on if var is not None)
+    if len(bonus.grid_export) != len(terms.quotes):
+        raise PlanningSolutionRejected("planning_forecast_invalid")
+    for var in (*terms.grid_import, *bonus.grid_export):
+        index = _handle(var, model, "planning_forecast_invalid")
+        if index in used:
             raise PlanningSolutionRejected("planning_forecast_invalid")
-        used.add(var.idx)
+        used.add(index)
     issues = [*bonus.issues, *source.issues, *evidence.limitations]
+    raw_exports = tuple(var.x for var in bonus.grid_export)
     forecast = _series(terms, tuple(var.x for var in terms.grid_import),
-                       tuple(var.x for var in bonus.grid_export), source.engine_cell_kwh,
+                       raw_exports, source.engine_cell_kwh,
                        "optimizer_forecast", issues)
     baseline = _series(terms, baseline_import, baseline_export, (Decimal(0),) * len(terms.quotes),
                        "fixed_no_battery_baseline", issues)
     forecast_result = settle_series(forecast, terms.context.price_batch.snapshots, bonus.opening)
     baseline_result = settle_series(baseline, terms.context.price_batch.snapshots, bonus.opening)
+    _audit_auxiliary_quantities(bonus, source, raw_exports, forecast, forecast_result, evidence, used, issues)
+    # De gewone modelcontrole blijft volledig, ná de eigen foutclassificatie van hulpvelden.
+    _check_model_solution(model)
     errors = []
     expected_model = Decimal(0)
     for i, (price, line) in enumerate(zip(terms.quotes, forecast_result.lines, strict=True)):
@@ -320,13 +505,6 @@ def _audit_planning_solution(terms, baseline_import, baseline_export, evidence):
         for actual, expected in zip(model_values, (line.import_cost, line.base_export_revenue, line.bonus_revenue), strict=True):
             if expected is not None:
                 errors.append(abs(actual - expected))
-        if line.bonus_kwh is not None:
-            if source.raw_cell_kwh[i] > 0 and line.bonus_kwh != 0:
-                raise PlanningSolutionRejected("planning_parity_failed", interval_index=i)
-            if bonus.source.required[i] and source.discharge_on[i] == 0:
-                first = _number(bonus.first_kwh[i].x, "planning_parity_failed", i)
-                if (first == 0) != (line.bonus_kwh == 0):
-                    raise PlanningSolutionRejected("planning_parity_failed", interval_index=i)
     model_cost = _number(terms.energy_cost.x, "planning_parity_failed")
     errors.append(abs(model_cost - expected_model))
     forecast_cost, baseline_cost = _energy_total(forecast_result), _energy_total(baseline_result)
