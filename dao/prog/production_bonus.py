@@ -3,6 +3,9 @@
 Pure functies: geen database, geen Home Assistant. Elke functie behalve
 add_to_model() accepteert cfg=None en antwoordt dan "geen bonus", zodat
 aanroepers geen eigen guard nodig hebben.
+
+add_to_model is uitsluitend legacy: geen fallback voor nieuwe settlement,
+geen bewijs van bruto-celuitsluiting of chronologische cap in het nieuwe regime.
 """
 
 import datetime

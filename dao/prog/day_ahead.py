@@ -13,12 +13,14 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from contextlib import contextmanager
+from decimal import Decimal
 from inspect import getattr_static
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from mip import BINARY, CONTINUOUS, INTEGER, Model, minimize, xsum
+from mip import BINARY, CONTINUOUS, INTEGER, LinExpr, Model, Var, minimize, xsum
 from pandas.core.dtypes.inference import is_number
 from utils import (
     calc_adjustment_heatcurve,
@@ -47,7 +49,24 @@ from dao.prog.fastctrl.publication import (
     publication_lock,
     read_publication,
 )
+from dao.prog.settlement.optimization import (
+    OptimizationInputError,
+    SourcePolicy,
+    build_bonus_terms,
+    make_cell_discharge_input,
+)
+from dao.prog.settlement.optimization_audit import (
+    FinancialModelTerms,
+    PlanningAuditResult,
+    PlanningSolutionRejected,
+    _check_context,
+    audit_planning_solution,
+    read_solver_evidence,
+)
 from dao.prog.settlement.publication import FinancialPlanBlocked
+from dao.prog.settlement.service import PlanningContext
+from dao.prog.settlement.tariffs import quote
+from dao.prog.settlement.types import Origin
 
 _libc = ctypes.CDLL(None)
 
@@ -89,6 +108,106 @@ def _log_native_output(text: str) -> None:
     for line in text.splitlines():
         if line.strip():
             logging.info(line)
+
+
+def bind_day_ahead_finance(
+    model: Model, *, context: PlanningContext | None,
+    intervals: Sequence[tuple[int, int]], meter_id: str,
+    dc_from_bat: Sequence[Sequence[Var]], installation_battery_count: int,
+    battery_indices: Sequence[int], no_battery_evidence: str | None,
+    hour_fractions: Sequence[Decimal], discharge_efficiencies: Sequence[Decimal],
+    grid_import: Sequence[Var], grid_export: Sequence[Var],
+    export_bounds_kwh: Sequence[Decimal], origins: Sequence[Origin],
+    source_policy: SourcePolicy | None,
+) -> FinancialModelTerms | None:
+    """Pure offline modelgrens; ontbrekende context behoudt de legacyroute."""
+    if context is None:
+        return None
+    intervals = tuple(intervals)
+    try:
+        prices = context.quotes
+        _check_context(context, prices, context.state, meter_id)
+        if (not intervals or intervals[0][0] != prices[0].start_ts
+            or intervals[-1][1] != prices[-1].end_ts
+            or any(a >= b or (i and intervals[i-1][1] != a)
+                   for i, (a, b) in enumerate(intervals))):
+            raise OptimizationInputError("planning_grid_invalid")
+        aligned, position = [], 0
+        for start, end in intervals:
+            group = []
+            at = start
+            while position < len(prices) and at < end:
+                price = prices[position]
+                if price.start_ts != at or price.end_ts > end:
+                    raise OptimizationInputError("planning_quote_invalid")
+                group.append(price)
+                at = price.end_ts
+                position += 1
+            if not group or at != end:
+                raise OptimizationInputError("planning_quote_invalid")
+            if len(group) == 1:
+                aligned.append(group[0])
+            else:
+                first = group[0]
+                if end - start != 3600 or any(
+                    (p.snapshot, p.spot_ex_vat, p.import_rate, p.export_rate)
+                    != (first.snapshot, first.spot_ex_vat, first.import_rate, first.export_rate)
+                    for p in group
+                ):
+                    raise OptimizationInputError("planning_quote_invalid")
+                aligned.append(quote(first.snapshot, start, end, first.spot_ex_vat))
+        if position != len(prices):
+            raise OptimizationInputError("planning_quote_invalid")
+    except (AttributeError, IndexError, TypeError, ValueError, PlanningSolutionRejected) as exc:
+        if isinstance(exc, OptimizationInputError):
+            raise
+        raise OptimizationInputError("planning_quote_invalid") from exc
+    cell = make_cell_discharge_input(model, dc_from_bat, meter_id=meter_id,
+        installation_battery_count=installation_battery_count, battery_indices=battery_indices,
+        no_battery_evidence=no_battery_evidence, hour_fractions=hour_fractions,
+        discharge_efficiencies=discharge_efficiencies)
+    imports, exports = tuple(grid_import), tuple(grid_export)
+    seen = {v.idx for row in cell.bus_power_vars for v in row}
+    seen.update(v.idx for v in exports)
+    if len(imports) != len(aligned):
+        raise OptimizationInputError("planning_grid_invalid")
+    for i, var in enumerate(imports):
+        if (not isinstance(var, Var) or var.model is not model or var.idx < 0
+            or model.vars[var.idx] is not var or var.idx in seen
+            or not math.isfinite(var.lb) or not math.isfinite(var.ub)
+            or var.lb < 0 or var.ub < var.lb or var.ub >= sys.float_info.max):
+            raise OptimizationInputError("planning_grid_invalid", interval_index=i)
+        seen.add(var.idx)
+    bonus = build_bonus_terms(model, aligned, exports, cell, export_bounds_kwh,
+                             context.state, origins=origins, source_policy=source_policy)
+    energy_cost = xsum(imp * float(price.import_rate) - exp * float(price.export_rate)
+                      for imp, exp, price in zip(imports, exports, aligned, strict=True)) - bonus.revenue
+    return FinancialModelTerms(context, tuple(aligned), imports, bonus, energy_cost)
+
+
+def bind_day_ahead_cost(
+    model: Model, *, cost: Var, legacy_energy_cost: LinExpr,
+    other_cost: LinExpr, financial_terms: FinancialModelTerms | None,
+) -> None:
+    energy = legacy_energy_cost if financial_terms is None else financial_terms.energy_cost
+    model += cost == energy + other_cost
+
+
+def finish_day_ahead_finance(
+    terms: FinancialModelTerms, *, org_l: Sequence[float], org_t: Sequence[float], cbc_log: str,
+) -> PlanningAuditResult:
+    """Controleer de laatst geselecteerde oplossing; baseline-export is negatief."""
+    try:
+        imports = tuple(Decimal(str(value)) for value in org_l)
+        signed_exports = tuple(Decimal(str(value)) for value in org_t)
+        if (any(not v.is_finite() or v < 0 for v in imports)
+            or any(not v.is_finite() or v > 0 for v in signed_exports)):
+            raise ValueError("Invalid baseline sign")
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise PlanningSolutionRejected("planning_forecast_invalid") from exc
+    evidence = read_solver_evidence(terms.bonus.source.cell_discharge.model, cbc_log=cbc_log)
+    return audit_planning_solution(terms, baseline_import_kwh=imports,
+        baseline_export_kwh=tuple(-v for v in signed_exports), evidence=evidence)
 
 
 class DaCalc(DaBase):
@@ -205,6 +324,7 @@ class DaCalc(DaBase):
         start_interval_dt = datetime.datetime.fromtimestamp(start_interval_ts)
         # A7/A10b leveren later een echte gepinde context; nooit een v2-default verzinnen.
         financial_context: FinancialContext | None = None
+        settlement_context: PlanningContext | None = None
         self._financial_preflight(
             planning_start_ts=start_interval_ts,
             horizon_end_ts=start_interval_ts + self.interval_s,
@@ -3332,9 +3452,28 @@ class DaCalc(DaBase):
         ##################################################################
         #        bonus op teruglevering (bijv. Budget Thuis ZonneBonus)   #
         ##################################################################
+        financial_terms = bind_day_ahead_finance(
+            model, context=settlement_context,
+            intervals=tuple((int(ts[u]), int(interval_ts[u]) + self.interval_s) for u in range(U)),
+            meter_id=self._financial_pricing.settlement.meter_id if self._financial_pricing is not None else "legacy",
+            dc_from_bat=dc_from_bat, installation_battery_count=B,
+            battery_indices=tuple(range(B)),
+            no_battery_evidence="modeled_installation_has_no_batteries" if B == 0 else None,
+            hour_fractions=tuple(Decimal(str(h)) for h in hour_fraction),
+            discharge_efficiencies=tuple(Decimal(str(e)) for e in eff_bat_to_dc),
+            grid_import=c_l, grid_export=c_t,
+            export_bounds_kwh=tuple(Decimal(str(var.ub)) for var in c_t),
+            # Zonder afzonderlijk topologiebewijs geen verified-PV claim.
+            origins=("unknown",) * U,
+            source_policy=self._financial_pricing.settlement.planning_source_policy if self._financial_pricing is not None else None,
+        )
         bonus_cfg = getattr(self, "production_bonus", None)
         bonus_active = any(p > 0 for p in pb)
-        if bonus_active:
+        if financial_terms is not None:
+            bonus_remaining = None
+            c_t_bonus = financial_terms.bonus.eligible_kwh
+            bonus_revenue = financial_terms.bonus.revenue
+        elif bonus_active:
             bonus_remaining = self.production_bonus_remaining_kwh(start)
             # PV-productie per interval in kWh: de bovengrens in de modus "pv only"
             pv_kwh = [
@@ -3394,10 +3533,10 @@ class DaCalc(DaBase):
             p_bat = sum(pt) / U
 
         # alles in kWh * prijs = kosten in euro
-        model += cost == (
-            xsum(c_l[u] * pl[u] - c_t[u] * pt[u] for u in range(U))
-            - bonus_revenue
-            + xsum(cycle_cost[b] + penalty_cost[b] for b in range(B))
+        bind_day_ahead_cost(model, cost=cost,
+            legacy_energy_cost=xsum(c_l[u] * pl[u] - c_t[u] * pt[u] for u in range(U)) - bonus_revenue,
+            financial_terms=financial_terms,
+            other_cost=xsum(cycle_cost[b] + penalty_cost[b] for b in range(B))
             + xsum(switch_cost[e] + low_soc_penalty[e] for e in range(EV))
             + xsum(
                 (soc_mid[b][0] - soc_mid[b][U])
@@ -3427,6 +3566,8 @@ class DaCalc(DaBase):
             model.verbose = 1
         model.threads = getattr(self, "_solver_threads", -1)
         if getattr(self, "_debug_capture_vars", False):
+            self._debug_financial_terms = financial_terms
+            self._debug_planning_audit = None
             try:
                 from da_debug import build_var_registry
 
@@ -3506,7 +3647,6 @@ class DaCalc(DaBase):
 
         # er is een oplossing
         # afdrukken van de resultaten
-        logging.info("Het programma heeft een optimale oplossing gevonden.")
         old_cost_da = 0
         sum_old_cons = 0
         org_l = []
@@ -3563,6 +3703,21 @@ class DaCalc(DaBase):
                 old_cost_da += netto * pt[u]
                 org_l.append(0)
                 org_t.append(netto)
+        financial_audit = None
+        if financial_terms is not None:
+            financial_audit = finish_day_ahead_finance(
+                financial_terms, org_l=org_l, org_t=org_t, cbc_log=native["cbc_log"],
+            )
+            if getattr(self, "_debug_capture_vars", False):
+                self._debug_planning_audit = financial_audit
+            logging.info(f"A8 energiecomponent: {financial_audit.engine_energy_cost_eur}")
+            logging.info(f"A8 referentie-energiecomponent: {financial_audit.baseline_energy_cost_eur}")
+            logging.info(f"A8 besparing energiecomponent: {financial_audit.savings_energy_eur}")
+            logging.info("A8 pariteit %s", "volledig" if financial_audit.parity_complete else "onvolledig")
+            logging.info("A8 issues: %s", ", ".join(financial_audit.issues))
+            logging.info("Totale modelobjective (inclusief niet-A8-termen): %s", cost.x)
+        else:
+            logging.info("Het programma heeft een optimale oplossing gevonden.")
         if self.boiler_present:
             boiler_at_23 = (boiler_temp[U].x - (boiler_setpoint - boiler_hysterese)) * (
                 spec_heat_boiler / (3600 * cop_boiler)
@@ -3879,15 +4034,19 @@ class DaCalc(DaBase):
                 c_hp[u].x,
                 c_ev_sum[u],
                 solar_hour_sum_opt[u],
-                c_l[u].x * pl[u],
-                -(c_t[u].x * pt[u] + (c_t_bonus[u].x * pb[u] if c_t_bonus is not None else 0.0)),
+                c_l[u].x * pl[u] if financial_audit is None else float(financial_audit.forecast_result.lines[u].import_cost),
+                -(c_t[u].x * pt[u] + (c_t_bonus[u].x * pb[u] if c_t_bonus is not None else 0.0))
+                if financial_audit is None else (
+                    None if financial_audit.forecast_result.lines[u].bonus_revenue is None else
+                    -float(financial_audit.forecast_result.lines[u].base_export_revenue
+                           + financial_audit.forecast_result.lines[u].bonus_revenue)),
                 boiler_temp[u + 1].x,
             ]
             if M > 0:
                 row = row + [c_ma_sum[u]]
             d_f_rows.append(tuple(row))
         d_f = pd.DataFrame(d_f_rows, columns=cols)
-        if not self.debug:
+        if not self.debug and financial_terms is None:
             d_f_save = d_f.drop(["b_tem"], axis=1)
             save_tijd = tijd.copy()
             if interval_fraction_first_interval < 0.99:  # drop first row
@@ -3915,13 +4074,14 @@ class DaCalc(DaBase):
         logging.info(f"Berekende prognoses: \n{d_f.to_string(index=False)}\n")
         # , formatters={'uur':'{:03d}'.format}))
 
-        logging.info(f"Consumption            {delivery.x: 7.2f} (kWh)")
-        logging.info(f"Cost consumption       {cost_consumption: 7.2f} (€)")
-        logging.info(f"Tariff consumption     {tariff_consumption: 8.3f} (€/kWh)")
-        logging.info(f"Production             {production.x: 7.2f} (kWh)")
-        logging.info(f"Profit production      {profit_production: 7.2f} (€)")
-        logging.info(f"Tariff production      {tariff_production: 8.3f} (€/kWh)\n")
-        if c_t_bonus is not None:
+        if financial_audit is None:
+            logging.info(f"Consumption            {delivery.x: 7.2f} (kWh)")
+            logging.info(f"Cost consumption       {cost_consumption: 7.2f} (€)")
+            logging.info(f"Tariff consumption     {tariff_consumption: 8.3f} (€/kWh)")
+            logging.info(f"Production             {production.x: 7.2f} (kWh)")
+            logging.info(f"Profit production      {profit_production: 7.2f} (€)")
+            logging.info(f"Tariff production      {tariff_production: 8.3f} (€/kWh)\n")
+        if c_t_bonus is not None and financial_audit is None:
             bonus_kwh = sum(c_t_bonus[u].x for u in range(U))
             bonus_eur = sum(c_t_bonus[u].x * pb[u] for u in range(U))
             logging.info(f"Bonus teruglevering    {bonus_kwh: 7.2f} (kWh)")
@@ -3962,21 +4122,22 @@ class DaCalc(DaBase):
             + boiler_storage
         )
 
-        logging.info(
-            "\nCalculation profit after optimize in €\n"
-            f"Cost before optimize           {old_cost_da: 7.2f}\n"
-            f"Cost consumption   {cost_consumption: 7.2f}\n"
-            f"Bat cycle cost     {total_cycle_cost: 7.2f}\n"
-            f"Bat penalty cost   {total_penalty_cost: 7.2f}\n"
-            f"EV switch costs    {total_switch_cost: 7.2f}\n"
-            f"EV low soc costs   {total_low_soc_cost: 7.2f}\n"
-            f"Battery storage    {battery_storage: 7.2f}\n"
-            f"Boiler storage     {boiler_storage: 7.2f}\n"
-            f"Profit production  {profit_production: 7.2f}\n"
-            f"Total              {total_cost: 7.2f}\n"
-            f"Cost after optimize            {cost.x: 7.2f}\n"
-            f"Profit:                        {old_cost_da - cost.x: 7.2f}"
-        )
+        if financial_audit is None:
+            logging.info(
+                "\nCalculation profit after optimize in €\n"
+                f"Cost before optimize           {old_cost_da: 7.2f}\n"
+                f"Cost consumption   {cost_consumption: 7.2f}\n"
+                f"Bat cycle cost     {total_cycle_cost: 7.2f}\n"
+                f"Bat penalty cost   {total_penalty_cost: 7.2f}\n"
+                f"EV switch costs    {total_switch_cost: 7.2f}\n"
+                f"EV low soc costs   {total_low_soc_cost: 7.2f}\n"
+                f"Battery storage    {battery_storage: 7.2f}\n"
+                f"Boiler storage     {boiler_storage: 7.2f}\n"
+                f"Profit production  {profit_production: 7.2f}\n"
+                f"Total              {total_cost: 7.2f}\n"
+                f"Cost after optimize            {cost.x: 7.2f}\n"
+                f"Profit:                        {old_cost_da - cost.x: 7.2f}"
+            )
 
         # doorzetten van alle settings naar HA
         if not self.debug:

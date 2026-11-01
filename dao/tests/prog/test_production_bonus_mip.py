@@ -1,4 +1,4 @@
-"""production_bonus.add_to_model(): the MIP building block that calc_optimum() uses.
+"""Legacy production_bonus.add_to_model(): not the new settlement source model.
 
 calc_optimum() needs Home Assistant, so the model around the block is built by
 hand: two intervals, the first inside the bonus window, PV only in the first,

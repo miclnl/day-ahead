@@ -448,11 +448,12 @@ def _install_model_capture(patches: "_PatchList", target) -> None:
 
 
 # Zet een opgelost model om naar een result-dict, gedeeld door RecordingIO en ReplayIO zodat beide dezelfde vorm opleveren om te diffen.
-def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict) -> Optional[dict]:
+def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict, *,
+                       financial_terms=None, planning_audit=None) -> Optional[dict]:
     if model is None:
         return None
     try:
-        return {
+        result = {
             "meta": {
                 "dao_version": _dao_version(),
                 "solver": getattr(model, "solver_name", None),
@@ -476,6 +477,26 @@ def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict) -> Op
                 "result file can hold."
             ),
         }
+        if financial_terms is not None:
+            source = financial_terms.bonus.source
+            cell = source.cell_discharge
+            result["settlement"] = {
+                "policy": source.policy_version,
+                "required": list(source.required),
+                "bus_unit": "kW", "cell_unit": "kWh", "minimum_cell_kwh": "0.001",
+                "upper_cell_kwh": [str(value) for value in cell.upper_bounds_kwh],
+                "model_upper_cell_kwh": list(cell.model_upper_bounds_kwh),
+                "gross_cell_kwh": [value.x for value in cell.total_kwh],
+                "parity_complete": None if planning_audit is None else planning_audit.parity_complete,
+                "parity_error_eur": None if planning_audit is None else str(planning_audit.parity_error_eur),
+                "evidence": None if planning_audit is None else {
+                    name: (list(value) if isinstance(value, tuple) else value if isinstance(value, (int, str)) or value is None else str(value))
+                    for name in planning_audit.evidence.__dataclass_fields__
+                    for value in (getattr(planning_audit.evidence, name),)
+                },
+                "issues": list(financial_terms.bonus.issues if planning_audit is None else planning_audit.issues),
+            }
+        return result
     except Exception:
         logger.exception("Kon solve-resultaat niet opbouwen")
         return None
@@ -805,6 +826,8 @@ class RecordingIO:
             self._model,
             self._cbc_log_chunks,
             {"captured_at": self._captured_at.isoformat()},
+            financial_terms=getattr(self._primary, "_debug_financial_terms", None),
+            planning_audit=getattr(self._primary, "_debug_planning_audit", None),
         )
         if result is None:
             return
@@ -898,6 +921,7 @@ class ReplayIO:
         self._reads: set[str] = set()
         self._freeze = None  # freezegun handle, set in _install_patches
         self._model = None  # last mip.Model.optimize() was called on
+        self._primary = None
         self._cbc_log_chunks: list[str] = []
 
         meta = self._snapshot.get("meta", {})
@@ -977,6 +1001,8 @@ class ReplayIO:
                 "source_snapshot": self._source,
                 "solver_threads": threads_used,
             },
+            financial_terms=getattr(self._primary, "_debug_financial_terms", None),
+            planning_audit=getattr(self._primary, "_debug_planning_audit", None),
         )
 
     # -- context manager -----------------------------------------------
@@ -1031,6 +1057,8 @@ class ReplayIO:
         # Dwingt debug-modus en het gekozen aantal threads af op elke geconstrueerde instantie, ongeacht wie hem aanmaakt.
         def _wrapped_init(instance, *args, **kwargs):
             original_init(instance, *args, **kwargs)
+            if self._primary is None:
+                self._primary = instance
             if instance.config is not None:
                 instance.debug = True
                 instance._solver_threads = (
@@ -1275,6 +1303,21 @@ def build_var_registry(local_vars: dict) -> VarRegistry:
         elif isinstance(value, (list, tuple)):
             _walk(name, value, ())
 
+    # Frozen DTO's worden niet generiek doorlopen: alleen bekende modelhandles.
+    terms = local_vars.get("financial_terms")
+    if terms is not None:
+        bonus = terms.bonus
+        for name, value in (
+            ("settlement_source", bonus.source.discharge_on),
+            ("settlement_eligible", bonus.eligible_kwh),
+            ("settlement_first", bonus.first_kwh),
+            ("settlement_C", bonus.cumulative_export_kwh),
+            ("settlement_Q", bonus.capped_export_kwh),
+            ("settlement_cap_saturated", bonus.cap_saturated),
+            ("settlement_Q_open", bonus.capped_opening_kwh),
+            ("settlement_opening_cap_saturated", bonus.opening_cap_saturated),
+        ):
+            _walk(name, value, ())
     return VarRegistry(by_idx, samples)
 
 
@@ -1314,7 +1357,7 @@ SHAPES: dict[str, tuple[tuple[str, ...], str, str]] = {
     "ac_from_dc_w": (("b", "u", "ds"), "0..1", "SOS2 weight, discharge"),
     "dc_from_ac": (("b", "u"), "kW", "battery charge power, DC side"),
     "dc_to_ac": (("b", "u"), "kW", "battery discharge power, DC side"),
-    "dc_from_bat": (("b", "u"), "kW", "power out of the battery cells"),
+    "dc_from_bat": (("b", "u"), "kW", "gross discharge power on the DC bus"),
     "dc_to_bat": (("b", "u"), "kW", "power into the battery cells"),
     "soc": (("b", "u_boundary"), "%", "state of charge"),
     "soc_low": (("b", "u_boundary"), "%", "SoC share below the optimal-low split"),
@@ -1353,6 +1396,14 @@ SHAPES: dict[str, tuple[tuple[str, ...], str, str]] = {
     "c_l_on": (("u",), "bool", "importing this interval"),
     "c_t_on": (("u",), "bool", "exporting this interval"),
     "c_t_bonus": (("u",), "kWh", "grid export that earns the production bonus"),
+    "settlement_source": (("u",), "bool", "gross cell discharge active"),
+    "settlement_eligible": (("u",), "kWh", "source-eligible first export"),
+    "settlement_first": (("u",), "kWh", "chronological first export"),
+    "settlement_C": (("u",), "kWh", "uncapped cumulative export"),
+    "settlement_Q": (("u",), "kWh", "capped cumulative export"),
+    "settlement_cap_saturated": (("u",), "bool", "end cap saturation"),
+    "settlement_Q_open": (("u",), "kWh", "opening export capped at current cap"),
+    "settlement_opening_cap_saturated": (("u",), "bool", "opening cap saturation"),
     # heat pump — mutually exclusive per run depending on
     # heating_options.adjustment: "on/off" builds hp_bl_on/hp_start_index,
     # "power"/"heating curve" builds p_hp/hp_s_w (a third active add_sos()
