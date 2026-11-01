@@ -146,6 +146,11 @@ class SettlementConfig(_SettlementConfigBase):
         default=[], description="Non-overlapping contract versions",
         json_schema_extra={"x-help": "Each version has explicit validity and terms. Drafts cannot be used in active mode; tariff changes may keep the same contract identifier.", "x-ui-section": SECTION},
     )
+    planning_source_policy: Literal["aggregate_cell_min_1wh_v1"] | None = Field(
+        default=None, alias="planning source policy",
+        description="Planning-only gross cell discharge domain policy",
+        json_schema_extra={"x-help": "Null selects no policy. aggregate_cell_min_1wh_v1 requires zero or at least 1 Wh gross cell discharge for the whole battery group per applicable full bonus quarter. This can make planning infeasible; it is not a hardware minimum or permission for activation.", "x-ui-section": SECTION},
+    )
 
     @model_validator(mode="after")
     def validate_contracts(self):

@@ -60,6 +60,28 @@ def test_default_off_preserves_legacy():
     assert ProductionBonusConfig().vat_percent is None
 
 
+def test_policy_none_alias_and_invalid():
+    """The planner domain is explicit and cannot silently activate with settlement."""
+    policy = "aggregate_cell_min_1wh_v1"
+    assert SettlementConfig().planning_source_policy is None
+    assert SettlementConfig(planning_source_policy=None).planning_source_policy is None
+    for name in ("planning source policy", "planning_source_policy"):
+        parsed = SettlementConfig.model_validate({name: policy})
+        assert parsed.planning_source_policy == policy
+        assert parsed.mode == "off"
+    data = {"planning source policy": policy, "planning_source_policy": policy}
+    original = deepcopy(data)
+    assert SettlementConfig.model_validate(data).planning_source_policy == policy
+    assert data == original
+    for bad in ({"planning source policy": "aggregate_cell_min_2wh_v1"},
+                {"planning source policy": "typo"},
+                {"planning source policy": policy, "planning_source_policy": None}):
+        with pytest.raises(ValueError):
+            SettlementConfig.model_validate(bad)
+    for mode in ("active", "shadow"):
+        assert configured(mode=mode).settlement.planning_source_policy is None
+
+
 @pytest.mark.parametrize("missing", ["supply start", "hour price rule"])
 def test_confirmed_rejects_missing_terms(missing):
     terms = contract(**{missing: None if missing == "supply start" else "unconfirmed"})

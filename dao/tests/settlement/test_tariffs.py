@@ -140,6 +140,14 @@ def test_snapshot_hash_is_canonical_and_changes_only_with_financial_input(pricin
     assert changed.supply_start == first.supply_start
 
 
+def test_policy_does_not_change_tariff_hash(pricing, contract):
+    """Planning domain selection is not a supplier term or financial revision."""
+    plain = pricing(settlement={})
+    selected = pricing(settlement={"planning source policy": "aggregate_cell_min_1wh_v1"})
+    assert selected.settlement.planning_source_policy == "aggregate_cell_min_1wh_v1"
+    assert make_snapshot(plain, contract()) == make_snapshot(selected, contract())
+
+
 def test_hour_quote_repeated_for_four_quarters(snapshot):
     snap = snapshot(vat_production=((date(2027, 1, 1), Decimal("21")),))
     start = epoch("2027-01-01", 12)

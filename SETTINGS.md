@@ -1696,6 +1696,7 @@ Optional contract-based electricity settlement, default off. Leaving out prices.
 | `mode` | string | No | `"off"` | Settlement calculation mode. Options: `off`, `shadow`, `active` |
 | `meter id` | string (optional) | No | `null` | Stable metering-installation identifier |
 | `contracts` | list[[SettlementContractConfig](#settlementcontractconfig)] | No | `[]` | Non-overlapping contract versions |
+| `planning source policy` | string (optional) | No | `null` | Planning-only gross cell discharge domain policy |
 
 <details>
 <summary><b>📖 Field Details</b> (click to expand)</summary>
@@ -1711,6 +1712,10 @@ Used with interval start and registered input revision to identify input. An inp
 **`contracts`**
 
 Each version has explicit validity and terms. Drafts cannot be used in active mode; tariff changes may keep the same contract identifier.
+
+**`planning source policy`**
+
+Null selects no policy. aggregate_cell_min_1wh_v1 requires zero or at least 1 Wh gross cell discharge for the whole battery group per applicable full bonus quarter. This can make planning infeasible; it is not a hardware minimum or permission for activation.
 
 </details>
 

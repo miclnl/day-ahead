@@ -3566,6 +3566,22 @@
           "type": "array",
           "x-help": "Each version has explicit validity and terms. Drafts cannot be used in active mode; tariff changes may keep the same contract identifier.",
           "x-ui-section": "Settlement"
+        },
+        "planning source policy": {
+          "anyOf": [
+            {
+              "const": "aggregate_cell_min_1wh_v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Planning-only gross cell discharge domain policy",
+          "title": "Planning Source Policy",
+          "x-help": "Null selects no policy. aggregate_cell_min_1wh_v1 requires zero or at least 1 Wh gross cell discharge for the whole battery group per applicable full bonus quarter. This can make planning infeasible; it is not a hardware minimum or permission for activation.",
+          "x-ui-section": "Settlement"
         }
       },
       "title": "SettlementConfig",
