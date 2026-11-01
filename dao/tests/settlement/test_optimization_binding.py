@@ -1,7 +1,7 @@
 """The optimizer must bind every original cell flow with correct units and bounds."""
 
 import math
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 from fractions import Fraction
 
@@ -57,6 +57,25 @@ def test_cell_conversion_and_outward_bounds():
     assert [item.x for item in result.total_kwh] == pytest.approx([0.002, 0.001])
     with pytest.raises(FrozenInstanceError):
         result.meter_id = "changed"
+
+
+def test_cell_binding_records_and_rechecks_both_original_bounds():
+    """A changed or forged lower bound must not escape the frozen binding."""
+    from dao.prog.settlement.optimization import _validate_cell_binding
+
+    model, matrix = matrix_model()
+    matrix[0][0].lb = 0.001
+    cell = binding(model, matrix)
+    assert cell.bus_lower_bounds_kw == ((D("0.001"), D("0")), (D("0"), D("0")))
+    assert cell.bus_upper_bounds_kw == ((D("0.0032"), D("0.0032")),
+                                        (D("0.004"), D("0.004")))
+    _validate_cell_binding(cell, model)
+    forged = replace(cell, bus_lower_bounds_kw=((D("0"), D("0")), (D("0"), D("0"))))
+    with pytest.raises(ValueError, match="cell_conversion_invalid"):
+        _validate_cell_binding(forged, model)
+    matrix[0][0].lb = 0
+    with pytest.raises(ValueError, match="cell_conversion_invalid"):
+        _validate_cell_binding(cell, model)
 
 
 @pytest.mark.parametrize("case,code", [

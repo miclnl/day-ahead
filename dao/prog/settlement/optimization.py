@@ -34,6 +34,7 @@ class CellDischargeInput:
     bus_power_vars: tuple[tuple[mip.Var, ...], ...]
     hour_fractions: tuple[Decimal, ...]
     discharge_efficiencies: tuple[Decimal, ...]
+    bus_lower_bounds_kw: tuple[tuple[Decimal, ...], ...]
     bus_upper_bounds_kw: tuple[tuple[Decimal, ...], ...]
     cell_coefficients: tuple[tuple[Fraction, ...], ...]
     model_coefficients: tuple[tuple[float, ...], ...]
@@ -83,9 +84,9 @@ def make_cell_discharge_input(
         raise OptimizationInputError("cell_conversion_invalid")
 
     seen = set()
-    bounds, ratios, coefficients, per_battery = [], [], [], []
+    lower_bounds, bounds, ratios, coefficients, per_battery = [], [], [], [], []
     for b, row in enumerate(matrix):
-        row_bounds, row_ratios, row_coefficients, row_terms = [], [], [], []
+        row_lower, row_bounds, row_ratios, row_coefficients, row_terms = [], [], [], [], []
         for i, var in enumerate(row):
             if (not isinstance(var, mip.Var) or var.model is not model or var.idx < 0
                 or var.idx >= len(model.vars) or model.vars[var.idx] is not var):
@@ -103,10 +104,12 @@ def make_cell_discharge_input(
                 raise OptimizationInputError("cell_conversion_invalid", interval_index=i) from exc
             if not math.isfinite(coefficient) or coefficient <= 0:
                 raise OptimizationInputError("cell_conversion_invalid", interval_index=i)
+            row_lower.append(Decimal(str(var.lb)))
             row_bounds.append(Decimal(str(var.ub)))
             row_ratios.append(ratio)
             row_coefficients.append(coefficient)
             row_terms.append(var * coefficient)
+        lower_bounds.append(tuple(row_lower))
         bounds.append(tuple(row_bounds))
         ratios.append(tuple(row_ratios))
         coefficients.append(tuple(row_coefficients))
@@ -122,7 +125,7 @@ def make_cell_discharge_input(
         model_bounds.append(_outward_float(max(exact, actual), code="cell_bounds_invalid", interval_index=i))
     return CellDischargeInput(
         model, meter_id, count, indices, no_battery_evidence, matrix, hours, efficiencies,
-        tuple(bounds), tuple(ratios), tuple(coefficients), tuple(per_battery), tuple(total),
+        tuple(lower_bounds), tuple(bounds), tuple(ratios), tuple(coefficients), tuple(per_battery), tuple(total),
         tuple(exact_bounds), tuple(model_bounds),
     )
 
@@ -177,7 +180,7 @@ def _validate_cell_binding(cell: CellDischargeInput, model: mip.Model) -> None:
         battery_indices=cell.battery_indices, no_battery_evidence=cell.no_battery_evidence,
         hour_fractions=cell.hour_fractions, discharge_efficiencies=cell.discharge_efficiencies,
     )
-    for field in ("bus_upper_bounds_kw", "cell_coefficients", "model_coefficients",
+    for field in ("bus_lower_bounds_kw", "bus_upper_bounds_kw", "cell_coefficients", "model_coefficients",
                   "upper_bounds_kwh", "model_upper_bounds_kwh"):
         if getattr(cell, field) != getattr(checked, field):
             raise OptimizationInputError("cell_conversion_invalid")
