@@ -3627,8 +3627,12 @@ class DaCalc(DaBase):
                 financial_terms.bonus.grid_export, financial_terms.bonus.export_bounds_kwh,
                 financial_terms.bonus.opening, snapshots=financial_terms.context.price_batch.snapshots)
             # Eén totale cel→DC-bus→AC-referentie; geen tweede roundtripfactor.
-            terminal_terms = terminal_value(financial_terms.quotes,
-                tuple(eff_bat_to_dc[b] * avg_eff_dc_to_ac[b] for b in range(B)))
+            # Vermenigvuldig decimale factoren vóór de floatgrens. De bestaande
+            # DTO weigert meer dan 12 decimalen; niet stil afronden/quantiseren.
+            with localcontext() as decimal_context:
+                decimal_context.prec = 36
+                terminal_terms = terminal_value(financial_terms.quotes,
+                    tuple(Decimal(str(eff_bat_to_dc[b])) * Decimal(str(avg_eff_dc_to_ac[b])) for b in range(B)))
         bonus_cfg = getattr(self, "production_bonus", None)
         bonus_active = any(p > 0 for p in pb)
         if financial_terms is not None:
@@ -3701,8 +3705,9 @@ class DaCalc(DaBase):
         if terminal_terms is not None:
             with localcontext() as decimal_context:
                 decimal_context.prec = 36
+                # Alleen fysieke celenergie telt; de low/mid-verdeling is niet uniek.
                 battery_terminal_cost = xsum(
-                    (soc_mid[b][0] - soc_mid[b][U]) * one_soc[b]
+                    (soc[b][0] - soc[b][U]) * one_soc[b]
                     * float(terminal_terms.eur_per_ac_kwh * efficiency)
                     for b, (_, efficiency) in enumerate(terminal_terms.reference_efficiency_by_battery)
                 )

@@ -91,6 +91,7 @@ def capture(monkeypatch, tmp_path, request):
         "bat_to_dc efficiency": efficiency, "dc_to_bat efficiency": 1,
         "cycle cost": 0.01,
         "solar": [{"name": f"pv-{b}", "max power": 4, "tilt": 30, "orientation": 0, "capacity": 4}],
+        **settings.get("battery", {}),
     }) for b, efficiency in enumerate((0.8, 1.0))]
     instance.ev_options, instance.machines, instance.solar = [], [], []
     instance.boiler_options = instance.heating_options = None
@@ -457,13 +458,8 @@ def pre_strategy_cost_binding():
     return compile(ast.Module(body=body[start:end+1], type_ignores=[]), da.__file__, "exec")
 
 
-@pytest.mark.parametrize("spot,expected", [
-    ("0.20", (0.16, 0.20)), ("-0.20", (0, 0)),
-    ("0.123456789012", (0.0987654312096, 0.123456789012)),
-])
-def test_actual_producer_builds_period_and_terminal_before_solve(capture, snapshot, bonus_rules,
-                                                               monkeypatch, spot, expected):
-    """A new-route terminal replaces p_bat once, including the zero-clipped mean."""
+def new_route_cost_namespace(capture, snapshot, bonus_rules, *, spot="0.20"):
+    """Reuse the captured producer and its pinned context, without a live context setter."""
     args = capture["finance"]
     context = context_for(snapshot, bonus_rules, args["intervals"], meter=args["meter_id"])
     snap = replace(context.quotes[0].snapshot, bonus=None)
@@ -472,7 +468,17 @@ def test_actual_producer_builds_period_and_terminal_before_solve(capture, snapsh
         price_batch=replace(context.price_batch, snapshots=(snap,), items=tuple(
             replace(item, spot=replace(item.spot, price_ex_vat=D(spot)))
             for item in context.price_batch.items)))
-    local = {**da.__dict__, **capture["locals"], "settlement_context": context}
+    return {**da.__dict__, **capture["locals"], "settlement_context": context}
+
+
+@pytest.mark.parametrize("spot,expected", [
+    ("0.20", (0.16, 0.20)), ("-0.20", (0, 0)),
+    ("0.123456789012", (0.0987654312096, 0.123456789012)),
+])
+def test_actual_producer_builds_period_and_terminal_before_solve(capture, snapshot, bonus_rules,
+                                                               monkeypatch, spot, expected):
+    """A new-route terminal replaces p_bat once, including the zero-clipped mean."""
+    local = new_route_cost_namespace(capture, snapshot, bonus_rules, spot=spot)
     model = capture["model"]
     monkeypatch.setattr(model, "optimize", lambda *a, **k: pytest.fail("prebuild solve"))
     with localcontext() as decimal_context:
@@ -484,9 +490,78 @@ def test_actual_producer_builds_period_and_terminal_before_solve(capture, snapsh
     assert local["terminal_terms"].eur_per_ac_kwh == max(D("0"), D(spot))
     expr = model.constrs[-1].expr.expr
     for b, coefficient in enumerate(expected):
-        assert expr.get(local["soc_mid"][b][0], 0) == pytest.approx(-coefficient)
-        assert expr.get(local["soc_mid"][b][12], 0) == pytest.approx(coefficient)
+        assert expr.get(local["soc"][b][0], 0) == pytest.approx(-coefficient)
+        assert expr.get(local["soc"][b][12], 0) == pytest.approx(coefficient)
+        for var in (local["soc_mid"][b][0], local["soc_mid"][b][12]):
+            assert expr.get(var, 0) == 0
     assert capture["finance"]["context"] is None  # Actual liveflow remains unbound.
+
+
+@pytest.mark.parametrize("capture", [
+    {"battery": {"lower limit": 20, "optimal lower level": 50}},
+    {"battery": {"lower limit": 20, "optimal lower level": 50,
+        "discharge stages": [{"power": 2000, "efficiency": 0.9}, {"power": 4000, "efficiency": 0.9}]}},
+], indirect=True)
+def test_actual_producer_terminal_equal_physical_energy_ignores_soc_allocation(capture, snapshot, bonus_rules):
+    """A feasible low/mid reallocation must not create EUR at unchanged stored energy."""
+    local = new_route_cost_namespace(capture, snapshot, bonus_rules)
+    with localcontext() as decimal_context:
+        decimal_context.prec = 3
+        exec(pre_strategy_cost_binding(), local)
+    model, end = capture["model"], local["U"]
+    for b in range(local["B"]):
+        assert local["lower_limit"][b] == 20 and local["opt_low_level"][b] == 50
+        for u in range(end):
+            model += local["dc_to_bat"][b][u] == 0
+            model += local["dc_from_bat"][b][u] == 0
+        model += local["soc_mid"][b][0] == 0
+        model += local["soc_mid"][b][end] == 30
+    model.verbose = 0
+    model.objective = mip.minimize(local["cost"])
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    for b in range(local["B"]):
+        assert [v.x for v in local["soc"][b]] == pytest.approx([50] * (end+1))
+        assert local["soc_low"][b][0].x == pytest.approx(50)
+        assert local["soc_low"][b][end].x == pytest.approx(20)
+    assert local["battery_terminal_cost"].x == pytest.approx(0)
+    # No wear/device/boiler/penalty cost: the full cost must not contain the
+    # fictitious -EUR 10.8 legacy split value (30 * 0.20 * (0.8 + 1)).
+    assert sum(v.x for v in local["cycle_cost"] + local["penalty_cost"]) == pytest.approx(0)
+    assert local["boiler_temp"][end].x == local["boiler_temp"][0].x
+    assert local["period_terms"].credit.x == 0
+    assert local["cost"].x == pytest.approx(local["financial_terms"].energy_cost.x)
+
+
+@pytest.mark.parametrize("capture", [{"battery": {
+    "discharge stages": [{"power": 2000, "efficiency": 0.9}, {"power": 4000, "efficiency": 0.9}],
+}}], indirect=True)
+def test_actual_producer_terminal_multiplies_reference_factors_as_decimal(capture, snapshot, bonus_rules):
+    """Cell 0.8 and inverter 0.9 must give exact reference 0.72 even at caller precision 3."""
+    local = new_route_cost_namespace(capture, snapshot, bonus_rules, spot="0.123456789012")
+    with localcontext() as decimal_context:
+        decimal_context.prec = 3
+        exec(pre_strategy_cost_binding(), local)
+    assert local["eff_bat_to_dc"] == [0.8, 1.0]
+    assert local["avg_eff_dc_to_ac"] == [0.9, 0.9]
+    assert local["terminal_terms"].reference_efficiency_by_battery == (("0", D("0.72")), ("1", D("0.9")))
+    expr = capture["model"].constrs[-1].expr.expr
+    for b, coefficient in enumerate((0.08888888808864, 0.1111111101108)):
+        assert expr.get(local["soc"][b][0], 0) == pytest.approx(-coefficient)
+        assert expr.get(local["soc"][b][12], 0) == pytest.approx(coefficient)
+
+
+@pytest.mark.parametrize("capture", [{"battery": {
+    "bat_to_dc efficiency": 0.123456789012,
+    "discharge stages": [{"power": 2000, "efficiency": 0.9}, {"power": 4000, "efficiency": 0.9}],
+}}], indirect=True)
+def test_actual_producer_terminal_rejects_overprecise_reference_without_quantizing(capture, snapshot, bonus_rules):
+    """The exact 0.1111111101108 product exceeds the unchanged twelve-place DTO policy."""
+    local = new_route_cost_namespace(capture, snapshot, bonus_rules)
+    with localcontext() as decimal_context:
+        decimal_context.prec = 3
+        with pytest.raises(ValueError, match="reference efficiency: at most 12 decimal places"):
+            exec(pre_strategy_cost_binding(), local)
 
 
 @pytest.mark.parametrize("outcome", ["success", "audit_failure", "model_mutation", "solution_mutation"])
