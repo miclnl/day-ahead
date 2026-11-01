@@ -53,9 +53,12 @@ from dao.prog.fastctrl.publication import (
 )
 from dao.prog.settlement.optimization import (
     OptimizationInputError,
+    PeriodModelTerms,
     SourcePolicy,
     build_bonus_terms,
+    build_month_floor_terms,
     make_cell_discharge_input,
+    terminal_value,
 )
 from dao.prog.settlement.optimization_audit import (
     FinancialModelTerms,
@@ -63,6 +66,7 @@ from dao.prog.settlement.optimization_audit import (
     PlanningSolutionRejected,
     _check_context,
     _check_evidence,
+    audit_period_solution,
     audit_planning_solution,
     read_solver_evidence,
     validate_source_solution,
@@ -200,8 +204,13 @@ def bind_day_ahead_finance(
 def bind_day_ahead_cost(
     model: Model, *, cost: Var, legacy_energy_cost: LinExpr,
     other_cost: LinExpr, financial_terms: FinancialModelTerms | None,
+    period_terms: PeriodModelTerms | None = None,
 ) -> None:
+    if period_terms is not None and financial_terms is None:
+        raise OptimizationInputError("planning_grid_invalid")
     energy = legacy_energy_cost if financial_terms is None else financial_terms.energy_cost
+    if period_terms is not None:
+        energy = energy - period_terms.credit
     model += cost == energy + other_cost
 
 
@@ -383,6 +392,12 @@ class DaCalc(DaBase):
         _start_soc: float | None = None,
         _start_ev_soc: float | None = None,
     ):
+        if getattr(self, "_debug_capture_vars", False):
+            self._debug_financial_terms = None
+            self._debug_planning_audit = None
+            self._debug_finalized_solution = None
+            self._debug_period_terms = None
+            self._debug_period_audit = None
         # _start_dt = datetime.datetime(year=2026, month=5, day=24, hour=11, minute=0)
         # _start_soc = 78.0
         # _start_ev_soc = 67.0
@@ -3550,6 +3565,15 @@ class DaCalc(DaBase):
             origins=("unknown",) * U,
             source_policy=self._financial_pricing.settlement.planning_source_policy if self._financial_pricing is not None else None,
         )
+        period_terms = None
+        terminal_terms = None
+        if financial_terms is not None:
+            period_terms = build_month_floor_terms(model, financial_terms.quotes,
+                financial_terms.bonus.grid_export, financial_terms.bonus.export_bounds_kwh,
+                financial_terms.bonus.opening, snapshots=financial_terms.context.price_batch.snapshots)
+            # Eén totale cel→DC-bus→AC-referentie; geen tweede roundtripfactor.
+            terminal_terms = terminal_value(financial_terms.quotes,
+                tuple(eff_bat_to_dc[b] * avg_eff_dc_to_ac[b] for b in range(B)))
         bonus_cfg = getattr(self, "production_bonus", None)
         bonus_active = any(p > 0 for p in pb)
         if financial_terms is not None:
@@ -3615,20 +3639,27 @@ class DaCalc(DaBase):
         else:
             p_bat = sum(pt) / U
 
+        battery_terminal_cost = xsum(
+            (soc_mid[b][0] - soc_mid[b][U]) * one_soc[b]
+            * eff_bat_to_dc[b] * avg_eff_dc_to_ac[b] * p_bat for b in range(B)
+        )
+        if terminal_terms is not None:
+            with localcontext() as decimal_context:
+                decimal_context.prec = 36
+                battery_terminal_cost = xsum(
+                    (soc_mid[b][0] - soc_mid[b][U]) * one_soc[b]
+                    * float(terminal_terms.eur_per_ac_kwh * efficiency)
+                    for b, (_, efficiency) in enumerate(terminal_terms.reference_efficiency_by_battery)
+                )
+
         # alles in kWh * prijs = kosten in euro
         bind_day_ahead_cost(model, cost=cost,
             legacy_energy_cost=xsum(c_l[u] * pl[u] - c_t[u] * pt[u] for u in range(U)) - bonus_revenue,
             financial_terms=financial_terms,
+            period_terms=period_terms,
             other_cost=xsum(cycle_cost[b] + penalty_cost[b] for b in range(B))
             + xsum(switch_cost[e] + low_soc_penalty[e] for e in range(EV))
-            + xsum(
-                (soc_mid[b][0] - soc_mid[b][U])
-                * one_soc[b]
-                * eff_bat_to_dc[b]
-                * avg_eff_dc_to_ac[b]
-                * p_bat
-                for b in range(B)
-            )
+            + battery_terminal_cost
             # waarde energie boiler
             - (boiler_temp[U] - boiler_temp[0])
             * (spec_heat_boiler / (3600 * cop_boiler))
@@ -3652,6 +3683,8 @@ class DaCalc(DaBase):
             self._debug_financial_terms = financial_terms
             self._debug_planning_audit = None
             self._debug_finalized_solution = None
+            self._debug_period_terms = period_terms
+            self._debug_period_audit = None
             try:
                 from da_debug import build_var_registry
 
@@ -3798,17 +3831,33 @@ class DaCalc(DaBase):
                 org_l.append(0)
                 org_t.append(netto)
         financial_audit = None
+        period_audit = None
         if financial_terms is not None:
             financial_audit = finish_day_ahead_finance(
                 finalized_solution, org_l=org_l, org_t=org_t,
             )
+            if period_terms is not None:
+                _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
+                period_audit = audit_period_solution(financial_terms, period_terms, planning_audit=financial_audit)
+                _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
+                _check_evidence(model, finalized_solution.evidence)
             if getattr(self, "_debug_capture_vars", False):
                 self._debug_planning_audit = financial_audit
+                self._debug_period_terms = period_terms
+                self._debug_period_audit = period_audit
             logging.info(f"A8 energiecomponent: {financial_audit.engine_energy_cost_eur}")
             logging.info(f"A8 referentie-energiecomponent: {financial_audit.baseline_energy_cost_eur}")
             logging.info(f"A8 besparing energiecomponent: {financial_audit.savings_energy_eur}")
             logging.info("A8 pariteit %s", "volledig" if financial_audit.parity_complete else "onvolledig")
             logging.info("A8 issues: %s", ", ".join(financial_audit.issues))
+            if period_audit is not None:
+                logging.info("A9 maandcredit bruto EUR: modelondergrens=%s; engineprognose=%s; exact=%s; issues=%s",
+                    period_audit.model_credit_eur, period_audit.engine_closed_credit_eur,
+                    period_audit.exact, ", ".join(period_audit.issues))
+                logging.info("A9 conservatief model: CBC-optimaliteit geldt alleen voor de gekozen objective; "
+                    "na bronverfijning alleen voor de vernauwde ruimte. Geen globaal oorspronkelijk optimum. "
+                    "export_mean_v1 is een eindwaardeheuristiek; enginebedragen zijn estimated, "
+                    "geen leveranciersgarantie; economics_supported=false.")
             logging.info("Totale modelobjective (inclusief niet-A8-termen): %s", cost.x)
         else:
             logging.info("Het programma heeft een optimale oplossing gevonden.")
@@ -4195,6 +4244,8 @@ class DaCalc(DaBase):
             )
             total_cycle_cost += cycle_cost[b].x
             total_penalty_cost += penalty_cost[b].x
+        if financial_terms is not None:
+            battery_storage = battery_terminal_cost.x
         total_switch_cost = 0
         total_low_soc_cost =0
         for e in range(EV):

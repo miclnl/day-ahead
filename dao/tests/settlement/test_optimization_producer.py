@@ -8,7 +8,7 @@ import socket
 import sys
 import textwrap
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from types import SimpleNamespace
 
 import mip
@@ -37,6 +37,10 @@ from dao.prog.settlement.types import (
 )
 from dao.tests.settlement.test_optimization_audit import financial_case, override_solution
 from dao.tests.settlement.test_optimization_bonus import POLICY, ts
+from dao.tests.settlement.test_optimization_periods import (
+    audited_period_case,
+    financial_period_case,
+)
 from dao.tests.settlement.test_publication import pricing_config
 
 D = Decimal
@@ -180,6 +184,8 @@ def test_real_producer_refinement_and_positive_bonus(capture, snapshot, bonus_ru
     context = context_for(snapshot, bonus_rules, args["intervals"], meter=args["meter_id"])
     terms = da.bind_day_ahead_finance(model, **{**args, "context": context, "origins": ("verified_pv",) * 12,
                                              "source_policy": POLICY})
+    periods = da.build_month_floor_terms(model, terms.quotes, terms.bonus.grid_export,
+        terms.bonus.export_bounds_kwh, terms.bonus.opening, snapshots=terms.context.price_batch.snapshots)
     cost_args = capture["cost"]
     assert cost_args["financial_terms"] is None
     old_other = signature(cost_args["other_cost"])
@@ -190,8 +196,8 @@ def test_real_producer_refinement_and_positive_bonus(capture, snapshot, bonus_ru
     expected_other[local["boiler_temp"][0].idx] = 0.01648148148148148
     expected_other[local["boiler_temp"][12].idx] = -0.01648148148148148
     assert old_other[1] == pytest.approx(expected_other)
-    da.bind_day_ahead_cost(model, **{**cost_args, "financial_terms": terms})
-    expected = cost_args["cost"] - terms.energy_cost - cost_args["other_cost"]
+    da.bind_day_ahead_cost(model, **{**cost_args, "financial_terms": terms, "period_terms": periods})
+    expected = cost_args["cost"] - terms.energy_cost + periods.credit - cost_args["other_cost"]
     assert signature(model.constrs[-1].expr)[1] == signature(expected)[1]
     assert signature(cost_args["other_cost"]) == old_other
     coeffs = terms.energy_cost.expr
@@ -221,6 +227,10 @@ def test_real_producer_refinement_and_positive_bonus(capture, snapshot, bonus_ru
     monkeypatch.setattr(model, "optimize", resolve)
     selected = da.finalize_day_ahead_finance(terms, cbc_log="")
     result = da.finish_day_ahead_finance(selected, org_l=[0.0]*12, org_t=[-1.0]*12)
+    period_result = da.audit_period_solution(selected.terms, periods, planning_audit=result)
+    assert period_result.model_credit_eur == 0
+    assert period_result.exact is False
+    assert (da.model_digest(model), da.solution_digest(model)) == (selected.model_digest, selected.solution_digest)
     assert len(solves) == int(residual)
     assert (selected.refinement is not None) == residual
     assert signature(cost_args["other_cost"]) == old_other
@@ -399,7 +409,7 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
 
     monkeypatch.setattr(model, "optimize", resolve)
     instance = SimpleNamespace(_debug_capture_vars=True)
-    namespace = dict(self=instance, model=model, financial_terms=terms, cost=cost,
+    namespace = dict(self=instance, model=model, financial_terms=terms, period_terms=None, cost=cost,
         native={"cbc_log": "Welcome to the CBC MILP Solver Version: 2.10.12"},
         B=1, U=1, EV=1, M=1, solar_num=1, pv_dc_num=[0], hour_fraction=[0.25],
         ac_to_dc=[[device]], ac_from_dc=[[device]], c_ev=[[device]], c_ma_u=[[device]],
@@ -430,3 +440,120 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
     assert "A8 energiecomponent: -0.13" in caplog.text
     assert "A8 referentie-energiecomponent: 0.05" in caplog.text
     assert "A8 besparing energiecomponent: 0.18" in caplog.text
+
+
+def pre_strategy_cost_binding():
+    """Use the real producer's pre-solve block, never a new offline optimizer."""
+    body = ast.parse(textwrap.dedent(inspect.getsource(da.DaCalc.calc_optimum))).body[0].body
+    start = next(i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "financial_terms" for t in node.targets))
+    end = next(i for i, node in enumerate(body) if isinstance(node, ast.Expr)
+               and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+               and node.value.func.id == "bind_day_ahead_cost")
+    return compile(ast.Module(body=body[start:end+1], type_ignores=[]), da.__file__, "exec")
+
+
+@pytest.mark.parametrize("spot,expected", [
+    ("0.20", (0.16, 0.20)), ("-0.20", (0, 0)),
+    ("0.123456789012", (0.0987654312096, 0.123456789012)),
+])
+def test_actual_producer_builds_period_and_terminal_before_solve(capture, snapshot, bonus_rules,
+                                                               monkeypatch, spot, expected):
+    """A new-route terminal replaces p_bat once, including the zero-clipped mean."""
+    args = capture["finance"]
+    context = context_for(snapshot, bonus_rules, args["intervals"], meter=args["meter_id"])
+    snap = replace(context.quotes[0].snapshot, bonus=None)
+    context = replace(context,
+        quotes=tuple(quote(snap, a, b, D(spot)) for a, b in args["intervals"]),
+        price_batch=replace(context.price_batch, snapshots=(snap,), items=tuple(
+            replace(item, spot=replace(item.spot, price_ex_vat=D(spot)))
+            for item in context.price_batch.items)))
+    local = {**da.__dict__, **capture["locals"], "settlement_context": context}
+    model = capture["model"]
+    monkeypatch.setattr(model, "optimize", lambda *a, **k: pytest.fail("prebuild solve"))
+    with localcontext() as decimal_context:
+        decimal_context.prec = 3
+        exec(pre_strategy_cost_binding(), local)
+    assert "period_terms" in local and local["period_terms"] is not None
+    assert local["period_terms"].issues == ("monthly_credit_omitted_open_or_unknown",)
+    assert local["terminal_terms"].policy_version == "export_mean_v1"
+    assert local["terminal_terms"].eur_per_ac_kwh == max(D("0"), D(spot))
+    expr = model.constrs[-1].expr.expr
+    for b, coefficient in enumerate(expected):
+        assert expr.get(local["soc_mid"][b][0], 0) == pytest.approx(-coefficient)
+        assert expr.get(local["soc_mid"][b][12], 0) == pytest.approx(coefficient)
+    assert capture["finance"]["context"] is None  # Actual liveflow remains unbound.
+
+
+@pytest.mark.parametrize("outcome", ["success", "audit_failure", "model_mutation", "solution_mutation"])
+def test_period_consumer_audit_precedes_preview_and_guards_digests(snapshot, monkeypatch, caplog, outcome):
+    """Period audit failure or mutation must stop every financial preview and capture."""
+    model, terms, periods = financial_period_case(snapshot)
+    cost = model.add_var(lb=-10, ub=10)
+    da.bind_day_ahead_cost(model, cost=cost, legacy_energy_cost=mip.xsum([]),
+                          other_cost=mip.xsum([]), financial_terms=terms, period_terms=periods)
+    model.objective = cost
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    assert hasattr(da, "audit_period_solution")
+    audit_period_solution = da.audit_period_solution
+    calls = []
+
+    def audit(*args, **kwargs):
+        calls.append(True)
+        if outcome == "audit_failure":
+            raise PlanningSolutionRejected("planning_period_parity_failed")
+        result = audit_period_solution(*args, **kwargs)
+        if outcome == "model_mutation":
+            model.add_var(ub=1)
+        elif outcome == "solution_mutation":
+            override_solution(monkeypatch, model, {terms.grid_import[0].idx: 0.1})
+        return result
+
+    monkeypatch.setattr(da, "audit_period_solution", audit)
+    monkeypatch.setattr(model, "optimize", lambda *a, **k: pytest.fail("extra solve"))
+    instance = SimpleNamespace(_debug_capture_vars=True)
+    namespace = dict(self=instance, model=model, financial_terms=terms, period_terms=periods, cost=cost,
+        native={"cbc_log": ""}, B=0, U=2, EV=0, M=0, solar_num=1, pv_dc_num=[],
+        hour_fraction=[1.0, 1.0], ac_to_dc=[], ac_from_dc=[], c_ev=[], c_ma_u=[],
+        pv_ac=[[terms.grid_import[0], terms.grid_import[1]]], solar_prod=[[0.0, 1.0]],
+        b_l=[0.0, 0.0], c_b=terms.grid_import, c_hp=terms.grid_import, pl=[0.1, 0.1], pt=[0.1, 0.1])
+    with caplog.at_level(logging.INFO):
+        if outcome == "success":
+            exec(post_strategy_consumers(), da.__dict__, namespace)
+        else:
+            with pytest.raises(PlanningSolutionRejected, match="planning_period_parity_failed|planning_solution_stale"):
+                exec(post_strategy_consumers(), da.__dict__, namespace)
+    assert calls == [True]
+    if outcome == "success":
+        assert instance._debug_period_terms is periods
+        assert instance._debug_period_audit.engine_closed_credit_eur == D("0.1186")
+        assert "A9" in caplog.text and "conservatief" in caplog.text
+    else:
+        assert not hasattr(instance, "_debug_period_audit")
+        assert "A8 energiecomponent" not in caplog.text
+
+
+def test_period_audit_remains_separate_from_a8_public_interfaces(snapshot):
+    _, terms, _, selected, audit = audited_period_case(snapshot)
+    assert tuple(inspect.signature(da.finalize_day_ahead_finance).parameters) == ("terms", "cbc_log")
+    assert tuple(inspect.signature(da.finish_day_ahead_finance).parameters) == ("selected", "org_l", "org_t")
+    for value in (terms, selected, audit):
+        assert "period_terms" not in value.__dataclass_fields__
+        assert "period_audit" not in value.__dataclass_fields__
+
+
+def test_period_debug_is_cleared_even_when_preflight_denies(capture):
+    """A denied later calculation must not leak an earlier successful period audit."""
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    names = ("_debug_financial_terms", "_debug_planning_audit", "_debug_finalized_solution",
+             "_debug_period_terms", "_debug_period_audit")
+    for name in names:
+        setattr(instance, name, object())
+    instance.config.prices = pricing_config()
+    for attr in ("_financial_pricing", "_financial_policy", "_financial_plan_path"):
+        if hasattr(instance, attr):
+            delattr(instance, attr)
+    with pytest.raises(FinancialPlanBlocked):
+        instance.calc_optimum(_start_dt=dt.datetime.fromtimestamp(ts()))
+    assert all(getattr(instance, name) is None for name in names)

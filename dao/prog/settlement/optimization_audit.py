@@ -1,6 +1,7 @@
 """Onafhankelijke kandidaatcontrole; solverfeasibility is geen bronbewijs."""
 
 import re
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,15 +13,22 @@ from zoneinfo import ZoneInfo
 import mip
 import mip.cbc as cbc
 
-from dao.prog.settlement.engine import _bonus_period, settle_series
+from dao.prog.settlement.engine import (
+    _bonus_period,
+    _contract_periods,
+    _month_period,
+    settle_series,
+)
 from dao.prog.settlement.metering import resolve_spot
 from dao.prog.settlement.optimization import (
     BonusModelTerms,
+    MonthFloorTerms,
     OptimizationInputError,
+    PeriodModelTerms,
     _validate_cell_binding,
 )
 from dao.prog.settlement.service import PlanningContext
-from dao.prog.settlement.tariffs import bonus_in_window, quote, resolve_snapshot
+from dao.prog.settlement.tariffs import _effective_value, bonus_in_window, quote, resolve_snapshot
 from dao.prog.settlement.types import InputInterval, PriceQuote, SettlementResult
 
 _AUXILIARY_CODE = "planning_auxiliary_mismatch"
@@ -87,6 +95,14 @@ class PlanningAuditResult:
     savings_energy_eur: Decimal | None
     parity_error_eur: Decimal | None
     parity_complete: bool
+    issues: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodAudit:
+    model_credit_eur: Decimal
+    engine_closed_credit_eur: Decimal | None
+    exact: bool
     issues: tuple[str, ...]
 
 
@@ -522,3 +538,234 @@ def _audit_planning_solution(terms, baseline_import, baseline_export, evidence):
         model_cost, forecast_cost, baseline_cost,
         None if not complete else baseline_cost - forecast_cost,
         max(errors, default=Decimal(0)) if complete else None, complete, tuple(dict.fromkeys(issues)))
+
+
+_PERIOD_CODE = "planning_period_parity_failed"
+_PERIOD_EUR_BUDGET = Decimal("0.000001")
+_PERIOD_OMITTED = "monthly_credit_omitted_open_or_unknown"
+_PERIOD_MIXED = "monthly_credit_conservative_mixed_vat"
+
+
+def _period_close(actual, expected):
+    if abs(actual - expected) > _PERIOD_EUR_BUDGET:
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+
+
+def _period_expression(expression, model):
+    if not isinstance(expression, mip.LinExpr):
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+    _number(expression.const, _PERIOD_CODE)
+    for var, coefficient in expression.expr.items():
+        _handle(var, model, _PERIOD_CODE)
+        _number(coefficient, _PERIOD_CODE)
+    return _number(expression.x, _PERIOD_CODE)
+
+
+def _period_binding_and_replay(terms, audit):
+    """Herleid uit A8-handles en de raw context, nooit uit een periodetermclaim."""
+    bonus = terms.bonus
+    model = bonus.source.cell_discharge.model
+    source = _validate_physical_source(bonus, audit.evidence)
+    _check_context(terms.context, terms.quotes, bonus.opening, bonus.source.cell_discharge.meter_id)
+    n = len(terms.quotes)
+    if (terms.quotes != bonus.quotes or not n or len(terms.grid_import) != n
+        or len(bonus.grid_export) != n or len(bonus.export_bounds_kwh) != n):
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+    used = {v.idx for row in bonus.source.cell_discharge.bus_power_vars for v in row}
+    used.update(v.idx for v in bonus.source.discharge_on if v is not None)
+    for i, (imp, exp, bound) in enumerate(zip(terms.grid_import, bonus.grid_export,
+                                            bonus.export_bounds_kwh, strict=True)):
+        if i and terms.quotes[i-1].end_ts != terms.quotes[i].start_ts:
+            raise PlanningSolutionRejected(_PERIOD_CODE)
+        for var in (imp, exp):
+            identity = _handle(var, model, _PERIOD_CODE)
+            lower, upper = _number(var.lb, _PERIOD_CODE), _number(var.ub, _PERIOD_CODE)
+            if identity in used or lower < 0 or upper < lower or var.ub >= sys.float_info.max:
+                raise PlanningSolutionRejected(_PERIOD_CODE)
+            used.add(identity)
+        if not isinstance(bound, Decimal) or _number(bound, _PERIOD_CODE) < Decimal(str(exp.ub)):
+            raise PlanningSolutionRejected(_PERIOD_CODE)
+    forecast = _series(terms, tuple(var.x for var in terms.grid_import),
+        tuple(var.x for var in bonus.grid_export), source.engine_cell_kwh, "optimizer_forecast", [])
+    baseline = _series(terms, tuple(item.import_kwh for item in audit.baseline),
+        tuple(item.export_kwh for item in audit.baseline), (Decimal(0),)*n, "fixed_no_battery_baseline", [])
+    if audit.source != source or audit.forecast != forecast or audit.baseline != baseline:
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+    # Beide trajecten opnieuw vanaf dezelfde immutable opening, met hun eigen
+    # negatieve btwgrondslagen. Geen forecastcredit aan de referentie toeschrijven.
+    snapshots = terms.context.price_batch.snapshots
+    forecast_result = settle_series(forecast, snapshots, bonus.opening)
+    baseline_result = settle_series(baseline, snapshots, bonus.opening)
+    if audit.forecast_result != forecast_result or audit.baseline_result != baseline_result:
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+    return model, forecast, forecast_result
+
+
+def _period_calendar(terms, result):
+    """Alleen kalenderhergebruik uit de engine; geen tweede afrekenkern."""
+    snapshots = sorted(terms.context.price_batch.snapshots, key=lambda s: s.valid_from_ts)
+    bounds = _contract_periods(snapshots)
+    previous = terms.bonus.opening.month
+    segments = []
+    for i, price in enumerate(terms.quotes):
+        start, end = _month_period(price.snapshot, price.start_ts, previous,
+                                   bounds[price.snapshot.valid_from_ts])
+        if not start <= price.start_ts < price.end_ts <= end:
+            raise PlanningSolutionRejected(_PERIOD_CODE)
+        key = start, end, price.snapshot.contract_id, price.snapshot.monthly_export_floor
+        if not segments or segments[-1][0] != key:
+            segments.append((key, []))
+        segments[-1][1].append(i)
+        previous = result.lines[i].after_state.month
+    return segments
+
+
+def _period_prefix(terms, first_key):
+    opening, price = terms.bonus.opening, terms.quotes[0]
+    month = opening.month
+    if month is None:
+        return
+    rates = set()
+    negative = Decimal(0)
+    for rate, basis in month.negative_basis_by_vat:
+        rate, basis = _number(rate, _PERIOD_CODE), _number(basis, _PERIOD_CODE)
+        if rate < 0 or basis < 0 or rate in rates:
+            raise PlanningSolutionRejected(_PERIOD_CODE)
+        rates.add(rate)
+        negative += basis
+    if month.spot_export_eur is not None:
+        revenue = _number(month.spot_export_eur, _PERIOD_CODE)
+        if month.complete and negative < max(Decimal(0), -revenue):
+            raise PlanningSolutionRejected(_PERIOD_CODE)
+    if price.snapshot.monthly_export_floor != "none" and price.start_ts != first_key[0]:
+        natural_end = _month_period(price.snapshot, price.start_ts, None, (None, None))[1]
+        if (month.contract_id != first_key[2] or month.period_start_ts != first_key[0]
+            or not month.period_start_ts <= opening.asof_ts < month.period_end_ts
+            or month.period_end_ts > natural_end):
+            raise PlanningSolutionRejected(_PERIOD_CODE)
+
+
+def _period_reference(terms, forecast, key, indices):
+    """Onafhankelijke C/brutogrenzen, zowel raw solver als genormaliseerde prognose."""
+    start, end, _, floor = key
+    zero = (Decimal(0),)*3
+    if floor == "none":
+        return zero, zero, None, True, ()
+    first = indices[0]
+    month = terms.bonus.opening.month
+    opening = None
+    rates = set()
+    if terms.quotes[first].start_ts == start:
+        opening = Decimal(0)
+    elif first == 0 and month is not None and month.complete:
+        opening = month.spot_export_eur
+        rates.update(rate for rate, basis in month.negative_basis_by_vat if basis > 0)
+    for i in indices:
+        price = terms.quotes[i]
+        if price.spot_ex_vat < 0 and terms.bonus.export_bounds_kwh[i] > 0:
+            day = datetime.fromtimestamp(price.start_ts, ZoneInfo(price.snapshot.timezone)).date()
+            rate = _number(_effective_value(price.snapshot.vat_production, day), _PERIOD_CODE)
+            if rate < 0:
+                raise PlanningSolutionRejected(_PERIOD_CODE)
+            rates.add(rate)
+    if opening is None or terms.quotes[indices[-1]].end_ts != end:
+        return zero, zero, None, False, (_PERIOD_OMITTED,)
+    opening = _number(opening, _PERIOD_CODE)
+    # De exacte Decimal- én werkelijke floatenvelop moeten C=0 bewijzen.
+    lower, solver_lower = Fraction(opening), Fraction.from_float(float(opening))
+    raw_revenue = normalized_revenue = opening
+    for i in indices:
+        spot, var = terms.quotes[i].spot_ex_vat, terms.bonus.grid_export[i]
+        lo = min(Fraction(Decimal(str(var.lb))), Fraction.from_float(var.lb))
+        hi = max(Fraction(terms.bonus.export_bounds_kwh[i]), Fraction.from_float(var.ub))
+        lower += min(Fraction(spot)*lo, Fraction(spot)*hi)
+        solver_lower += min(Fraction.from_float(float(spot))*Fraction.from_float(var.lb),
+                            Fraction.from_float(float(spot))*Fraction.from_float(var.ub))
+        raw_revenue += _number(var.x, _PERIOD_CODE) * spot
+        normalized_revenue += forecast[i].export_kwh * spot
+    if min(lower, solver_lower) >= 0:
+        return zero, zero, None, True, ()
+    if not rates:
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+    vat = min(rates), max(rates)
+    exact = vat[0] == vat[1]
+    values = []
+    for revenue in (raw_revenue, normalized_revenue):
+        credit = max(Decimal(0), -revenue)
+        values.append((credit, credit*(1 + vat[0]/100), credit*(1 + vat[1]/100)))
+    return values[0], values[1], vat, exact, () if exact else (_PERIOD_MIXED,)
+
+
+def audit_period_solution(
+    terms: FinancialModelTerms, periods: PeriodModelTerms, *, planning_audit: PlanningAuditResult,
+) -> PeriodAudit:
+    """Solve-vrije A9-controle; conservatisme blijft buiten A8-EUR-pariteit."""
+    with localcontext() as context:
+        context.prec = 36
+        try:
+            return _audit_period_solution(terms, periods, planning_audit)
+        except PlanningSolutionRejected as exc:
+            if exc.code == _PERIOD_CODE:
+                raise
+            raise PlanningSolutionRejected(_PERIOD_CODE) from exc
+        except (ArithmeticError, AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+            raise PlanningSolutionRejected(_PERIOD_CODE) from exc
+
+
+def _audit_period_solution(terms, periods, audit):
+    if not isinstance(periods, PeriodModelTerms) or periods.policy_version != "vat_lower_bound_v1":
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+    model, forecast, result = _period_binding_and_replay(terms, audit)
+    segments = _period_calendar(terms, result)
+    _period_prefix(terms, segments[0][0])
+    if len(segments) != len(periods.periods):
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+    model_sum = [Decimal(0), Decimal(0)]
+    raw_sum = [Decimal(0), Decimal(0)]
+    normalized_sum = [Decimal(0), Decimal(0)]
+    engine_sum = Decimal(0)
+    exact_all, issues = True, []
+    adjustments = {(a.period_start_ts, a.period_end_ts): a for a in result.adjustments}
+    for (key, indices), period in zip(segments, periods.periods, strict=True):
+        if (not isinstance(period, MonthFloorTerms)
+            or (period.period_start_ts, period.period_end_ts, period.contract_id) != key[:3]
+            or period.interval_indices != tuple(indices)):
+            raise PlanningSolutionRejected(_PERIOD_CODE)
+        raw, normalized, vat, exact, period_issues = _period_reference(terms, forecast, key, indices)
+        if period.vat_bounds_percent != vat or period.exact is not exact or period.issues != period_issues:
+            raise PlanningSolutionRejected(_PERIOD_CODE)
+        actual = tuple(_period_expression(expr, model) for expr in
+                       (period.credit_ex_vat, period.credit, period.credit_upper))
+        for value, expected, normalized_value in zip(actual, raw, normalized, strict=True):
+            _period_close(value, expected)
+            _period_close(value, normalized_value)
+        for i in range(2):
+            model_sum[i] += actual[i+1]
+            raw_sum[i] += raw[i+1]
+            normalized_sum[i] += normalized[i+1]
+        if key[3] != "none" and terms.quotes[indices[-1]].end_ts == key[1]:
+            adjustment = adjustments.get(key[:2])
+            if adjustment is None:
+                if _PERIOD_OMITTED not in period_issues:
+                    raise PlanningSolutionRejected(_PERIOD_CODE)
+                engine_sum = None
+            else:
+                engine_credit = _number(adjustment.credit_total, _PERIOD_CODE)
+                if engine_sum is not None:
+                    engine_sum += engine_credit
+                if _PERIOD_OMITTED not in period_issues:
+                    _period_close(adjustment.credit_ex_vat, normalized[0])
+                    if (engine_credit < normalized[1] - _PERIOD_EUR_BUDGET
+                        or engine_credit > normalized[2] + _PERIOD_EUR_BUDGET):
+                        raise PlanningSolutionRejected(_PERIOD_CODE)
+        exact_all &= exact
+        issues.extend(period_issues)
+    issues = tuple(dict.fromkeys(issues))
+    if periods.exact is not exact_all or periods.issues != issues:
+        raise PlanningSolutionRejected(_PERIOD_CODE)
+    totals = tuple(_period_expression(expr, model) for expr in (periods.credit, periods.credit_upper))
+    for i, value in enumerate(totals):
+        for expected in (model_sum[i], raw_sum[i], normalized_sum[i]):
+            _period_close(value, expected)
+    _check_model_solution(model)
+    return PeriodAudit(totals[0], engine_sum, exact_all, issues)

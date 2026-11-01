@@ -2,8 +2,10 @@
 
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 
 import mip
+import pytest
 
 from dao.prog import da_debug, day_ahead
 from dao.tests.settlement import conftest as settlement_fixtures
@@ -12,6 +14,7 @@ from dao.tests.settlement.test_optimization_audit import (
     override_solution,
     run_audit,
 )
+from dao.tests.settlement.test_optimization_periods import audited_period_case, period_audit
 
 
 def test_debug_registers_source_and_cap_without_var_equality(monkeypatch):
@@ -91,3 +94,55 @@ def test_debug_presents_finalization_and_only_canonical_money(monkeypatch):
     assert any(issue.startswith("planning_auxiliary_residual:") for issue in diag["issues"])
     assert "refined_original_optimality_unproven" in diag["issues"]
     assert "synthetic-meter" not in json.dumps(diag)
+
+
+@pytest.mark.parametrize("mode,engine", [("closed", "0.1186"), ("unknown", None), ("open", "0")])
+def test_period_debug_keeps_model_credit_separate_from_engine_credit(mode, engine):
+    """Omitted or conservative planner credit must not masquerade as a paid engine amount."""
+    snapshot = settlement_fixtures.snapshot.__wrapped__()
+    model, terms, periods, selected, audit = audited_period_case(snapshot, mode=mode)
+    result = period_audit(terms, periods, audit)
+    legacy = da_debug._build_result_dict(model, [], {}, financial_terms=terms, planning_audit=audit,
+                                         finalized_solution=selected)
+    payload = da_debug._build_result_dict(model, [], {}, financial_terms=terms, planning_audit=audit,
+        finalized_solution=selected, period_terms=periods, period_audit=result)
+    diag = payload["settlement"].pop("periods")
+    assert payload == legacy
+    assert diag["policy"] == "vat_lower_bound_v1"
+    assert diag["exact"] is False
+    assert (None if diag["engine_closed_credit_eur"] is None else Decimal(diag["engine_closed_credit_eur"])) == (
+        None if engine is None else Decimal(engine))
+    assert Decimal(diag["model_credit_eur"]) == pytest.approx(
+        Decimal("0.109") if mode == "closed" else Decimal("0"), abs=Decimal("0.000001"))
+    assert diag["credit_unit"] == "EUR gross"
+    assert diag["estimated"] is True
+    assert diag["economics_supported"] is False
+    if mode == "closed":
+        assert Decimal(diag["selected_trajectory_credit_difference_eur"]) == pytest.approx(
+            Decimal("0.0096"), abs=Decimal("0.000001"))
+        assert Decimal(diag["baseline_engine_closed_credit_eur"]) == Decimal("0.0605")
+        assert diag["interval_bound_proven"] is True
+    else:
+        assert diag["selected_trajectory_credit_difference_eur"] is None
+        assert diag["interval_bound_proven"] is False
+    assert "conservative_objective_not_global_original_optimum" in diag["limitations"]
+    assert "terminal_export_mean_v1_heuristic" in diag["limitations"]
+    assert "synthetic-meter" not in json.dumps(diag)
+
+
+def test_period_debug_flows_through_both_existing_capture_replay_callsites(tmp_path):
+    """Real capture/replay serializers must retain the separately audited period result."""
+    snapshot = settlement_fixtures.snapshot.__wrapped__()
+    model, terms, periods, selected, audit = audited_period_case(snapshot, mode="unknown")
+    result = period_audit(terms, periods, audit)
+    primary = SimpleNamespace(_debug_financial_terms=terms, _debug_planning_audit=audit,
+        _debug_finalized_solution=selected, _debug_period_terms=periods, _debug_period_audit=result)
+    recording = da_debug.RecordingIO(out_dir=tmp_path)
+    recording._primary, recording._model = primary, model
+    recording._write_result("synthetic")
+    captured = json.loads(recording.result_path.read_text())
+    replay = da_debug.ReplayIO.__new__(da_debug.ReplayIO)
+    replay._primary, replay._model, replay._cbc_log_chunks = primary, model, []
+    replay._recorded_solver_threads, replay._solver_threads_override, replay._source = 1, None, "synthetic"
+    assert replay.build_result()["settlement"]["periods"] == captured["settlement"]["periods"]
+    assert captured["settlement"]["periods"]["engine_closed_credit_eur"] is None

@@ -50,6 +50,7 @@ import logging
 import math
 import subprocess
 import sys
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any, Optional
 
@@ -480,7 +481,8 @@ def _finalization_dict(selected):
 
 
 def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict, *,
-                       financial_terms=None, planning_audit=None, finalized_solution=None) -> Optional[dict]:
+                       financial_terms=None, planning_audit=None, finalized_solution=None,
+                       period_terms=None, period_audit=None) -> Optional[dict]:
     if model is None:
         return None
     try:
@@ -537,10 +539,59 @@ def _build_result_dict(model, cbc_log_chunks: list[str], extra_meta: dict, *,
                     for line in planning_audit.forecast_result.lines],
                 "issues": list(financial_terms.bonus.issues if planning_audit is None else planning_audit.issues),
             }
+            if period_terms is not None:
+                result["settlement"]["periods"] = _period_result_dict(period_terms, period_audit, planning_audit)
         return result
     except Exception:
         logger.exception("Kon solve-resultaat niet opbouwen")
         return None
+
+
+def _closed_period_credit(result):
+    """Alleen bestaande canonieke correcties tonen; geen tweede engineberekening."""
+    if result is None:
+        return None
+    closed = {(line.after_state.month.period_start_ts, line.after_state.month.period_end_ts)
+              for line in result.lines if line.after_state.month is not None
+              and line.end_ts == line.after_state.month.period_end_ts}
+    amounts = {(a.period_start_ts, a.period_end_ts): a.credit_total for a in result.adjustments}
+    if closed != amounts.keys():
+        return None
+    with localcontext() as context:
+        context.prec = 36
+        return sum(amounts.values(), Decimal(0))
+
+
+def _period_result_dict(terms, audit, planning_audit):
+    proven = "monthly_credit_omitted_open_or_unknown" not in terms.issues
+    engine = None if audit is None else audit.engine_closed_credit_eur
+    baseline = _closed_period_credit(None if planning_audit is None else planning_audit.baseline_result)
+    difference = None
+    if proven and audit is not None and engine is not None:
+        with localcontext() as context:
+            context.prec = 36
+            difference = str(engine - audit.model_credit_eur)
+    return {
+        "policy": terms.policy_version, "exact": terms.exact if audit is None else audit.exact,
+        "issues": list(terms.issues if audit is None else audit.issues),
+        "credit_unit": "EUR gross", "estimated": True, "economics_supported": False,
+        "model_credit_eur": None if audit is None else str(audit.model_credit_eur),
+        "model_credit_upper_eur": None if audit is None else str(terms.credit_upper.x),
+        "engine_closed_credit_eur": None if engine is None else str(engine),
+        "baseline_engine_closed_credit_eur": None if baseline is None or audit is None else str(baseline),
+        "interval_bound_proven": proven and audit is not None,
+        "selected_trajectory_credit_difference_eur": difference,
+        "coverage": [{
+            "period_start_ts": p.period_start_ts, "period_end_ts": p.period_end_ts,
+            "interval_indices": list(p.interval_indices), "exact": p.exact, "issues": list(p.issues),
+            "vat_bounds_percent": None if p.vat_bounds_percent is None else [str(r) for r in p.vat_bounds_percent],
+        } for p in terms.periods],
+        "limitations": ["conservative_objective_not_global_original_optimum",
+                        "refinement_optimality_only_in_narrowed_space", "terminal_export_mean_v1_heuristic",
+                        "selected_trajectory_difference_not_global_opportunity_gap",
+                        "open_or_unknown_zero_is_omitted_incentive_not_eventual_credit_bound",
+                        "estimated_engine_credit_not_supplier_guarantee"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +921,8 @@ class RecordingIO:
             financial_terms=getattr(self._primary, "_debug_financial_terms", None),
             planning_audit=getattr(self._primary, "_debug_planning_audit", None),
             finalized_solution=getattr(self._primary, "_debug_finalized_solution", None),
+            period_terms=getattr(self._primary, "_debug_period_terms", None),
+            period_audit=getattr(self._primary, "_debug_period_audit", None),
         )
         if result is None:
             return
@@ -1046,6 +1099,8 @@ class ReplayIO:
             financial_terms=getattr(self._primary, "_debug_financial_terms", None),
             planning_audit=getattr(self._primary, "_debug_planning_audit", None),
             finalized_solution=getattr(self._primary, "_debug_finalized_solution", None),
+            period_terms=getattr(self._primary, "_debug_period_terms", None),
+            period_audit=getattr(self._primary, "_debug_period_audit", None),
         )
 
     # -- context manager -----------------------------------------------

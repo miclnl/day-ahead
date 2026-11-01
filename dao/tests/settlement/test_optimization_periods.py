@@ -10,10 +10,22 @@ from zoneinfo import ZoneInfo
 import mip
 import pytest
 
+from dao.prog import day_ahead
+from dao.prog.fastctrl.plan import FinancialBasis
+from dao.prog.settlement import optimization_audit
 from dao.prog.settlement.engine import settle_series
 from dao.prog.settlement.optimization import OptimizationInputError
+from dao.prog.settlement.service import PlanningContext
 from dao.prog.settlement.tariffs import quote
-from dao.prog.settlement.types import InputInterval, MonthState, SettlementState, TerminalValue
+from dao.prog.settlement.types import (
+    InputInterval,
+    MonthState,
+    PriceBatch,
+    RegisteredSpot,
+    SettlementState,
+    SpotInterval,
+    TerminalValue,
+)
 
 D = Decimal
 ZONE = ZoneInfo("Europe/Amsterdam")
@@ -451,3 +463,298 @@ def test_terminal_invalid_reference_efficiency_is_rejected(snapshot, efficiency)
     start = ts("2027-01-16", 12)
     with pytest.raises(ValueError):
         terminal_value((quote(snapshot(), start, start + 900, D("0.20")),), (efficiency,))
+
+
+def financial_period_case(snapshot, *, amounts=("0.5", "1"), spots=("-0.10", "0.15"),
+                          revenue="-0.20", groups=(("21", "0.20"),), mode="closed",
+                          vat="9", snapshots=None):
+    """Build the actual finance binding before any solve, with pinned hourly prices."""
+    end = ts("2027-01-16") if mode == "open" else ts("2027-02-01")
+    snap = snapshot(vat_production=((date(2027, 1, 1), D(vat)),),
+                    monthly_export_floor="none" if mode == "disabled" else "spot_zero")
+    if snapshots is not None:
+        snap = snapshots[0]
+    else:
+        snapshots = (snap,)
+    prices = tuple(quote(snap, end - (len(spots)-i)*3600, end - (len(spots)-i-1)*3600, D(spot))
+                   for i, spot in enumerate(spots))
+    first = prices[0].start_ts
+    opening = prefix(first, revenue=None if mode == "unknown" else revenue,
+                     groups=groups, complete=mode != "unknown")
+    if mode == "missing":
+        opening = replace(opening, month=None)
+    return bind_financial_period_case(prices, amounts, opening, snapshots)
+
+
+def bind_financial_period_case(prices, amounts, opening, snapshots):
+    from dao.prog.settlement.optimization import build_month_floor_terms
+
+    first, end = prices[0].start_ts, prices[-1].end_ts
+    hashes = tuple(s.snapshot_hash for s in snapshots)
+    basis = FinancialBasis("synthetic-meter", 1, hashes, ts("2027-01-01"),
+                           first, end, first, first)
+    raw = tuple(RegisteredSpot(SpotInterval(p.start_ts, p.end_ts, p.spot_ex_vat,
+                                           "synthetic-price", "estimated"), 1, "b" * 64)
+                for p in prices)
+    batch = PriceBatch("synthetic-meter", 1, first, end, raw, tuple(snapshots), first, first)
+    context = PlanningContext(basis, opening, prices, batch)
+    model, exports, bounds = model_grid(prices, amounts)
+    terms = day_ahead.bind_day_ahead_finance(model, context=context,
+        intervals=tuple((p.start_ts, p.end_ts) for p in prices), meter_id="synthetic-meter",
+        dc_from_bat=(), installation_battery_count=0, battery_indices=(),
+        no_battery_evidence="synthetic inventory",
+        hour_fractions=tuple(D(p.end_ts-p.start_ts)/D(3600) for p in prices),
+        discharge_efficiencies=(), grid_import=tuple(model.add_var(ub=0) for _ in prices),
+        grid_export=exports, export_bounds_kwh=bounds, origins=("verified_pv",)*len(prices),
+        source_policy=None)
+    periods = build_month_floor_terms(model, terms.quotes, terms.bonus.grid_export,
+        terms.bonus.export_bounds_kwh, terms.bonus.opening, snapshots=context.price_batch.snapshots)
+    return model, terms, periods
+
+
+def audited_period_case(snapshot, **kwargs):
+    model, terms, periods = financial_period_case(snapshot, **kwargs)
+    model.objective = terms.energy_cost - periods.credit
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    selected = day_ahead.finalize_day_ahead_finance(terms, cbc_log="")
+    audit = day_ahead.finish_day_ahead_finance(selected, org_l=(0.0, 0.0), org_t=(0.0, -1.0))
+    return model, terms, periods, selected, audit
+
+
+def period_audit(terms, periods, audit):
+    assert hasattr(optimization_audit, "audit_period_solution")
+    return optimization_audit.audit_period_solution(terms, periods, planning_audit=audit)
+
+
+def test_period_cost_binding_uses_lower_gross_credit_once(snapshot):
+    """Subtracting the engine/upper credit or counting the lower credit twice is wrong."""
+    model, terms, periods = financial_period_case(snapshot)
+    cost = model.add_var(lb=-10, ub=10)
+    day_ahead.bind_day_ahead_cost(model, cost=cost, legacy_energy_cost=mip.xsum([]) + 7,
+        other_cost=mip.xsum([]) + 0.03, financial_terms=terms, period_terms=periods)
+    model.objective = cost
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    assert terms.energy_cost.x == pytest.approx(-0.109)
+    assert periods.credit.x == pytest.approx(0.109)
+    assert periods.credit_upper.x == pytest.approx(0.121)
+    assert cost.x == pytest.approx(-0.188)
+
+
+@pytest.mark.parametrize("direction,export,credit,cost_value", [
+    ("min", 1, 0.0545, -0.0255), ("max", 0.5, 0, 0.0145),
+])
+def test_period_cost_free_export_crosses_zero_revenue(snapshot, direction, export, credit, cost_value):
+    """The two-sided max remains valid when the objective chooses either side of R=0."""
+    model, terms, periods = financial_period_case(snapshot, amounts=(None, "0"),
+        spots=("-0.10", "0"), revenue="0.05", groups=())
+    cost = model.add_var(lb=-10, ub=10)
+    day_ahead.bind_day_ahead_cost(model, cost=cost, legacy_energy_cost=mip.xsum([]),
+        other_cost=-0.08 * terms.bonus.grid_export[0], financial_terms=terms, period_terms=periods)
+    model.objective = mip.minimize(cost) if direction == "min" else mip.maximize(cost)
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    assert terms.bonus.grid_export[0].x == pytest.approx(export)
+    assert periods.credit.x == pytest.approx(credit)
+    assert cost.x == pytest.approx(cost_value)
+
+
+def test_period_cost_without_financial_binding_is_rejected(snapshot):
+    model, _, periods = financial_period_case(snapshot)
+    with pytest.raises(OptimizationInputError, match="planning_grid_invalid"):
+        day_ahead.bind_day_ahead_cost(model, cost=model.add_var(lb=-10),
+            legacy_energy_cost=mip.xsum([]), other_cost=mip.xsum([]),
+            financial_terms=None, period_terms=periods)
+
+
+def test_period_audit_accepts_conservatism_not_wrong_model(snapshot, monkeypatch):
+    """The EUR 0.0096 gap is conservative credit, never A8 parity tolerance."""
+    from dao.prog.settlement import optimization
+
+    model, terms, periods, selected, audit = audited_period_case(snapshot)
+    before = (day_ahead.model_digest(model), day_ahead.solution_digest(model))
+    monkeypatch.setattr(optimization, "build_month_floor_terms", lambda *a, **k: pytest.fail("self audit"))
+    monkeypatch.setattr(model, "optimize", lambda *a, **k: pytest.fail("post-selection solve"))
+    result = period_audit(terms, periods, audit)
+    assert result.model_credit_eur == pytest.approx(D("0.109"), abs=D("0.000001"))
+    assert result.engine_closed_credit_eur == D("0.1186")
+    assert result.exact is False and result.issues == (MIXED,)
+    assert audit.parity_complete and audit.parity_error_eur <= D("0.000001")
+    assert audit.model_energy_cost_eur == pytest.approx(D("-0.109"), abs=D("0.000001"))
+    assert before == (selected.model_digest, selected.solution_digest)
+    assert before == (day_ahead.model_digest(model), day_ahead.solution_digest(model))
+    with pytest.raises(FrozenInstanceError):
+        result.exact = True
+    assert not hasattr(result, "__dict__")
+
+
+@pytest.mark.parametrize("case", [
+    "lower", "upper", "ex_vat", "total", "total_upper", "vat", "exact", "issues", "policy",
+    "duplicate", "missing_period", "wrong_period", "wrong_indices", "engine_low", "engine_high",
+    "engine_within_envelope_not_canonical", "missing_engine", "duplicate_engine", "wrong_engine_period",
+    "baseline_forecast_credit", "forecast_binding", "export_bound", "quote_binding", "foreign_expression",
+])
+def test_period_audit_rejects_wrong_model_and_replay(snapshot, case):
+    model, terms, periods, _, audit = audited_period_case(snapshot)
+    period, = periods.periods
+    if case in ("lower", "upper", "ex_vat"):
+        field = {"lower": "credit", "upper": "credit_upper", "ex_vat": "credit_ex_vat"}[case]
+        periods = replace(periods, periods=(replace(period, **{field: getattr(period, field) + 0.01}),))
+    elif case in ("total", "total_upper"):
+        field = "credit" if case == "total" else "credit_upper"
+        periods = replace(periods, **{field: getattr(periods, field) + 0.01})
+    elif case == "vat":
+        periods = replace(periods, periods=(replace(period, vat_bounds_percent=(D("9"), D("50"))),))
+    elif case == "exact":
+        periods = replace(periods, exact=True, periods=(replace(period, exact=True),))
+    elif case == "issues":
+        periods = replace(periods, issues=(), periods=(replace(period, issues=()),))
+    elif case == "policy":
+        periods = replace(periods, policy_version="unapproved")
+    elif case == "duplicate":
+        periods = replace(periods, periods=(period, period))
+    elif case == "missing_period":
+        periods = replace(periods, periods=())
+    elif case == "wrong_period":
+        periods = replace(periods, periods=(replace(period, contract_id="wrong"),))
+    elif case == "wrong_indices":
+        periods = replace(periods, periods=(replace(period, interval_indices=(1, 0)),))
+    elif case.startswith("engine_"):
+        amount = {"engine_low": "0.108", "engine_high": "0.122",
+                  "engine_within_envelope_not_canonical": "0.110"}[case]
+        adj, = audit.forecast_result.adjustments
+        adj = replace(adj, credit_total=D(amount), credit_vat=D(amount)-adj.credit_ex_vat)
+        audit = replace(audit, forecast_result=replace(audit.forecast_result, adjustments=(adj,)))
+    elif case in ("missing_engine", "duplicate_engine", "wrong_engine_period"):
+        adj, = audit.forecast_result.adjustments
+        adjustments = () if case == "missing_engine" else (adj, adj) if case == "duplicate_engine" else (
+            replace(adj, period_start_ts=adj.period_start_ts+1),)
+        audit = replace(audit, forecast_result=replace(audit.forecast_result, adjustments=adjustments))
+    elif case == "baseline_forecast_credit":
+        audit = replace(audit, baseline_result=replace(audit.baseline_result,
+            adjustments=audit.forecast_result.adjustments))
+    elif case == "forecast_binding":
+        audit = replace(audit, forecast=(replace(audit.forecast[0], export_kwh=D("0")), audit.forecast[1]))
+    elif case == "export_bound":
+        terms = replace(terms, bonus=replace(terms.bonus, export_bounds_kwh=(D("0.1"), D("1"))))
+    elif case == "quote_binding":
+        terms = replace(terms, quotes=(replace(terms.quotes[0], spot_ex_vat=D("-0.2")), terms.quotes[1]))
+    else:
+        foreign = mip.Model(solver_name=mip.CBC)
+        periods = replace(periods, credit=foreign.add_var(ub=1) * 1)
+    with pytest.raises(optimization_audit.PlanningSolutionRejected, match="planning_period_parity_failed"):
+        period_audit(terms, periods, audit)
+
+
+def test_baseline_has_its_own_vat_weight(snapshot):
+    """Forecast and baseline must not share the forecast's weighted credit."""
+    _, terms, periods, _, audit = audited_period_case(snapshot)
+    result = period_audit(terms, periods, audit)
+    assert result.engine_closed_credit_eur == D("0.1186")
+    assert audit.baseline_result.adjustments[0].credit_total == D("0.0605")
+    assert audit.forecast_result.adjustments[0].credit_vat == D("0.0186")
+    assert audit.baseline_result.adjustments[0].credit_vat == D("0.0105")
+    assert audit.savings_energy_eur == D("-0.0545")
+    assert audit.baseline_result.lines[0].before_state is terms.bonus.opening
+    assert audit.forecast_result.lines[0].before_state is terms.bonus.opening
+
+
+@pytest.mark.parametrize("mode,spot,revenue,vat,exact,engine", [
+    ("open", "-0.10", "-0.20", "9", False, "0"),
+    ("unknown", "-0.10", "-0.20", "9", False, None),
+    ("missing", "-0.10", "-0.20", "9", False, None),
+    ("disabled", "-0.10", "-0.20", "9", True, "0"),
+    ("closed", "0", "0", "9", True, "0"),
+    ("closed", "-0.10", "-0.20", "0", False, "0.292"),
+    ("closed", "0", "-0.20", "9", True, "0.242"),
+])
+def test_period_audit_preserves_unknown_open_disabled_and_zero(snapshot, mode, spot, revenue, vat, exact, engine):
+    _, terms, periods, _, audit = audited_period_case(snapshot, mode=mode, spots=(spot, "0"),
+                                                    revenue=revenue, vat=vat)
+    result = period_audit(terms, periods, audit)
+    assert result.exact is exact
+    assert result.engine_closed_credit_eur == (None if engine is None else D(engine))
+    if mode in ("open", "unknown", "missing"):
+        assert result.model_credit_eur == 0
+        assert result.issues == (OMITTED,)
+
+
+@pytest.mark.parametrize("spots,amounts,vat,exact,lower,engine", [
+    (("-0.10", "0.15"), ("0.5", "1"), "21", True, "0.121", "0.121"),
+    (("-0.10", "0.30"), ("0", "1"), "9", False, "0", "0"),
+])
+def test_period_audit_exactness_is_presolved_not_reclassified(snapshot, spots, amounts, vat, exact, lower, engine):
+    _, terms, periods, _, audit = audited_period_case(snapshot, spots=spots, amounts=amounts, vat=vat)
+    result = period_audit(terms, periods, audit)
+    assert result.model_credit_eur == pytest.approx(D(lower), abs=D("0.000001"))
+    assert result.engine_closed_credit_eur == D(engine)
+    assert result.exact is exact
+
+
+@pytest.mark.parametrize("changed_contract", [True, False])
+def test_period_audit_calendar_uses_all_pinned_snapshots(snapshot, changed_contract):
+    """The same quote and prefix close only with the pinned adjacent contract change."""
+    end = ts("2027-01-16")
+    first = snapshot(valid_to_ts=end)
+    adjacent = snapshot(snapshot_hash="c"*64, valid_from_ts=end,
+                        contract_id="next-contract" if changed_contract else first.contract_id)
+    model, terms, periods, _, audit = audited_period_case(snapshot, mode="open",
+        revenue="0", groups=(), spots=("-0.20", "0"), snapshots=(first, adjacent))
+    result = period_audit(terms, periods, audit)
+    assert result.model_credit_eur == pytest.approx(D("0.1") if changed_contract else D("0"))
+    assert result.engine_closed_credit_eur == (D("0.1") if changed_contract else D("0"))
+    assert result.exact is changed_contract
+    assert day_ahead.model_digest(model)
+    if changed_contract:
+        # A coherent reduced context still cannot certify terms built with a
+        # different calendar. Do not trust the builder's own period end.
+        context = replace(terms.context, basis=replace(terms.context.basis, snapshot_hashes=(first.snapshot_hash,)),
+                          price_batch=replace(terms.context.price_batch, snapshots=(first,)))
+        changed = replace(terms, context=context)
+        with pytest.raises(optimization_audit.PlanningSolutionRejected, match="planning_period_parity_failed"):
+            period_audit(changed, periods, audit)
+
+
+@pytest.mark.parametrize("unknown", [True, False])
+def test_period_audit_closed_then_open_month_never_double_counts(snapshot, unknown):
+    end = ts("2027-02-01")
+    snap = snapshot(vat_production=((date(2027, 1, 1), D("21")),))
+    prices = (quote(snap, end-3600, end, D("-0.20")), quote(snap, end, end+3600, D("-0.10")))
+    model, terms, periods = bind_financial_period_case(prices, ("1", "1"),
+        prefix(end-3600, revenue=None if unknown else "0", complete=not unknown), (snap,))
+    model.objective = terms.energy_cost - periods.credit
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    selected = day_ahead.finalize_day_ahead_finance(terms, cbc_log="")
+    audit = day_ahead.finish_day_ahead_finance(selected, org_l=(0.0, 0.0), org_t=(-1.0, -1.0))
+    result = period_audit(terms, periods, audit)
+    assert result.model_credit_eur == pytest.approx(D("0") if unknown else D("0.242"))
+    assert result.engine_closed_credit_eur == (None if unknown else D("0.242"))
+    assert periods.periods[1].vat_bounds_percent is None
+    assert result.issues == (OMITTED,)
+    assert result.exact is False
+
+
+@pytest.mark.parametrize("spot,changed,accepted", [("-2000", 1, True), ("-2000", 2, False), ("-3000", 1, False)])
+def test_period_audit_normalization_budget_applies_per_component_and_horizon(snapshot, monkeypatch,
+                                                                           spot, changed, accepted):
+    """Two individually sub-budget normalization errors may not exceed the sum budget."""
+    from dao.tests.settlement.test_optimization_audit import override_solution
+
+    boundary, end = ts("2027-01-16", 23), ts("2027-01-17")
+    first = snapshot(valid_to_ts=boundary)
+    second = snapshot(snapshot_hash="c"*64, contract_id="next-contract", valid_from_ts=boundary, valid_to_ts=end)
+    adjacent = snapshot(snapshot_hash="d"*64, contract_id="following-contract", valid_from_ts=end)
+    prices = (quote(first, boundary-3600, boundary, D(spot)), quote(second, boundary, end, D(spot)))
+    model, terms, periods = bind_financial_period_case(prices, ("0.5", "0.5"), prefix(boundary-3600),
+                                                      (first, second, adjacent))
+    model.objective = terms.energy_cost - periods.credit
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    selected = day_ahead.finalize_day_ahead_finance(terms, cbc_log="")
+    audit = day_ahead.finish_day_ahead_finance(selected, org_l=(0.0, 0.0), org_t=(-0.5, -0.5))
+    # Controlled raw read perturbations, not claims about this CBC solution.
+    # Each still normalizes to exactly the original 0.500000000 kWh.
+    override_solution(monkeypatch, model, {var.idx: 0.50000000049 for var in terms.bonus.grid_export[:changed]})
+    if accepted:
+        result = period_audit(terms, periods, audit)
+        assert result.engine_closed_credit_eur == D("2000")
+    else:
+        with pytest.raises(optimization_audit.PlanningSolutionRejected, match="planning_period_parity_failed"):
+            period_audit(terms, periods, audit)
