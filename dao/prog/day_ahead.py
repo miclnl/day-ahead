@@ -22,7 +22,7 @@ from inspect import getattr_static
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from mip import BINARY, CONTINUOUS, INTEGER, LinExpr, Model, Var, minimize, xsum
+from mip import BINARY, CONTINUOUS, INTEGER, InfeasibleSolution, LinExpr, Model, Var, minimize, xsum
 from pandas.core.dtypes.inference import is_number
 from utils import (
     calc_adjustment_heatcurve,
@@ -269,6 +269,89 @@ def _audit_battery_wear_cost(
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise PlanningSolutionRejected(code) from exc
     return total, tuple(dict.fromkeys(issues))
+
+
+def _battery_cell_power_binding(model, dc_to_bat, dc_from_bat, battery_count, interval_count):
+    """Controleer de volledige oorspronkelijke DC-matrices vóór modelmutatie."""
+    code = "battery_direction_binding_invalid"
+    try:
+        if (not isinstance(model, Model) or type(battery_count) is not int or battery_count < 0
+            or type(interval_count) is not int or interval_count <= 0
+            or len(dc_to_bat) != battery_count or len(dc_from_bat) != battery_count):
+            raise ValueError(code)
+        used = set()
+        for matrix in (dc_to_bat, dc_from_bat):
+            for row in matrix:
+                if len(row) != interval_count:
+                    raise ValueError(code)
+                for var in row:
+                    if (not isinstance(var, Var) or var.model is not model or var.idx < 0
+                        or var.idx >= len(model.vars) or model.vars[var.idx] is not var
+                        or var.idx in used or var.var_type != CONTINUOUS
+                        or not math.isfinite(var.lb) or not math.isfinite(var.ub)
+                        or not 0 <= var.lb <= var.ub):
+                        raise ValueError(code)
+                    used.add(var.idx)
+        return used
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise OptimizationInputError(code) from exc
+
+
+def _bind_battery_cell_direction(
+    model: Model, *, dc_to_bat: Sequence[Sequence[Var]], dc_from_bat: Sequence[Sequence[Var]],
+    installation_battery_count: int, interval_count: int,
+) -> tuple[tuple[Var, ...], ...]:
+    """Eén fysieke celrichting per batterij; het toegestane vermogen blijft continu."""
+    _battery_cell_power_binding(model, dc_to_bat, dc_from_bat, installation_battery_count, interval_count)
+    direction = tuple(tuple(model.add_var(var_type=BINARY, name=f"cell_charge_on_{b}_{i}")
+                            for i in range(interval_count)) for b in range(installation_battery_count))
+    for b, row in enumerate(direction):
+        for i, on in enumerate(row):
+            model += dc_to_bat[b][i] <= dc_to_bat[b][i].ub * on
+            model += dc_from_bat[b][i] <= dc_from_bat[b][i].ub * (1 - on)
+    return direction
+
+
+def _audit_battery_cell_direction(
+    model: Model, *, dc_to_bat: Sequence[Sequence[Var]], dc_from_bat: Sequence[Sequence[Var]],
+    cell_charge_on: Sequence[Sequence[Var]], installation_battery_count: int, interval_count: int,
+) -> None:
+    """Geen positieve rest in de uitgeschakelde celrichting accepteren, ook niet legacy."""
+    code = "battery_direction_solution_invalid"
+    index = None
+    try:
+        used = _battery_cell_power_binding(model, dc_to_bat, dc_from_bat,
+                                          installation_battery_count, interval_count)
+        tolerance = Decimal(str(model.integer_tol))
+        if (not tolerance.is_finite() or not 0 <= tolerance < Decimal("0.5")
+            or len(cell_charge_on) != installation_battery_count):
+            raise ValueError(code)
+        for b, row in enumerate(cell_charge_on):
+            if len(row) != interval_count:
+                raise ValueError(code)
+            for index, on in enumerate(row):
+                if (not isinstance(on, Var) or on.model is not model or on.idx < 0
+                    or on.idx >= len(model.vars) or model.vars[on.idx] is not on or on.idx in used
+                    or not ((on.var_type == BINARY and on.lb == 0 and on.ub == 1)
+                            or (on.var_type == INTEGER and on.lb == on.ub and on.lb in (0, 1)))):
+                    raise ValueError(code)
+                used.add(on.idx)
+                value = Decimal(str(on.x))
+                if not value.is_finite():
+                    raise ValueError(code)
+                choices = [n for n in (0, 1) if on.lb <= n <= on.ub
+                           and abs(Fraction(value) - n) <= Fraction(tolerance)]
+                if len(choices) != 1:
+                    raise ValueError(code)
+                charge, discharge = dc_to_bat[b][index], dc_from_bat[b][index]
+                if (any(var.x is None or not math.isfinite(var.x) or not var.lb <= var.x <= var.ub
+                        for var in (charge, discharge))
+                    or (discharge.x if choices[0] else charge.x) != 0):
+                    raise ValueError(code)
+        model.check_optimization_results()
+    except (OptimizationInputError, TypeError, ValueError, AttributeError, ArithmeticError,
+            AssertionError, InfeasibleSolution) as exc:
+        raise PlanningSolutionRejected(code, interval_index=index) from exc
 
 
 def finalize_day_ahead_finance(
@@ -1240,6 +1323,11 @@ class DaCalc(DaBase):
             ]
             for b in range(B)
         ]
+
+        cell_charge_on = _bind_battery_cell_direction(
+            model, dc_to_bat=dc_to_bat, dc_from_bat=dc_from_bat,
+            installation_battery_count=B, interval_count=U,
+        )
 
         # SoC
         soc = [
@@ -3828,6 +3916,13 @@ class DaCalc(DaBase):
         if financial_terms is not None:
             finalized_solution = finalize_day_ahead_finance(financial_terms, cbc_log=native["cbc_log"])
             financial_terms = finalized_solution.terms
+            _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
+        _audit_battery_cell_direction(
+            model, dc_to_bat=dc_to_bat, dc_from_bat=dc_from_bat, cell_charge_on=cell_charge_on,
+            installation_battery_count=B, interval_count=U,
+        )
+        if finalized_solution is not None:
+            _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
             if getattr(self, "_debug_capture_vars", False):
                 self._debug_finalized_solution = finalized_solution
                 self._debug_financial_terms = financial_terms

@@ -51,6 +51,19 @@ def test_debug_registers_source_and_cap_without_var_equality(monkeypatch):
     assert da_debug.build_var_registry({"financial_terms": unknown})
 
 
+def test_debug_registers_physical_cell_direction_separately():
+    model = mip.Model(solver_name=mip.CBC)
+    charge = tuple(tuple(model.add_var(ub=3) for _ in range(3)) for _ in range(2))
+    discharge = tuple(tuple(model.add_var(ub=7) for _ in range(3)) for _ in range(2))
+    direction = day_ahead._bind_battery_cell_direction(model, dc_to_bat=charge, dc_from_bat=discharge,
+        installation_battery_count=2, interval_count=3)
+    registry = da_debug.build_var_registry({"cell_charge_on": direction})
+    for b, row in enumerate(direction):
+        for i, var in enumerate(row):
+            assert registry.get(var.idx) == ("cell_charge_on", (b, i))
+    assert da_debug.SHAPES["cell_charge_on"][:2] == (("b", "u"), "bool")
+
+
 def test_debug_presents_finalization_and_only_canonical_money(monkeypatch):
     """The initial evidence and raw eligible residue cannot masquerade as final earnings."""
     snapshot = settlement_fixtures.snapshot.__wrapped__()

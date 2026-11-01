@@ -20,6 +20,7 @@ from dao.prog.config.models.base import FlexFloat
 from dao.prog.config.models.devices.battery import BatteryConfig
 from dao.prog.config.models.production_bonus import ProductionBonusConfig
 from dao.prog.fastctrl.plan import FinancialBasis
+from dao.prog.settlement.optimization import OptimizationInputError
 from dao.prog.settlement.optimization_audit import (
     PlanningSolutionRejected,
     validate_source_solution,
@@ -82,6 +83,8 @@ def capture(monkeypatch, tmp_path, request):
     settings = getattr(request, "param", {})
     if isinstance(settings, (int, float)):
         settings = {"baseload": settings}
+    if settings.get("hourly"):
+        instance.interval, instance.interval_s, instance.steps_day = "1hour", 3600, 24
     instance.config = SimpleNamespace(prices=None, baseload=[settings.get("baseload", 0.0)] * 24,
                                      max_gap=FlexFloat(value=0.005))
     instance.battery_options = [BatteryConfig.model_validate({
@@ -108,7 +111,8 @@ def capture(monkeypatch, tmp_path, request):
                  "set_entity_state", "set_entity_option", "select_option", "save_df", "export_fast_plan"):
         monkeypatch.setattr(instance, name, forbidden)
     start = settings.get("start", ts())
-    stamps = [start + 900 * i for i in range(12)]
+    grid_start = start // instance.interval_s * instance.interval_s
+    stamps = [grid_start + instance.interval_s * i for i in range(12)]
     dates = [dt.datetime.fromtimestamp(at) for at in stamps]
     prices = pd.DataFrame({"time": dates, "da_ex": [0.1] * 12,
                            "da_cons": [0.2] * 12, "da_prod": [0.1] * 12, "da_bonus": [0.0] * 12})
@@ -385,6 +389,9 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
     model, terms = financial_case(snapshot, bonus_rules)
     device = model.add_var(ub=1, name="continuous_device_flow")
     cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    cell_charge_on = da._bind_battery_cell_direction(model, dc_to_bat=((device,),), dc_from_bat=((cell,),),
+        installation_battery_count=1, interval_count=1)
+    model += cell_charge_on[0][0] == 1
     wear_cost = model.add_var(ub=1)
     model += wear_cost == (device + cell) * 0.0025
     cost = model.add_var(lb=-10, ub=10)
@@ -415,7 +422,8 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
     namespace = dict(self=instance, model=model, financial_terms=terms, period_terms=None, cost=cost,
         native={"cbc_log": "Welcome to the CBC MILP Solver Version: 2.10.12"},
         B=1, U=1, EV=1, M=1, solar_num=1, pv_dc_num=[0], hour_fraction=[0.25],
-        dc_to_bat=[[device]], dc_from_bat=[[cell]], kwh_cycle_cost=[0.01], cycle_cost=[wear_cost],
+        dc_to_bat=[[device]], dc_from_bat=[[cell]], cell_charge_on=cell_charge_on,
+        kwh_cycle_cost=[0.01], cycle_cost=[wear_cost],
         ac_to_dc=[[device]], ac_from_dc=[[device]], c_ev=[[device]], c_ma_u=[[device]],
         pv_ac=[[device]], solar_prod=[[0.5]], b_l=[0.0], c_b=[device], c_hp=[device], pl=[0.1], pt=[0.1])
     if outcome != "success":
@@ -594,7 +602,7 @@ def test_period_consumer_audit_precedes_preview_and_guards_digests(snapshot, mon
     namespace = dict(self=instance, model=model, financial_terms=terms, period_terms=periods, cost=cost,
         native={"cbc_log": ""}, B=0, U=2, EV=0, M=0, solar_num=1, pv_dc_num=[],
         hour_fraction=[1.0, 1.0], ac_to_dc=[], ac_from_dc=[], c_ev=[], c_ma_u=[],
-        dc_to_bat=[], dc_from_bat=[], kwh_cycle_cost=[], cycle_cost=[],
+        dc_to_bat=[], dc_from_bat=[], cell_charge_on=(), kwh_cycle_cost=[], cycle_cost=[],
         pv_ac=[[terms.grid_import[0], terms.grid_import[1]]], solar_prod=[[0.0, 1.0]],
         b_l=[0.0, 0.0], c_b=terms.grid_import, c_hp=terms.grid_import, pl=[0.1, 0.1], pt=[0.1, 0.1])
     with caplog.at_level(logging.INFO):
@@ -637,3 +645,160 @@ def test_period_debug_is_cleared_even_when_preflight_denies(capture):
     with pytest.raises(FinancialPlanBlocked):
         instance.calc_optimum(_start_dt=dt.datetime.fromtimestamp(ts()))
     assert all(getattr(instance, name) is None for name in names)
+
+
+@pytest.mark.parametrize("capture", [{}, {"start": ts(minute=7) + 30}, {"hourly": True}], indirect=True)
+@pytest.mark.parametrize("financial", [False, True])
+@pytest.mark.parametrize("charge,discharge", [(1, 1), (1.25, 0), (0, 1), (0, 0), (0.37, 0), (0, 0.63)])
+def test_real_producer_cell_directions_are_exclusive_and_continuous(
+        capture, snapshot, bonus_rules, financial, charge, discharge):
+    """Original producer flows, including partial powers, cannot use both cell directions."""
+    model, local, args = capture["model"], capture["locals"], capture["finance"]
+    if financial:
+        da.bind_day_ahead_finance(model, **{**args,
+            "context": context_for(snapshot, bonus_rules, args["intervals"], meter=args["meter_id"]),
+            "origins": ("unknown",) * local["U"], "source_policy": None})
+    assert local["dc_to_bat"][0][0].ub == local["dc_from_bat"][0][0].ub == 8
+    assert len(local["cell_charge_on"]) == 2
+    for b in range(local["B"]):
+        for i in range(local["U"]):
+            model += local["dc_to_bat"][b][i] == (charge if (b, i) == (0, 0) else 0)
+            model += local["dc_from_bat"][b][i] == (discharge if (b, i) == (0, 0) else 0)
+    model.objective = mip.xsum([])
+    model.verbose = 0
+    assert model.optimize() == (mip.OptimizationStatus.INFEASIBLE if charge and discharge
+                                else mip.OptimizationStatus.OPTIMAL)
+    if not (charge and discharge):
+        # Feasibility proof, not strict acceptance of a constant-objective incumbent.
+        # Tiny disabled-direction residues are rejected separately by the final audit tests.
+        model.check_optimization_results()
+        assert local["dc_to_bat"][0][0].x == pytest.approx(charge, abs=1e-9)
+        assert local["dc_from_bat"][0][0].x == pytest.approx(discharge, abs=1e-9)
+
+
+@pytest.mark.parametrize("mode", ["pass_through", "pv_charge_and_export", "opposite_batteries"])
+def test_cell_direction_is_independent_of_inverter_and_other_batteries(capture, snapshot, bonus_rules, mode):
+    """An AC export direction must not prohibit DC-PV charging, or another battery's discharge."""
+    model, local, args = capture["model"], capture["locals"], capture["finance"]
+    terms = da.bind_day_ahead_finance(model, **{**args,
+        "context": context_for(snapshot, bonus_rules, args["intervals"], meter=args["meter_id"]),
+        "origins": ("verified_pv",) * local["U"], "source_policy": POLICY})
+    for b in range(2):
+        for i in range(local["U"]):
+            model += local["dc_to_bat"][b][i] == (1 if b == i == 0 and mode != "pass_through" else 0)
+            model += local["dc_from_bat"][b][i] == (1 if b == 1 and i == 0 and mode == "opposite_batteries" else 0)
+    model.objective = terms.energy_cost
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    selected = da.finalize_day_ahead_finance(terms, cbc_log="")
+    da._audit_battery_cell_direction(model, dc_to_bat=local["dc_to_bat"], dc_from_bat=local["dc_from_bat"],
+        cell_charge_on=local["cell_charge_on"], installation_battery_count=2, interval_count=local["U"])
+    audit = da.finish_day_ahead_finance(selected, org_l=(0.0,) * local["U"], org_t=(-1.0,) * local["U"])
+    assert local["ac_from_dc"][0][0].x > 0
+    assert audit.forecast[0].battery_discharge_kwh == (D("0.25") if mode == "opposite_batteries" else 0)
+    assert audit.forecast_result.lines[0].bonus_kwh == (0 if mode == "opposite_batteries" else audit.forecast[0].export_kwh)
+
+
+@pytest.mark.parametrize("bad", ["missing", "duplicate", "foreign", "negative", "nonfinite", "integer", "axis"])
+def test_cell_direction_binding_rejects_incomplete_or_invalid_handles_before_mutation(monkeypatch, bad):
+    model = mip.Model(solver_name=mip.CBC)
+    charge, discharge = model.add_var(ub=3), model.add_var(ub=7)
+    matrix = ((charge,),)
+    if bad == "missing":
+        matrix = ()
+    elif bad == "duplicate":
+        matrix = ((discharge,),)
+    elif bad == "foreign":
+        other = mip.Model(solver_name=mip.CBC)
+        matrix = ((other.add_var(ub=3),),)
+    elif bad == "negative":
+        charge.lb = -1
+    elif bad == "nonfinite":
+        # Native CBC converts an infinite bound to a finite maximum; exercise bad readback explicitly.
+        get_upper = model.solver.var_get_ub
+        monkeypatch.setattr(model.solver, "var_get_ub", lambda var: float("inf") if var is charge else get_upper(var))
+    elif bad == "integer":
+        charge.var_type = mip.INTEGER
+    before = (model.num_cols, model.num_rows)
+    with pytest.raises(OptimizationInputError, match="battery_direction_binding_invalid"):
+        da._bind_battery_cell_direction(model, dc_to_bat=matrix, dc_from_bat=((discharge,),),
+            installation_battery_count=1, interval_count=0 if bad == "axis" else 1)
+    assert (model.num_cols, model.num_rows) == before
+
+
+@pytest.mark.parametrize("charge,discharge", [(0, 0), (0, 1.2), (0.7, 0), (0, 2.9)])
+def test_cell_direction_zero_and_unequal_upper_bounds(charge, discharge):
+    model = mip.Model(solver_name=mip.CBC)
+    model.verbose = 0
+    assert da._bind_battery_cell_direction(model, dc_to_bat=(), dc_from_bat=(),
+        installation_battery_count=0, interval_count=3) == ()
+    c, d = model.add_var(ub=0.7), model.add_var(ub=2.9)
+    y = da._bind_battery_cell_direction(model, dc_to_bat=((c,),), dc_from_bat=((d,),),
+                                      installation_battery_count=1, interval_count=1)
+    model += c == charge
+    model += d == discharge
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    da._audit_battery_cell_direction(model, dc_to_bat=((c,),), dc_from_bat=((d,),), cell_charge_on=y,
+                                    installation_battery_count=1, interval_count=1)
+    y[0][0].lb = y[0][0].ub = int(charge > 0)
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    da._audit_battery_cell_direction(model, dc_to_bat=((c,),), dc_from_bat=((d,),), cell_charge_on=y,
+                                    installation_battery_count=1, interval_count=1)
+    d.ub = 0
+    if discharge:
+        assert model.optimize() == mip.OptimizationStatus.INFEASIBLE
+
+
+def test_cell_direction_audit_rejects_native_model_check_failure(monkeypatch):
+    """A valid direction is not permission to accept a model rejected by its native checker."""
+    model = mip.Model(solver_name=mip.CBC)
+    model.verbose = 0
+    c, d = model.add_var(ub=0), model.add_var(ub=0)
+    y = da._bind_battery_cell_direction(model, dc_to_bat=((c,),), dc_from_bat=((d,),),
+                                      installation_battery_count=1, interval_count=1)
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+
+    def invalid():
+        raise mip.InfeasibleSolution("Controlled native model check failure")
+
+    monkeypatch.setattr(model, "check_optimization_results", invalid)
+    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+        da._audit_battery_cell_direction(model, dc_to_bat=((c,),), dc_from_bat=((d,),), cell_charge_on=y,
+                                        installation_battery_count=1, interval_count=1)
+
+
+@pytest.mark.parametrize("financial", [False, True])
+@pytest.mark.parametrize("fault", ["off_charge", "off_discharge", "negative", "nonfinite", "wrong_y", "fractional_y"])
+def test_final_cell_direction_audit_precedes_every_consumer(capture, snapshot, bonus_rules, monkeypatch, financial, fault):
+    """Even a tiny disabled-direction value must fail before arrays or an accepted debug selection."""
+    model, local = capture["model"], capture["locals"]
+    namespace = new_route_cost_namespace(capture, snapshot, bonus_rules) if financial else {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    for key in ("dc_to_bat", "dc_from_bat"):
+        for row in local[key]:
+            for var in row:
+                model += var == 0
+    y = local["cell_charge_on"][0][0]
+    model += y == (1 if fault == "off_discharge" else 0)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    # Inject only at the direction audit boundary, after genuine financial finalization.
+    audit = da._audit_battery_cell_direction
+
+    def inspect_direction(*args, **kwargs):
+        if fault in ("off_charge", "negative", "nonfinite"):
+            var = local["dc_to_bat"][0][0]
+            value = {"off_charge": 1e-12, "negative": -1e-12, "nonfinite": float("nan")}[fault]
+        elif fault == "off_discharge":
+            var, value = local["dc_from_bat"][0][0], 1e-12
+        else:
+            var, value = y, 2 if fault == "wrong_y" else 0.5
+        override_solution(monkeypatch, model, {var.idx: value})
+        return audit(*args, **kwargs)
+
+    namespace.update(_audit_battery_cell_direction=inspect_direction, native={"cbc_log": ""})
+    monkeypatch.setattr(model, "optimize", lambda: pytest.fail("Direction audit must not solve"))
+    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+        exec(post_strategy_consumers(), namespace)
+    assert not {"accu_in_sum", "org_l", "org_t", "financial_audit"} & namespace.keys()
+    assert not getattr(capture["instance"], "_debug_finalized_solution", None)
