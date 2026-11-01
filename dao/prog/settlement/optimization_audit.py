@@ -1,0 +1,346 @@
+"""Onafhankelijke kandidaatcontrole; solverfeasibility is geen bronbewijs."""
+
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, localcontext
+from fractions import Fraction
+from typing import Literal
+
+import mip
+import mip.cbc as cbc
+
+from dao.prog.settlement.engine import settle_series
+from dao.prog.settlement.metering import resolve_spot
+from dao.prog.settlement.optimization import (
+    BonusModelTerms,
+    OptimizationInputError,
+    _validate_cell_binding,
+)
+from dao.prog.settlement.service import PlanningContext
+from dao.prog.settlement.tariffs import quote, resolve_snapshot
+from dao.prog.settlement.types import InputInterval, PriceQuote, SettlementResult
+
+
+class PlanningSolutionRejected(RuntimeError):
+    def __init__(self, code: str, *, interval_index: int | None = None) -> None:
+        self.code = code
+        self.interval_index = interval_index
+        super().__init__(code if interval_index is None else f"{code}: interval {interval_index}")
+
+
+@dataclass(frozen=True, slots=True)
+class SolverEvidence:
+    python_mip_version: str
+    solver_name: str
+    cbc_version: str | None
+    integer_tol: Decimal
+    infeas_tol: Decimal
+    opt_tol: Decimal
+    cbc_primal_tol: Decimal | None
+    cbc_dual_tol: Decimal | None
+    integer_binding: Literal["python_mip_cbc_setDblParam"]
+    max_mip_gap_abs: Decimal
+    max_nodes: int
+    status: str
+    num_solutions: int
+    objective_value: Decimal
+    objective_bound: Decimal | None
+    gap: Decimal | None
+    limitations: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SourceAudit:
+    bus_values_kw: tuple[tuple[Decimal, ...], ...]
+    raw_cell_kwh: tuple[Fraction, ...]
+    engine_cell_kwh: tuple[Decimal, ...]
+    discharge_on: tuple[int | None, ...]
+    issues: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FinancialModelTerms:
+    context: PlanningContext
+    quotes: tuple[PriceQuote, ...]
+    grid_import: tuple[mip.Var, ...]
+    bonus: BonusModelTerms
+    energy_cost: mip.LinExpr
+
+
+@dataclass(frozen=True, slots=True)
+class PlanningAuditResult:
+    source: SourceAudit
+    evidence: SolverEvidence
+    forecast: tuple[InputInterval, ...]
+    baseline: tuple[InputInterval, ...]
+    forecast_result: SettlementResult
+    baseline_result: SettlementResult
+    model_energy_cost_eur: Decimal
+    engine_energy_cost_eur: Decimal | None
+    baseline_energy_cost_eur: Decimal | None
+    savings_energy_eur: Decimal | None
+    parity_error_eur: Decimal | None
+    parity_complete: bool
+    issues: tuple[str, ...]
+
+
+def _number(value, code, index=None):
+    try:
+        if value is None or isinstance(value, bool):
+            raise ValueError("Missing numeric value")
+        result = Decimal(str(value))
+        if not result.is_finite():
+            raise ValueError("Nonfinite numeric value")
+        return result
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise PlanningSolutionRejected(code, interval_index=index) from exc
+
+
+def read_solver_evidence(model: mip.Model, *, cbc_log: str) -> SolverEvidence:
+    """Lees het geïnspecteerde adapterpad; claim geen native integer-readback."""
+    unavailable = "solver_evidence_unavailable"
+    if (model.solver_name != mip.CBC or type(model.solver) is not cbc.SolverCbc
+        or mip.__version__ != "1.17.6" or not isinstance(cbc_log, str)):
+        raise PlanningSolutionRejected(unavailable)
+    integer, primal, dual = (_number(value, unavailable) for value in
+                             (model.integer_tol, model.infeas_tol, model.opt_tol))
+    if not 0 <= integer < Decimal("0.5") or primal < 0 or dual < 0:
+        raise PlanningSolutionRejected(unavailable)
+    try:
+        native_primal = _number(cbc.cbclib.Cbc_getPrimalTolerance(model.solver._model), unavailable)
+        native_dual = _number(cbc.cbclib.Cbc_getDualTolerance(model.solver._model), unavailable)
+    except (AttributeError, TypeError) as exc:
+        raise PlanningSolutionRejected(unavailable) from exc
+    if native_primal != primal or native_dual != dual:
+        raise PlanningSolutionRejected(unavailable)
+    if (model.status not in (mip.OptimizationStatus.OPTIMAL, mip.OptimizationStatus.FEASIBLE)
+        or model.num_solutions < 1):
+        raise PlanningSolutionRejected("solver_solution_unavailable")
+    objective = _number(model.objective_value, "solver_solution_unavailable")
+    limitations = ["cbc_integer_native_readback_unavailable"]
+    optional = []
+    for name in ("objective_bound", "gap"):
+        try:
+            optional.append(_number(getattr(model, name), unavailable))
+        except PlanningSolutionRejected:
+            optional.append(None)
+            limitations.append(f"solver_{name}_unavailable")
+    if model.status == mip.OptimizationStatus.FEASIBLE:
+        limitations.append("solver_optimality_unproven")
+    version = re.search(r"Welcome to the CBC MILP Solver.*?\bVersion:\s*([0-9][\w.+-]*)", cbc_log, re.S)
+    if version is None:
+        limitations.append("cbc_version_unavailable")
+    gap_limit = _number(model.max_mip_gap_abs, unavailable)
+    if gap_limit < 0 or type(model.max_nodes) is not int or model.max_nodes < 0:
+        raise PlanningSolutionRejected(unavailable)
+    return SolverEvidence(mip.__version__, model.solver_name, None if version is None else version[1],
+        integer, primal, dual, native_primal, native_dual, "python_mip_cbc_setDblParam",
+        gap_limit, model.max_nodes, model.status.name, model.num_solutions, objective,
+        optional[0], optional[1], tuple(limitations))
+
+
+def _check_evidence(model, evidence):
+    current = read_solver_evidence(model, cbc_log="")
+    if not isinstance(evidence, SolverEvidence):
+        raise PlanningSolutionRejected("solver_evidence_unavailable")
+    for name in SolverEvidence.__dataclass_fields__:
+        if name not in ("cbc_version", "limitations") and getattr(current, name) != getattr(evidence, name):
+            raise PlanningSolutionRejected("solver_evidence_unavailable")
+
+
+def _normalize_energy(value: Fraction) -> Decimal:
+    """Half-up op de invoergrens, met rationale som vóór enige afronding."""
+    units, remainder = divmod(value.numerator * 10**9, value.denominator)
+    if 2 * remainder >= value.denominator:
+        units += 1
+    return Decimal(f"{units}e-9")
+
+
+def validate_source_solution(terms: BonusModelTerms, *, evidence: SolverEvidence) -> SourceAudit:
+    model = terms.source.cell_discharge.model
+    _check_evidence(model, evidence)
+    code = "source_domain_solution_invalid"
+    cell = terms.source.cell_discharge
+    try:
+        _validate_cell_binding(cell, model)
+    except (OptimizationInputError, TypeError, ValueError) as exc:
+        raise PlanningSolutionRejected(code) from exc
+    n = len(terms.quotes)
+    if any(len(values) != n for values in (terms.source.required, terms.source.discharge_on,
+                                           terms.eligible_kwh, terms.first_kwh)):
+        raise PlanningSolutionRejected(code)
+    values = tuple(tuple(_number(var.x, code, i) for i, var in enumerate(row))
+                   for row in cell.bus_power_vars)
+    totals, normalized, statuses, issues = [], [], [], []
+    for i in range(n):
+        for b, row in enumerate(values):
+            if row[i] < 0 or row[i] > cell.bus_upper_bounds_kw[b][i]:
+                raise PlanningSolutionRejected(code, interval_index=i)
+        total = sum((Fraction(row[i]) * cell.cell_coefficients[b][i]
+                     for b, row in enumerate(values)), Fraction(0))
+        if total > cell.upper_bounds_kwh[i]:
+            raise PlanningSolutionRejected(code, interval_index=i)
+        on = None
+        if terms.source.required[i]:
+            var = terms.source.discharge_on[i]
+            if var is None:
+                if cell.upper_bounds_kwh[i] >= Fraction(1, 1000):
+                    raise PlanningSolutionRejected(code, interval_index=i)
+                on = 0
+            else:
+                if var.model is not model or var.var_type != mip.BINARY:
+                    raise PlanningSolutionRejected(code, interval_index=i)
+                binary = _number(var.x, code, i)
+                choices = [candidate for candidate in (0, 1) if abs(binary - candidate) <= evidence.integer_tol]
+                if len(choices) != 1:
+                    raise PlanningSolutionRejected(code, interval_index=i)
+                on = choices[0]
+            if ((on == 0 and any(row[i] != 0 for row in values))
+                or (on == 1 and total < Fraction(1, 1000))):
+                raise PlanningSolutionRejected(code, interval_index=i)
+        engine = _normalize_energy(total)
+        if ((total > 0 and engine == 0) or Fraction(engine) > cell.upper_bounds_kwh[i]
+            or (on == 1 and engine < Decimal("0.001"))):
+            raise PlanningSolutionRejected("source_domain_normalization_invalid", interval_index=i)
+        if Fraction(engine) != total:
+            issues.append("forecast_energy_normalized")
+        eligible = _number(terms.eligible_kwh[i].x, code, i)
+        if eligible < 0:
+            raise PlanningSolutionRejected(code, interval_index=i)
+        if terms.source.required[i] and on == 0:
+            first = _number(terms.first_kwh[i].x, code, i)
+            if first != eligible:
+                raise PlanningSolutionRejected(code, interval_index=i)
+        elif eligible != 0:
+            raise PlanningSolutionRejected(code, interval_index=i)
+        totals.append(total)
+        normalized.append(engine)
+        statuses.append(on)
+    try:
+        model.check_optimization_results()
+    except (AssertionError, mip.InfeasibleSolution) as exc:
+        raise PlanningSolutionRejected(code) from exc
+    return SourceAudit(values, tuple(totals), tuple(normalized), tuple(statuses), tuple(dict.fromkeys(issues)))
+
+
+def _check_context(context, prices, opening, meter_id):
+    """Eén gepinde raw prijsselectie, geen nieuwe DB-/configlezing."""
+    code = "planning_forecast_invalid"
+    try:
+        batch, basis = context.price_batch, context.basis
+        hashes = tuple(snapshot.snapshot_hash for snapshot in batch.snapshots)
+        if (context.state != opening or context.state.asof_ts != prices[0].start_ts
+            or basis.meter_id != meter_id or batch.meter_id != meter_id
+            or basis.input_revision != batch.input_revision or batch.input_revision <= 0
+            or set(basis.snapshot_hashes) != set(hashes) or len(hashes) != len(set(hashes))
+            or basis.planning_start_ts != prices[0].start_ts or basis.horizon_end_ts != prices[-1].end_ts
+            or batch.start_ts > prices[0].start_ts or batch.end_ts < prices[-1].end_ts):
+            raise PlanningSolutionRejected(code)
+        for price in prices:
+            snapshot = resolve_snapshot(batch.snapshots, price.start_ts, price.end_ts)
+            resolved = resolve_spot(snapshot, price.start_ts, price.end_ts,
+                                    tuple(item.spot for item in batch.items))
+            if (snapshot != price.snapshot or resolved.quality == "incomplete"
+                or resolved.price_ex_vat != price.spot_ex_vat
+                or quote(snapshot, price.start_ts, price.end_ts, resolved.price_ex_vat) != price):
+                raise PlanningSolutionRejected(code)
+    except (AttributeError, IndexError, TypeError, ValueError) as exc:
+        raise PlanningSolutionRejected(code) from exc
+
+
+def _energy(value, issues, i):
+    raw = _number(value, "planning_forecast_invalid", i)
+    if raw < 0:
+        raise PlanningSolutionRejected("planning_forecast_invalid", interval_index=i)
+    normalized = _normalize_energy(Fraction(raw))
+    if raw > 0 and normalized == 0:
+        raise PlanningSolutionRejected("planning_forecast_invalid", interval_index=i)
+    if normalized != raw:
+        issues.append("forecast_energy_normalized")
+    return normalized
+
+
+def _series(terms, imports, exports, cell, source, issues):
+    if not (len(imports) == len(exports) == len(cell) == len(terms.quotes)):
+        raise PlanningSolutionRejected("planning_forecast_invalid")
+    return tuple(InputInterval(
+        start_ts=price.start_ts, end_ts=price.end_ts, import_kwh=_energy(imp, issues, i),
+        export_kwh=_energy(exp, issues, i), battery_discharge_kwh=cell[i],
+        origin=terms.bonus.origins[i], quality="estimated", sources=(source,),
+        spot_ex_vat=price.spot_ex_vat, spot_source="planning_price_batch", input_revision=0,
+        input_hash="", meter_id=terms.bonus.source.cell_discharge.meter_id,
+    ) for i, (price, imp, exp) in enumerate(zip(terms.quotes, imports, exports, strict=True)))
+
+
+def _energy_total(result):
+    components = [(line.import_cost, line.base_export_revenue, line.bonus_revenue) for line in result.lines]
+    if any(value is None for row in components for value in row):
+        return None
+    return sum((imp - base - bonus for imp, base, bonus in components), Decimal(0))
+
+
+def audit_planning_solution(
+    terms: FinancialModelTerms, *, baseline_import_kwh: Sequence[Decimal],
+    baseline_export_kwh: Sequence[Decimal], evidence: SolverEvidence,
+) -> PlanningAuditResult:
+    with localcontext() as context:
+        context.prec = 36
+        return _audit_planning_solution(terms, tuple(baseline_import_kwh), tuple(baseline_export_kwh), evidence)
+
+
+def _audit_planning_solution(terms, baseline_import, baseline_export, evidence):
+    bonus = terms.bonus
+    model = bonus.source.cell_discharge.model
+    source = validate_source_solution(bonus, evidence=evidence)
+    if terms.quotes != bonus.quotes or len(terms.grid_import) != len(terms.quotes):
+        raise PlanningSolutionRejected("planning_forecast_invalid")
+    _check_context(terms.context, terms.quotes, bonus.opening, bonus.source.cell_discharge.meter_id)
+    used = {v.idx for row in bonus.source.cell_discharge.bus_power_vars for v in row}
+    used.update(var.idx for var in bonus.grid_export)
+    for var in terms.grid_import:
+        if var.model is not model or var.idx in used or var.idx < 0 or model.vars[var.idx] is not var:
+            raise PlanningSolutionRejected("planning_forecast_invalid")
+        used.add(var.idx)
+    issues = [*bonus.issues, *source.issues, *evidence.limitations]
+    forecast = _series(terms, tuple(var.x for var in terms.grid_import),
+                       tuple(var.x for var in bonus.grid_export), source.engine_cell_kwh,
+                       "optimizer_forecast", issues)
+    baseline = _series(terms, baseline_import, baseline_export, (Decimal(0),) * len(terms.quotes),
+                       "fixed_no_battery_baseline", issues)
+    forecast_result = settle_series(forecast, terms.context.price_batch.snapshots, bonus.opening)
+    baseline_result = settle_series(baseline, terms.context.price_batch.snapshots, bonus.opening)
+    errors = []
+    expected_model = Decimal(0)
+    for i, (price, line) in enumerate(zip(terms.quotes, forecast_result.lines, strict=True)):
+        model_values = (_number(terms.grid_import[i].x, "planning_forecast_invalid", i) * price.import_rate,
+                        _number(bonus.grid_export[i].x, "planning_forecast_invalid", i) * price.export_rate,
+                        _number(bonus.eligible_kwh[i].x, "planning_forecast_invalid", i) * price.bonus_rate)
+        expected_model += model_values[0] - model_values[1] - model_values[2]
+        for actual, expected in zip(model_values, (line.import_cost, line.base_export_revenue, line.bonus_revenue), strict=True):
+            if expected is not None:
+                errors.append(abs(actual - expected))
+        if line.bonus_kwh is not None:
+            if source.raw_cell_kwh[i] > 0 and line.bonus_kwh != 0:
+                raise PlanningSolutionRejected("planning_parity_failed", interval_index=i)
+            if bonus.source.required[i] and source.discharge_on[i] == 0:
+                first = _number(bonus.first_kwh[i].x, "planning_parity_failed", i)
+                if (first == 0) != (line.bonus_kwh == 0):
+                    raise PlanningSolutionRejected("planning_parity_failed", interval_index=i)
+    model_cost = _number(terms.energy_cost.x, "planning_parity_failed")
+    errors.append(abs(model_cost - expected_model))
+    forecast_cost, baseline_cost = _energy_total(forecast_result), _energy_total(baseline_result)
+    if forecast_cost is not None:
+        errors.append(abs(model_cost - forecast_cost))
+    if any(error > Decimal("0.000001") for error in errors):
+        raise PlanningSolutionRejected("planning_parity_failed")
+    complete = forecast_cost is not None and baseline_cost is not None
+    if not complete:
+        issues.append("planning_parity_incomplete")
+    for result in (forecast_result, baseline_result):
+        for line in result.lines:
+            issues.extend(line.issues)
+    return PlanningAuditResult(source, evidence, forecast, baseline, forecast_result, baseline_result,
+        model_cost, forecast_cost, baseline_cost,
+        None if not complete else baseline_cost - forecast_cost,
+        max(errors, default=Decimal(0)) if complete else None, complete, tuple(dict.fromkeys(issues)))
