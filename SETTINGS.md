@@ -143,7 +143,7 @@ Configure your home battery storage system for optimal energy management and cos
 | `dc_to_bat max power` | [FlexFloat](#flexfloat) (optional) | No | `null` | DC to battery max power in watts (Unit: `W`) _Must be > 0_ |
 | `bat_to_dc efficiency` | number | Yes | — | Battery to DC efficiency (Unit: `ratio`) _0.0-1.0, typically 0.95-0.98_ |
 | `bat_to_dc max power` | [FlexFloat](#flexfloat) (optional) | No | `null` | Battery to DC max power in watts (Unit: `W`) _Must be > 0_ |
-| `cycle cost` | number | Yes | — | Cost per battery cycle in euros (Unit: `€`) _Must be >= 0, typically €0.50-€1.50 per cycle_ |
+| `cycle cost` | number | Yes | — | Wear cost in EUR per kWh of DC-bus throughput (Unit: `EUR/kWh DC-bus throughput`) _Must be >= 0; 0 explicitly assumes zero wear cost_ |
 | `entity set power feedin` | [EntityId](#entityid) (optional) | No | `null` | HA entity to set power feed-in to grid |
 | `entity set operating mode` | [EntityId](#entityid) (optional) | No | `null` | HA entity to set battery operating mode |
 | `entity set operating mode on` | string (optional) | No | `"Aan"` | Value for operating mode ON |
@@ -237,7 +237,7 @@ Maximum power for battery to DC bus conversion in watts. Rarely used in typical 
 
 **`cycle cost`**
 
-Degradation cost per full charge-discharge cycle in euros. Used to factor battery wear into optimization. Calculate as: (battery_cost / warranted_cycles). Example: €5000 battery with 6000 cycles = €0.83/cycle.
+Degradation cost in EUR per kWh of DC-bus throughput, counting both charging and discharging. This is not a price per full cycle. Existing numeric values are not converted; no capacity or efficiency factor is applied. A value of 0 is an explicit zero-wear assumption, not evidence of free battery use. Converting a full-cycle quote requires usable cell capacity and both cell efficiencies; there is no automatic conversion.
 
 **`entity set power feedin`**
 

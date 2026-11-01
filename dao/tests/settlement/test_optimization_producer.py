@@ -383,11 +383,13 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
     """Moving finalization after any array extraction must expose stale device/PV data."""
     model, terms = financial_case(snapshot, bonus_rules)
     device = model.add_var(ub=1, name="continuous_device_flow")
+    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
+    wear_cost = model.add_var(ub=1)
+    model += wear_cost == (device + cell) * 0.0025
     cost = model.add_var(lb=-10, ub=10)
     model += cost == terms.energy_cost
     assert model.optimize() == mip.OptimizationStatus.OPTIMAL
     raw_get, optimize = model.solver.var_get_x, model.optimize
-    cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
     override_solution(monkeypatch, model, {cell.idx: 1e-13, device.idx: 0})
     calls = []
 
@@ -397,7 +399,7 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
         result = optimize()
         # Another feasible degenerate device value, deliberately independent of
         # objective/status. The real new source solution is not modified.
-        override_solution(monkeypatch, model, {device.idx: 0.25})
+        override_solution(monkeypatch, model, {device.idx: 0.25, wear_cost.idx: 0.000625})
         if outcome == "new_residual":
             override_solution(monkeypatch, model, {cell.idx: 1e-13})
         elif outcome == "missing_evidence":
@@ -412,6 +414,7 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
     namespace = dict(self=instance, model=model, financial_terms=terms, period_terms=None, cost=cost,
         native={"cbc_log": "Welcome to the CBC MILP Solver Version: 2.10.12"},
         B=1, U=1, EV=1, M=1, solar_num=1, pv_dc_num=[0], hour_fraction=[0.25],
+        dc_to_bat=[[device]], dc_from_bat=[[cell]], kwh_cycle_cost=[0.01], cycle_cost=[wear_cost],
         ac_to_dc=[[device]], ac_from_dc=[[device]], c_ev=[[device]], c_ma_u=[[device]],
         pv_ac=[[device]], solar_prod=[[0.5]], b_l=[0.0], c_b=[device], c_hp=[device], pl=[0.1], pt=[0.1])
     if outcome != "success":
@@ -427,6 +430,7 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
     assert namespace["accu_in_sum"] == namespace["accu_out_sum"] == [0.0625]
     assert namespace["c_ev_sum"] == namespace["c_ma_sum"] == [0.25]
     assert namespace["solar_hour_sum_opt"] == [0.25]
+    assert namespace["battery_wear_eur"] == D("0.000625")
     assert namespace["org_l"] == [0.5]
     assert namespace["org_t"] == [0]
     result = namespace["financial_audit"]
@@ -515,6 +519,7 @@ def test_period_consumer_audit_precedes_preview_and_guards_digests(snapshot, mon
     namespace = dict(self=instance, model=model, financial_terms=terms, period_terms=periods, cost=cost,
         native={"cbc_log": ""}, B=0, U=2, EV=0, M=0, solar_num=1, pv_dc_num=[],
         hour_fraction=[1.0, 1.0], ac_to_dc=[], ac_from_dc=[], c_ev=[], c_ma_u=[],
+        dc_to_bat=[], dc_from_bat=[], kwh_cycle_cost=[], cycle_cost=[],
         pv_ac=[[terms.grid_import[0], terms.grid_import[1]]], solar_prod=[[0.0, 1.0]],
         b_l=[0.0, 0.0], c_b=terms.grid_import, c_hp=terms.grid_import, pl=[0.1, 0.1], pt=[0.1, 0.1])
     with caplog.at_level(logging.INFO):

@@ -293,12 +293,12 @@ class BatteryConfig(BaseModel):
     cycle_cost: float = Field(
         alias="cycle cost",
         ge=0,
-        description="Cost per battery cycle in euros",
+        description="Wear cost in EUR per kWh of DC-bus throughput",
         json_schema_extra={
-            "x-help": "Degradation cost per full charge-discharge cycle in euros. Used to factor battery wear into optimization. Calculate as: (battery_cost / warranted_cycles). Example: €5000 battery with 6000 cycles = €0.83/cycle.",
-            "x-unit": "€",
+            "x-help": "Degradation cost in EUR per kWh of DC-bus throughput, counting both charging and discharging. This is not a price per full cycle. Existing numeric values are not converted; no capacity or efficiency factor is applied. A value of 0 is an explicit zero-wear assumption, not evidence of free battery use. Converting a full-cycle quote requires usable cell capacity and both cell efficiencies; there is no automatic conversion.",
+            "x-unit": "EUR/kWh DC-bus throughput",
             "x-ui-section": "Power Configuration",
-            "x-validation-hint": "Must be >= 0, typically €0.50-€1.50 per cycle",
+            "x-validation-hint": "Must be >= 0; 0 explicitly assumes zero wear cost",
         },
     )
 

@@ -16,7 +16,7 @@ import time
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import replace
-from decimal import Decimal, localcontext
+from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 from inspect import getattr_static
 from zoneinfo import ZoneInfo
@@ -71,6 +71,7 @@ from dao.prog.settlement.optimization_audit import (
     read_solver_evidence,
     validate_source_solution,
 )
+from dao.prog.settlement.optimization_economics import battery_wear_cost
 from dao.prog.settlement.optimization_refinement import (
     FinalizedPlanningSolution,
     SourceRefinementReport,
@@ -217,6 +218,57 @@ def bind_day_ahead_cost(
 def _check_solution_version(model: Model, structure: str, solution: str) -> None:
     if model_digest(model) != structure or solution_digest(model) != solution:
         raise PlanningSolutionRejected("planning_solution_stale")
+
+
+def _audit_battery_wear_cost(
+    model: Model, *, dc_to_bat: Sequence[Sequence[Var]], dc_from_bat: Sequence[Sequence[Var]],
+    hour_fraction: Sequence[float], kwh_cycle_cost: Sequence[float], cycle_cost: Sequence[Var],
+) -> tuple[Decimal, tuple[str, ...]]:
+    """Reken originele finale busdoorzet na, onafhankelijk van MIP-kostenwaarden."""
+    code = "planning_battery_wear_mismatch"
+
+    def number(value):
+        result = Decimal(str(value))
+        if isinstance(value, bool) or not result.is_finite() or result < 0:
+            raise ValueError("Ongeldige slijtagegrondslag")
+        return result
+
+    def extracted(var):
+        if (not isinstance(var, Var) or var.model is not model or var.idx < 0
+            or var.idx >= len(model.vars) or model.vars[var.idx] is not var):
+            raise ValueError("Ongeldige slijtagebinding")
+        return number(var.x)
+
+    try:
+        count = len(kwh_cycle_cost)
+        if any(len(values) != count for values in (dc_to_bat, dc_from_bat, cycle_cost)):
+            raise ValueError("Onvolledige batterijgroep")
+        with localcontext() as context:
+            context.prec = 36
+            hours = tuple(number(value) for value in hour_fraction)
+            if not hours or any(value == 0 for value in hours):
+                raise ValueError("Ongeldige intervalduur")
+            total, model_total, issues = Decimal("0"), Decimal("0"), []
+            for b in range(count):
+                if len(dc_to_bat[b]) != len(hours) or len(dc_from_bat[b]) != len(hours):
+                    raise ValueError("Onvolledige busdoorzet")
+                rate = number(kwh_cycle_cost[b])
+                charge = sum((extracted(var) * h for var, h in zip(dc_to_bat[b], hours, strict=True)), Decimal("0"))
+                discharge = sum((extracted(var) * h for var, h in zip(dc_from_bat[b], hours, strict=True)), Decimal("0"))
+                wear = battery_wear_cost(dc_charge_kwh=charge, dc_discharge_kwh=discharge,
+                                        eur_per_dc_bus_throughput_kwh=rate)
+                modeled = extracted(cycle_cost[b])
+                if abs(wear - modeled) > Decimal("0.000001"):
+                    raise ValueError("Slijtagekosten wijken af")
+                total += wear
+                model_total += modeled
+                if rate == 0:
+                    issues.append("battery_wear_zero_assumption")
+            if abs(total - model_total) > Decimal("0.000001"):
+                raise ValueError("Totale slijtagekosten wijken af")
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise PlanningSolutionRejected(code) from exc
+    return total, tuple(dict.fromkeys(issues))
 
 
 def finalize_day_ahead_finance(
@@ -926,7 +978,10 @@ class DaCalc(DaBase):
             ac = float(self.battery_options[b].capacity)
             one_soc.append(ac / 100)  # 1% van 28 kWh = 0,28 kWh
             kwh_cycle_cost.append(self.battery_options[b].cycle_cost)
-            logging.debug(f"cycle cost: {kwh_cycle_cost[b]} eur/kWh")
+            logging.debug(f"cycle cost: {kwh_cycle_cost[b]} EUR/kWh DC-busdoorzet (laden én ontladen)")
+            if kwh_cycle_cost[b] == 0:
+                logging.info("Batterij %s: issue battery_wear_zero_assumption (expliciete nul-slijtageaanname)",
+                             self.battery_options[b].name)
 
             eff_dc_to_bat.append(float(self.battery_options[b].dc_to_bat_efficiency))
             # fractie van 1
@@ -3603,7 +3658,7 @@ class DaCalc(DaBase):
             c_t_bonus = None
             bonus_revenue = 0
 
-        #  cycle cost per batterij
+        # Slijtage per batterij: EUR/kWh DC-busdoorzet aan beide zijden, zonder capaciteit/η.
         cycle_cost = [model.add_var(var_type=CONTINUOUS, lb=0) for _ in range(B)]
         for b in range(B):
             model += cycle_cost[b] == xsum(
@@ -3832,6 +3887,8 @@ class DaCalc(DaBase):
                 org_t.append(netto)
         financial_audit = None
         period_audit = None
+        battery_wear_eur = None
+        battery_wear_issues = ()
         if financial_terms is not None:
             financial_audit = finish_day_ahead_finance(
                 finalized_solution, org_l=org_l, org_t=org_t,
@@ -3841,6 +3898,13 @@ class DaCalc(DaBase):
                 period_audit = audit_period_solution(financial_terms, period_terms, planning_audit=financial_audit)
                 _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
                 _check_evidence(model, finalized_solution.evidence)
+            _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
+            battery_wear_eur, battery_wear_issues = _audit_battery_wear_cost(
+                model, dc_to_bat=dc_to_bat, dc_from_bat=dc_from_bat, hour_fraction=hour_fraction,
+                kwh_cycle_cost=kwh_cycle_cost, cycle_cost=cycle_cost,
+            )
+            _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
+            _check_evidence(model, finalized_solution.evidence)
             if getattr(self, "_debug_capture_vars", False):
                 self._debug_planning_audit = financial_audit
                 self._debug_period_terms = period_terms
@@ -3850,6 +3914,8 @@ class DaCalc(DaBase):
             logging.info(f"A8 besparing energiecomponent: {financial_audit.savings_energy_eur}")
             logging.info("A8 pariteit %s", "volledig" if financial_audit.parity_complete else "onvolledig")
             logging.info("A8 issues: %s", ", ".join(financial_audit.issues))
+            logging.info("Batterijslijtage DC-busdoorzet EUR: %s; issues=%s",
+                         battery_wear_eur, ", ".join(battery_wear_issues))
             if period_audit is not None:
                 logging.info("A9 maandcredit bruto EUR: modelondergrens=%s; engineprognose=%s; exact=%s; issues=%s",
                     period_audit.model_credit_eur, period_audit.engine_closed_credit_eur,
