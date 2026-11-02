@@ -3694,10 +3694,11 @@ class DaCalc(DaBase):
         ##################################################################
         #        bonus op teruglevering (bijv. Budget Thuis ZonneBonus)   #
         ##################################################################
+        settlement_cfg = None if self._financial_pricing is None else self._financial_pricing.settlement
         financial_terms = bind_day_ahead_finance(
             model, context=settlement_context,
             intervals=tuple((int(ts[u]), int(interval_ts[u]) + self.interval_s) for u in range(U)),
-            meter_id=self._financial_pricing.settlement.meter_id if self._financial_pricing is not None else "legacy",
+            meter_id=settlement_cfg.meter_id if settlement_cfg is not None else "legacy",
             dc_from_bat=dc_from_bat, installation_battery_count=B,
             battery_indices=tuple(range(B)),
             no_battery_evidence="modeled_installation_has_no_batteries" if B == 0 else None,
@@ -3707,7 +3708,7 @@ class DaCalc(DaBase):
             export_bounds_kwh=tuple(Decimal(str(var.ub)) for var in c_t),
             # Zonder afzonderlijk topologiebewijs geen verified-PV claim.
             origins=("unknown",) * U,
-            source_policy=self._financial_pricing.settlement.planning_source_policy if self._financial_pricing is not None else None,
+            source_policy=settlement_cfg.planning_source_policy if settlement_cfg is not None else None,
         )
         period_terms = None
         terminal_terms = None

@@ -6,6 +6,7 @@ import logging
 import math
 from decimal import Decimal, localcontext
 from io import BytesIO
+from itertools import accumulate
 from zoneinfo import ZoneInfo
 
 import matplotlib.pyplot as plt
@@ -1501,8 +1502,8 @@ class Report(DaBase):
             is_line = row["kind"] == "interval"
             item = inputs.get((at, row.get("line_input_revision"), row.get("input_hash"))) if is_line else None
             profit = _amount_sum((row["base_export_revenue"], row["bonus_revenue"])) if is_line else row["credit_total"]
-            rows.append({interval: label, "vanaf": self._local_datetime(at),
-                         "tot": self._local_datetime(row["end_ts"]),
+            rows.append({interval: label, "vanaf": moment,
+                         "tot": datetime.datetime.fromtimestamp(row["end_ts"], ZoneInfo(self.time_zone)),
                          "consumption": item.import_kwh if item is not None else None if is_line else Decimal("0"),
                          "production": item.export_kwh if item is not None else None if is_line else Decimal("0"),
                          "cost": row["import_cost"] if is_line else Decimal("0"), "profit": profit,
@@ -1516,8 +1517,9 @@ class Report(DaBase):
                 moment = datetime.datetime.fromtimestamp(cursor, ZoneInfo(self.time_zone))
                 label = moment.strftime("%Y-%m-%d %H:00%z" if interval == "uur" else
                                         "%Y-%m-%d" if interval == "dag" else "%Y-%m")
-                rows.append({interval: label, "vanaf": self._local_datetime(cursor),
-                             "tot": self._local_datetime(stop), "consumption": None, "production": None,
+                rows.append({interval: label, "vanaf": moment,
+                             "tot": datetime.datetime.fromtimestamp(stop, ZoneInfo(self.time_zone)),
+                             "consumption": None, "production": None,
                              "cost": None, "profit": None, "datasoort": "calculated", "quality": "incomplete",
                              "freshness": view.freshness, "generation": view.generation})
                 cursor = stop
@@ -1532,6 +1534,8 @@ class Report(DaBase):
                 "generation": "first", "quality": lambda values: "incomplete" if "incomplete" in set(values)
                 else "estimated" if "estimated" in set(values) else "measured",
             })
+            # Dubbele wintertijduren op werkelijk tijdstip ordenen, niet op offsetlabel.
+            result = result.sort_values("vanaf").reset_index(drop=True)
         with localcontext() as context:
             context.prec = 36
             result["netto_consumption"] = result["consumption"] - result["production"]
@@ -3808,20 +3812,24 @@ class Report(DaBase):
         df = pd.DataFrame()
         if field in ["grid"] + grid_fields:  # grid data
             df_grid = self.get_grid_data(periode, _tot=tot)
-            df_grid["time"] = df_grid["vanaf"].apply(
-                lambda x: pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
-            )
+            df_grid["time"] = df_grid["vanaf"]
+
+            def cumulative_grid(values):
+                if "view" in df_grid.attrs:
+                    # Boek/legacybedragen exact combineren; een onbekende prefix blijft onbekend.
+                    return list(accumulate(values, lambda total, value: _amount_sum((total, value))))
+                return values.cumsum()
 
             if field in grid_fields:
                 df = df_grid[["time", field, "datasoort"]].copy()
                 if cumulate:
-                    df[field] = df_grid[field].cumsum()
+                    df[field] = cumulative_grid(df_grid[field])
                 df.rename({field: "value"}, axis=1, inplace=True)
             if field == "grid":
                 df = df_grid[["time", "datasoort"] + grid_fields].copy()
                 if cumulate:
                     for field in grid_fields:
-                        df[field] = df[field].cumsum()
+                        df[field] = cumulative_grid(df[field])
         elif field == "da":
             df = self.get_price_data(
                 self.periodes[periode]["vanaf"],
@@ -3857,9 +3865,11 @@ class Report(DaBase):
             )
             return result
 
-        df["time"] = pd.to_datetime(df["time"])
-        df["time_ts"] = localize_hour_buckets(df["time"], self.time_zone)
-        df["time"] = df["time"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M"))
+        moments = df["time"].map(pd.Timestamp)
+        # Alleen naïeve legacylabels lokaliseren; de boekidentiteit nooit opnieuw raden.
+        df["time_ts"] = moments.map(lambda moment: moment.tz_convert(self.time_zone) if moment.tzinfo is not None
+                                  else moment.tz_localize(self.time_zone, ambiguous=False, nonexistent="shift_forward"))
+        df["time"] = df["time_ts"].apply(lambda x: x.strftime("%Y-%m-%d %H:%M"))
         df.rename(columns={"datasoort": "datatype"}, inplace=True)
         cols = df.columns.tolist()
         cols = cols[-1:] + cols[:-1]

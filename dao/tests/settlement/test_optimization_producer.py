@@ -18,6 +18,7 @@ import pytest
 import dao.prog.day_ahead as da
 from dao.prog.config.models.base import FlexFloat
 from dao.prog.config.models.devices.battery import BatteryConfig
+from dao.prog.config.models.pricing import PricingConfig
 from dao.prog.config.models.production_bonus import ProductionBonusConfig
 from dao.prog.fastctrl.plan import FinancialBasis
 from dao.prog.settlement.optimization import OptimizationInputError
@@ -85,7 +86,7 @@ def capture(monkeypatch, tmp_path, request):
         settings = {"baseload": settings}
     if settings.get("hourly"):
         instance.interval, instance.interval_s, instance.steps_day = "1hour", 3600, 24
-    instance.config = SimpleNamespace(prices=None, baseload=[settings.get("baseload", 0.0)] * 24,
+    instance.config = SimpleNamespace(prices=settings.get("prices"), baseload=[settings.get("baseload", 0.0)] * 24,
                                      max_gap=FlexFloat(value=0.005))
     instance.battery_options = [BatteryConfig.model_validate({
         "name": f"synthetic-{b}", "entity actual level": f"sensor.synthetic_{b}", "capacity": 100,
@@ -155,6 +156,21 @@ def capture(monkeypatch, tmp_path, request):
 
 def signature(expr):
     return expr.const, {v.idx: c for v, c in expr.expr.items()}
+
+
+@pytest.mark.parametrize("capture", [{"prices": PricingConfig.model_validate(
+    pricing_config().model_dump(exclude={"settlement"}))}], indirect=True)
+def test_real_producer_accepts_legacy_pricing_without_settlement(capture):
+    """Normal legacy pricing must reach cost binding and solve without opting into settlement."""
+    model, args = capture["model"], capture["finance"]
+    assert capture["instance"]._financial_pricing.settlement is None
+    assert args["context"] is None and args["meter_id"] == "legacy" and args["source_policy"] is None
+    assert da.bind_day_ahead_finance(model, **args) is None
+    assert capture["cost"]["financial_terms"] is None
+    da.bind_day_ahead_cost(model, **capture["cost"])
+    model.objective = capture["cost"]["cost"]
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
 
 
 @pytest.mark.parametrize("capture,cell_power,residual", [

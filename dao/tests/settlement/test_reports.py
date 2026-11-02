@@ -68,6 +68,61 @@ def test_report_keeps_frozen_tariff_after_config_edit(system, report):
     assert set(after.bonus_kind) == {"calculated"}
 
 
+@pytest.fixture
+def wintertime_book(system, report, request):
+    from dao.prog.settlement.types import MeterInterval, SpotInterval
+
+    start = int(dt.datetime(2027, 10, 31, 0, tzinfo=dt.UTC).timestamp())
+    end = start + 7200
+    system.clock[0] = end + 86400
+    system.meter.items = [MeterInterval(at, at + 900, "0.25", "0", "0", "verified_pv", "measured",
+                                       ("synthetic-wintertime",)) for at in range(start, end, 900)]
+    system.spots[:] = [SpotInterval(start, start + 3600, "0.10", "synthetic-hour", "measured"),
+                      SpotInterval(start + 3600, end, "0.40", "synthetic-hour", "measured")]
+    published_start = start + 3600 if getattr(request, "param", None) == "missing_first" else start
+    system.service.consolidate(published_start, end, publish=True, reason="wintertime-book")
+    report.periodes = {"wintertime": {"vanaf": start, "tot": end, "interval": "uur"}}
+    return report, start, end
+
+
+def test_book_grid_keeps_both_wintertime_hours_in_chronological_order(wintertime_book):
+    """Offset labels must not reverse October's two 02:00 hours or erase their UTC identity."""
+    report, start, end = wintertime_book
+    frame = report.get_grid_data("wintertime")
+    assert list(frame.cost) == [Decimal("0.10"), Decimal("0.40")]
+    assert [int(moment.timestamp()) for moment in frame.vanaf] == [start, start + 3600]
+    assert [int(moment.timestamp()) for moment in frame.tot] == [start + 3600, end]
+    assert [moment.strftime("%H:%M%z") for moment in frame.vanaf] == ["02:00+0200", "02:00+0100"]
+
+
+@pytest.mark.parametrize("field", ["grid", "cost"])
+@pytest.mark.parametrize("cumulate", [False, True])
+def test_grid_api_preserves_wintertime_identity_before_cumulation(wintertime_book, field, cumulate):
+    """The two local 02:00 labels need separate UTC timestamps and chronological running totals."""
+    report, start, _ = wintertime_book
+    payload = json.loads(report.get_api_data(field, "wintertime", cumulate=cumulate))
+    rows = payload["data"]
+    assert [row["time_ts"] for row in rows] == [start * 1000, (start + 3600) * 1000]
+    assert [row["time"] for row in rows] == ["2027-10-31 02:00", "2027-10-31 02:00"]
+    assert [Decimal(str(row["cost" if field == "grid" else "value"])) for row in rows] == (
+        [Decimal("0.10"), Decimal("0.50")] if cumulate else [Decimal("0.10"), Decimal("0.40")])
+
+
+@pytest.mark.parametrize("wintertime_book", ["missing_first"], indirect=True)
+def test_unpublished_wintertime_hour_keeps_distinct_identity_and_unknown_cost(wintertime_book):
+    """A gap before the repeated hour must retain its own instant, not become known zero."""
+    report, start, _ = wintertime_book
+    frame = report.get_grid_data("wintertime")
+    assert [int(moment.timestamp()) for moment in frame.vanaf] == [start, start + 3600]
+    assert pd.isna(frame.cost.iloc[0]) and frame.cost.iloc[1] == Decimal("0.40")
+    payload = json.loads(report.get_api_data("cost", "wintertime"))
+    assert [row["time_ts"] for row in payload["data"]] == [start * 1000, (start + 3600) * 1000]
+    assert payload["data"][0]["value"] is None
+    assert Decimal(payload["data"][1]["value"]) == Decimal("0.40")
+    cumulative = json.loads(report.get_api_data("cost", "wintertime", cumulate=True))
+    assert [row["value"] for row in cumulative["data"]] == [None, None]
+
+
 def test_unknown_pre2027_history_stays_legacy(report, monkeypatch):
     calls = []
     def legacy(*args, **kwargs):
@@ -217,6 +272,11 @@ def test_mixed_grid_range_uses_stored_legacy_then_book_never_both(local_config):
     table = report.calc_grid_columns(frame, "uur", "tabel")
     assert len(frame) == 2 and list(frame.cost) == [7.0, Decimal("0.03")]
     assert table[("Kosten", "eur")].iloc[-1] == Decimal("7.03")
+    report.periodes = {"mixed": {"vanaf": dt.datetime(2026, 12, 31, 23),
+                                "tot": dt.datetime(2027, 1, 1, 0, 15), "interval": "uur"}}
+    rows = json.loads(report.get_api_data("cost", "mixed", cumulate=True))["data"]
+    assert [row["time_ts"] for row in rows] == [(START_TS - 3600) * 1000, START_TS * 1000]
+    assert [Decimal(str(row["value"])) for row in rows] == [Decimal("7.0"), Decimal("7.03")]
 
 
 def test_settlement_api_preserves_old_components_and_separate_month_credit(system, report, terms):
