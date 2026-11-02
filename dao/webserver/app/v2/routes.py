@@ -797,13 +797,13 @@ def config():
     error = None
     success = None
 
-    if request.method == "POST" and "config" in request.form:
-        newconfig = request.form["config"]
+    if request.method == "POST":
+        content = request.form.get("config", "")
         try:
             # Syntax and schema: a config that does not validate would put
             # the scheduler in a restart loop.
-            validate_config_data(json.loads(newconfig))
-            atomic_write_text(Path(path), newconfig)
+            validate_config_data(json.loads(content))
+            atomic_write_text(Path(path), content)
             # This process just wrote the file, so the cached copy the
             # display paths use is stale.
             _invalidate_cached_config()
@@ -811,8 +811,9 @@ def config():
         except (ValueError, OSError) as err:
             error = "Error: " + str(err)
 
-    with open(path, "r") as file:
-        content = file.read()
+    else:
+        with open(path, "r") as file:
+            content = file.read()
 
     return render_template(
         "v2/config.html",
@@ -828,18 +829,19 @@ def secrets():
     error = None
     success = None
 
-    if request.method == "POST" and "secrets" in request.form:
-        newsecrets = request.form["secrets"]
+    if request.method == "POST":
+        content = request.form.get("secrets", "")
         try:
-            if not isinstance(json.loads(newsecrets), dict):
+            if not isinstance(json.loads(content), dict):
                 raise ValueError("secrets.json moet een JSON-object met sleutel/waarde zijn")
-            atomic_write_text(Path(path), newsecrets)
+            atomic_write_text(Path(path), content)
             success = "Secrets updated successfully"
         except (ValueError, OSError) as err:
             error = "Error: " + str(err)
 
-    with open(path, "r") as file:
-        content = file.read()
+    else:
+        with open(path, "r") as file:
+            content = file.read()
 
     return render_template(
         "v2/secrets.html",
