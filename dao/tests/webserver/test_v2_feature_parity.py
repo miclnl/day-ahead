@@ -13,9 +13,21 @@ These tests keep both from regressing now that v1 is gone and there is no
 fallback interface.
 """
 
+import datetime
+import socket
+import subprocess
+import sys
+import threading
+from types import SimpleNamespace
+
+import pandas as pd
 import pytest
 
+from dao.lib import da_prices
+from dao.prog import task_state
 from dao.prog import tasks as task_registry
+from dao.prog.da_base import DaBase
+from dao.tests.lib.test_da_prices import FakeDb, _values
 
 from .conftest import INGRESS, SUPERVISOR, csrf_token
 
@@ -25,6 +37,44 @@ def v2_routes(client):
     import importlib
 
     return importlib.import_module("app.v2.routes")
+
+
+@pytest.fixture
+def manual_price_context(v2_routes, monkeypatch):
+    """Only context construction and the provider are fake, not the queue/CLI."""
+    config = SimpleNamespace(time_zone="Europe/Helsinki")
+    backend = SimpleNamespace(time_zone="America/New_York")
+    backend_calls = []
+
+    class FrozenDatetime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            instant = datetime.datetime(2026, 6, 14, 22, 30, tzinfo=datetime.UTC)
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    clock = SimpleNamespace(
+        datetime=FrozenDatetime, time=datetime.time, timedelta=datetime.timedelta
+    )
+
+    def fake_report(file_name):
+        backend_calls.append(file_name)
+        return backend
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Manual price refresh must not start real backend I/O or task workers")
+
+    monkeypatch.setattr(v2_routes, "_cached_config", lambda: config)
+    monkeypatch.setattr(v2_routes, "Report", fake_report)
+    monkeypatch.setattr(v2_routes, "datetime", clock)
+    monkeypatch.setattr(da_prices, "datetime", clock)
+    monkeypatch.setattr(DaBase, "__init__", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket.socket, "connect_ex", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(threading.Thread, "start", forbidden)
+    return config, backend, backend_calls
 
 
 class TestCo2Report:
@@ -167,45 +217,143 @@ class TestTaskParameters:
         assert b'name="prijzen_tot"' in response.data
         assert b'name="days"' in response.data
 
-    def test_submitted_dates_reach_the_request(self, client):
-        from dao.prog import task_state
+    @pytest.mark.parametrize("task", ["prices", "get_prices", "update_prices"])
+    @pytest.mark.parametrize("dates", [
+        {"prijzen_start": "2026-01-01", "prijzen_tot": "2026-01-03"},
+        {"prijzen_start": "2026-01-01"},
+        {"prijzen_tot": "2026-01-03"},
+    ])
+    def test_submitted_dates_reach_the_request(
+        self, client, v2_routes, monkeypatch, task, dates
+    ):
+        def forbidden(*args, **kwargs):
+            pytest.fail("Chosen dates must not need installation context")
 
-        client.post(
+        monkeypatch.setattr(v2_routes, "_cached_config", forbidden)
+        monkeypatch.setattr(v2_routes, "Report", forbidden)
+        response = client.post(
             "/v2/task-exec",
             data={
-                "task": "prices",
-                "prijzen_start": "2026-01-01",
-                "prijzen_tot": "2026-01-03",
+                "task": task,
+                **dates,
                 "csrf_token": csrf_token(client, "/v2/tasks"),
             },
             headers=INGRESS,
             environ_base=SUPERVISOR,
         )
 
-        entry = task_state.running_tasks()["prices"]
-        assert entry["parameters"] == {
-            "prijzen_start": "2026-01-01",
-            "prijzen_tot": "2026-01-03",
-        }
+        assert response.status_code == 302
+        assert task_state.pending_requests()["prices"]["parameters"] == dates
 
-    def test_blank_parameters_are_dropped(self, client):
-        """An empty date must not be appended to the command line; the price
-        fetch then covers its default range instead of parsing "" as a date."""
-        from dao.prog import task_state
+    @pytest.mark.parametrize("task, fields, canonical, expected", [
+        ("update_meteo", {}, "meteo", {}),
+        ("fast_simulate", {"days": "  "}, "fast_control_simulate", {}),
+        ("fast_simulate", {"days": "21"}, "fast_control_simulate", {"days": "21"}),
+    ])
+    def test_other_tasks_do_not_need_installation_context(
+        self, client, v2_routes, monkeypatch, task, fields, canonical, expected
+    ):
+        def forbidden(*args, **kwargs):
+            pytest.fail("Other tasks must not need installation context")
 
-        client.post(
+        monkeypatch.setattr(v2_routes, "_cached_config", forbidden)
+        monkeypatch.setattr(v2_routes, "Report", forbidden)
+        response = client.post(
             "/v2/task-exec",
             data={
-                "task": "prices",
-                "prijzen_start": "",
-                "prijzen_tot": "  ",
+                "task": task,
+                **fields,
                 "csrf_token": csrf_token(client, "/v2/tasks"),
             },
             headers=INGRESS,
             environ_base=SUPERVISOR,
         )
 
-        assert task_state.running_tasks()["prices"]["parameters"] == {}
+        assert response.status_code == 302
+        assert task_state.pending_requests()[canonical]["parameters"] == expected
+
+    @pytest.mark.parametrize("task", ["prices", "get_prices", "update_prices"])
+    @pytest.mark.parametrize("fields", [{}, {"prijzen_start": "", "prijzen_tot": "  "}])
+    @pytest.mark.parametrize("config_zone, backend_zone, day, first_epoch", [
+        ("Europe/Helsinki", "America/New_York", "2026-06-15", 1781470800),
+        (None, "Europe/Helsinki", "2026-06-15", 1781470800),
+        ("America/New_York", "Europe/Helsinki", "2026-06-14", 1781409600),
+        (None, "America/New_York", "2026-06-14", 1781409600),
+    ])
+    def test_manual_price_refresh_bypasses_presence_shortcut_via_queue(
+        self, client, v2_routes, manual_price_context, monkeypatch,
+        task, fields, config_zone, backend_zone, day, first_epoch,
+    ):
+        config, backend, backend_calls = manual_price_context
+        config.time_zone = config_zone
+        backend.time_zone = backend_zone
+        db = FakeDb(present=datetime.datetime(2100, 1, 1, 23), zone=config_zone or backend_zone)
+        prices = da_prices.DaPrices(SimpleNamespace(interval="1hour"), db, country="NL")
+        provider_calls = []
+
+        class FakeNordpool:
+            def fetch(self, *, areas, end_date, resolution):
+                provider_calls.append(end_date.date())
+                assert areas == ["NL"] and resolution == 60
+                assert end_date.date() in (datetime.date(2026, 6, 14), datetime.date(2026, 6, 15))
+                return {"areas": {"NL": {"values": _values(end_date.date(), 24)}}}
+
+        monkeypatch.setattr(da_prices, "Prices", FakeNordpool)
+        runner = SimpleNamespace(
+            prices=prices, prices_options=SimpleNamespace(source_day_ahead="nordpool")
+        )
+        # The unchanged CLI/scheduler default still respects already-present data.
+        monkeypatch.setattr(sys, "argv", ["day_ahead.py", "prices"])
+        DaBase.get_day_ahead_prices(runner)
+        assert provider_calls == [] and db.saved == []
+
+        response = client.post(
+            "/v2/task-exec",
+            data={"task": task, **fields, "csrf_token": csrf_token(client, "/v2/tasks")},
+            headers=INGRESS,
+            environ_base=SUPERVISOR,
+        )
+
+        assert response.status_code == 302
+        entry = task_state.pending_requests()["prices"]
+        assert entry["source"] == "dashboard"
+        assert entry["parameters"] == {"prijzen_start": day}
+        assert backend_calls == ([] if config_zone else [v2_routes.app_datapath + "options.json"])
+        # Requesting must not execute the fetch; the scheduler owns that work.
+        assert provider_calls == [] and db.saved == []
+        pending = task_state.take_pending("prices")
+        cmd = task_registry.build_cmd("prices", pending["parameters"])
+        assert cmd == ["python3", "../prog/day_ahead.py", "prices", day]
+        monkeypatch.setattr(sys, "argv", cmd[1:])
+        DaBase.get_day_ahead_prices(runner)
+
+        assert provider_calls == [datetime.date(2026, 6, 14), datetime.date(2026, 6, 15)]
+        frame = pd.concat(db.saved, ignore_index=True)
+        epochs = frame["time"].astype("int64")
+        assert len(epochs) == epochs.nunique() == 24
+        assert epochs.iloc[0] == first_epoch
+        assert epochs.iloc[-1] == first_epoch + 23 * 3600
+        assert frame["code"].unique().tolist() == ["da"]
+
+    def test_manual_price_refresh_keeps_ingress_and_csrf_checks(
+        self, client, v2_routes, monkeypatch
+    ):
+        def forbidden(*args, **kwargs):
+            pytest.fail("Rejected requests must not read installation context")
+
+        monkeypatch.setattr(v2_routes, "_cached_config", forbidden)
+        monkeypatch.setattr(v2_routes, "Report", forbidden)
+        response = client.post(
+            "/v2/task-exec", data={"task": "prices"},
+            headers=INGRESS, environ_base=SUPERVISOR,
+        )
+        assert response.status_code == 400
+        response = client.post(
+            "/v2/task-exec",
+            data={"task": "prices", "csrf_token": csrf_token(client, "/v2/tasks")},
+        )
+        assert response.status_code == 401
+        assert task_state.pending_requests() == {}
 
     def test_every_declared_parameter_has_a_field_definition(self):
         """A parameter in the registry with no PARAMETER_FIELDS entry would

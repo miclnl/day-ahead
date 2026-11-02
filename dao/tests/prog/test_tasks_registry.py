@@ -103,14 +103,23 @@ class TestBuildCmd:
             "python3", "../prog/day_ahead.py", "prices", "2026-01-01", "2026-01-03",
         ]
 
-    def test_missing_and_empty_parameters_are_skipped(self):
-        """The v1 dashboard behaved this way: 'prices' without dates fetches
-        the default range instead of being handed an empty string to parse."""
-        assert tasks.build_cmd("prices", {}) == [
+    @pytest.mark.parametrize("key", ["prices", "get_prices", "update_prices"])
+    def test_missing_and_empty_parameters_are_skipped(self, key):
+        """Only the manual dashboard fills a start; CLI/scheduler defaults stay implicit."""
+        assert tasks.build_cmd(key) == [
             "python3", "../prog/day_ahead.py", "prices",
         ]
-        assert tasks.build_cmd("prices", {"prijzen_start": "  "}) == [
+        assert tasks.build_cmd(key, {}) == [
             "python3", "../prog/day_ahead.py", "prices",
+        ]
+        assert tasks.build_cmd(key, {"prijzen_start": "  "}) == [
+            "python3", "../prog/day_ahead.py", "prices",
+        ]
+
+    @pytest.mark.parametrize("key", ["prices", "get_prices", "update_prices"])
+    def test_a_manual_price_start_is_forwarded_without_filling_an_end(self, key):
+        assert tasks.build_cmd(key, {"prijzen_start": "2026-06-15"}) == [
+            "python3", "../prog/day_ahead.py", "prices", "2026-06-15",
         ]
 
     def test_an_alias_builds_the_same_command_as_its_canonical_key(self):

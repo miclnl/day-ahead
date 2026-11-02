@@ -3,6 +3,7 @@ from flask import Blueprint, abort, render_template, request, redirect, url_for
 
 from dao.prog.version import __version__
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from dao.prog.da_report import Report
 from dao.prog import task_state
 from dao.prog import tasks as task_registry
@@ -294,6 +295,15 @@ def task_exec():
         for parameter in declared
         if request.form.get(parameter, "").strip()
     }
+
+    if canonical == "prices" and not values:
+        # A manual refresh must bypass the already-present shortcut. Resolve
+        # today in the installation zone, not the web worker's server zone.
+        config = _cached_config()
+        time_zone = config.time_zone if config is not None else None
+        if not time_zone:
+            time_zone = Report(app_datapath + "options.json").time_zone
+        values["prijzen_start"] = datetime.datetime.now(ZoneInfo(time_zone)).date().isoformat()
 
     # Hand the work to the scheduler process instead of running it here.
     # This request is served by a gunicorn worker that gets recycled on
