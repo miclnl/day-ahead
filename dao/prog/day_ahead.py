@@ -2556,6 +2556,10 @@ class DaCalc(DaBase):
                     model += c_ev[e][u] == 0
                     model += p_ev[e][u] == 0
                     model += ev_accu_in[e][u] == 0
+                    model += ev_is_off[e][u] == 1
+                    model += ev_is_on[e][u] == 0
+                    for cs in range(ECS[e]):
+                        model += stage_on[e][cs][u] == 0
                     model += ev_is_partial[e][u] == 0
                     model += ev_boundary_stop[e][u] == 0
                     model += ev_delta_soc[e][u] == 0
