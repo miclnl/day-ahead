@@ -15,11 +15,14 @@ a small site directory (data copied from the shipped example, app package
 linked) and imports the app from there.
 """
 
+import hashlib
 import importlib
 import json
 import socket
 import subprocess
 import threading
+from html.parser import HTMLParser
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +34,14 @@ from markupsafe import escape
 
 from dao.prog.config.loader import CURRENT_VERSION
 from dao.prog.da_base import DaBase
+from dao.tests.config.test_atomic_config import (
+    _managed_process,
+    _message,
+    _pause_replace,
+    _paused_config_writer,
+    _probe_transaction,
+    _waiting_config_writer,
+)
 
 from .conftest import INGRESS, SUPERVISOR, csrf_token as _csrf_token  # noqa: E402
 
@@ -74,6 +85,177 @@ def _assert_editor_serialization(response, editor, submitted):
     assert preserved, "The serialized textarea must bind one fixed LF and unchanged escaped input"
 
 
+def _editor_fields(response):
+    """Parse hidden fields only; textarea evidence remains the serialization guard."""
+    fields = {}
+
+    class HiddenFields(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "input" and attrs.get("name") in ("csrf_token", "revision"):
+                fields[attrs["name"]] = attrs.get("value", "")
+
+    HiddenFields().feed(response.get_data(as_text=True))
+    assert fields.get("csrf_token")
+    assert len(fields.get("revision", "")) == 64, "Editor GET must provide a byte revision"
+    return fields
+
+
+def _editor_form(client, editor):
+    """Use the real GET's CSRF and revision fields, without bypassing either gate."""
+    response = client.get(f"/v2/{editor}", headers=INGRESS, environ_base=SUPERVISOR)
+    assert response.status_code == 200
+    return _editor_fields(response)
+
+
+@pytest.mark.parametrize("editor", ["config", "secrets"])
+def test_editor_get_revision_hashes_exact_saved_bytes(client, editor_sandbox, editor):
+    _, paths = editor_sandbox
+    saved = '\r\n{ "//note": "café" }\r\n'.encode()
+    paths[editor].write_bytes(saved)
+
+    form = _editor_form(client, editor)
+
+    assert form["revision"] == hashlib.sha256(saved).hexdigest()
+    response = client.get(f"/v2/{editor}", headers=INGRESS, environ_base=SUPERVISOR)
+    _assert_editor_serialization(response, editor, saved.decode("utf-8"))
+
+
+@pytest.mark.parametrize("editor", ["config", "secrets"])
+@pytest.mark.parametrize("revision", [None, "", "invalid", "0" * 64])
+def test_editor_requires_matching_revision(
+    client, editor_sandbox, caplog, editor, revision
+):
+    routes, paths = editor_sandbox
+    token = _csrf_token(client, f"/v2/{editor}")
+    cached = routes._cached_config()
+    before = {name: path.read_bytes() for name, path in paths.items()}
+    submitted = '\n {"//note": "</textarea><script>b8c_sandbox</script>& café"}\t\n'
+    form = {editor: submitted, "csrf_token": token}
+    if revision is not None:
+        form["revision"] = revision
+    caplog.clear()
+
+    response = client.post(
+        f"/v2/{editor}", data=form, headers=INGRESS, environ_base=SUPERVISOR,
+    )
+
+    assert response.status_code == 409
+    assert b"Error:" in response.data
+    assert b"updated successfully" not in response.data
+    unchanged = all(path.read_bytes() == before[name] for name, path in paths.items())
+    assert unchanged, "A missing or stale revision must not change either file"
+    assert routes._cached_config() is cached
+    assert "b8c_sandbox" not in caplog.text, "Conflict input must not be logged"
+    _assert_editor_serialization(response, editor, submitted)
+
+
+@pytest.mark.parametrize("editor", ["config", "secrets"])
+def test_stale_editor_form_cannot_overwrite_newer_editor_save(
+    client, editor_sandbox, editor
+):
+    routes, paths = editor_sandbox
+    stale_form = _editor_form(client, editor)
+    newer = '\n {"config_version": 3, "//note": "newer sandbox save"}\r\n'
+    response = client.post(
+        f"/v2/{editor}", data={**stale_form, editor: newer},
+        headers=INGRESS, environ_base=SUPERVISOR,
+    )
+    assert response.status_code == 200
+    assert b"updated successfully" in response.data
+    successful_form = _editor_fields(response)
+    assert successful_form["revision"] == hashlib.sha256(newer.encode("utf-8")).hexdigest()
+    cached = routes._cached_config()
+    updated_form = _editor_form(client, editor)
+    assert updated_form["revision"] == hashlib.sha256(newer.encode("utf-8")).hexdigest()
+    assert updated_form["revision"] != stale_form["revision"]
+    stale_input = '\n {"//note": "stale </textarea>& café"}\t\n'
+
+    response = client.post(
+        f"/v2/{editor}", data={**stale_form, editor: stale_input},
+        headers=INGRESS, environ_base=SUPERVISOR,
+    )
+
+    assert response.status_code == 409
+    assert _editor_fields(response)["revision"] == stale_form["revision"]
+    unchanged = paths[editor].read_bytes() == newer.encode("utf-8")
+    assert unchanged, "A stale editor must preserve the newer saved bytes"
+    assert routes._cached_config() is cached
+    _assert_editor_serialization(response, editor, stale_input)
+
+
+def test_mode_change_and_editor_conflict_preserves_newer_data(client, editor_sandbox):
+    routes, paths = editor_sandbox
+    path = paths["config"]
+    form = {
+        "csrf_token": _csrf_token(client, "/v2/config"),
+        "revision": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    cached = routes._cached_config()
+    submitted = '\n {"//note": "stale </textarea>& café"}\t\n'
+
+    def post(connection):
+        _probe_transaction(connection, path)
+        response = client.post(
+            "/v2/config", data={**form, "config": submitted},
+            headers=INGRESS, environ_base=SUPERVISOR,
+        )
+        connection.send(("response", response.status_code))
+        assert b"updated successfully" not in response.data
+        assert routes._cached_config() is cached
+        _assert_editor_serialization(response, "config", submitted)
+
+    with _managed_process(_paused_config_writer, path, "mode") as mode:
+        _message(mode, "before_replace")
+        mode.send("publish")
+        (published_inode,) = _message(mode, "after_replace")
+        newer = path.read_bytes()
+        with _managed_process(post) as editor:
+            (lock_inode,) = _message(editor, "blocked")
+            assert lock_inode != published_inode
+            mode.send("unlock")
+            _message(mode, "done")
+            _message(editor, "read")
+            assert _message(editor, "response") == (409,)
+            _message(editor, "done")
+
+    assert path.read_bytes() == newer
+    assert json.loads(newer)["fast control"]["mode"] == "active"
+
+
+def test_editor_holds_transaction_through_publication(client, editor_sandbox):
+    _, paths = editor_sandbox
+    path = paths["config"]
+    form = _editor_form(client, "config")
+    submitted = '{"config_version": 3, "//note": "keep editor change"}\n'
+
+    def post(connection):
+        _pause_replace(connection)
+        response = client.post(
+            "/v2/config", data={**form, "config": submitted},
+            headers=INGRESS, environ_base=SUPERVISOR,
+        )
+        connection.send(("response", response.status_code))
+        assert b"Config updated successfully" in response.data
+
+    with _managed_process(post) as editor:
+        _message(editor, "before_replace")
+        with _managed_process(_waiting_config_writer, path, "mode") as mode:
+            _message(mode, "blocked")
+            editor.send("publish")
+            _message(editor, "after_replace")
+            assert path.read_text(encoding="utf-8") == submitted
+            editor.send("unlock")
+            assert _message(editor, "response") == (200,)
+            _message(editor, "done")
+            _message(mode, "read")
+            _message(mode, "done")
+
+    saved = json.loads(path.read_bytes())
+    assert saved["//note"] == "keep editor change"
+    assert saved["fast control"]["mode"] == "active"
+
+
 @pytest.mark.parametrize("editor", ["config", "secrets"])
 @pytest.mark.parametrize("failure", ["syntax", "schema", "empty", "whitespace", "io"])
 def test_editor_preserves_unsaved_input(
@@ -81,7 +263,7 @@ def test_editor_preserves_unsaved_input(
 ):
     """A rejected POST must not replace even empty input with saved content."""
     routes, paths = editor_sandbox
-    token = _csrf_token(client, f"/v2/{editor}")
+    form = _editor_form(client, editor)
     cached = routes._cached_config()
     assert cached is not None
     before = {name: path.read_bytes() for name, path in paths.items()}
@@ -118,7 +300,7 @@ def test_editor_preserves_unsaved_input(
     caplog.clear()
     with got_request_exception.connected_to(record_exception, client.application):
         response = client.post(
-            f"/v2/{editor}", data={editor: submitted, "csrf_token": token},
+            f"/v2/{editor}", data={**form, editor: submitted},
             headers=INGRESS, environ_base=SUPERVISOR,
         )
 
@@ -139,26 +321,32 @@ def test_editor_preserves_unsaved_input(
 
 
 @pytest.mark.parametrize("editor", ["config", "secrets"])
-def test_editor_post_does_not_read_saved_content(
+def test_editor_post_checks_revision_without_replacing_input(
     client, editor_sandbox, monkeypatch, editor
 ):
     routes, paths = editor_sandbox
-    token = _csrf_token(client, f"/v2/{editor}")
+    form = _editor_form(client, editor)
     cached = routes._cached_config()
     submitted = '\n {"config_version": ' + str(CURRENT_VERSION) + ', "//note": "saved"}\t\n'
 
-    def forbidden_read(*args, **kwargs):
-        pytest.fail("Only GET may read saved editor content")
+    original_read_bytes = Path.read_bytes
+    reads = []
+
+    def read_bytes(path):
+        if path == paths[editor]:
+            reads.append(path)
+        return original_read_bytes(path)
 
     with monkeypatch.context() as post_only:
-        post_only.setattr(routes, "open", forbidden_read, raising=False)
+        post_only.setattr(Path, "read_bytes", read_bytes)
         response = client.post(
-            f"/v2/{editor}", data={editor: submitted, "csrf_token": token},
+            f"/v2/{editor}", data={**form, editor: submitted},
             headers=INGRESS, environ_base=SUPERVISOR,
         )
 
     assert response.status_code == 200
     assert b"updated successfully" in response.data
+    assert reads == [paths[editor]], "POST reads disk only to check the revision, never as editor input"
     assert paths[editor].read_bytes() == submitted.encode("utf-8")
     _assert_editor_serialization(response, editor, submitted)
     if editor == "config":
@@ -233,11 +421,11 @@ def test_the_config_editor_writes_only_its_own_file(client, site):
     # after this one loads a config with nothing in it.
     options = site / "data" / "options.json"
     before = options.read_text(encoding="utf-8")
-    token = _csrf_token(client, "/v2/config")
+    form = _editor_form(client, "config")
     try:
         response = client.post(
             "/v2/config",
-            data={"config": '{"nonsense": true}', "csrf_token": token},
+            data={**form, "config": '{"nonsense": true}'},
             headers=INGRESS,
             environ_base=SUPERVISOR,
         )
@@ -252,12 +440,12 @@ def test_the_config_editor_writes_only_its_own_file(client, site):
 def test_the_config_editor_rejects_invalid_config(client, site):
     """A typo in the editor must not be able to leave an options.json the
     scheduler cannot load, which would put it in a restart loop."""
-    token = _csrf_token(client, "/v2/config")
+    form = _editor_form(client, "config")
     before = (site / "data" / "options.json").read_text(encoding="utf-8")
 
     response = client.post(
         "/v2/config",
-        data={"config": '{"battery": "nope"}', "csrf_token": token},
+        data={**form, "config": '{"battery": "nope"}'},
         headers=INGRESS,
         environ_base=SUPERVISOR,
     )

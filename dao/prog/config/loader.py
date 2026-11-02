@@ -8,6 +8,8 @@ import shutil
 import json
 import math
 import logging
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, Type
 from pydantic import BaseModel, ValidationError
@@ -81,20 +83,65 @@ def validate_config_data(config_data: Any) -> BaseModel:
         raise ConfigValidationError(e) from e
 
 
+@contextmanager
+def config_transaction(path: Path):
+    """Lock the whole read/validate/write, on an inode that survives replace.
+
+    All configuration writers share this sidecar. Never remove or replace it:
+    a waiter may still hold its descriptor after the target has been replaced.
+    The low-level atomic writer deliberately does not acquire this lock again.
+    """
+    path = Path(path)
+    with open(path.with_name(f".{path.name}.lock"), "a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     """Write a file so a reader never sees a half-written version.
 
     The content goes to a temporary file in the same directory, is flushed to
     disk and then renamed over the target. A crash in the middle leaves the
-    old file untouched instead of a truncated options.json.
+    old file untouched instead of a truncated options.json. Each writer owns
+    an exclusive, private (0600) temp; it must never reuse another writer's file.
     """
     path = Path(path)
-    tmp = path.with_name(f".{path.name}.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8", newline="")
+        except BaseException:
+            # Until fdopen succeeds, this function still owns the descriptor.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        try:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException:
+            # close may flush again and fail; keep the active primary error.
+            try:
+                stream.close()
+            except BaseException:
+                pass
+            raise
+        else:
+            # With no primary error, a close failure must prevent publication.
+            stream.close()
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            # replace already removed it, or cleanup failed: neither may mask
+            # the original write/fsync/replace error. Only ever unlink our temp.
+            pass
 
 
 def json_safe(data: Any) -> Any:
@@ -139,26 +186,27 @@ def set_fast_control_mode(config_path: Path, new_mode: str) -> None:
     if new_mode not in FAST_CONTROL_MODES:
         raise ValueError(f"Ongeldige modus {new_mode!r}")
     config_path = Path(config_path)
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    if not isinstance(raw, dict):
-        raise ValueError("options.json moet een JSON-object zijn")
-    key = "fast control" if "fast control" in raw or "fast_control" not in raw else "fast_control"
-    section = raw.get(key)
-    if not isinstance(section, dict):
-        section = {}
-    current = section.get("mode")
-    if isinstance(current, dict):
-        current = current.get("value")
-    if FlexValue.is_entity_id(current):
-        raise ValueError(
-            f"De modus wordt gestuurd door Home Assistant entity {current}; "
-            f"wijzig die in Home Assistant"
-        )
-    section["mode"] = new_mode
-    raw[key] = section
-    validate_config_data(raw)
-    atomic_write_json(config_path, raw)
+    with config_transaction(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("options.json moet een JSON-object zijn")
+        key = "fast control" if "fast control" in raw or "fast_control" not in raw else "fast_control"
+        section = raw.get(key)
+        if not isinstance(section, dict):
+            section = {}
+        current = section.get("mode")
+        if isinstance(current, dict):
+            current = current.get("value")
+        if FlexValue.is_entity_id(current):
+            raise ValueError(
+                f"De modus wordt gestuurd door Home Assistant entity {current}; "
+                f"wijzig die in Home Assistant"
+            )
+        section["mode"] = new_mode
+        raw[key] = section
+        validate_config_data(raw)
+        atomic_write_json(config_path, raw)
 
 
 class ConfigurationLoader:
@@ -213,14 +261,10 @@ class ConfigurationLoader:
         Returns:
             Migrated configuration (not yet validated with Pydantic)
         """
-        with open(self.config_path, "r+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-
+        with config_transaction(self.config_path):
             # Load raw config
-            config_data = json.load(f)
-
-            # Store original for unknown key preservation
-            self._raw_options = config_data.copy()
+            with open(self.config_path, encoding="utf-8") as f:
+                config_data = json.load(f)
 
             # Check if migration needed
             config_version = config_data.get("config_version")
@@ -256,13 +300,14 @@ class ConfigurationLoader:
                 # default into the user's file and dropped explicit nulls, so
                 # the file looked different depending on who saved it last and
                 # later default changes never reached existing installations.
-                self._raw_options = copy.deepcopy(migrated_data)
                 atomic_write_json(self.config_path, migrated_data)
                 logger.info(f"Saved migrated configuration to {self.config_path}")
             else:
                 logger.debug("Configuration is up to date, no migration needed")
                 migrated_data = config_data
 
+            # Publish the raw cache only after any required write succeeded.
+            self._raw_options = copy.deepcopy(migrated_data)
             return migrated_data
 
     def load_and_validate(self) -> BaseModel:

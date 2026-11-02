@@ -33,6 +33,7 @@ from dao.prog.da_base import DaBase
 from dao.tests.lib.test_da_prices import FakeDb, _values
 
 from .conftest import INGRESS, SUPERVISOR, csrf_token
+from .test_security import _editor_form
 
 
 @pytest.fixture
@@ -136,13 +137,13 @@ class TestCo2Report:
     ):
         # Prime the actual cache: saving must invalidate it, not just write a file.
         assert not v2_routes.co2_available()
-        token = csrf_token(client, "/v2/config")
+        form = _editor_form(client, "config")
         document = json.loads(co2_config.read_text(encoding="utf-8"))
         document["report"] = {key: raw, "//note": "keep this spelling"}
         submitted = json.dumps(document, indent=2)
 
         response = client.post(
-            "/v2/config", data={"config": submitted, "csrf_token": token},
+            "/v2/config", data={**form, "config": submitted},
             headers=INGRESS, environ_base=SUPERVISOR,
         )
 
@@ -164,13 +165,13 @@ class TestCo2Report:
         {"co2 intensity sensor": "sensor.co2_intensity", "co2_intensity_sensor": "sensor.other"},
     ])
     def test_invalid_co2_config_cannot_overwrite_saved_file(self, client, co2_config, report):
-        token = csrf_token(client, "/v2/config")
+        form = _editor_form(client, "config")
         before = co2_config.read_text(encoding="utf-8")
         document = json.loads(before)
         document["report"] = report
 
         response = client.post(
-            "/v2/config", data={"config": json.dumps(document), "csrf_token": token},
+            "/v2/config", data={**form, "config": json.dumps(document)},
             headers=INGRESS, environ_base=SUPERVISOR,
         )
 

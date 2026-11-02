@@ -3,6 +3,7 @@ from flask import Blueprint, abort, render_template, request, redirect, url_for
 
 from dao.prog.version import __version__
 from pathlib import Path
+from hashlib import sha256
 from zoneinfo import ZoneInfo
 from dao.prog.da_report import Report
 from dao.prog import task_state
@@ -10,6 +11,7 @@ from dao.prog import tasks as task_registry
 from dao.prog.config.loader import (
     ConfigurationLoader,
     atomic_write_text,
+    config_transaction,
     set_fast_control_mode,
     validate_config_data,
 )
@@ -793,62 +795,81 @@ def reportsv2():
 
 @v2.route("/config", methods=["GET", "POST"])
 def config():
-    path = app_datapath + "options.json"
+    path = Path(app_datapath + "options.json")
     error = None
     success = None
+    status = 200
 
     if request.method == "POST":
         content = request.form.get("config", "")
+        revision = request.form.get("revision", "")
         try:
-            # Syntax and schema: a config that does not validate would put
-            # the scheduler in a restart loop.
-            validate_config_data(json.loads(content))
-            atomic_write_text(Path(path), content)
-            # This process just wrote the file, so the cached copy the
-            # display paths use is stale.
-            _invalidate_cached_config()
-            success = "Config updated successfully"
+            with config_transaction(path):
+                if revision != sha256(path.read_bytes()).hexdigest():
+                    error = "Error: Het bestand is intussen gewijzigd. Bewaar uw invoer en herlaad de editor."
+                    status = 409
+                else:
+                    # Validate under the same lock as revision check and write.
+                    validate_config_data(json.loads(content))
+                    atomic_write_text(path, content)
+                    _invalidate_cached_config()
+                    success = "Config updated successfully"
+                    revision = sha256(content.encode("utf-8")).hexdigest()
         except (ValueError, OSError) as err:
             error = "Error: " + str(err)
 
     else:
-        with open(path, "r") as file:
-            content = file.read()
+        with config_transaction(path):
+            saved = path.read_bytes()
+        content = saved.decode("utf-8")
+        revision = sha256(saved).hexdigest()
 
     return render_template(
         "v2/config.html",
         content=content,
         success=success,
         error=error,
-    )
+        revision=revision,
+    ), status
 
 
 @v2.route("/secrets", methods=["GET", "POST"])
 def secrets():
-    path = app_datapath + "secrets.json"
+    path = Path(app_datapath + "secrets.json")
     error = None
     success = None
+    status = 200
 
     if request.method == "POST":
         content = request.form.get("secrets", "")
+        revision = request.form.get("revision", "")
         try:
-            if not isinstance(json.loads(content), dict):
-                raise ValueError("secrets.json moet een JSON-object met sleutel/waarde zijn")
-            atomic_write_text(Path(path), content)
-            success = "Secrets updated successfully"
+            with config_transaction(path):
+                if revision != sha256(path.read_bytes()).hexdigest():
+                    error = "Error: Het bestand is intussen gewijzigd. Bewaar uw invoer en herlaad de editor."
+                    status = 409
+                else:
+                    if not isinstance(json.loads(content), dict):
+                        raise ValueError("secrets.json moet een JSON-object met sleutel/waarde zijn")
+                    atomic_write_text(path, content)
+                    success = "Secrets updated successfully"
+                    revision = sha256(content.encode("utf-8")).hexdigest()
         except (ValueError, OSError) as err:
             error = "Error: " + str(err)
 
     else:
-        with open(path, "r") as file:
-            content = file.read()
+        with config_transaction(path):
+            saved = path.read_bytes()
+        content = saved.decode("utf-8")
+        revision = sha256(saved).hexdigest()
 
     return render_template(
         "v2/secrets.html",
         content=content,
         success=success,
         error=error,
-    )
+        revision=revision,
+    ), status
 
 
 FAST_STATE_PATH = "../data/fast_state.json"

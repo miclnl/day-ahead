@@ -12,6 +12,24 @@ from dao.prog.config.loader import (
     ConfigurationLoader,
     validate_config_data,
 )
+from dao.prog.config import loader as loader_module
+
+
+def test_failed_migration_write_does_not_publish_raw_cache(tmp_path, monkeypatch):
+    path = tmp_path / "options.json"
+    path.write_bytes(b'{"//note": "synthetic legacy document"}\n')
+    before = path.read_bytes()
+    loader = ConfigurationLoader(path)
+
+    def fail_write(*args, **kwargs):
+        raise OSError("Synthetic migration write failure")
+
+    monkeypatch.setattr(loader_module, "atomic_write_json", fail_write)
+    with pytest.raises(OSError, match="Synthetic migration write failure"):
+        loader.load_and_validate()
+
+    assert path.read_bytes() == before
+    assert loader._raw_options is None
 
 
 @pytest.mark.parametrize(("document", "field"), [
