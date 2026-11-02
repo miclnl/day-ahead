@@ -9,6 +9,7 @@ import json
 import math
 import pprint as pp
 import logging
+from zoneinfo import ZoneInfo
 
 
 class DaPrices:
@@ -28,8 +29,11 @@ class DaPrices:
 
         Without an explicit range the prices for today (and, after noon, for
         tomorrow) are fetched, unless the database already holds them. An
-        explicit ``_start``/``_end`` is a backfill request: the range is
-        fetched as given and the "already present" check is skipped. The CLI
+        explicit ``_start``/``_end`` is a half-open backfill request: the range
+        is fetched as given and the "already present" check is skipped. Nordpool
+        interprets naive bounds in the configured database/installation zone;
+        aware bounds retain their instants. Fetch dates follow the separate
+        CET/CEST market delivery calendar. The CLI
         entry point (DaBase.get_day_ahead_prices) is the only place that
         turns command line arguments into that range; this method must not
         look at sys.argv, it also runs inside the web server.
@@ -38,21 +42,35 @@ class DaPrices:
             resolution = 60
         else:
             resolution = 15
-        now = datetime.datetime.now()
+        nordpool = source.lower() == "nordpool"
+        tz = self.db_da.tzinfo if nordpool else None
+        now = datetime.datetime.now(tz) if nordpool else datetime.datetime.now()
         explicit_range = _start is not None or _end is not None
         # start
         if _start is None:
-            start = pd.Timestamp(year=now.year, month=now.month, day=now.day, tz="CET")
+            if nordpool:
+                start = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=tz)
+            else:
+                start = pd.Timestamp(year=now.year, month=now.month, day=now.day, tz="CET")
         else:
             start = _start
+        if nordpool and start.tzinfo is None:
+            start = start.replace(tzinfo=tz)
         # end
         if _end is None:
-            if now.hour < 12:
-                end = start + datetime.timedelta(days=1)
+            days = 1 if now.hour < 12 else 2
+            if nordpool:
+                local_start = start.astimezone(tz)
+                end = datetime.datetime.combine(
+                    local_start.date() + datetime.timedelta(days=days),
+                    local_start.timetz(),
+                )
             else:
-                end = start + datetime.timedelta(days=2)
+                end = start + datetime.timedelta(days=days)
         else:
             end = _end
+        if nordpool and end.tzinfo is None:
+            end = end.replace(tzinfo=tz)
 
         if not explicit_range:
             present = self.db_da.get_time_border_record("da")
@@ -117,53 +135,76 @@ class DaPrices:
                             f"Geen data van Entsoe tussen {last_time_dt} en {end_dt}"
                         )
 
-        if source.lower() == "nordpool":
-            # ophalen bij Nordpool. Without an explicit range the library
-            # fetches the prices for tomorrow (end_date=None).
+        if nordpool:
+            # Keep the existing market-CET contract separate from the
+            # installation zone: the client sends a date label, not a zone.
+            # CET observes CEST and has 23/25-hour delivery days at DST.
+            source_tz = ZoneInfo("CET")
+            start_ts, end_ts = start.timestamp(), end.timestamp()
+            if start_ts >= end_ts:
+                return
             prices_spot = Prices()
-            end_date = start if explicit_range else None
-            day_label = end_date.strftime("%Y-%m-%d") if end_date else "tomorrow"
-            try:
-                act_spot_prices = prices_spot.fetch(
-                    areas=[self.country], end_date=end_date, resolution=resolution
-                )
-            except Exception as ex:
-                logging.error(f"Geen data van Nordpool voor {day_label}: {ex}")
-                return
-            if not act_spot_prices:
-                logging.error(f"Geen data van Nordpool voor {day_label}")
-                return
-            try:
-                act_values = act_spot_prices["areas"][self.country]["values"]
-            except (KeyError, TypeError):
-                logging.error(
-                    f"Onverwacht antwoord van Nordpool voor {day_label}: "
-                    f"{str(act_spot_prices)[:200]}"
-                )
-                return
-            s = pp.pformat(act_values, indent=2)
-            logging.info(f"Day ahead prijzen van Nordpool:\n {s}")
-            rows = []
-            for act_value in act_values:
-                value = act_value.get("value")
-                if value is None or not math.isfinite(value):
-                    continue
-                rows.append([str(int(act_value["start"].timestamp())), "da", value / 1000])
-            df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
-            logging.debug(
-                f"Day ahead prices for {day_label}"
-                f" (source: nordpool, db-records): \n {df_db.to_string(index=False)}"
+            day = datetime.datetime.combine(
+                start.astimezone(source_tz).date(), datetime.time.min, tzinfo=source_tz
             )
-            # A full day has 24 hours or 96 quarters; the autumn DST day has one
-            # hour more, the spring day one less, so allow one hour of slack.
-            expected = 24 * 60 // resolution
-            if len(df_db) < expected - 60 // resolution:
-                logging.warning(
-                    f"Retrieve of day ahead prices for {day_label} incomplete: "
-                    f"{len(df_db)} of {expected} values"
+            while day.timestamp() < end_ts:
+                fetch_day = day
+                day = datetime.datetime.combine(
+                    fetch_day.date() + datetime.timedelta(days=1),
+                    datetime.time.min,
+                    tzinfo=source_tz,
                 )
-            if len(df_db) > 0:
-                self.db_da.savedata(df_db)
+                day_label = fetch_day.strftime("%Y-%m-%d")
+                try:
+                    act_spot_prices = prices_spot.fetch(
+                        areas=[self.country], end_date=fetch_day, resolution=resolution
+                    )
+                except Exception as ex:
+                    logging.error(f"Geen data van Nordpool voor {day_label}: {ex}")
+                    continue
+                if not act_spot_prices:
+                    logging.error(f"Geen data van Nordpool voor {day_label}")
+                    continue
+                try:
+                    act_values = act_spot_prices["areas"][self.country]["values"]
+                except (KeyError, TypeError):
+                    logging.error(
+                        f"Onverwacht antwoord van Nordpool voor {day_label}: "
+                        f"{str(act_spot_prices)[:200]}"
+                    )
+                    continue
+                s = pp.pformat(act_values, indent=2)
+                logging.info(f"Day ahead prijzen van Nordpool:\n {s}")
+                rows = []
+                lower = max(start_ts, fetch_day.timestamp())
+                upper = min(end_ts, day.timestamp())
+                for act_value in act_values:
+                    value = act_value.get("value")
+                    if value is None or not math.isfinite(value):
+                        continue
+                    # Compare instants, not wall times: both autumn folds count.
+                    time_stamp = act_value["start"].timestamp()
+                    if lower <= time_stamp < upper:
+                        rows.append([str(int(time_stamp)), "da", value / 1000])
+                df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
+                logging.debug(
+                    f"Day ahead prices for {day_label}"
+                    f" (source: nordpool, db-records): \n {df_db.to_string(index=False)}"
+                )
+                # Count only requested slot starts; a partial boundary is not a
+                # missing price, but a single absent slot within it still is.
+                step = resolution * 60
+                expected = math.ceil((upper - fetch_day.timestamp()) / step) - math.ceil(
+                    (lower - fetch_day.timestamp()) / step
+                )
+                actual = df_db["time"].nunique()
+                if actual < expected:
+                    logging.warning(
+                        f"Retrieve of day ahead prices for {day_label} incomplete: "
+                        f"{actual} of {expected} values"
+                    )
+                if len(df_db) > 0:
+                    self.db_da.savedata(df_db)
 
         if source.lower() == "easyenergy":
             # ophalen bij EasyEnergy
