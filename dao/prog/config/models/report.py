@@ -3,7 +3,9 @@ Reporting configuration models.
 """
 
 from typing import Optional
-from pydantic import BaseModel, Field, ConfigDict
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from .base import EntityId
 
 
@@ -125,7 +127,14 @@ class ReportConfig(BaseModel):
         alias="co2 intensity sensor",
         description="HA entity for CO2 intensity",
         json_schema_extra={
-            "x-help": "Optional: Home Assistant sensor for grid CO2 intensity (gCO2/kWh). Used to calculate and report carbon footprint of electricity usage.",
+            "x-help": "Optional: One Home Assistant sensor for grid CO2 intensity (gCO2/kWh). "
+            "Accepts 'co2 intensity sensor', 'co2_intensity_sensor' or the legacy key "
+            "'entity co2-intensity', as an entity ID string or a list containing exactly "
+            "one entity ID. Normalized to a single typed entity ID; null or [] means absent. "
+            "Multiple sensors, invalid entity IDs and conflicting aliases are rejected. "
+            "Equivalent aliases are accepted. Saving the raw configuration preserves its "
+            "key spelling and value form. Used to calculate and report carbon footprint "
+            "of electricity usage.",
             "x-unit": "gCO2/kWh",
             "x-ui-section": "General",
             "x-ui-widget-filter": "sensor",
@@ -139,6 +148,38 @@ class ReportConfig(BaseModel):
             "x-ui-section": "General",
         },
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_co2_sensor(cls, data):
+        """Consume all CO2 spellings without changing the raw configuration."""
+        if not isinstance(data, dict):
+            return data
+        aliases = ("co2 intensity sensor", "co2_intensity_sensor", "entity co2-intensity")
+        normalized = {}
+        for key in aliases:
+            if key not in data:
+                continue
+            value = data[key]
+            if isinstance(value, list):
+                if not value:
+                    value = None
+                elif len(value) == 1 and isinstance(value[0], str):
+                    value = value[0]
+                else:
+                    raise ValueError("CO2 intensity must contain exactly one sensor entity ID")
+            if value is not None and not isinstance(value, str):
+                raise ValueError("CO2 intensity must be an entity ID string, singleton list or null")
+            normalized[key] = value
+        if not normalized:
+            return data
+        if len(set(normalized.values())) > 1:
+            raise ValueError(f"Conflicting CO2 intensity sensor aliases: {', '.join(normalized)}")
+        result = dict(data)
+        for key in normalized:
+            del result[key]
+        result["co2 intensity sensor"] = next(iter(normalized.values()))
+        return result
 
     model_config = ConfigDict(
         extra="allow",
@@ -162,13 +203,18 @@ Connect actual energy measurements to Day Ahead Optimizer:
 
 ## Entity Lists
 
-All entity fields accept lists of HA sensors:
+The `entities ...` fields accept lists of HA sensors:
 ```json
 "entities_grid_consumption": [
   "sensor.grid_import_meter",
   "sensor.backup_meter"
 ]
 ```
+
+CO2 intensity uses a single typed entity ID, not a multi-sensor list. The keys
+`co2 intensity sensor`, `co2_intensity_sensor` and legacy `entity co2-intensity`
+accept a string or a one-sensor list. `null` and `[]` disable CO2 reporting.
+Multiple sensors, invalid entity IDs and conflicting aliases are rejected.
 
 ## Key Measurements
 

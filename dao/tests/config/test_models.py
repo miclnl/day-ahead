@@ -79,6 +79,83 @@ class TestEntityId:
         assert "x-ui-widget" not in entity_def
 
 
+class TestReportCo2Sensor:
+    @pytest.mark.parametrize("key", [
+        "co2 intensity sensor", "co2_intensity_sensor", "entity co2-intensity",
+    ])
+    @pytest.mark.parametrize(("raw", "expected"), [
+        ("sensor.co2_intensity", "sensor.co2_intensity"),
+        (["sensor.co2_intensity"], "sensor.co2_intensity"),
+        (None, None),
+        ([], None),
+    ])
+    def test_co2_aliases_normalize_to_one_typed_entity(self, key, raw, expected):
+        from dao.prog.config.models.report import ReportConfig
+
+        report = ReportConfig.model_validate({key: raw, "custom": "preserved"})
+
+        assert report.co2_intensity_sensor == expected
+        if expected is not None:
+            assert isinstance(report.co2_intensity_sensor, EntityId)
+        assert report.model_extra == {"custom": "preserved"}
+
+    def test_omitted_co2_sensor_is_absent(self):
+        from dao.prog.config.models.report import ReportConfig
+
+        assert ReportConfig().co2_intensity_sensor is None
+
+    @pytest.mark.parametrize("key", [
+        "co2 intensity sensor", "co2_intensity_sensor", "entity co2-intensity",
+    ])
+    @pytest.mark.parametrize("raw", [
+        "not_an_entity_id", "sensor.", "", 42, True,
+        {"entity": "sensor.co2_intensity"},
+        ["not_an_entity_id"], [None], [["sensor.co2_intensity"]],
+        ["sensor.co2_intensity", "sensor.other"],
+        ["sensor.co2_intensity", "sensor.co2_intensity"],
+    ])
+    def test_invalid_or_multiple_co2_entities_are_rejected(self, key, raw):
+        from dao.prog.config.models.report import ReportConfig
+
+        with pytest.raises(ValidationError):
+            ReportConfig.model_validate({key: raw})
+
+    @pytest.mark.parametrize("keys", [
+        ("co2 intensity sensor", "co2_intensity_sensor"),
+        ("co2 intensity sensor", "entity co2-intensity"),
+        ("co2_intensity_sensor", "entity co2-intensity"),
+    ])
+    @pytest.mark.parametrize("other", ["sensor.other", None, []])
+    def test_conflicting_co2_aliases_are_rejected(self, keys, other):
+        from dao.prog.config.models.report import ReportConfig
+
+        with pytest.raises(ValidationError, match="Conflicting.*CO2"):
+            ReportConfig.model_validate({keys[0]: "sensor.co2_intensity", keys[1]: other})
+
+    @pytest.mark.parametrize("present", [True, False])
+    def test_equivalent_co2_aliases_are_consumed_without_mutating_raw_data(self, present):
+        import copy
+
+        from dao.prog.config.models.report import ReportConfig
+
+        raw = {
+            "co2 intensity sensor": "sensor.co2_intensity" if present else None,
+            "co2_intensity_sensor": ["sensor.co2_intensity"] if present else [],
+            "entity co2-intensity": ["sensor.co2_intensity"] if present else None,
+        }
+        before = copy.deepcopy(raw)
+
+        report = ReportConfig.model_validate(raw)
+
+        assert raw == before
+        assert report.co2_intensity_sensor == ("sensor.co2_intensity" if present else None)
+        assert report.model_extra == {}
+        dumped = report.model_dump(by_alias=True)
+        assert dumped["co2 intensity sensor"] == ("sensor.co2_intensity" if present else None)
+        assert "co2_intensity_sensor" not in dumped
+        assert "entity co2-intensity" not in dumped
+
+
 class TestFlexValue:
     def test_serialization_literal(self):
         fv = FlexFloat(value=95)

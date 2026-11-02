@@ -839,7 +839,7 @@ Het is allemaal optioneel.
 |                           | entities machine consumption  | list of string   | []                                 |                                                    | 
 |                           | entities battery consumption  | list of string   | []                                 |                                                    | 
 |                           | entities battery production   | list of string   | []                                 |                                                    | 
-|                           | entity co2-intensity          | list of string   | []                                 |                                                    |
+|                           | co2 intensity sensor          | string / 1-item list | null                           | Aliases: co2_intensity_sensor, entity co2-intensity  |
 | **scheduler**             | active                        | boolean          | True                               | 
 |                           |                               | list             | {time, task}                       |                                                    | 
 
@@ -1610,7 +1610,8 @@ Via het dashboard kun je met het programma diverse rapportages genereren.
 Van de meeste sensoren houdt Home Assistant het verbruik bij in de historische database.
 Dat geldt met name voor de sensoren die je hebt opgegeven (of kunt opgeven) bij de configuratie van het energiedashboard van HA.
 Het programma gebruikt deze sensoren ook voor het berekenen van de baseload (basisverbruik) van je woning.
-Default waarde is een lege lijst: []
+Voor de `entities ...`-velden is de default waarde een lege lijst: [].
+CO2-intensiteit is optioneel en gebruikt precies één sensor, met default `null`.
 
 Je kunt de volgende onderdelen invullen
 * entities grid consumption 
@@ -1623,7 +1624,14 @@ Je kunt de volgende onderdelen invullen
 * entities machine consumption
 * entities battery consumption
 * entities battery production
-* entity co2-intensity<br>
+* co2 intensity sensor (ook `co2_intensity_sensor` of de legacykey `entity co2-intensity`)<br>
+
+Voor CO2 accepteren alle drie de sleutels een entity-ID als string of een lijst met
+precies één entity-ID; intern wordt dit één getypeerde entity-ID. `null` en `[]`
+betekenen dat er geen CO2-sensor is ingesteld. Meerdere sensoren, ongeldige
+entity-ID's en tegenstrijdige aliases worden afgewezen. Gelijkwaardige aliases
+zijn toegestaan. Bij opslaan van de ruwe configuratie blijven de sleutelspelling
+en de oorspronkelijke string-/lijstvorm behouden.
 
 Als voorbeeld: zo heb ik deze lijst ingevuld:
 ``` 
@@ -1646,7 +1654,7 @@ Als voorbeeld: zo heb ik deze lijst ingevuld:
     "entities machine consumption": [],
     "entities battery consumption": ["sensor.ess_grid_consumption"],
     "entities battery production": ["sensor.ess_grid_production"],
-    "entity co2-intensity": ["sensor.co2_intensity"]
+    "co2 intensity sensor": "sensor.co2_intensity"
   },
 ```
 
@@ -1655,7 +1663,8 @@ Het programma beschikt over een mogelijkheid om je CO2-emissie te berekenen en t
 Deze mogelijkheid moet je zelf activeren in enkele stappen:
 1.  Activeer en configureer in Home Assistant de integratie: "Electricity Maps" (free tier, account).
 2. Als het goed is gegaan komen er in HA twee sensoren bij, maar het gaat om de sensor **CO2-intensity** (g CO2 eq/kWh). <br>
-Vul de naam van die sensor in bij report:<br> `"entity co2-intensity": ["sensor.co2_intensity"]` (zie hierboven).
+Vul de naam van die sensor in bij report:<br> `"co2 intensity sensor": "sensor.co2_intensity"` (zie hierboven).
+De bestaande schrijfwijze `"entity co2-intensity": ["sensor.co2_intensity"]` blijft ook geldig.
 3. Herstart DAO via Instellingen/Add-ons/DAO
 4. Ga naar het dashboard van DAO en klik op Report.
 5. Je krijgt nu (naast grid en balans) een extra rapportage item: **CO2**

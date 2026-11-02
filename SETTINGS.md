@@ -1950,13 +1950,18 @@ Connect actual energy measurements to Day Ahead Optimizer:
 
 ## Entity Lists
 
-All entity fields accept lists of HA sensors:
+The `entities ...` fields accept lists of HA sensors:
 ```json
 "entities_grid_consumption": [
   "sensor.grid_import_meter",
   "sensor.backup_meter"
 ]
 ```
+
+CO2 intensity uses a single typed entity ID, not a multi-sensor list. The keys
+`co2 intensity sensor`, `co2_intensity_sensor` and legacy `entity co2-intensity`
+accept a string or a one-sensor list. `null` and `[]` disable CO2 reporting.
+Multiple sensors, invalid entity IDs and conflicting aliases are rejected.
 
 ## Key Measurements
 
@@ -2046,7 +2051,7 @@ List of Home Assistant sensor entities measuring appliance/machine consumption (
 
 **`co2 intensity sensor`**
 
-Optional: Home Assistant sensor for grid CO2 intensity (gCO2/kWh). Used to calculate and report carbon footprint of electricity usage.
+Optional: One Home Assistant sensor for grid CO2 intensity (gCO2/kWh). Accepts 'co2 intensity sensor', 'co2_intensity_sensor' or the legacy key 'entity co2-intensity', as an entity ID string or a list containing exactly one entity ID. Normalized to a single typed entity ID; null or [] means absent. Multiple sensors, invalid entity IDs and conflicting aliases are rejected. Equivalent aliases are accepted. Saving the raw configuration preserves its key spelling and value form. Used to calculate and report carbon footprint of electricity usage.
 
 **`sensors`**
 

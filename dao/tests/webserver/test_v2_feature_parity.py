@@ -14,10 +14,12 @@ fallback interface.
 """
 
 import datetime
+import json
 import socket
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -26,6 +28,7 @@ import pytest
 from dao.lib import da_prices
 from dao.prog import task_state
 from dao.prog import tasks as task_registry
+from dao.prog.config.loader import CURRENT_VERSION, ConfigurationLoader
 from dao.prog.da_base import DaBase
 from dao.tests.lib.test_da_prices import FakeDb, _values
 
@@ -78,6 +81,130 @@ def manual_price_context(v2_routes, monkeypatch):
 
 
 class TestCo2Report:
+    @pytest.fixture
+    def co2_config(self, v2_routes, monkeypatch, tmp_path):
+        """Real config/menu/editor, with only backend I/O fenced off."""
+        options = tmp_path / "options.json"
+        options.write_text(json.dumps({
+            "config_version": CURRENT_VERSION,
+            "time_zone": "Europe/Amsterdam",
+            "report": {},
+        }), encoding="utf-8")
+        (tmp_path / "secrets.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(v2_routes, "app_datapath", str(tmp_path) + "/")
+        monkeypatch.setattr(v2_routes, "_config_cache", None)
+        monkeypatch.setattr(v2_routes, "_config_cache_loaded", False)
+        # Report rendering needs history; the menu and typed config do not.
+        monkeypatch.setattr(v2_routes, "reports_gen", lambda *a, **kw: ["<table></table>"])
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("CO2 config/menu tests must not start backend I/O or workers")
+
+        monkeypatch.setattr(DaBase, "__init__", forbidden)
+        monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+        monkeypatch.setattr(socket, "create_connection", forbidden)
+        monkeypatch.setattr(socket.socket, "connect", forbidden)
+        monkeypatch.setattr(socket.socket, "connect_ex", forbidden)
+        monkeypatch.setattr(subprocess, "Popen", forbidden)
+        monkeypatch.setattr(threading.Thread, "start", forbidden)
+        return options
+
+    @pytest.mark.parametrize("raw", ["sensor.co2_intensity", ["sensor.co2_intensity"]])
+    def test_legacy_co2_config_reaches_report_menu(self, client, co2_config, raw):
+        document = json.loads(co2_config.read_text(encoding="utf-8"))
+        document["report"] = {"entity co2-intensity": raw}
+        co2_config.write_text(json.dumps(document), encoding="utf-8")
+
+        response = client.get(
+            "/v2/reports?subject=grid", headers=INGRESS, environ_base=SUPERVISOR
+        )
+
+        assert response.status_code == 200
+        assert b'value="co2"' in response.data
+
+    @pytest.mark.parametrize("key", [
+        "co2 intensity sensor", "co2_intensity_sensor", "entity co2-intensity",
+    ])
+    @pytest.mark.parametrize(("raw", "expected"), [
+        ("sensor.co2_intensity", "sensor.co2_intensity"),
+        (["sensor.co2_intensity"], "sensor.co2_intensity"),
+        (None, None),
+        ([], None),
+    ])
+    def test_co2_config_save_reload_preserves_raw_spelling(
+        self, client, v2_routes, co2_config, key, raw, expected
+    ):
+        # Prime the actual cache: saving must invalidate it, not just write a file.
+        assert not v2_routes.co2_available()
+        token = csrf_token(client, "/v2/config")
+        document = json.loads(co2_config.read_text(encoding="utf-8"))
+        document["report"] = {key: raw, "//note": "keep this spelling"}
+        submitted = json.dumps(document, indent=2)
+
+        response = client.post(
+            "/v2/config", data={"config": submitted, "csrf_token": token},
+            headers=INGRESS, environ_base=SUPERVISOR,
+        )
+
+        assert response.status_code == 200
+        assert b"Config updated successfully" in response.data
+        assert co2_config.read_text(encoding="utf-8") == submitted
+        reloaded = ConfigurationLoader(co2_config).load_and_validate()
+        assert reloaded.report.co2_intensity_sensor == expected
+        response = client.get("/v2/reports", headers=INGRESS, environ_base=SUPERVISOR)
+        assert response.status_code == 200
+        assert (b'value="co2"' in response.data) == (expected is not None)
+
+    @pytest.mark.parametrize("report", [
+        {"entity co2-intensity": "not_an_entity_id"},
+        {"entity co2-intensity": ["not_an_entity_id"]},
+        {"entity co2-intensity": ["sensor.co2_intensity", "sensor.other"]},
+        {"co2 intensity sensor": "sensor.co2_intensity", "entity co2-intensity": "sensor.other"},
+        {"co2_intensity_sensor": "sensor.co2_intensity", "entity co2-intensity": None},
+        {"co2 intensity sensor": "sensor.co2_intensity", "co2_intensity_sensor": "sensor.other"},
+    ])
+    def test_invalid_co2_config_cannot_overwrite_saved_file(self, client, co2_config, report):
+        token = csrf_token(client, "/v2/config")
+        before = co2_config.read_text(encoding="utf-8")
+        document = json.loads(before)
+        document["report"] = report
+
+        response = client.post(
+            "/v2/config", data={"config": json.dumps(document), "csrf_token": token},
+            headers=INGRESS, environ_base=SUPERVISOR,
+        )
+
+        assert response.status_code == 200
+        assert b"Error:" in response.data
+        assert co2_config.read_text(encoding="utf-8") == before
+
+    @pytest.mark.parametrize("key", [
+        "co2 intensity sensor", "co2_intensity_sensor", "entity co2-intensity",
+    ])
+    @pytest.mark.parametrize(("raw", "expected"), [
+        ("sensor.co2_intensity", ["sensor.co2_intensity"]),
+        (["sensor.co2_intensity"], ["sensor.co2_intensity"]),
+        (None, []),
+        ([], []),
+    ])
+    def test_typed_co2_config_keeps_report_sensor_list(
+        self, v2_routes, co2_config, monkeypatch, key, raw, expected
+    ):
+        document = json.loads(co2_config.read_text(encoding="utf-8"))
+        document["report"] = {key: raw}
+        co2_config.write_text(json.dumps(document), encoding="utf-8")
+
+        def local_config_only(report, file_name):
+            # Keep Report.__init__ real, replacing only DaBase's HA/DB startup.
+            report.config = ConfigurationLoader(Path(file_name)).load_and_validate()
+            report.prices_options = SimpleNamespace(last_invoice=datetime.date(2026, 1, 1))
+
+        monkeypatch.setattr(DaBase, "__init__", local_config_only)
+        report = v2_routes.Report(str(co2_config), _now=datetime.datetime(2026, 11, 2, 12))
+
+        assert report.co2_intensity_sensor == expected
+        assert report.co2_dict["co2_intensity"]["sensors"] == expected
+
     def test_the_subject_is_offered_when_a_sensor_is_configured(
         self, client, v2_routes, monkeypatch
     ):
