@@ -405,9 +405,9 @@ def _import_targets():
 
 
 # ---------------------------------------------------------------------------
-# Write-primitive no-ops, shared by ReplayIO (always) and RecordingIO's
+# Known write-channel no-ops, shared by ReplayIO (always) and RecordingIO's
 # opt-in debug mode (its ``debug=True`` constructor argument). Suppressing
-# at these primitives rather than chasing call sites is the same principle
+# at these explicit boundaries rather than chasing call sites follows the principle
 # used for every read channel above: the boundary is the stable thing, the
 # call sites are not.
 # ---------------------------------------------------------------------------
@@ -431,6 +431,16 @@ def _make_noop_call_service(label: str):
         return None
 
     return _noop_call_service
+
+
+def _make_noop_record_presence(label: str):
+    # Presence registration reads HA only to write save_hourly_value; skip
+    # this write channel explicitly, without relaxing any replay read.
+    def _noop_record_presence(instance):
+        logger.debug("%s: onderdrukt write record_presence()", label)
+        return None
+
+    return _noop_record_presence
 
 
 # Onderdrukt het wegschrijven van de PNG-afbeelding die day_ahead.py ongeacht debug-modus altijd maakt.
@@ -662,8 +672,9 @@ class RecordingIO:
     same write-primitive no-ops ``ReplayIO`` always applies — because
     `self.debug` alone does *not* gate everything: `self.notify(...)` and
     one `set_value(entity_avg_temp, ...)` call in day_ahead.py are
-    unconditional regardless of the flag. Reads still happen for real and
-    are still captured; only the write side is suppressed.
+    unconditional regardless of the flag. Presence registration is also a
+    write channel, including its incidental HA reads. Planning reads still
+    happen for real and are captured; only write channels are suppressed.
 
     ``png`` is a separate switch, independent of ``debug``: day_ahead.py
     writes a chart PNG unconditionally regardless of ``self.debug``, and
@@ -756,6 +767,7 @@ class RecordingIO:
             label = f"RecordingIO(debug, {self.out_dir})"
             self._patches.set(DaBase, "set_value", _make_noop_set_value(label))
             self._patches.set(DaBase, "call_service", _make_noop_call_service(label))
+            self._patches.set(BaseloadService, "record_presence", _make_noop_record_presence(label))
 
         # Independent of --debug: day_ahead.py writes a PNG chart
         # unconditionally, regardless of self.debug. Off by default here —
@@ -1416,6 +1428,7 @@ class ReplayIO:
         label = f"ReplayIO ({self._source})"
         self._patches.set(DaBase, "set_value", _make_noop_set_value(label))
         self._patches.set(DaBase, "call_service", _make_noop_call_service(label))
+        self._patches.set(BaseloadService, "record_presence", _make_noop_record_presence(label))
 
         # Independent of the (always-on) HA write suppression above: the
         # PNG is a plain local file, not an HA/DB write, so whether to

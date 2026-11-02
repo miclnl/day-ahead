@@ -275,8 +275,8 @@ def test_capture_cli_sanitizes_read_failure(tmp_path, monkeypatch, capsys):
 
 
 # Clock/TZ mutation belongs to a dedicated process, never a scheduler process.
-# Stop the real producer at preflight: its actual start/arguments have been
-# selected, but no config/DB/HA/forecast/model inputs have been consulted yet.
+# Clock tests stop the real producer at preflight, before external inputs.
+# Presence tests use the real service with synthetic HA and a DB write spy.
 _ISOLATED_SETUP = """
 import datetime as dt
 import json
@@ -285,6 +285,7 @@ import os
 import socket
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -336,6 +337,20 @@ def observe(base, *args, **kwargs):
     except StartObserved as exc:
         return exc.args[0]
     raise AssertionError("producer did not reach preflight")
+
+def presence_service(base, data_dir):
+    states = {"person.synthetic_home": "home", "person.synthetic_away": "not_home"}
+    base.config.baseload_options.absence.entities_presence = list(states)
+    base._ha_client = SimpleNamespace(
+        get_state=lambda *, entity_id: SimpleNamespace(state=states[entity_id]))
+    writes = []
+    base.db_da = SimpleNamespace(save_hourly_value=lambda code, moment, value:
+                                writes.append([code, value]))
+    base.db_ha = None
+    base.ha_context = da_base.HAContext(0.0, 0.0, base.time_zone, "NL")
+    service = base.baseload_service()
+    service.data_dir = Path(data_dir)
+    return service, writes
 """
 
 
@@ -352,6 +367,143 @@ def _isolated_replay(code, data, *, process_zone="UTC"):
     )
     assert child.returncode == 0, child.stdout + child.stderr
     return json.loads(child.stdout)
+
+
+@pytest.mark.parametrize("recorded_presence", [False, True])
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_replay_presence_does_not_write(tmp_path, snapshot, recorded_presence, body_fails):
+    # Removing the explicit write boundary must expose either the real DB
+    # write or the incidental HA read, even on a service made before entry.
+    if recorded_presence:
+        snapshot["ha_states"] = {"person.synthetic_home": "home", "person.synthetic_away": "not_home"}
+    output = _isolated_replay("""
+        base = calculator()
+        service, writes = presence_service(base, data["data_dir"])
+        service.record_presence()
+        assert writes == [["presence", 0.5]]
+        writes.clear()
+        replay = da_debug.ReplayIO(data["snapshot"])
+        try:
+            with replay:
+                service.record_presence()
+                assert writes == [], writes
+                assert replay.reads == set(), replay.reads
+                if data["body_fails"]:
+                    raise RuntimeError("controlled presence body failure")
+        except RuntimeError as exc:
+            assert data["body_fails"] and str(exc) == "controlled presence body failure"
+        service.record_presence()
+        assert writes == [["presence", 0.5]]
+        assert replay._patches._entries == []
+        print(json.dumps({"writes_after_cleanup": writes}))
+    """, {"snapshot": snapshot, "data_dir": str(tmp_path), "body_fails": body_fails})
+    assert output == {"writes_after_cleanup": [["presence", 0.5]]}
+
+
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_capture_presence_write_boundary_is_debug_only(tmp_path, debug, body_fails):
+    # Debug capture must suppress presence, but ordinary recording remains
+    # passthrough. Both normal and exceptional exits restore the real service.
+    output = _isolated_replay("""
+        base = calculator()
+        service, writes = presence_service(base, data["out_dir"])
+        recording = da_debug.RecordingIO(data["out_dir"], debug=data["debug"])
+        try:
+            with recording:
+                recording._primary = base
+                service.record_presence()
+                assert writes == ([] if data["debug"] else [["presence", 0.5]]), writes
+                if data["body_fails"]:
+                    raise RuntimeError("controlled presence body failure")
+        except RuntimeError as exc:
+            assert data["body_fails"] and str(exc) == "controlled presence body failure"
+        snapshot = json.loads(recording.snapshot_path.read_text())
+        assert snapshot["ha_states"] == ({} if data["debug"] else {
+            "person.synthetic_home": "home", "person.synthetic_away": "not_home"})
+        writes.clear()
+        service.record_presence()
+        assert writes == [["presence", 0.5]]
+        assert recording._patches._entries == []
+        print(json.dumps({"writes_after_cleanup": writes}))
+    """, {"out_dir": str(tmp_path), "debug": debug, "body_fails": body_fails})
+    assert output == {"writes_after_cleanup": [["presence", 0.5]]}
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_producer_debug_presence_does_not_write(tmp_path, debug):
+    # Exercise calc_optimum itself, not a reconstructed debug branch. Stop at
+    # the next (solar) boundary, after a real presence service could write.
+    output = _isolated_replay("""
+        import pandas as pd
+
+        base = calculator()
+        service, writes = presence_service(base, data["data_dir"])
+        base.debug = data["debug"]
+        base.interval, base.interval_s, base.steps_day = "1hour", 3600, 24
+        base.file_name = "synthetic-unused-options"
+        base.config.baseload = [0.2] * 24
+        base.use_calc_baseload = False
+        base.battery_options = []
+        base.solar = [SimpleNamespace(entity_pv_switch=None, max_power=1.0)]
+        base._financial_preflight = lambda **kwargs: None
+        base.notify = lambda *args: None
+        dates = pd.date_range("2026-01-16T12:00:00", periods=9, freq="h")
+        prices = pd.DataFrame({"time": dates, "da_ex": 0.1, "da_cons": 0.2, "da_prod": 0.1})
+        forecast = pd.DataFrame({"tijd": dates})
+        base.db_da.get_prognose_data = lambda **kwargs: forecast.copy()
+
+        class PresenceObserved(Exception):
+            pass
+
+        def stop_at_solar(*args):
+            raise PresenceObserved
+
+        base.calc_solar_predictions = stop_at_solar
+        report = SimpleNamespace(get_price_data=lambda *args, **kwargs: prices.copy())
+        with patch.object(day_ahead, "Report", lambda *args: report), \
+             freezegun.freeze_time("2026-01-16T12:00:00"):
+            try:
+                base.calc_optimum()
+            except PresenceObserved:
+                pass
+            else:
+                raise AssertionError("producer did not reach the boundary after presence")
+        print(json.dumps({"writes": writes}))
+    """, {"data_dir": str(tmp_path), "debug": debug})
+    assert output["writes"] == ([] if debug else [["presence", 0.5]])
+
+
+@pytest.mark.parametrize("channel", ["ha", "db"])
+def test_replay_unknown_read_after_first_solve_still_aborts(tmp_path, snapshot, channel):
+    # A real solved model is no licence to default an unknown service input;
+    # current_regime's ordinary Exception fallbacks must not swallow the miss.
+    output = _isolated_replay("""
+        base = calculator()
+        service, writes = presence_service(base, data["data_dir"])
+        try:
+            with da_debug.ReplayIO(data["snapshot"]) as replay:
+                model = mip.Model(solver_name=mip.CBC)
+                model.verbose = 0
+                model.objective = model.add_var(lb=1, ub=1)
+                assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+                assert replay._model is model
+                if data["channel"] == "ha":
+                    base.config.baseload_options.absence.entity_away = "sensor.synthetic_soc"
+                    service.db_da = None
+                else:
+                    service.db_da = da_base.make_db_da()
+                service.current_regime(dt.date(2026, 1, 17))
+        except da_debug.SnapshotMiss as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("unknown read after first solve did not abort")
+        assert writes == []
+        assert replay._patches._entries == []
+        print(json.dumps({"message": message, "reads": sorted(replay.reads)}))
+    """, {"snapshot": snapshot, "data_dir": str(tmp_path), "channel": channel})
+    assert (ENTITY if channel == "ha" else "get_column_data") in output["message"]
+    assert output["reads"] == ([ENTITY] if channel == "ha" else [])
 
 
 @pytest.mark.parametrize("positional", [False, True])
