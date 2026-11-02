@@ -454,6 +454,7 @@ class DaCalc(DaBase):
         self.heating_options = self.config.heating
         self.use_calc_baseload = self.config.use_calc_baseload
         self.hp_present = False
+        self.hp_control_allowed = False
         self.hp_enabled = False
         self.hp_adjustment = None
         self.hp_heat_demand = "eco"
@@ -2489,15 +2490,20 @@ class DaCalc(DaBase):
         )
         if not self.hp_present:
             logging.info("Warmtepomp niet aanwezig - warmtepomp wordt niet ingepland")
-            self.hp_enabled = False
+            self.hp_control_allowed = False
+            self.hp_adjustment = None
         else:
+            # "adjustment" : keuze uit "on/off" | "power" | "heating curve", default "power"
+            self.hp_adjustment = (self.heating_options.adjustment or "power").lower()
             entity_hp_enabled = self.heating_options.entity_hp_enabled
-            self.hp_enabled = (entity_hp_enabled is None) or self.get_bool(
+            self.hp_control_allowed = (entity_hp_enabled is None) or self.get_bool(
                 entity_hp_enabled, True, "Warmtepomp ingeschakeld"
             )
-            if not self.hp_enabled:
+            if not self.hp_control_allowed:
                 logging.info("Warmtepomp staat uit - warmtepomp wordt niet ingepland")
+        self.hp_enabled = self.hp_control_allowed
         if self.hp_enabled:
+            logging.info(f"Regeling warmtepomp: {self.hp_adjustment}")
             # degree days
             degree_days_today = self.meteo.calc_graaddagen(weighted=True)
             logging.info(f"Gewogen graaddagen vandaag: {degree_days_today:.1f} K.day")
@@ -2554,10 +2560,6 @@ class DaCalc(DaBase):
                 model += hp_on[u] == 0
         else:
             # self.hp_enabled == True
-            # "adjustment" : keuze uit "on/off" | "power" | "heating curve", default "power"
-            self.hp_adjustment = (self.heating_options.adjustment or "power").lower()
-            logging.info(f"Regeling warmtepomp: {self.hp_adjustment}")
-
             # heat demand: off, eco, max
             entity_hp_heat_demand = self.heating_options.entity_hp_heat_demand
             # Is er warmte vraag - zo ja, dan inplannen vanaf interval 0
@@ -5019,6 +5021,8 @@ class DaCalc(DaBase):
                             f"op {hp_power:<0.3f} kW"
                         )
 
+            if self.hp_control_allowed:
+                # Curve control remains allowed without scheduling the compressor.
                 #  curve adjustment
                 entity_curve_adjustment = (
                     self.heating_options.entity_adjust_heating_curve
