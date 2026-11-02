@@ -607,11 +607,12 @@ class DaBase:
             )
 
     def get_meteo_data(self, show_graph: bool = False):
-        self.meteo.get_meteo_data(show_graph)
+        status = self.meteo.get_meteo_data(show_graph)
+        return status.hours_total > 0
 
     @staticmethod
     def get_tibber_data():
-        get_tibber_data()
+        return get_tibber_data()
 
     @staticmethod
     def consolidate_data():
@@ -626,8 +627,8 @@ class DaBase:
                 start_dt = datetime.datetime.strptime(start_str, "%Y-%m-%d")
             except Exception as ex:
                 error_handling(ex)
-                return
-        report.consolidate_data(start_dt)
+                return False
+        return report.consolidate_data(start_dt)
 
     @classmethod
     def local_settlement_app(cls, file_name):
@@ -697,14 +698,14 @@ class DaBase:
             )
         return self._settlement_service
 
-    def consolidate_settlement(self) -> None:
+    def consolidate_settlement(self):
         cfg = self.config.prices.settlement if self.config.prices is not None else None
         if cfg is None or cfg.mode == "off":
             return
         service = self.settlement_service()
         start, end = service.scheduled_range()
         if start < end:
-            service.consolidate(start, end, publish=True, reason="scheduled")
+            return service.consolidate(start, end, publish=True, reason="scheduled")
 
     def production_bonus_remaining_kwh(self, moment: datetime.datetime) -> float | None:
         """Compatibilitygrens: onbekende afrekenstaat geeft géén positieve prikkel.
@@ -758,10 +759,10 @@ class DaBase:
                 f"Ongeldige datum in argumenten {dates}; gebruik YYYY-MM-DD "
                 f"(bijvoorbeeld: day_ahead.py prices 2026-01-01 2026-01-03)"
             )
-            return
+            return False
         if start is not None and end is None:
             end = start + datetime.timedelta(days=1)
-        self.prices.get_prices(source, _start=start, _end=end)
+        return self.prices.get_prices(source, _start=start, _end=end)
 
     def save_df(
         self, tablename: str, tijd: list, df: pd.DataFrame, vintage: bool = False
@@ -934,7 +935,7 @@ class DaBase:
         dacalc = DaCalc(self.file_name)
         # dacalc = DaCalc("../data/tst_options/options_mirabis.json")
         dacalc.debug = True
-        dacalc.calc_optimum()
+        return dacalc.calc_optimum()
         # dacalc.calc_optimum(_start_dt=datetime.datetime(2025, 9, 28, 21, minute=0), _start_soc=50)
 
     def calc_optimum(self):
@@ -942,7 +943,7 @@ class DaBase:
 
         dacalc = DaCalc(self.file_name)
         dacalc.debug = False
-        dacalc.calc_optimum()
+        return dacalc.calc_optimum()
 
     def baseload_service(self):
         from dao.forecast.baseload.service import BaseloadService
@@ -976,7 +977,7 @@ class DaBase:
         from da_report import Report
 
         Report(self.file_name).check_baseload_sensors()
-        self.baseload_service().fit()
+        return self.baseload_service().fit()
 
     def forecast_accuracy(self, days: int = 30):
         """Report how far the forecasts were off, and prune the archive.
@@ -1097,7 +1098,7 @@ class DaBase:
                 days = int(sys.argv[2])
             except ValueError:
                 logging.warning(f"Ongeldig aantal dagen: {sys.argv[2]}, 7 gebruikt")
-        fast_main(
+        return fast_main(
             [
                 "--options",
                 self.file_name or "../data/options.json",
@@ -1135,10 +1136,14 @@ class DaBase:
         # those configured for ml/auto, trains the ML model too -- in that
         # order, since the ML model's own features include the physical
         # model's (now current) output.
-        self.pv_service().run_training()
+        return self.pv_service().run_training()
 
-    def run_task_function(self, task, logfile: bool = True):
+    def run_task_function(self, task, logfile: bool = True) -> int:
         """Run *task* in this process, logging it to its own file.
+
+        Exact False is failure (1), explicit integer statuses are preserved,
+        and successful legacy returns (including None and True) are success (0).
+        Exceptions propagate after the logger is restored.
 
         Every handler this adds to the root logger is removed again in the
         finally, which is what the old version got wrong in three ways:
@@ -1158,7 +1163,7 @@ class DaBase:
         """
         if task not in self.tasks:
             logging.error(f"Onbekende taak: {task}")
-            return
+            return 1
         run_task = self.tasks[task]
         function_name = run_task.get("function")
         if not function_name:
@@ -1168,7 +1173,7 @@ class DaBase:
                 f"Taak {task} kan niet in dit proces draaien, "
                 f"gebruik het commando: {' '.join(run_task['cmd'])}"
             )
-            return
+            return 1
 
         logger = logging.getLogger()
         formatter = logging.Formatter(
@@ -1225,9 +1230,14 @@ class DaBase:
                 f"taak: {function_name}"
             )
             self.db_da.log_pool_status()
-            getattr(self, function_name)()
+            result = getattr(self, function_name)()
             self.set_last_activity()
             self.db_da.log_pool_status()
+            if result is False:
+                return 1
+            if isinstance(result, int) and not isinstance(result, bool):
+                return result
+            return 0
         except Exception:
             logging.exception("Er is een fout opgetreden, zie de fout-tracering")
             raise

@@ -10,6 +10,7 @@ import datetime as dt
 import logging
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -33,6 +34,7 @@ from utils import (
 )
 
 from dao.prog import production_bonus
+from dao.prog import tasks as task_registry
 from dao.prog.boiler_profile import boiler_profile
 from dao.prog.config.models.pricing import PricingConfig
 from dao.prog.da_base import DaBase
@@ -595,7 +597,7 @@ class DaCalc(DaBase):
                 f"Er ontbreken kwartier- of uurwaarden van de day-ahead tarieven, "
                 f"de berekening wordt afgebroken"
             )
-            return None
+            return False
 
         end_prog = price_data["time"].iloc[-1]
         if self.interval == "15min":
@@ -605,7 +607,7 @@ class DaCalc(DaBase):
                     f"Er ontbreken kwartierwaarden van de day-ahead tarieven, "
                     f"de berekening wordt afgebroken"
                 )
-                return None
+                return False
 
         while price_data.iloc[0]["time"] < start_interval_dt:
             price_data = price_data.iloc[1:]
@@ -615,7 +617,7 @@ class DaCalc(DaBase):
         )
         if prog_data is None or len(prog_data) == 0:
             logging.error(f"Er ontbreken meteo waarden, de berekening wordt afgebroken")
-            return None
+            return False
 
         prog_data.index = pd.to_datetime(prog_data["tijd"])
         while len(prog_data) > 0 and prog_data.iloc[0]["tijd"] < start_interval_dt:
@@ -633,7 +635,7 @@ class DaCalc(DaBase):
             self.notify(
                 "Er ontbreken voor een aantal uur gegevens; er kan niet worden gerekend"
             )
-            return None
+            return False
         if u_data <= 8 or u_prices <= 8:
             logging.warning(
                 f"Er ontbreken voor een aantal uur meteogegevens "
@@ -686,7 +688,7 @@ class DaCalc(DaBase):
                 f"Baseload: verkeerd aantal waarden ({len(b_l)} in plaats van "
                 f"{U}), de berekening wordt afgebroken"
             )
-            return None
+            return False
         if not self.debug:
             try:
                 self.baseload_service().record_presence()
@@ -1531,7 +1533,7 @@ class DaCalc(DaBase):
                     f"'min soc end opt' ({min_soc_end_opt}); "
                     f"het programma kan nu geen optimale oplossing berekenem"
                 )
-                return None
+                return False
 
             model += soc[b][U] >= max(opt_low_level[b] / 2, min_soc_end_opt)
             model += soc[b][U] <= max_soc_end_opt
@@ -3744,7 +3746,7 @@ class DaCalc(DaBase):
             logging.info(f"Rekentijd: {end_calc - start_calc:<5.2f} sec")
             if model.num_solutions == 0:
                 logging.warning(f"Geen oplossing voor: {self.strategy}")
-                return None
+                return False
         elif self.strategy == "minimize consumption":
             strategie = "minimale levering"
             logging.info(f"Strategie: {strategie}")
@@ -3755,7 +3757,7 @@ class DaCalc(DaBase):
                 _log_native_output(native["cbc_log"])
             if model.num_solutions == 0:
                 logging.warning(f"Geen oplossing voor: {self.strategy}")
-                return None
+                return False
             min_delivery = max(0.0, delivery.x)
             logging.info("Eerste berekening")
             logging.info(f"Kosten (euro): {cost.x:<6.2f}")
@@ -3776,14 +3778,14 @@ class DaCalc(DaBase):
                     logging.warning(
                         f"Geen oplossing in na herberekening voor: {self.strategy}"
                     )
-                    return None
+                    return False
             logging.info("Herberekening")
             logging.info(f"Kosten (euro): {cost.x:<6.2f}")
             logging.info(f"Levering (kWh): {delivery.x:<6.2f}")
         else:
             logging.error("Kies een strategie in options")
             # strategie = 'niet gekozen'
-            return None
+            return False
 
         # Suppress FutureWarning messages
         # import warnings
@@ -3794,7 +3796,7 @@ class DaCalc(DaBase):
             logging.error(
                 f"Er is helaas geen oplossing gevonden, kijk naar je instellingen."
             )
-            return None
+            return False
 
         # Finaliseer vóór iedere .x-afgeleide resultaatarray en baseline.
         # Deze lokale stap bezit het model; na selectie volgen geen solves meer.
@@ -6048,7 +6050,7 @@ class DaCalc(DaBase):
 
     def calc_optimum_debug(self):
         self.debug = True
-        self.calc_optimum()
+        return self.calc_optimum()
 
     def notify(self, message: str, notification_calculation: bool = False):
         """
@@ -6064,56 +6066,44 @@ class DaCalc(DaBase):
             )
 
 
-def main():
-    """
-    main function
-    """
+def main(argv=None) -> int:
+    """Run registry tasks in order, stopping at the first failed task.
 
-    da_calc = DaCalc("../data/options.json")
-    if da_calc.config is None:
-        return
-    if len(sys.argv) > 1:
-        args = sys.argv[1:]
+    Keep argv visible to the historical date-parameter wrappers for the
+    duration of this call, without changing the caller's argument list.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    previous_argv = sys.argv
+    try:
+        sys.argv = [previous_argv[0], *args]
+        da_calc = DaCalc("../data/options.json")
+        if da_calc.config is None:
+            return 1
         for arg in args:
             if arg.lower() == "debug":
                 da_calc.debug = not da_calc.debug
                 continue
-            if arg.lower() == "calc":
-                if da_calc.debug:
-                    da_calc.run_task_function("calc_optimum_met_debug")
-                else:
-                    da_calc.run_task_function("calc_optimum")
-                continue
-            if arg.lower() == "meteo":
-                da_calc.run_task_function("meteo")
-                continue
-            if arg.lower() == "prices":
-                da_calc.run_task_function("prices")
-                continue
-            if arg.lower() == "tibber":
-                da_calc.run_task_function("tibber")
-                continue
-            if arg.lower() == "clean":
-                da_calc.run_task_function("clean")
-                continue
-            if arg.lower() == "consolidate":
-                da_calc.run_task_function("consolidate")
-                continue
-            if arg.lower() == "calc_baseloads":
-                da_calc.run_task_function("calc_baseloads")
-                continue
-            if arg.lower() == "train":
-                da_calc.run_task_function("train_ml_predictions")
-                continue
-            if arg.lower() == "accuracy":
-                da_calc.run_task_function("forecast_accuracy")
-                continue
-    da_calc.db_da.log_pool_status()
-    import platform
-    machine = platform.machine()
-    if machine == "aarch64" or machine == "arm64":
-        os._exit(0)
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg):
+                continue  # The price/consolidation/provider wrapper parses dates.
+            key = task_registry.resolve(arg.lower())
+            if key is None:
+                logging.error(f"Onbekende taak: {arg}")
+                return 1
+            if key == "calc_optimum" and da_calc.debug:
+                key = "calc_optimum_met_debug"
+            status = da_calc.run_task_function(key)
+            if status != 0:
+                return status
+        da_calc.db_da.log_pool_status()
+        return 0
+    finally:
+        sys.argv = previous_argv
 
 
 if __name__ == "__main__":
-    main()
+    import platform
+
+    status = main()
+    if platform.machine() in ("aarch64", "arm64"):
+        os._exit(status)
+    sys.exit(status)

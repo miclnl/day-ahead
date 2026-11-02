@@ -69,7 +69,7 @@ TASKS: dict[str, dict[str, Any]] = {
         "function": "calc_optimum",
         "file_name": "calc",
         "schedulable": True,
-        "aliases": ("calc_zonder_debug", "optimize_regular"),
+        "aliases": ("calc_zonder_debug", "optimize_regular", "calc"),
     },
     "tibber": {
         "name": "Verbruiksgegevens bij Tibber ophalen",
@@ -110,7 +110,7 @@ TASKS: dict[str, dict[str, Any]] = {
         "function": "clean_data",
         "file_name": "clean",
         "schedulable": True,
-        "aliases": (),
+        "aliases": ("clean_data",),
     },
     "train_ml_predictions": {
         "name": "ML modellen trainen",
@@ -118,7 +118,7 @@ TASKS: dict[str, dict[str, Any]] = {
         "function": "train_ml_predictions",
         "file_name": "train",
         "schedulable": True,
-        "aliases": ("train_ml",),
+        "aliases": ("train_ml", "train"),
     },
     "consolidate": {
         "name": "Verbruik/productie consolideren",
@@ -134,7 +134,7 @@ TASKS: dict[str, dict[str, Any]] = {
         "function": "forecast_accuracy",
         "file_name": "accuracy",
         "schedulable": True,
-        "aliases": (),
+        "aliases": ("accuracy",),
     },
     "settlement_consolidate": {
         "name": "Berekende afrekening consolideren",

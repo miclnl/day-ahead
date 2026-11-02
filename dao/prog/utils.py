@@ -135,7 +135,7 @@ def get_tibber_data():
             latest_ts = start_ts
         except Exception as ex:
             error_handling(ex)
-            return
+            return False
 
     # no starttime
     if (len(sys.argv) <= 2) or (start_ts is None):
@@ -215,10 +215,10 @@ def get_tibber_data():
         tibber_dict = resp.json()
     except (requests.RequestException, ValueError) as ex:
         logging.error(f"Ophalen verbruiksgegevens bij Tibber mislukt: {ex}")
-        return
+        return False
     if tibber_dict.get("errors"):
         logging.error(f"Tibber API gaf fouten terug: {tibber_dict['errors']}")
-        return
+        return False
     try:
         home = tibber_dict["data"]["viewer"]["homes"][0]
         production_nodes = home["production"]["nodes"]
@@ -227,7 +227,7 @@ def get_tibber_data():
         logging.error(
             f"Onverwacht antwoord van Tibber ({ex}): {str(tibber_dict)[:200]}"
         )
-        return
+        return False
     # Collect a plain list of (time, code, value) tuples and build the
     # frame once, instead of tibber_df.loc[tibber_df.shape[0]] = row per
     # node/field pair: that copies the whole frame on every append.

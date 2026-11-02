@@ -107,6 +107,7 @@ class DaPrices:
             except Exception as ex:
                 logging.error(ex)
                 logging.error(f"Geen data van Entsoe: tussen {start} en {end}")
+                return False
             if len(da_prices.index) > 0:
                 da_prices = (
                     da_prices.reset_index()
@@ -134,6 +135,9 @@ class DaPrices:
                         logging.warning(
                             f"Geen data van Entsoe tussen {last_time_dt} en {end_dt}"
                         )
+            else:
+                logging.error(f"Geen data van Entsoe: tussen {start} en {end}")
+                return False
 
         if nordpool:
             # Keep the existing market-CET contract separate from the
@@ -147,6 +151,7 @@ class DaPrices:
             day = datetime.datetime.combine(
                 start.astimezone(source_tz).date(), datetime.time.min, tzinfo=source_tz
             )
+            failed = False
             while day.timestamp() < end_ts:
                 fetch_day = day
                 day = datetime.datetime.combine(
@@ -161,9 +166,11 @@ class DaPrices:
                     )
                 except Exception as ex:
                     logging.error(f"Geen data van Nordpool voor {day_label}: {ex}")
+                    failed = True
                     continue
                 if not act_spot_prices:
                     logging.error(f"Geen data van Nordpool voor {day_label}")
+                    failed = True
                     continue
                 try:
                     act_values = act_spot_prices["areas"][self.country]["values"]
@@ -172,6 +179,7 @@ class DaPrices:
                         f"Onverwacht antwoord van Nordpool voor {day_label}: "
                         f"{str(act_spot_prices)[:200]}"
                     )
+                    failed = True
                     continue
                 s = pp.pformat(act_values, indent=2)
                 logging.info(f"Day ahead prijzen van Nordpool:\n {s}")
@@ -205,6 +213,10 @@ class DaPrices:
                     )
                 if len(df_db) > 0:
                     self.db_da.savedata(df_db)
+                elif expected > 0:
+                    failed = True
+            if failed:
+                return False
 
         if source.lower() == "easyenergy":
             # ophalen bij EasyEnergy
@@ -222,7 +234,7 @@ class DaPrices:
                 json_object = resp.json()
             except (requests.RequestException, ValueError) as ex:
                 logging.error(f"Ophalen day-ahead prijzen bij EasyEnergy mislukt: {ex}")
-                return
+                return False
             logging.debug(json_object)
             df = pd.DataFrame.from_records(json_object)
             if df.empty or not {"Timestamp", "TariffReturn"} <= set(df.columns):
@@ -230,7 +242,7 @@ class DaPrices:
                     f"Onverwacht antwoord van EasyEnergy, geen prijzen opgeslagen: "
                     f"{str(json_object)[:200]}"
                 )
-                return
+                return False
             logging.info(
                 f"Day ahead prijzen van Easyenergy:\n {df.to_string(index=False)}"
             )
@@ -314,10 +326,10 @@ class DaPrices:
                 tibber_dict = resp.json()
             except (requests.RequestException, ValueError) as ex:
                 logging.error(f"Ophalen day-ahead prijzen bij Tibber mislukt: {ex}")
-                return
+                return False
             if tibber_dict.get("errors"):
                 logging.error(f"Tibber API gaf fouten terug: {tibber_dict['errors']}")
-                return
+                return False
             try:
                 subscription = tibber_dict["data"]["viewer"]["homes"][0][
                     "currentSubscription"
@@ -330,7 +342,7 @@ class DaPrices:
                     f"Onverwacht antwoord van Tibber ({ex}), geen prijzen opgeslagen: "
                     f"{str(tibber_dict)[:200]}"
                 )
-                return
+                return False
             rows = []
             for lst in [today_nodes, tomorrow_nodes, range_nodes]:
                 for node in lst:
@@ -341,6 +353,9 @@ class DaPrices:
                     value = float(node["energy"])
                     logging.info(f"{node} {dt} {time_stamp} {value}")
                     rows.append((time_stamp, "da", value))
+            if not rows:
+                logging.error("Geen day-ahead prijzen van Tibber ontvangen")
+                return False
             df_db = pd.DataFrame(rows, columns=["time", "code", "value"])
             logging.debug(
                 f"Day ahead prijzen (source: tibber, db-records): \n "
