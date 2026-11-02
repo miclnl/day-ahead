@@ -3026,10 +3026,11 @@ class DaCalc(DaBase):
                     # ieder interval/uur maar een aan
                     model += (xsum(hp_s_on[s][u] for s in range(S))) == 1
                     """
-                    model.add_sos(
-                        [(hp_s_w[u][s], hp_stages[s]["max_power"]) for s in range(S)],
-                        2,
-                    )
+                    if S > 2:
+                        model.add_sos(
+                            [(hp_s_w[u][s], hp_stages[s]["max_power"]) for s in range(S)],
+                            2,
+                        )
 
                     # geproduceerde warmte = vermogen in W * COP_schijf /1000 in kWh
                     model += (

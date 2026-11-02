@@ -1,6 +1,7 @@
 """Required heat, not the available horizon, determines power-mode blocks."""
 
 import datetime as dt
+import logging
 import sys
 from types import SimpleNamespace
 
@@ -20,7 +21,7 @@ def power_hp_model(capture, monkeypatch):
     """Reuse the offline capture boundary; build the real HP producer and CBC."""
     instance = capture["instance"]
     start = capture["locals"]["start_dt"]
-    instance.battery_options = []
+    batteries = instance.battery_options
     instance.meteo = SimpleNamespace(calc_graaddagen=lambda **kwargs: 1.0)
 
     ha_writes = []
@@ -34,16 +35,19 @@ def power_hp_model(capture, monkeypatch):
         monkeypatch.setattr(instance, name, forbidden_write)
 
     def build(*, prices, heat_kwh, minimum_hours, adjustment, demand="eco", run_hours=None,
-              boiler=None):
+              boiler=None, stages=None, with_batteries=False):
+        instance.battery_options = batteries if with_batteries else []
+        configured_stages = stages if stages is not None else [{"max_power": 1000, "cop": 4}]
         instance.heating_options = HeatingEnabled.model_validate({
             "adjustment": adjustment,
             "degree days factor": heat_kwh,
             "min run length": minimum_hours,
-            "stages": [{"max_power": 1000, "cop": 4}],
+            "stages": configured_stages,
             "entity hp heat demand": "sensor.synthetic_hp_demand",
             **({"entity hp heat produced": "sensor.synthetic_hp_heat"} if run_hours is not None else {}),
         })
         states = {"sensor.synthetic_hp_demand": demand, "sensor.synthetic_hp_heat": "0"}
+        states.update({battery.entity_actual_level: "50" for battery in instance.battery_options})
         if boiler is not None:
             instance.boiler_options = BoilerEnabled.model_validate({
                 "entity actual temp.": "sensor.synthetic_boiler_temp",
@@ -83,6 +87,11 @@ def power_hp_model(capture, monkeypatch):
         instance.db_da = SimpleNamespace(get_prognose_data=lambda **kwargs: forecast.copy())
         found = {}
         bind_cost = da.bind_day_ahead_cost
+        add_sos, sos = mip.Model.add_sos, []
+
+        def record_sos(model, members, sos_type):
+            sos.append((tuple((var.idx, weight) for var, weight in members), sos_type))
+            return add_sos(model, members, sos_type)
 
         class Captured(Exception):
             pass
@@ -93,6 +102,7 @@ def power_hp_model(capture, monkeypatch):
             raise Captured
 
         with monkeypatch.context() as spies:
+            spies.setattr(mip.Model, "add_sos", record_sos)
             spies.setattr(da, "bind_day_ahead_cost", capture_cost)
             with pytest.raises(Captured):
                 instance.calc_optimum(_start_dt=start)
@@ -105,10 +115,13 @@ def power_hp_model(capture, monkeypatch):
             (stamps[0] + instance.interval_s - int(start.timestamp())) / 3600,
             *([1 / steps_per_hour] * (len(tariffs) - 1)),
         ]
-        assert [stage["max_power"] for stage in found["hp_stages"]] == [0, 1000]
+        assert [stage["max_power"] for stage in found["hp_stages"]] == [
+            0, *(stage["max_power"] for stage in configured_stages),
+        ]
         model.verbose = 0
         model.objective = mip.minimize(found["cost"])
         found["ha_writes"] = ha_writes
+        found["sos"] = sos
         return found
 
     return build
@@ -333,6 +346,117 @@ def test_high_runtime_keeps_physical_no_block_route(power_hp_model, adjustment, 
     steps = 3600 // local["self"].interval_s
     assert [flag.x for flag in local["hp_on"][:7 * steps]] == pytest.approx([1] * (7 * steps))
     assert local["cost"].x == pytest.approx(cost)
+
+
+@pytest.mark.parametrize("capture", [{"hourly": True}], indirect=True)
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_hourly_thirty_kwh_native_readback(power_hp_model, adjustment, caplog):
+    """A two-point SOS2 must not admit half a stage with a binary on flag of one."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        local = power_hp_model(
+            prices=[0.10] * 7 + [0.60], heat_kwh=30, minimum_hours=5, adjustment=adjustment,
+        )
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.WARNING, "Er ontbreken voor een aantal uur meteogegevens "
+         "(en/of dynamische prijzen)\ncontroleer of alle gegevens zijn opgehaald"),
+    ]
+    assert local["blocks_num"] == 0
+    assert local["heat_needed"] == 30
+    assert local["hours_avail"] == local["U"] == 8
+    assert local["min_run_length"] == 5
+    assert local["hour_fraction"] == [1] * 8
+    assert [stage["cop"] for stage in local["hp_stages"][1:]] == [4]
+    assert all(flag.var_type == mip.BINARY for flag in local["hp_on"])
+    assert_schedule(local, heat_kwh=32, runtime_hours=8, hp_cost=1.30)
+    assert [flag.x for flag in local["hp_on"]] == pytest.approx([1] * 8)
+    assert [tuple(var.x for var in row) for row in local["hp_s_w"]] == [(0, 1)] * 8
+    assert local["cost"].x == pytest.approx(1.30)
+
+
+@pytest.mark.parametrize("capture", [{"hourly": True, "battery": {
+    "charge stages": [{"power": 2000, "efficiency": 1}],
+    "discharge stages": [{"power": 2000, "efficiency": 1}],
+}}], indirect=True)
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_two_stage_hp_omits_only_redundant_sos2(power_hp_model, adjustment):
+    """Only HP registration is redundant; even two-member battery SOS2s must survive."""
+    local = power_hp_model(
+        prices=[0.10] * 7 + [0.60], heat_kwh=30, minimum_hours=5, adjustment=adjustment,
+        with_batteries=True,
+    )
+    assert local["S"] == 2
+    expected = [
+        (tuple((var.idx, power) for var, power in zip(row, (0, 2), strict=True)), 2)
+        for b in range(2) for u in range(8)
+        for row in (local["ac_to_dc_w"][b][u], local["ac_from_dc_w"][b][u])
+    ]
+    assert local["sos"] == expected
+    model = local["model"]
+    for name in ("dc_to_bat", "dc_from_bat"):
+        for row in local[name]:
+            for var in row:
+                model += var == 0
+    assert_schedule(local, heat_kwh=32, runtime_hours=8, hp_cost=1.30)
+
+
+@pytest.mark.parametrize("capture", [
+    pytest.param({"hourly": True}, id="hour"),
+    pytest.param({}, id="quarter"),
+    pytest.param({"start": ts(minute=7) + 30}, id="partial-quarter"),
+], indirect=True)
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_multistage_hp_interpolation_remains_continuous(power_hp_model, adjustment):
+    """Discretizing positive stages loses the valid 1500 W / 5 kW heat operating point."""
+    local = power_hp_model(
+        prices=[0.10] * 7 + [0.60], heat_kwh=30, minimum_hours=5, adjustment=adjustment,
+        stages=[{"max_power": 1000, "cop": 4}, {"max_power": 2000, "cop": 3}],
+    )
+    model, hours = local["model"], local["hour_fraction"][0]
+    assert local["blocks_num"] == 0
+    assert local["S"] == 3
+    assert local["sos"] == [
+        (tuple((var.idx, power) for var, power in zip(row, (0, 1000, 2000), strict=True)), 2)
+        for row in local["hp_s_w"]
+    ]
+    model += local["c_hp"][0] == 1.5 * hours
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    assert local["hp_on"][0].x == 1
+    assert [var.x for var in local["hp_s_w"][0]] == pytest.approx([0, 0.5, 0.5])
+    assert [row[0].x for row in local["p_hp"]] == pytest.approx([0, 500, 1000])
+    assert local["h_hp"][0].x == pytest.approx(5 * hours)
+    assert sum(var.x for var in local["h_hp"]) >= 30 - 1e-7
+    assert local["ha_writes"] == []
+
+
+@pytest.mark.parametrize("capture", [{"hourly": True}], indirect=True)
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+@pytest.mark.parametrize("positive_stages,expected", [
+    pytest.param((1, 2), mip.OptimizationStatus.OPTIMAL, id="adjacent-control"),
+    pytest.param((1, 3), mip.OptimizationStatus.INFEASIBLE, id="nonadjacent"),
+])
+def test_nonadjacent_hp_weights_are_infeasible(power_hp_model, adjustment, positive_stages, expected):
+    """Removing multi-stage SOS2 admits a nonadjacent positive-stage mixture."""
+    local = power_hp_model(
+        prices=[0.10] * 7 + [0.60], heat_kwh=30, minimum_hours=5, adjustment=adjustment,
+        stages=[{"max_power": 1000, "cop": 4}, {"max_power": 2000, "cop": 3},
+                {"max_power": 3000, "cop": 2}],
+    )
+    model = local["model"]
+    assert local["blocks_num"] == 0
+    assert local["S"] == 4
+    for s, weight in enumerate(local["hp_s_w"][0]):
+        model += weight == (0.5 if s in positive_stages else 0)
+    assert model.optimize() == expected
+    if expected == mip.OptimizationStatus.OPTIMAL:
+        model.check_optimization_results()
+        assert local["hp_on"][0].x == 1
+        assert local["c_hp"][0].x == pytest.approx(1.5)
+        assert local["h_hp"][0].x == pytest.approx(5)
+    else:
+        assert model.num_solutions == 0
+    assert local["ha_writes"] == []
 
 
 @pytest.mark.parametrize("capture", [{"start": ts(minute=7) + 30}], indirect=True)
