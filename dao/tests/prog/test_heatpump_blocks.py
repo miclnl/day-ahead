@@ -9,7 +9,9 @@ import pandas as pd
 import pytest
 
 from dao.prog import day_ahead as da
+from dao.prog.config.models.devices.boiler import BoilerEnabled
 from dao.prog.config.models.devices.heating import HeatingEnabled
+from dao.tests.settlement.test_optimization_bonus import ts
 from dao.tests.settlement.test_optimization_producer import capture as capture
 
 
@@ -21,16 +23,51 @@ def power_hp_model(capture, monkeypatch):
     instance.battery_options = []
     instance.meteo = SimpleNamespace(calc_graaddagen=lambda **kwargs: 1.0)
 
-    def build(*, prices, heat_kwh, minimum_hours, adjustment):
+    ha_writes = []
+
+    def forbidden_write(*args, **kwargs):
+        ha_writes.append((args, kwargs))
+        pytest.fail("heat-pump producer attempted an external write")
+
+    for name in ("set_value", "call_service", "turn_on", "turn_off", "set_entity_value",
+                 "set_entity_state", "set_entity_option", "select_option", "save_df", "export_fast_plan"):
+        monkeypatch.setattr(instance, name, forbidden_write)
+
+    def build(*, prices, heat_kwh, minimum_hours, adjustment, demand="eco", run_hours=None,
+              boiler=None):
         instance.heating_options = HeatingEnabled.model_validate({
             "adjustment": adjustment,
             "degree days factor": heat_kwh,
             "min run length": minimum_hours,
             "stages": [{"max_power": 1000, "cop": 4}],
+            "entity hp heat demand": "sensor.synthetic_hp_demand",
+            **({"entity hp heat produced": "sensor.synthetic_hp_heat"} if run_hours is not None else {}),
         })
+        states = {"sensor.synthetic_hp_demand": demand, "sensor.synthetic_hp_heat": "0"}
+        if boiler is not None:
+            instance.boiler_options = BoilerEnabled.model_validate({
+                "entity actual temp.": "sensor.synthetic_boiler_temp",
+                "entity setpoint": "input_number.synthetic_boiler_setpoint",
+                "entity hysterese": "input_number.synthetic_boiler_hysteresis",
+                "switch entity": "switch.synthetic_boiler",
+                "cooling rate": 0.5, "heating allowed below": 50,
+                "cop": 4, "elec. power": 1000, **boiler,
+            })
+            states.update({"sensor.synthetic_boiler_temp": "40",
+                           "input_number.synthetic_boiler_setpoint": "50",
+                           "input_number.synthetic_boiler_hysteresis": "5"})
+
+        def get_state(entity_id):
+            if entity_id not in states:
+                pytest.fail(f"unexpected synthetic HA read: {entity_id}")
+            return SimpleNamespace(state=states[entity_id])
+
+        monkeypatch.setattr(instance, "get_state", get_state)
+        monkeypatch.setattr(instance, "get_float", da.DaCalc.get_float.__get__(instance))
         steps_per_hour = 3600 // instance.interval_s
         tariffs = [price for price in prices for _ in range(steps_per_hour)]
-        stamps = [int(start.timestamp()) + instance.interval_s * u for u in range(len(tariffs))]
+        grid_start = int(start.timestamp()) // instance.interval_s * instance.interval_s
+        stamps = [grid_start + instance.interval_s * u for u in range(len(tariffs))]
         dates = [dt.datetime.fromtimestamp(at) for at in stamps]
         price_data = pd.DataFrame({
             "time": dates, "da_ex": tariffs, "da_cons": tariffs,
@@ -41,7 +78,8 @@ def power_hp_model(capture, monkeypatch):
             "glob_rad": [0.0] * len(tariffs), "temp": [5.0] * len(tariffs),
         })
         monkeypatch.setattr(da, "Report", lambda *args: SimpleNamespace(
-            get_price_data=lambda *a, **k: price_data.copy()))
+            get_price_data=lambda *a, **k: price_data.copy(),
+            get_heatpump_run_hours=lambda entity: run_hours))
         instance.db_da = SimpleNamespace(get_prognose_data=lambda **kwargs: forecast.copy())
         found = {}
         bind_cost = da.bind_day_ahead_cost
@@ -61,11 +99,16 @@ def power_hp_model(capture, monkeypatch):
         model = found["model"]
         assert model.solver_name == mip.CBC
         assert found["U"] == len(tariffs)
-        assert found["heat_needed"] == heat_kwh
-        assert found["hour_fraction"] == [1 / steps_per_hour] * len(tariffs)
+        assert found["degree_days_factor"] == heat_kwh
+        assert found["heat_produced"] == 0
+        assert found["hour_fraction"] == [
+            (stamps[0] + instance.interval_s - int(start.timestamp())) / 3600,
+            *([1 / steps_per_hour] * (len(tariffs) - 1)),
+        ]
         assert [stage["max_power"] for stage in found["hp_stages"]] == [0, 1000]
         model.verbose = 0
         model.objective = mip.minimize(found["cost"])
+        found["ha_writes"] = ha_writes
         return found
 
     return build
@@ -89,6 +132,7 @@ def test_five_needed_hours_do_not_force_nine(power_hp_model, adjustment):
     assert [flag.x for flag in local["hp_on"]] == pytest.approx([
         int(price == 0.10) for price in local["pl"]])
     assert local["cost"].x == pytest.approx(0.50)
+    assert local["ha_writes"] == []
 
 
 @pytest.mark.parametrize("capture", [{"hourly": True}, {}], indirect=True, ids=["hour", "quarter"])
@@ -109,6 +153,7 @@ def test_single_block_can_exceed_minimum(power_hp_model, adjustment):
     assert [flag.x for flag in local["hp_on"]] == pytest.approx([
         int(price == 0.10) for price in local["pl"]])
     assert local["cost"].x == pytest.approx(0.60)
+    assert local["ha_writes"] == []
 
 
 @pytest.mark.parametrize("capture", [{"hourly": True}, {}], indirect=True, ids=["hour", "quarter"])
@@ -129,6 +174,179 @@ def test_last_block_keeps_remaining_whole_hours(power_hp_model, adjustment):
     assert [flag.x for flag in local["hp_on"]] == pytest.approx([
         int(price == 0.10) for price in local["pl"]])
     assert local["cost"].x == pytest.approx(0.60)
+    assert local["ha_writes"] == []
+
+
+def assert_schedule(local, *, heat_kwh, runtime_hours, hp_cost):
+    """One native solve; inspect physical output and tariff selection, not status alone."""
+    model = local["model"]
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    assert sum(var.x for var in local["h_hp"]) == pytest.approx(heat_kwh)
+    assert sum(var.x for var in local["c_hp"]) == pytest.approx(runtime_hours)
+    assert sum(flag.x * hours for flag, hours in zip(
+        local["hp_on"], local["hour_fraction"], strict=True)) == pytest.approx(runtime_hours)
+    assert sum(var.x * price for var, price in zip(
+        local["c_hp"], local["pl"], strict=True)) == pytest.approx(hp_cost)
+    assert local["ha_writes"] == []
+
+
+@pytest.mark.parametrize("capture,heat,runtime,cost", [
+    pytest.param({"hourly": True}, 12, 3, 0.30, id="hour"),
+    pytest.param({}, 9, 2.25, 0.225, id="quarter"),
+], indirect=["capture"])
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_fractional_required_duration_is_not_floored(power_hp_model, adjustment, heat, runtime, cost):
+    """Flooring 2.25 required hours loses heat; nominal counts also lose the last quarter."""
+    local = power_hp_model(
+        prices=[0.10, 0.60, 0.60, 0.60, 0.10, 0.10, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60],
+        heat_kwh=9, minimum_hours=1, adjustment=adjustment,
+    )
+    assert local["heat_needed"] == 9
+    assert_schedule(local, heat_kwh=heat, runtime_hours=runtime, hp_cost=cost)
+    assert all(flag.x == 0 for flag, price in zip(local["hp_on"], local["pl"], strict=True)
+               if price == 0.60)
+    assert local["cost"].x == pytest.approx(cost)
+
+
+@pytest.mark.parametrize("capture", [{"start": ts(minute=7) + 30}], indirect=True)
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_partial_first_quarter_keeps_heat_feasible(power_hp_model, adjustment):
+    """Four nominal quarters starting now contain only 52.5 minutes, not one hour."""
+    local = power_hp_model(
+        prices=[0.60, 0.10, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60],
+        heat_kwh=4, minimum_hours=1, adjustment=adjustment, demand="max",
+    )
+    assert local["hour_fraction"][0] == 0.125
+    assert local["heat_needed"] == 4
+    assert_schedule(local, heat_kwh=4.5, runtime_hours=1.125, hp_cost=0.55)
+    assert [flag.x for flag in local["hp_on"]] == pytest.approx([1] * 5 + [0] * 27)
+    assert local["cost"].x == pytest.approx(0.55)
+
+
+@pytest.mark.parametrize("capture", [{"hourly": True, "start": ts(minute=30)}], indirect=True)
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_partial_first_hour_keeps_minimum(power_hp_model, adjustment):
+    """A mandatory half-hour first slot needs the next whole slot to meet a one-hour minimum."""
+    local = power_hp_model(
+        prices=[0.60, 0.10, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60],
+        heat_kwh=4, minimum_hours=1, adjustment=adjustment, demand="max",
+    )
+    assert_schedule(local, heat_kwh=6, runtime_hours=1.5, hp_cost=0.40)
+    assert [flag.x for flag in local["hp_on"]] == pytest.approx([1, 1, 0, 0, 0, 0, 0, 0])
+    assert local["cost"].x == pytest.approx(0.40)
+
+
+@pytest.mark.parametrize("capture,heat,runtime,cost", [
+    pytest.param({"hourly": True}, 28, 7, 0.70, id="hour"),
+    pytest.param({"start": ts(minute=7) + 30}, 24.5, 6.125, 0.6125, id="partial-quarter"),
+], indirect=["capture"])
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_running_block_keeps_actual_remaining_duration(power_hp_model, adjustment, heat, runtime, cost):
+    """A running 1.5-hour block owes 1.5 real hours; truncating either span loses heat."""
+    local = power_hp_model(
+        prices=[0.10, 0.10, 0.60, 0.60, 0.60, 0.10, 0.10, 0.10, 0.10, 0.10, 0.60, 0.60],
+        heat_kwh=24, minimum_hours=3, adjustment=adjustment, run_hours=1.5,
+    )
+    assert_schedule(local, heat_kwh=heat, runtime_hours=runtime, hp_cost=cost)
+    active = [[u for u, flag in enumerate(row) if flag.x > 0.5] for row in local["hp_bl_on"]]
+    assert active[0][0] == 0
+    assert len(active[0]) == (2 if local["self"].interval_s == 3600 else 7)
+    assert active[0][-1] < active[1][0]
+    assert all(row == list(range(row[0], row[-1] + 1)) for row in active)
+    assert all(flag.x == 0 for flag, price in zip(local["hp_on"], local["pl"], strict=True)
+               if price == 0.60)
+    assert local["cost"].x == pytest.approx(cost)
+
+
+@pytest.mark.parametrize("capture", [{"hourly": True}, {}], indirect=True, ids=["hour", "quarter"])
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+@pytest.mark.parametrize("demand,run_hours,first,cost", [
+    ("eco", None, False, 0.10), ("max", None, True, 0.60), ("off", None, False, 0.10),
+    ("eco", 0.5, True, 0.60), ("max", 0.5, True, 0.60), ("off", 0.5, False, 0.10),
+    ("eco", 2, False, 0.10), ("max", 2, True, 0.60), ("off", 2, False, 0.10),
+])
+def test_heat_demand_preserves_running_or_price_selected_start(
+    power_hp_model, adjustment, demand, run_hours, first, cost,
+):
+    """Only max or an unfinished eco run forces start0; off must leave the first hour idle."""
+    local = power_hp_model(
+        prices=[0.60, 0.10, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60],
+        heat_kwh=4, minimum_hours=1, adjustment=adjustment, demand=demand, run_hours=run_hours,
+    )
+    assert_schedule(local, heat_kwh=4, runtime_hours=1, hp_cost=cost)
+    steps = 3600 // local["self"].interval_s
+    expected_hours = [int(first), int(not first), 0, 0, 0, 0, 0, 0]
+    assert [flag.x for flag in local["hp_on"]] == pytest.approx(
+        [flag for flag in expected_hours for _ in range(steps)])
+    assert local["cost"].x == pytest.approx(cost)
+
+
+@pytest.mark.parametrize("capture", [{"hourly": True}, {}], indirect=True, ids=["hour", "quarter"])
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_boiler_blocks_otherwise_cheapest_span(power_hp_model, adjustment):
+    """Space heating cannot take the cheap hour already used by the same pump's boiler."""
+    local = power_hp_model(
+        prices=[0.10, 0.20, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60],
+        heat_kwh=4, minimum_hours=1, adjustment=adjustment, boiler={},
+    )
+    assert_schedule(local, heat_kwh=4, runtime_hours=1, hp_cost=0.20)
+    steps = 3600 // local["self"].interval_s
+    assert [flag.x for flag in local["boiler_on"]] == pytest.approx([1] * steps + [0] * (7 * steps))
+    assert [flag.x for flag in local["hp_on"]] == pytest.approx([0] * steps + [1] * steps + [0] * (6 * steps))
+    assert all(hp.x + boiler.x <= 1 for hp, boiler in zip(
+        local["hp_on"], local["boiler_on"], strict=True))
+
+
+@pytest.mark.parametrize("capture,prices,power", [
+    pytest.param({"hourly": True}, [0.10] * 8, 125, id="hour"),
+    pytest.param({}, [0.10] * 3, 300, id="quarter"),
+], indirect=["capture"])
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_zero_available_hours_keeps_no_block_route(power_hp_model, adjustment, prices, power):
+    """An almost horizon-long boiler reservation leaves zero heuristic HP availability."""
+    local = power_hp_model(
+        prices=prices, heat_kwh=4, minimum_hours=1, adjustment=adjustment,
+        boiler={"elec. power": power},
+    )
+    assert local["hours_avail"] == 0
+    assert local["boiler_int"] == local["U"]
+    assert local["blocks_num"] == 0
+    assert local["heat_needed"] == 0  # Existing physical-cap route, not missing demand.
+    assert_schedule(local, heat_kwh=0, runtime_hours=0, hp_cost=0)
+    assert [flag.x for flag in local["hp_on"]] == pytest.approx([0] * local["U"])
+    assert sum(var.x for var in local["c_b"]) > 0
+
+
+@pytest.mark.parametrize("capture,heat,runtime,cost", [
+    pytest.param({"hourly": True}, 32, 8, 1.30, id="hour"),
+    pytest.param({}, 30, 7.5, 1.00, id="quarter"),
+], indirect=["capture"])
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_high_runtime_keeps_physical_no_block_route(power_hp_model, adjustment, heat, runtime, cost):
+    """The >80% route must still meet demand without enforcing artificial minimum blocks."""
+    local = power_hp_model(
+        prices=[0.10] * 7 + [0.60], heat_kwh=heat, minimum_hours=5, adjustment=adjustment,
+    )
+    assert local["blocks_num"] == 0
+    assert_schedule(local, heat_kwh=heat, runtime_hours=runtime, hp_cost=cost)
+    steps = 3600 // local["self"].interval_s
+    assert [flag.x for flag in local["hp_on"][:7 * steps]] == pytest.approx([1] * (7 * steps))
+    assert local["cost"].x == pytest.approx(cost)
+
+
+@pytest.mark.parametrize("capture", [{"start": ts(minute=7) + 30}], indirect=True)
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+def test_high_runtime_availability_uses_actual_first_interval(power_hp_model, adjustment):
+    """A partial horizon contains 7.875 hours, even when all eight nominal hours are needed."""
+    local = power_hp_model(
+        prices=[0.10] * 8, heat_kwh=31.5, minimum_hours=5, adjustment=adjustment,
+    )
+    assert local["hours_avail"] == 7.875
+    assert local["blocks_num"] == 0
+    assert local["heat_needed"] == 31.5
+    assert_schedule(local, heat_kwh=31.5, runtime_hours=7.875, hp_cost=0.7875)
+    assert [flag.x for flag in local["hp_on"]] == pytest.approx([1] * 32)
 
 
 @pytest.mark.parametrize("required,minimum,first,count,expected", [
@@ -152,3 +370,26 @@ def test_block_durations(required, minimum, first, count, expected):
         required_seconds=required, minimum_seconds=minimum,
         first_seconds=first, count=count,
     ) == expected
+
+
+@pytest.mark.parametrize("intervals,duration,expected", [
+    pytest.param((), 3600, (), id="empty"),
+    pytest.param(((0, 900),), 0, (), id="no-duration"),
+    pytest.param(((0, 3600), (3600, 7200), (7200, 10800)), 3600,
+                 ((0, 1), (1, 2), (2, 3)), id="exact-hours"),
+    pytest.param(((0, 3600), (3600, 7200), (7200, 10800)), 3601,
+                 ((0, 2), (1, 3)), id="remainder-second"),
+    pytest.param(((0, 450), (450, 1350), (1350, 2250), (2250, 3150), (3150, 4050)),
+                 3600, ((0, 5), (1, 5)), id="partial-first-quarter"),
+    pytest.param(((0, 1800), (1800, 5400)), 3600, ((0, 2), (1, 2)), id="partial-first-hour"),
+    pytest.param(((0, 450), (450, 1350)), 1350, ((0, 2),), id="exact-horizon-end"),
+    pytest.param(((0, 450), (450, 1350)), 1351, (), id="too-short-horizon"),
+    pytest.param(((0, 900), (1800, 2700), (2700, 3600)), 1800,
+                 ((1, 3),), id="do-not-bridge-gap"),
+])
+def test_block_spans(intervals, duration, expected):
+    """The shortest contiguous UTC span must meet the duration without inventing time."""
+    from dao.prog import heatpump_blocks
+
+    assert hasattr(heatpump_blocks, "block_spans"), "actual-interval span helper is missing"
+    assert heatpump_blocks.block_spans(intervals, duration) == expected

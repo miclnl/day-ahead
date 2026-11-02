@@ -51,7 +51,7 @@ from dao.prog.fastctrl.publication import (
     publication_lock,
     read_publication,
 )
-from dao.prog.heatpump_blocks import block_durations
+from dao.prog.heatpump_blocks import block_durations, block_spans
 from dao.prog.settlement.optimization import (
     OptimizationInputError,
     PeriodModelTerms,
@@ -3061,7 +3061,7 @@ class DaCalc(DaBase):
                 min_heat_prod = sum(
                     min_heat_power * hour_fraction[u] for u in range(U - boiler_int)
                 )
-                hours_avail = (U - boiler_int) * self.interval_s / 3600
+                hours_avail = sum(hour_fraction[u] for u in range(U - boiler_int))
                 logging.info(f"Aantal beschikbare uren: {hours_avail:.2f}")
                 logging.info(
                     f"Maximaal te produceren hoeveelheid warmte: {max_heat_prod:.1f} kWh"
@@ -3076,7 +3076,6 @@ class DaCalc(DaBase):
                     hp_hours = heat_needed / min_heat_power
                 else:
                     hp_hours = hours_avail * 0.9
-                hp_hours = math.floor(hp_hours)
                 logging.info(f"Aantal in te plannen uren: {hp_hours:.1f}")
 
                 model += xsum(h_hp[u] for u in range(U)) >= heat_needed
@@ -3174,13 +3173,12 @@ class DaCalc(DaBase):
                     # #896: verdeel benodigde duur, niet de beschikbare horizon.
                     # Eén blok draagt de hele duur; verlaag een te hoog bloktal.
                     durations = block_durations(
-                        required_seconds=int(hp_hours * 3600),
+                        required_seconds=math.ceil(hp_hours * 3600),
                         minimum_seconds=min_run_length * 3600,
-                        first_seconds=int(first_block_len * 3600),
+                        first_seconds=math.ceil(first_block_len * 3600),
                         count=blocks_num,
                     )
                     blocks_num = len(durations)
-                    block_len = [int(seconds / self.interval_s) for seconds in durations]
                     logging.info(
                         f"Blokduren in uren: {[seconds / 3600 for seconds in durations]}"
                     )
@@ -3216,33 +3214,57 @@ class DaCalc(DaBase):
                     model += (
                         hp_start_index[0] == first_block_start * 3600 / self.interval_s
                     )
-                for j in range(blocks_num):
-                    for u in range(U):
-                        model += (hp_start_index[j] - u) <= (U - u) * (
-                            1 - hp_bl_on[j][u]
+                if self.hp_adjustment == "on/off":
+                    for j in range(blocks_num):
+                        for u in range(U):
+                            model += (hp_start_index[j] - u) <= (U - u) * (
+                                1 - hp_bl_on[j][u]
+                            )
+
+                    # constraint 2
+                    # t−(A+P) ≤ t(1−Xt) for all t
+                    # "vertaald": u−(hp_start_index+run_length-1) ≤ u * (1−hp_bl_on[u]) for all u
+                    for j in range(blocks_num):
+                        for u in range(U):
+                            model += (u - (hp_start_index[j] + block_len[j] - 1)) <= (
+                                U * (1 - hp_bl_on[j][u])
+                            )
+
+                    # constraint 3
+                    # ∑tXt = P+1
+                    # "vertaald": xsum(hp_on[u] for all u) == min_run_length
+                    for j in range(blocks_num):
+                        model += xsum(hp_bl_on[j][u] for u in range(U)) == block_len[j]
+
+                    # Constraint 4: blocks mogen niet overlappen
+                    for j in range(blocks_num)[1:]:
+                        model += (
+                            hp_start_index[j - 1] + block_len[j - 1] <= hp_start_index[j]
                         )
-
-                # constraint 2
-                # t−(A+P) ≤ t(1−Xt) for all t
-                # "vertaald": u−(hp_start_index+run_length-1) ≤ u * (1−hp_bl_on[u]) for all u
-                for j in range(blocks_num):
-                    for u in range(U):
-                        model += (u - (hp_start_index[j] + block_len[j] - 1)) <= (
-                            U * (1 - hp_bl_on[j][u])
-                        )
-
-                # constraint 3
-                # ∑tXt = P+1
-                # "vertaald": xsum(hp_on[u] for all u) == min_run_length
-                for j in range(blocks_num):
-                    model += xsum(hp_bl_on[j][u] for u in range(U)) == block_len[j]
-
-                # aanvullend
-                # Constraint 4: blocks mogen niet overlappen
-                for j in range(blocks_num)[1:]:
-                    model += (
-                        hp_start_index[j - 1] + block_len[j - 1] <= hp_start_index[j]
+                else:
+                    # Kies per blok één werkelijk tijdspan, ook bij een verkort
+                    # eerste interval. Nominale aantallen verliezen daar draaitijd.
+                    hp_intervals = tuple(
+                        (int(ts[u]), int(interval_ts[u]) + self.interval_s) for u in range(U)
                     )
+                    hp_spans = [block_spans(hp_intervals, seconds) for seconds in durations]
+                    hp_span_on = [
+                        [model.add_var(var_type=BINARY) for _ in spans] for spans in hp_spans
+                    ]
+                    for j, spans in enumerate(hp_spans):
+                        model += xsum(hp_span_on[j]) == 1
+                        model += hp_start_index[j] == xsum(
+                            start * chosen for (start, _), chosen in zip(spans, hp_span_on[j], strict=True)
+                        )
+                        for u in range(U):
+                            model += hp_bl_on[j][u] == xsum(
+                                chosen for (start, end), chosen in zip(spans, hp_span_on[j], strict=True)
+                                if start <= u < end
+                            )
+                        if j > 0:
+                            model += xsum(
+                                end * chosen for (_, end), chosen in zip(hp_spans[j - 1], hp_span_on[j - 1], strict=True)
+                            ) <= hp_start_index[j]
 
                 for u in range(U):
                     # constraint 5: hp_bl_on -> hp_on
@@ -4077,10 +4099,11 @@ class DaCalc(DaBase):
             if blocks_num > 0:
                 logging.info("Blokken:")
             for j in range(blocks_num):
+                block_intervals = round(sum(hp_bl_on[j][u].x for u in range(U)))
                 logging.info(
                     f"Bloknr {j} start {int(hp_start_index[j].x)} "
-                    f"lengte {block_len[j]}"
-                    f" laatste {int(hp_start_index[j].x) + block_len[j] - 1}"
+                    f"lengte {block_intervals}"
+                    f" laatste {int(hp_start_index[j].x) + block_intervals - 1}"
                 )
             logging.info(f"u   uur   tar    hp_s_on hp_on heat cons")
             for u in range(U):
