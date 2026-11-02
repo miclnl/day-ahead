@@ -51,6 +51,7 @@ from dao.prog.fastctrl.publication import (
     publication_lock,
     read_publication,
 )
+from dao.prog.heatpump_blocks import block_durations
 from dao.prog.settlement.optimization import (
     OptimizationInputError,
     PeriodModelTerms,
@@ -3150,23 +3151,38 @@ class DaCalc(DaBase):
                     min_run_length = max(
                         min_run_length, math.floor(hp_hours / blocks_num)
                     )
+                    # length of lastblock
+                    last_block_len = (hp_hours - first_block_len) % min_run_length
+                    if last_block_len == 0:
+                        last_block_len = min_run_length
+                    logging.info(f"Eerste blok van {first_block_len} uur")
+                    if last_block_len < min_run_length:
+                        logging.info(
+                            f"Tussenin {blocks_num - 2} blokken van {min_run_length} uur"
+                        )
+                        logging.info(f"Laatste blok van {last_block_len:.1f} uur")
+                    else:
+                        logging.info(
+                            f"Dan nog {blocks_num - 1} blokken van {min_run_length} uur"
+                        )
+                    # alles omzetten naar het goede interval:
+                    block_len = [int(first_block_len * 3600 / self.interval_s)]
+                    for _ in range(blocks_num)[1:-1]:
+                        block_len.append(int(min_run_length * 3600 / self.interval_s))
+                    block_len.append(int(last_block_len * 3600 / self.interval_s))
                 else:
-                    min_run_length = max(
-                        min_run_length, math.floor(hours_avail / blocks_num)
+                    # #896: verdeel benodigde duur, niet de beschikbare horizon.
+                    # Eén blok draagt de hele duur; verlaag een te hoog bloktal.
+                    durations = block_durations(
+                        required_seconds=int(hp_hours * 3600),
+                        minimum_seconds=min_run_length * 3600,
+                        first_seconds=int(first_block_len * 3600),
+                        count=blocks_num,
                     )
-                # length of lastblock
-                last_block_len = (hp_hours - first_block_len) % min_run_length
-                if last_block_len == 0:
-                    last_block_len = min_run_length
-                logging.info(f"Eerste blok van {first_block_len} uur")
-                if last_block_len < min_run_length:
+                    blocks_num = len(durations)
+                    block_len = [int(seconds / self.interval_s) for seconds in durations]
                     logging.info(
-                        f"Tussenin {blocks_num - 2} blokken van {min_run_length} uur"
-                    )
-                    logging.info(f"Laatste blok van {last_block_len:.1f} uur")
-                else:
-                    logging.info(
-                        f"Dan nog {blocks_num - 1} blokken van {min_run_length} uur"
+                        f"Blokduren in uren: {[seconds / 3600 for seconds in durations]}"
                     )
                 logging.info(f"Totaal aantal blokken: {blocks_num}")
 
@@ -3183,16 +3199,6 @@ class DaCalc(DaBase):
                 ∑tXt = P+1
                 xsum(hp_on[u] for u in range(U)) == run_length
                 """
-
-                # alles omzetten naar het goede interval:
-                block_len = []
-                # eerste blok
-                block_len.append(int(first_block_len * 3600 / self.interval_s))
-                # tussenliggende blokken
-                for _ in range(blocks_num)[1:-1]:
-                    block_len.append(int(min_run_length * 3600 / self.interval_s))
-                # laatste
-                block_len.append(int(last_block_len * 3600 / self.interval_s))
 
                 # constraint 1
                 # A−t ≤ (tmax−t)(1−Xt) for all t

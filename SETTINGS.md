@@ -910,7 +910,7 @@ Define power levels and corresponding COP values:
 | `stages` | list[[HeatingStage](#heatingstage)] | No | `[]` | Heating power/COP stages _Required for 'power' and 'heating curve' adjustment; must be sorted by max_power_ |
 | `entity adjust heating curve` | [EntityId](#entityid) (optional) | No | `null` | HA entity to adjust heating curve |
 | `adjustment factor` | number (optional) | No | `null` | Factor for heating curve adjustment (Unit: `factor`) _Typically 0.5-2.0 if specified_ |
-| `min run length` | integer | No | `1` | Minimum run length in time intervals (Unit: `intervals`) _Must be >= 1, typically 2-4 for 1h intervals_ |
+| `min run length` | integer | No | `1` | Minimum run length in hours (Unit: `h`) _Must be >= 1; runtime uses 1-5 hours, typically 2-4_ |
 | `entity hp heat produced` | [EntityId](#entityid) (optional) | No | `null` | HA entity for heat produced (Unit: `kWh`) |
 | `entity hp heat demand` | [EntityId](#entityid) (optional) | No | `null` | HA entity for heat demand (Unit: `W`) |
 | `entity avg outside temp` | [EntityId](#entityid) (optional) | No | `null` | HA entity for average temperature (Unit: `°C`) |
@@ -951,7 +951,7 @@ Optional: Multiplier for heating curve adjustments. Higher values = more aggress
 
 **`min run length`**
 
-Minimum number of consecutive time intervals heat pump must run once started. Prevents excessive on/off cycling which reduces efficiency and equipment life. Typical: 2-4 intervals (2-4 hours).
+Minimum number of consecutive hours heat pump must run once started, also when planning in 15-minute intervals. Prevents excessive on/off cycling which reduces efficiency and equipment life. Runtime uses 1-5 hours; typical: 2-4 hours.
 
 **`entity hp heat produced`**
 

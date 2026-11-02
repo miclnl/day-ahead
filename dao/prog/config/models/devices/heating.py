@@ -145,12 +145,12 @@ class HeatingEnabled(BaseModel):
         default=1,
         alias="min run length",
         ge=1,
-        description="Minimum run length in time intervals",
+        description="Minimum run length in hours",
         json_schema_extra={
-            "x-help": "Minimum number of consecutive time intervals heat pump must run once started. Prevents excessive on/off cycling which reduces efficiency and equipment life. Typical: 2-4 intervals (2-4 hours).",
-            "x-unit": "intervals",
+            "x-help": "Minimum number of consecutive hours heat pump must run once started, also when planning in 15-minute intervals. Prevents excessive on/off cycling which reduces efficiency and equipment life. Runtime uses 1-5 hours; typical: 2-4 hours.",
+            "x-unit": "h",
             "x-ui-section": "Configuration",
-            "x-validation-hint": "Must be >= 1, typically 2-4 for 1h intervals",
+            "x-validation-hint": "Must be >= 1; runtime uses 1-5 hours, typically 2-4",
         },
     )
     entity_heat_produced: Optional[EntityId] = Field(
