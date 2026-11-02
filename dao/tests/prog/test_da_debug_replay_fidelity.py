@@ -2,11 +2,16 @@
 
 import datetime as dt
 import json
+import os
 import socket
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import freezegun.api
 import mip
+import pandas as pd
 import pytest
 
 from dao.prog import da_base, da_debug, day_ahead
@@ -267,3 +272,387 @@ def test_capture_cli_sanitizes_read_failure(tmp_path, monkeypatch, capsys):
     assert result == da_debug.EXIT_SOLVER_FAILURE
     assert json.loads(output)["error"] == "error"
     assert TOKEN not in output
+
+
+# Clock/TZ mutation belongs to a dedicated process, never a scheduler process.
+# Stop the real producer at preflight: its actual start/arguments have been
+# selected, but no config/DB/HA/forecast/model inputs have been consulted yet.
+_ISOLATED_SETUP = """
+import datetime as dt
+import json
+import logging
+import os
+import socket
+import sys
+import time
+from types import SimpleNamespace
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
+
+import freezegun.api
+import mip
+
+from dao.prog import da_base, da_debug, day_ahead
+from dao.prog.config.versions.v3 import ConfigurationV3
+
+data = json.loads(sys.stdin.read())
+time.tzset()
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("isolated fidelity test attempted live I/O")
+
+socket.socket.connect = socket.socket.connect_ex = forbidden
+da_base.HAClient = da_base.make_db_da = da_base.make_db_ha = forbidden
+
+class StartObserved(Exception):
+    pass
+
+def calculator():
+    base = day_ahead.DaCalc.__new__(day_ahead.DaCalc)
+    base.config = ConfigurationV3()
+    base.loader = SimpleNamespace(secrets={})
+    base.time_zone = "Europe/Amsterdam"
+    base.interval, base.interval_s = "15min", 900
+    base.debug, base.log_level = False, logging.INFO
+
+    def preflight(**kwargs):
+        local = sys._getframe(1).f_locals
+        raise StartObserved({
+            "start_ts": local["start_ts"],
+            "soc": local["_start_soc"], "ev_soc": local["_start_ev_soc"],
+            "local": local["start_dt"].isoformat(), "fold": local["start_dt"].fold,
+            "now_ts": dt.datetime.now().timestamp(),
+            "utc_now_ts": dt.datetime.now(dt.UTC).timestamp(),
+            "today": dt.date.today().isoformat(),
+            "localtime": time.strftime("%Y-%m-%dT%H:%M", time.localtime()),
+        })
+
+    base._financial_preflight = preflight
+    return base
+
+def observe(base, *args, **kwargs):
+    try:
+        base.calc_optimum(*args, **kwargs)
+    except StartObserved as exc:
+        return exc.args[0]
+    raise AssertionError("producer did not reach preflight")
+"""
+
+
+def _isolated_replay(code, data, *, process_zone="UTC"):
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    if process_zone is None:
+        env.pop("TZ", None)
+    else:
+        env["TZ"] = process_zone
+    child = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_ISOLATED_SETUP) + textwrap.dedent(code)],
+        input=json.dumps(data), env=env, capture_output=True, text=True, timeout=60,
+        check=False,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    return json.loads(child.stdout)
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_start_overrides_roundtrip(tmp_path, positional):
+    # Dropping captured overrides, or treating 0/None as absent, changes the
+    # arguments the real producer uses. Both positional and keyword callers win.
+    output = _isolated_replay("""
+        os.environ["TZ"] = "Europe/Amsterdam"
+        time.tzset()
+        base = calculator()
+        start = dt.datetime(2026, 10, 25, 2, 30, fold=1)
+        with da_debug.RecordingIO(data["out_dir"], debug=True) as recording:
+            recording._primary = base
+            if data["positional"]:
+                original = observe(base, start, 0.0, 67.0)
+            else:
+                original = observe(base, _start_dt=start, _start_soc=0.0, _start_ev_soc=67.0)
+        snapshot = json.loads(recording.snapshot_path.read_text())
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        with da_debug.ReplayIO(snapshot):
+            replayed = observe(base)
+            partial = observe(base, _start_soc=31.0)
+            cleared = observe(base, _start_dt=None, _start_soc=None, _start_ev_soc=None)
+            caller_start = dt.datetime(2026, 1, 16, 10, 15, tzinfo=dt.UTC)
+            if data["positional"]:
+                overridden = observe(base, caller_start, 12.0, 0.0)
+            else:
+                overridden = observe(base, _start_dt=caller_start, _start_soc=12.0, _start_ev_soc=0.0)
+        print(json.dumps({"snapshot": snapshot, "original": original, "replayed": replayed,
+                          "partial": partial, "cleared": cleared, "overridden": overridden}))
+    """, {"out_dir": str(tmp_path), "positional": positional})
+    snapshot = output["snapshot"]
+    assert snapshot["meta"]["schema_version"] == 2
+    assert snapshot["config"]["config_version"] == 3  # Not the snapshot schema.
+    assert snapshot["meta"]["start_utc"] == "2026-10-25T01:30:00+00:00"
+    assert snapshot["meta"]["time_zone"] == "Europe/Amsterdam"
+    assert snapshot["meta"]["start_args"] == {
+        "_start_dt": {"isoformat": "2026-10-25T02:30:00", "fold": 1},
+        "_start_soc": 0.0, "_start_ev_soc": 67.0,
+    }
+    for key in ("start_ts", "soc", "ev_soc", "local", "fold"):
+        assert output["replayed"][key] == output["original"][key]
+    assert output["partial"]["start_ts"] == output["original"]["start_ts"]
+    assert (output["partial"]["soc"], output["partial"]["ev_soc"]) == (31.0, 67.0)
+    assert output["cleared"]["start_ts"] == output["original"]["start_ts"]
+    assert (output["cleared"]["soc"], output["cleared"]["ev_soc"]) == (None, None)
+    assert output["overridden"]["local"] == "2026-01-16T11:15:00"
+    assert (output["overridden"]["soc"], output["overridden"]["ev_soc"]) == (12.0, 0.0)
+
+
+@pytest.mark.parametrize("process_zone", ["UTC", "America/New_York"])
+@pytest.mark.parametrize("explicit_start", [False, True])
+def test_replay_preserves_both_dst_instants_across_process_timezones(tmp_path, process_zone, explicit_start):
+    # UTC identity must come from the start actually used by calc_optimum,
+    # not its wrapper's earlier clock sample. The two local 02:30s differ 1h.
+    output = _isolated_replay("""
+        process_zone = os.environ["TZ"]
+        results = []
+        for fold, utc in enumerate(("2026-10-25T00:30:00+00:00", "2026-10-25T01:30:00+00:00")):
+            os.environ["TZ"] = "Europe/Amsterdam"
+            time.tzset()
+            real_datetime = dt.datetime
+            start = real_datetime.fromisoformat(utc).astimezone(ZoneInfo("Europe/Amsterdam"))
+
+            class CaptureClock(real_datetime):
+                calls = 0
+
+                @classmethod
+                def now(cls, tz=None):
+                    cls.calls += 1
+                    # RecordingIO construction + wrapper happen before the
+                    # producer's own start selection. Deliberately drift them.
+                    stamp = start.timestamp() - (60 if cls.calls <= 2 else 0)
+                    return real_datetime.fromtimestamp(stamp, tz)
+
+            base = calculator()
+            with patch.object(dt, "datetime", CaptureClock):
+                with da_debug.RecordingIO(data["out_dir"], label=str(fold), debug=True) as recording:
+                    recording._primary = base
+                    original = observe(base, _start_dt=start) if data["explicit_start"] else observe(base)
+            snapshot = json.loads(recording.snapshot_path.read_text())
+            os.environ["TZ"] = process_zone
+            time.tzset()
+            with da_debug.ReplayIO(snapshot) as replay:
+                assert os.environ["TZ"] == "Europe/Amsterdam"
+                replayed = observe(base)
+                identity = replay.time_identity
+            assert os.environ["TZ"] == process_zone
+            results.append({"utc": snapshot["meta"]["start_utc"], "original": original,
+                            "replayed": replayed, "identity": identity})
+        print(json.dumps(results))
+    """, {"out_dir": str(tmp_path), "explicit_start": explicit_start}, process_zone=process_zone)
+    assert [row["utc"] for row in output] == ["2026-10-25T00:30:00+00:00", "2026-10-25T01:30:00+00:00"]
+    assert output[1]["replayed"]["start_ts"] - output[0]["replayed"]["start_ts"] == 3600
+    for fold, row in enumerate(output):
+        assert row["identity"]["complete"] is True
+        assert row["identity"]["issues"] == []
+        assert row["replayed"]["start_ts"] == row["original"]["start_ts"]
+        assert row["replayed"]["local"] == "2026-10-25T02:30:00"
+        assert row["replayed"]["fold"] == fold
+        assert abs(row["replayed"]["now_ts"] - row["replayed"]["start_ts"]) < 2
+        assert abs(row["replayed"]["utc_now_ts"] - row["replayed"]["now_ts"]) < 1
+        assert row["replayed"]["today"] == "2026-10-25"
+        assert row["replayed"]["localtime"] == "2026-10-25T02:30"
+
+
+@pytest.mark.parametrize("index_kind", ["datetime", "range", "empty_range", "integer"])
+def test_frame_timezone_and_index_roundtrip(index_kind):
+    # Restoring UTC instead of the column/index zone, inferring object dates,
+    # losing ns precision, or replacing RangeIndex with integers is data drift.
+    times = pd.to_datetime(["2026-10-25T00:30:00.123456789Z", "2026-10-25T01:30:00.987654321Z"], utc=True)
+    frame = pd.DataFrame({
+        "tijd": times.tz_convert("Europe/Amsterdam"),
+        "other_zone": times.tz_convert("America/New_York"),
+        "naive": times.tz_localize(None),
+        "time": ["2026-01-01", "2026-01-02"],
+        "value": pd.Series([1.0, 2.5], dtype="float32"),
+        "count": pd.Series([1, None], dtype="Int64"),
+        "flag": pd.Series([True, None], dtype="boolean"),
+    })
+    if index_kind == "datetime":
+        frame.index = pd.DatetimeIndex(times.tz_convert("Europe/Amsterdam"), name="interval")
+    elif index_kind in ("range", "empty_range"):
+        frame.index = pd.RangeIndex(7, 11, 2, name="row")
+        if index_kind == "empty_range":
+            frame = frame.iloc[:0]
+    else:
+        frame.index = pd.Index([7, 11], name="row")
+    payload = json.loads(json.dumps(da_debug._dataframe_to_payload(frame)))
+    restored = da_debug._dataframe_from_payload(payload)
+    pd.testing.assert_frame_equal(restored, frame)
+    assert type(restored.index) is type(frame.index)
+
+
+@pytest.mark.parametrize("captured_at", [None, "2026-10-25T02:30:00", "2026-01-16T12:00:00"])
+def test_legacy_snapshot_reports_missing_identity(snapshot, captured_at):
+    # Legacy data stays readable, but even a successful solve must not imply
+    # an exact time identity (in particular the ambiguous naive autumn hour).
+    snapshot["meta"]["captured_at"] = captured_at
+    snapshot["ha_states"] = {ENTITY: "74.25"}
+    output = _isolated_replay("""
+        with da_debug.ReplayIO(data) as replay:
+            assert calculator().get_float("sensor.synthetic_soc", 0.0) == 74.25
+            model = mip.Model(solver_name=mip.CBC)
+            model.verbose = 0
+            model.objective = model.add_var(lb=1, ub=1)
+            assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+        print(json.dumps({"identity": replay.time_identity, "result": replay.build_result()}))
+    """, snapshot)
+    assert output["identity"]["complete"] is False
+    assert {"missing_start_utc", "missing_time_zone", "missing_start_args"} <= set(output["identity"]["issues"])
+    assert output["result"]["meta"]["time_identity"] == output["identity"]
+
+
+@pytest.mark.parametrize("process_zone", ["UTC", None])
+@pytest.mark.parametrize("failure_stage", ["clock_patch", "enter", "body", "stop"])
+def test_v2_replay_restores_timezone_and_clock_after_failure(snapshot, process_zone, failure_stage):
+    # Cleanup must cover TZ and the DST-correct clock methods as well as B1a's
+    # existing patches, including a partial enter and a failing clock stop.
+    snapshot["meta"].update(schema_version=2, start_utc="2026-10-25T01:30:00+00:00",
+                            time_zone="Europe/Amsterdam",
+                            start_args={"_start_dt": None, "_start_soc": None, "_start_ev_soc": None})
+    output = _isolated_replay("""
+        snapshot, stage = data["snapshot"], data["stage"]
+        original_tz = os.environ.get("TZ")
+        original_tzname = time.tzname
+        original_datetime = dt.datetime
+        original_methods = dict(vars(freezegun.api.FakeDatetime))
+        original_today = vars(freezegun.api.FakeDate)["today"]
+        original_localtime = time.localtime
+        original_get_state = da_base.DaBase.get_state
+        clock_count = len(freezegun.api.freeze_factories)
+        replay = da_debug.ReplayIO(snapshot)
+
+        def fail_after_start(clock):
+            original_start(clock)
+            raise da_debug.SnapshotMiss("controlled enter failure")
+
+        original_set = da_debug._PatchList.set
+
+        def fail_during_clock_patch(patches, target, name, value):
+            original_set(patches, target, name, value)
+            if stage == "clock_patch" and name == "today":
+                raise da_debug.SnapshotMiss("controlled clock patch failure")
+
+        original_start = freezegun.api._freeze_time.start
+        try:
+            with patch.object(freezegun.api._freeze_time, "start",
+                              fail_after_start if stage == "enter" else original_start), \
+                 patch.object(da_debug._PatchList, "set", fail_during_clock_patch):
+                with replay:
+                    assert os.environ["TZ"] == "Europe/Amsterdam"
+                    if stage == "body":
+                        raise da_debug.SnapshotMiss("controlled body failure")
+                    original_stop = replay._freeze.stop
+
+                    def fail_after_stop():
+                        original_stop()
+                        raise RuntimeError("controlled stop failure")
+
+                    replay._freeze.stop = fail_after_stop
+        except (da_debug.SnapshotMiss, RuntimeError) as exc:
+            assert "controlled" in str(exc)
+        else:
+            raise AssertionError("injected failure was not raised")
+        assert os.environ.get("TZ") == original_tz
+        assert time.tzname == original_tzname
+        assert dt.datetime is original_datetime
+        assert dict(vars(freezegun.api.FakeDatetime)) == original_methods
+        assert vars(freezegun.api.FakeDate)["today"] is original_today
+        assert time.localtime is original_localtime
+        assert da_base.DaBase.get_state is original_get_state
+        assert len(freezegun.api.freeze_factories) == clock_count
+        assert replay._freeze is None
+        assert replay._patches._entries == []
+        print(json.dumps({"restored": True}))
+    """, {"snapshot": snapshot, "stage": failure_stage}, process_zone=process_zone)
+    assert output == {"restored": True}
+
+
+@pytest.mark.parametrize("utc,local,fold", [
+    ("2026-10-25T00:30:00+00:00", "2026-10-25T02:30:00+02:00", 0),
+    ("2026-10-25T01:30:00+00:00", "2026-10-25T02:30:00+01:00", 1),
+    ("2026-07-01T22:30:00+00:00", "2026-07-02T00:30:00+02:00", 0),
+])
+def test_replay_clock_conversions_preserve_fold_and_local_date(snapshot, utc, local, fold):
+    # Parsing then converting an aware datetime must not silently reset fold;
+    # local date/time must also agree when the UTC calendar day differs.
+    snapshot["meta"].update(schema_version=2, start_utc=utc, time_zone="Europe/Amsterdam",
+                            start_args={"_start_dt": None, "_start_soc": None, "_start_ev_soc": None})
+    output = _isolated_replay("""
+        with da_debug.ReplayIO(data) as replay:
+            parsed = dt.datetime.fromisoformat(data["meta"]["start_utc"])
+            converted = parsed.astimezone(ZoneInfo("Europe/Amsterdam"))
+            local = dt.datetime.fromtimestamp(parsed.timestamp())
+            print(json.dumps({"converted": converted.isoformat(), "fold": converted.fold,
+                              "converted_ts": converted.timestamp(), "parsed_ts": parsed.timestamp(),
+                              "local_ts": local.timestamp(), "local_fold": local.fold,
+                              "today": dt.date.today().isoformat(),
+                              "localtime": time.strftime("%Y-%m-%dT%H:%M", time.localtime())}))
+    """, snapshot)
+    assert output["converted"] == local
+    assert output["fold"] == output["local_fold"] == fold
+    assert output["converted_ts"] == output["local_ts"] == output["parsed_ts"]
+    assert output["today"] == local[:10]
+    assert output["localtime"] == local[:16]
+
+
+def test_missing_clock_dependency_reports_incomplete_time_identity(snapshot):
+    # A valid snapshot alone is insufficient when the replay clock cannot be
+    # installed; do not report complete time evidence while using live now().
+    snapshot["meta"].update(schema_version=2, start_utc="2026-10-25T01:30:00+00:00",
+                            time_zone="Europe/Amsterdam",
+                            start_args={"_start_dt": None, "_start_soc": None, "_start_ev_soc": None})
+    output = _isolated_replay("""
+        import builtins
+
+        original_import = builtins.__import__
+
+        def without_clock(name, *args, **kwargs):
+            if name == "freezegun":
+                raise ImportError("synthetic unavailable clock dependency")
+            return original_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", without_clock):
+            with da_debug.ReplayIO(data) as replay:
+                assert replay._freeze is None
+        print(json.dumps(replay.time_identity))
+    """, snapshot)
+    assert output["complete"] is False
+    assert "clock_unavailable" in output["issues"]
+
+
+@pytest.mark.parametrize("field,value,issue", [
+    ("start_utc", None, "missing_start_utc"),
+    ("start_utc", "2026-10-25T02:30:00", "invalid_start_utc"),
+    ("time_zone", None, "missing_time_zone"),
+    ("time_zone", "Not/A_Zone", "invalid_time_zone"),
+    ("start_args", None, "missing_start_args"),
+    ("start_args", {"_start_dt": None}, "missing_start_args"),
+])
+def test_incomplete_v2_snapshot_reports_missing_identity(snapshot, field, value, issue):
+    snapshot["meta"].update(schema_version=2, start_utc="2026-10-25T01:30:00+00:00",
+                            time_zone="Europe/Amsterdam",
+                            start_args={"_start_dt": None, "_start_soc": None, "_start_ev_soc": None})
+    snapshot["meta"][field] = value
+    replay = da_debug.ReplayIO(snapshot)
+    assert replay.time_identity["complete"] is False
+    assert issue in replay.time_identity["issues"]
+
+
+def test_legacy_frame_payload_remains_readable():
+    payload = {
+        "data": '{"columns":["time","value"],"index":[0,1],'
+                '"data":[["2026-01-16T12:00:00.000",1.5],["2026-01-16T13:00:00.000",2.5]]}',
+        "dtypes": {"time": "datetime64[ns]", "value": "float64"},
+        "index_name": None, "index_is_datetime": False,
+    }
+    restored = da_debug._dataframe_from_payload(payload)
+    expected = pd.DataFrame({"time": pd.to_datetime(["2026-01-16T12:00:00", "2026-01-16T13:00:00"]),
+                             "value": [1.5, 2.5]})
+    expected["time"] = expected["time"].astype("datetime64[ns]")
+    pd.testing.assert_frame_equal(restored, expected)

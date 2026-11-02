@@ -550,6 +550,9 @@ class DaCalc(DaBase):
         modulo = start_ts % self.interval_s
         if modulo > (self.interval_s - 10):
             start_ts = start_ts + self.interval_s - modulo
+        record_start = getattr(self, "_debug_record_start", None)
+        if record_start is not None:
+            record_start(start_ts, _start_dt, _start_soc, _start_ev_soc)
         start_dt = dt.datetime.fromtimestamp(start_ts)
         start_hour = int(3600 * math.floor(start_ts / 3600))
         start_interval_ts = int(

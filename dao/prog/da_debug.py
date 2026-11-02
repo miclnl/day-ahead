@@ -44,15 +44,19 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import inspect
 import io
 import json
 import logging
 import math
+import os
 import subprocess
 import sys
+import time
 from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 
@@ -63,7 +67,7 @@ except ImportError:  # pragma: no cover - mip is a hard project dependency,
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_MIN_SUPPORTED = 1
 
 REDACTED_SECRET = "<redacted:SecretStr>"
@@ -192,24 +196,39 @@ def _assert_no_secret_leak(blob: str, secret_values: list[str]) -> None:
 # Serialiseert een DataFrame naar JSON met expliciete dtypes en index-type,
 # want standaard-JSON rondt floats af en kent geen datetime-index.
 def _dataframe_to_payload(df: pd.DataFrame) -> dict:
+    # pandas' aware ISO encoder truncates to microseconds even with date_unit=ns.
+    # Encode UTC-naive values and keep the original zones in dtype/index metadata.
+    encoded = df.copy()
+    for col, dtype in df.dtypes.items():
+        if isinstance(dtype, pd.DatetimeTZDtype):
+            encoded[col] = df[col].dt.tz_convert("UTC").dt.tz_localize(None)
+    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        encoded.index = df.index.tz_convert("UTC").tz_localize(None)
     return {
-        "data": df.to_json(orient="split", date_format="iso", double_precision=15),
+        "data": encoded.to_json(orient="split", date_format="iso", date_unit="ns", double_precision=15),
         "dtypes": {str(c): str(t) for c, t in df.dtypes.items()},
         "index_name": df.index.name,
         "index_is_datetime": isinstance(df.index, pd.DatetimeIndex),
+        "index_dtype": str(df.index.dtype),
+        "index_timezone": str(df.index.tz)
+        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None else None,
+        "index_range": {"start": df.index.start, "stop": df.index.stop, "step": df.index.step}
+        if isinstance(df.index, pd.RangeIndex) else None,
     }
 
 
 # Herstelt een DataFrame exact uit een payload: dtypes terugzetten 
 # en de index alleen naar datetime converteren als die dat origineel ook was.
 def _dataframe_from_payload(payload: dict) -> pd.DataFrame:
-    df = pd.read_json(io.StringIO(payload["data"]), orient="split")
+    df = pd.read_json(io.StringIO(payload["data"]), orient="split", dtype=False,
+                      convert_dates=False, convert_axes=False)
     for col, dtype in payload.get("dtypes", {}).items():
         if col not in df.columns:
             continue
         try:
             if dtype.startswith("datetime64"):
-                df[col] = pd.to_datetime(df[col])
+                aware = isinstance(pd.api.types.pandas_dtype(dtype), pd.DatetimeTZDtype)
+                df[col] = pd.to_datetime(df[col], utc=aware).astype(dtype)
             else:
                 df[col] = df[col].astype(dtype)
         except (TypeError, ValueError) as ex:
@@ -219,7 +238,16 @@ def _dataframe_from_payload(payload: dict) -> pd.DataFrame:
     # corrupted plain integer/RangeIndex frames, e.g. solar_predictions'
     # results, which have no datetime index at all.
     if payload.get("index_is_datetime"):
-        df.index = pd.to_datetime(df.index)
+        zone = payload.get("index_timezone")
+        df.index = pd.to_datetime(df.index, utc=bool(zone))
+        if zone:
+            df.index = df.index.tz_convert(zone)
+        if payload.get("index_dtype"):
+            df.index = df.index.astype(payload["index_dtype"])
+    elif payload.get("index_range") is not None:
+        df.index = pd.RangeIndex(**payload["index_range"])
+    elif payload.get("index_dtype"):
+        df.index = df.index.astype(payload["index_dtype"])
     df.index.name = payload.get("index_name")
     return df
 
@@ -672,6 +700,9 @@ class RecordingIO:
         self._heatpump_run_hours: dict[str, float] = {}
         self._solar_predictions: dict[str, pd.DataFrame] = {}
         self._captured_at = dt.datetime.now()
+        self._start_utc = None
+        self._time_zone = None
+        self._start_args = None
         self._model = None  # last mip.Model.optimize() was called on
         self._cbc_log_chunks: list[str] = []
         self.snapshot_path: Optional[Path] = None
@@ -860,6 +891,20 @@ class RecordingIO:
                 return original_calc_optimum(instance, *args, **kwargs)
 
             self._patches.set(DaCalc, "calc_optimum", _wrapped_calc_optimum)
+
+            # Observe the producer's effective start after its own clock read
+            # and interval rounding, rather than guessing from the wrapper.
+            def _record_start(instance, start_ts, start_dt, start_soc, start_ev_soc):
+                self._start_utc = dt.datetime.fromtimestamp(start_ts, dt.UTC).isoformat()
+                self._time_zone = instance.time_zone
+                self._start_args = {
+                    "_start_dt": {"isoformat": start_dt.isoformat(), "fold": start_dt.fold}
+                    if start_dt is not None else None,
+                    "_start_soc": start_soc,
+                    "_start_ev_soc": start_ev_soc,
+                }
+
+            self._patches.set(DaCalc, "_debug_record_start", _record_start)
             _install_cbc_log_capture(self._patches, day_ahead_module, self)
         except ImportError:
             logger.warning(
@@ -890,6 +935,9 @@ class RecordingIO:
             "schema_version": SCHEMA_VERSION,
             "schema_min_supported": SCHEMA_MIN_SUPPORTED,
             "captured_at": self._captured_at.isoformat(),
+            "start_utc": self._start_utc,
+            "time_zone": self._time_zone,
+            "start_args": self._start_args,
             "interval": getattr(self._primary, "interval", None),
             "solver_threads": getattr(self._primary, "_solver_threads", -1),
             "strategy": getattr(self._primary, "strategy", None),
@@ -1008,7 +1056,10 @@ class ReplayIO:
     falling back to a default or to live state. The one exception is the
     chart PNG, gated separately by ``png`` (default ``False``, since it's
     a plain local file with no HA/DB implications) rather than folded into
-    the always-on write suppression."""
+    the always-on write suppression.
+
+    Clock/class/TZ patches are process-global: use only in an isolated replay
+    process, with no parallel scheduler or other application work in it."""
 
     # Laadt de snapshot, controleert schemaversie en dao-versie, en zet alle read-only databronnen klaar voor gebruik tijdens replay.
     def __init__(
@@ -1050,6 +1101,8 @@ class ReplayIO:
         self._primary = None
         self._reads: set[str] = set()
         self._freeze = None  # freezegun handle, set in _install_patches
+        self._tz_changed = False
+        self._previous_tz = None
         self._model = None  # last mip.Model.optimize() was called on
         self._primary = None
         self._cbc_log_chunks: list[str] = []
@@ -1063,6 +1116,36 @@ class ReplayIO:
                 f"than the minimum supported ({SCHEMA_MIN_SUPPORTED}); "
                 f"this fixture predates the current snapshot format."
             )
+        issues = []
+        self._start_utc = None
+        if not meta.get("start_utc"):
+            issues.append("missing_start_utc")
+        else:
+            try:
+                start = dt.datetime.fromisoformat(meta["start_utc"])
+                if start.utcoffset() != dt.timedelta(0):
+                    raise ValueError("start_utc must be aware UTC")
+                self._start_utc = start
+            except (TypeError, ValueError):
+                issues.append("invalid_start_utc")
+        self._time_zone = meta.get("time_zone")
+        if not self._time_zone:
+            issues.append("missing_time_zone")
+        else:
+            try:
+                ZoneInfo(self._time_zone)
+            except (TypeError, ValueError, ZoneInfoNotFoundError):
+                issues.append("invalid_time_zone")
+                self._time_zone = None
+        self._start_args = meta.get("start_args") or {}
+        if not all(name in self._start_args for name in ("_start_dt", "_start_soc", "_start_ev_soc")):
+            issues.append("missing_start_args")
+        if schema_version < 2:
+            issues.append("legacy_time_identity_unproven")
+        self._time_identity = {"complete": not issues, "issues": issues}
+        if issues:
+            logger.warning("ReplayIO: incomplete time identity (%s); not exact financial replay evidence",
+                           ", ".join(issues))
         snapshot_version = meta.get("dao_version")
         current_version = _dao_version()
         if snapshot_version and current_version and snapshot_version != current_version:
@@ -1109,6 +1192,12 @@ class ReplayIO:
     def meta(self) -> dict:
         return dict(self._snapshot.get("meta", {}))
 
+    @property
+    def time_identity(self) -> dict:
+        """Time evidence only; completeness is not a financial/solver proof."""
+        identity = getattr(self, "_time_identity", {"complete": False, "issues": ["missing_time_identity"]})
+        return {"complete": identity["complete"], "issues": list(identity["issues"])}
+
     # Zet het opgeloste replaymodel om naar dezelfde vorm als een capture-resultaat, zodat replay-uitkomsten te diffen zijn tegen een capture of een andere replay.
     def build_result(self) -> Optional[dict]:
         """The replayed run's own objective/status/gap/cbc_log, in the same
@@ -1131,6 +1220,7 @@ class ReplayIO:
                 "replayed_at": dt.datetime.now().isoformat(),
                 "source_snapshot": self._source,
                 "solver_threads": threads_used,
+                "time_identity": self.time_identity,
             },
             financial_terms=getattr(self._primary, "_debug_financial_terms", None),
             planning_audit=getattr(self._primary, "_debug_planning_audit", None),
@@ -1158,7 +1248,16 @@ class ReplayIO:
                 self._freeze.stop()
         finally:
             self._freeze = None
-            self._patches.restore()
+            try:
+                self._patches.restore()
+            finally:
+                if self._tz_changed:
+                    if self._previous_tz is None:
+                        os.environ.pop("TZ", None)
+                    else:
+                        os.environ["TZ"] = self._previous_tz
+                    self._tz_changed = False
+                    time.tzset()
         return False
 
     # -- patch installation ----------------------------------------------
@@ -1186,6 +1285,22 @@ class ReplayIO:
             import dao.prog.day_ahead as day_ahead_module
 
             _install_cbc_log_capture(self._patches, day_ahead_module, self)
+            if self._start_utc is not None:
+                original_calc_optimum = day_ahead_module.DaCalc.calc_optimum
+                signature = inspect.signature(original_calc_optimum)
+
+                def _replay_calc_optimum(instance, *args, **kwargs):
+                    bound = signature.bind(instance, *args, **kwargs)
+                    # Presence, not truthiness: explicit None and zero win.
+                    # Use the effective instant for the default date, not the
+                    # raw naive argument interpreted in a different host TZ.
+                    bound.arguments.setdefault("_start_dt", self._start_utc)
+                    for name in ("_start_soc", "_start_ev_soc"):
+                        if name in self._start_args:
+                            bound.arguments.setdefault(name, self._start_args[name])
+                    return original_calc_optimum(*bound.args, **bound.kwargs)
+
+                self._patches.set(day_ahead_module.DaCalc, "calc_optimum", _replay_calc_optimum)
         except ImportError:
             logger.warning(
                 "ReplayIO: kon day_ahead niet importeren; het CBC-log "
@@ -1314,7 +1429,12 @@ class ReplayIO:
         try:
             import freezegun
 
-            captured_at = self._snapshot.get("meta", {}).get("captured_at")
+            if self._time_zone is not None:
+                self._previous_tz = os.environ.get("TZ")
+                self._tz_changed = True
+                os.environ["TZ"] = self._time_zone
+                time.tzset()
+            captured_at = self._start_utc or self._snapshot.get("meta", {}).get("captured_at")
             if captured_at:
                 # tick=True: the clock still starts anchored at captured_at
                 # (so calc_optimum()'s date/weekday-dependent reads land at
@@ -1327,9 +1447,25 @@ class ReplayIO:
                 # 0.00 sec" on every replay, since day_ahead.py measures
                 # solve time with time.perf_counter(), and a fully static
                 # clock makes any two reads of it identical by construction.
+                if self._time_zone is not None:
+                    # Freezegun's fixed-offset datetime conversion loses fold
+                    # and treats naive timestamps as UTC. Keep its ticking UTC
+                    # clock, but let stdlib/libc do local-time/DST conversion.
+                    api = freezegun.api
+                    self._patches.set(api.FakeDatetime, "now", classmethod(
+                        lambda cls, tz=None: api.real_datetime.fromtimestamp(time.time(), tz)))
+                    self._patches.set(api.FakeDatetime, "fromtimestamp", api.real_datetime.fromtimestamp)
+                    self._patches.set(api.FakeDatetime, "timestamp", api.real_datetime.timestamp)
+                    self._patches.set(api.FakeDatetime, "astimezone", api.real_datetime.astimezone)
+                    self._patches.set(api.FakeDate, "today", classmethod(
+                        lambda cls: api.real_datetime.fromtimestamp(time.time()).date()))
+                    self._patches.set(api, "fake_localtime", lambda seconds=None: api.real_localtime(
+                        time.time() if seconds is None else seconds))
                 self._freeze = freezegun.freeze_time(captured_at, tick=True)
                 self._freeze.start()
         except ImportError:
+            self._time_identity["complete"] = False
+            self._time_identity["issues"].append("clock_unavailable")
             logger.warning(
                 "ReplayIO: freezegun is niet beschikbaar; de wall-clock wordt "
                 "niet bevroren tijdens deze replay"
