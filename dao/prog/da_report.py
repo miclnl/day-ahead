@@ -3731,7 +3731,7 @@ class Report(DaBase):
     def get_pv_prognose(
             self, field: str, vanaf: datetime.datetime, tot: datetime.datetime
     ) -> pd.DataFrame:
-        df_result = pd.DataFrame()
+        df_result = pd.DataFrame(columns=["tijd", "prediction"])
         if field == "pv_ac":
             solar_num = len(self.solar)
             for s in range(solar_num):
@@ -3770,11 +3770,10 @@ class Report(DaBase):
             df_result = df_result.rename(
                 columns={"prediction": field, "date_time": "time"}
             )
+        # Behoud de bekende tijdidentiteit van PVService tot aan de API-weergave.
         df_result["time"] = df_result["tijd"]
         df_result["datasoort"] = "expected"
-        # df_result["time_ts"] = df_result["time"].apply(lambda x: int(x.timestamp()))
         df_result.drop("tijd", axis=1, inplace=True)
-        df_result["time"] = df_result["time"].dt.tz_localize(None)
         df_result.index = df_result["time"]
         return df_result
 
