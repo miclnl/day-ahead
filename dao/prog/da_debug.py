@@ -69,10 +69,27 @@ SCHEMA_MIN_SUPPORTED = 1
 REDACTED_SECRET = "<redacted:SecretStr>"
 
 
-class SnapshotMiss(RuntimeError):
+class SnapshotMiss(BaseException):
     """Raised by ReplayIO when a replayed run asks for input the snapshot
-    does not have. Never caught internally — a stale or incomplete fixture
-    must fail loudly, not silently fall back to live/default behaviour."""
+    does not have. Bypasses production's ``except Exception`` fallbacks — a
+    stale or incomplete fixture must stop, not invent live/default input."""
+
+
+class RecordedReadError(Exception):
+    """A captured HA read failure, safe for normal production fallbacks."""
+
+    def __init__(self, category: str):
+        self.category = category if category in ("timeout", "connection", "error") else "error"
+        super().__init__(f"Recorded HA read failure ({self.category})")
+
+
+def _exception_category(exc: BaseException) -> str:
+    """Only fixed categories leave capture; messages/type names may contain secrets."""
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, ConnectionError):
+        return "connection"
+    return "error"
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +667,7 @@ class RecordingIO:
         self._price_data_args: Optional[dict] = None
         self._prog_data: Optional[pd.DataFrame] = None
         self._ha_states: dict[str, str] = {}
+        self._ha_read_errors: dict[str, str] = {}
         self._baseload: dict[str, list] = {}
         self._heatpump_run_hours: dict[str, float] = {}
         self._solar_predictions: dict[str, pd.DataFrame] = {}
@@ -663,7 +681,11 @@ class RecordingIO:
 
     # Installeert de patches bij het binnengaan van de with-blok.
     def __enter__(self) -> "RecordingIO":
-        self._install_patches()
+        try:
+            self._install_patches()
+        except BaseException:
+            self._patches.restore()
+            raise
         return self
 
     # Schrijft de snapshot (best effort) en herstelt daarna altijd de patches, ook als het schrijven zelf mislukt.
@@ -721,7 +743,13 @@ class RecordingIO:
 
         # Roept de echte get_state aan en legt de teruggegeven state vast onder de entity-id.
         def _wrapped_get_state(instance, entity_id, *args, **kwargs):
-            result = original_get_state(instance, entity_id, *args, **kwargs)
+            try:
+                result = original_get_state(instance, entity_id, *args, **kwargs)
+            except Exception as exc:
+                self._ha_states.pop(entity_id, None)
+                self._ha_read_errors[entity_id] = _exception_category(exc)
+                raise
+            self._ha_read_errors.pop(entity_id, None)
             try:
                 self._ha_states[entity_id] = result.state
             except AttributeError:
@@ -871,7 +899,7 @@ class RecordingIO:
             "python_version": sys.version.split()[0],
             "config_hash": _config_hash(sanitized_config),
             "file_name": getattr(self._primary, "file_name", None),
-            "exception": f"{type(exc).__name__}: {exc}" if exc is not None else None,
+            "exception": _exception_category(exc) if exc is not None else None,
         }
 
         ha_context = None
@@ -895,6 +923,7 @@ class RecordingIO:
             if self._prog_data is not None
             else None,
             "ha_states": self._ha_states,
+            "ha_read_errors": self._ha_read_errors,
             "baseload": self._baseload,
             "heatpump_run_hours": self._heatpump_run_hours,
             "solar_predictions": {
@@ -1055,6 +1084,7 @@ class ReplayIO:
             else None
         )
         self._ha_states: dict[str, str] = self._snapshot.get("ha_states", {})
+        self._ha_read_errors: dict[str, str] = self._snapshot.get("ha_read_errors", {})
         self._baseload: dict[str, list] = self._snapshot.get("baseload", {})
         self._heatpump_run_hours: dict[str, float] = self._snapshot.get(
             "heatpump_run_hours", {}
@@ -1114,15 +1144,21 @@ class ReplayIO:
 
     # Installeert de patches bij het binnengaan van de with-blok.
     def __enter__(self) -> "ReplayIO":
-        self._install_patches()
+        try:
+            self._install_patches()
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
         return self
 
     # Stopt de bevroren klok en herstelt de patches bij het verlaten van de with-blok.
     def __exit__(self, exc_type, exc, tb) -> bool:
-        if self._freeze is not None:
-            self._freeze.stop()
+        try:
+            if self._freeze is not None:
+                self._freeze.stop()
+        finally:
             self._freeze = None
-        self._patches.restore()
+            self._patches.restore()
         return False
 
     # -- patch installation ----------------------------------------------
@@ -1180,6 +1216,8 @@ class ReplayIO:
         def _replay_get_state(instance, entity_id, *args, **kwargs):
             self._reads.add(entity_id)
             if entity_id not in self._ha_states:
+                if entity_id in self._ha_read_errors:
+                    raise RecordedReadError(self._ha_read_errors[entity_id]) from None
                 raise SnapshotMiss(
                     f"ReplayIO ({self._source}): entity '{entity_id}' is not "
                     f"present in the snapshot's ha_states — either the "
@@ -2748,7 +2786,7 @@ def cmd_capture(args: argparse.Namespace, data_dir: Path) -> int:
     data = {
         "snapshot": str(rec.snapshot_path) if rec.snapshot_path else None,
         "result": str(rec.result_path) if rec.result_path else None,
-        "error": f"{type(error).__name__}: {error}" if error is not None else None,
+        "error": _exception_category(error) if error is not None else None,
         "debug": bool(args.debug),
         "png": bool(args.png),
     }
@@ -3987,7 +4025,7 @@ _COMMANDS = {
 
 
 # Toont een fout consistent in tekst of JSON, met traceback, vlak vóór de bijbehorende exitcode wordt teruggegeven.
-def _print_error(args: argparse.Namespace, kind: str, ex: Exception) -> None:
+def _print_error(args: argparse.Namespace, kind: str, ex: BaseException) -> None:
     import traceback
 
     if getattr(args, "json", False):
