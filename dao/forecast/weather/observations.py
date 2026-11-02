@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 from datetime import date
 from typing import Optional
 
@@ -37,14 +38,25 @@ _OBSERVED_CODES = ("gr", "temp", "winds")
 
 
 def nearest_knmi_station(latitude: float, longitude: float) -> int:
-    """The automatic weather station closest to (latitude, longitude)."""
+    """The closest automatic station by great-circle distance; ties keep AWS order."""
     best_station: Optional[int] = None
     best_distance: Optional[float] = None
+    latitude_rad = math.radians(latitude)
     for station_id in KNMI_AWS_STATIONS:
         station = knmi.stations[station_id]
-        distance = (latitude - station.latitude) ** 2 + (
-            longitude - station.longitude
-        ) ** 2
+        station_latitude_rad = math.radians(station.latitude)
+        delta_latitude = station_latitude_rad - latitude_rad
+        delta_longitude = math.radians(station.longitude - longitude)
+        haversine = (
+            math.sin(delta_latitude / 2) ** 2
+            + math.cos(latitude_rad)
+            * math.cos(station_latitude_rad)
+            * math.sin(delta_longitude / 2) ** 2
+        )
+        # Roundoff can push the haversine outside [0, 1] at antipodes.
+        haversine = min(1.0, max(0.0, haversine))
+        # Angular distance gives the same ordering without an Earth-radius factor.
+        distance = 2 * math.atan2(math.sqrt(haversine), math.sqrt(1 - haversine))
         if best_distance is None or distance < best_distance:
             best_distance = distance
             best_station = station_id

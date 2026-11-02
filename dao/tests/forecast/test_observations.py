@@ -16,7 +16,9 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from knmi.metadata import Station
 
+from dao.forecast.weather import observations
 from dao.forecast.weather.observations import (
     fetch_knmi,
     nearest_knmi_station,
@@ -119,6 +121,51 @@ def stored(db):
 def test_nearest_station_picks_closest_aws():
     assert nearest_knmi_station(52.10, 5.18) == 260  # De Bilt
     assert nearest_knmi_station(52.928, 4.781) == 235  # De Kooy
+
+
+@pytest.fixture
+def synthetic_knmi_stations(monkeypatch):
+    stations = {
+        1: Station(number=1, longitude=5.0, latitude=52.1, altitude=0.0, name="North"),
+        2: Station(number=2, longitude=5.12, latitude=52.0, altitude=0.0, name="East"),
+    }
+    monkeypatch.setattr(observations, "KNMI_AWS_STATIONS", (1, 2))
+    monkeypatch.setattr(observations.knmi, "stations", stations)
+    return stations
+
+
+def test_station_selection_uses_distance_not_degree_squares(synthetic_knmi_stations):
+    # North is 11.119493 km away, East only 8.215011 km, despite 0.12 > 0.1 degrees.
+    assert nearest_knmi_station(52.0, 5.0) == 2
+
+
+def test_station_selection_ignores_non_aws_stations(synthetic_knmi_stations):
+    synthetic_knmi_stations[3] = synthetic_knmi_stations[1]._replace(
+        number=3, longitude=5.01, name="Manual"
+    )
+
+    assert nearest_knmi_station(52.1, 5.01) == 1
+
+
+@pytest.mark.parametrize("order", [(1, 2), (2, 1)])
+def test_station_selection_preserves_aws_order_on_equal_distance(
+    monkeypatch, synthetic_knmi_stations, order
+):
+    synthetic_knmi_stations[2] = synthetic_knmi_stations[2]._replace(
+        latitude=52.1, longitude=5.0
+    )
+    monkeypatch.setattr(observations, "KNMI_AWS_STATIONS", order)
+
+    assert nearest_knmi_station(52.0, 5.0) == order[0]
+
+
+def test_station_selection_handles_antipodal_roundoff(monkeypatch, synthetic_knmi_stations):
+    synthetic_knmi_stations[1] = synthetic_knmi_stations[1]._replace(
+        latitude=87.5, longitude=180.0
+    )
+    monkeypatch.setattr(observations, "KNMI_AWS_STATIONS", (1,))
+
+    assert nearest_knmi_station(-87.5, 0.0) == 1
 
 
 def test_fetch_knmi_does_not_shift_the_hour_aggregates(monkeypatch):
