@@ -51,6 +51,8 @@ def migrate_v0_to_v1(config: dict[str, Any]) -> dict[str, Any]:
         migrated["electric_vehicle"], list
     ):
         for ev in migrated["electric_vehicle"]:
+            if not isinstance(ev, dict):
+                continue  # Preserve invalid entries for Pydantic validation.
             value = None
             if "entity_stop_laden" in ev:
                 value = ev["entity_stop_laden"]

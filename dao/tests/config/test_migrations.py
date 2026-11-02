@@ -2,13 +2,62 @@
 Tests for configuration migrations.
 """
 
+import copy
+
 import pytest
 from dao.prog.config.migrations.migrator import migrate_config
 from dao.prog.config.migrations.unversioned_to_v0 import migrate_unversioned_to_v0
+from dao.prog.config.migrations.v0_to_v1 import migrate_v0_to_v1
 from dao.prog.config.models.pricing import PricingConfig
 from dao.prog.config.models.database import HADatabaseConfig, DatabaseConfig
 from dao.prog.config.models.scheduler import SchedulerConfig
 from dao.prog.config.migrations.v1_to_v2 import migrate_v1_to_v2
+
+
+@pytest.mark.parametrize("config", [
+    {"solar": 1},
+    {"battery": 1},
+    {"solar": [{"strings": 1}]},
+    {"battery": [{"solar": 1}]},
+    {"battery": [{"solar": [{"strings": 1}]}]},
+])
+def test_orientation_migration_preserves_invalid_array_shapes(config):
+    """Invalid arrays must survive unchanged so the loader can reject them."""
+    original = copy.deepcopy(config)
+
+    migrated = migrate_unversioned_to_v0(config)
+
+    assert migrated == {**original, "config_version": 0}
+    assert config == original
+
+
+@pytest.mark.parametrize("entry", [None, 1, "entity_stop_laden"])
+def test_ev_migration_preserves_invalid_entries(entry):
+    config = {"config_version": 0, "electric_vehicle": [entry]}
+    original = copy.deepcopy(config)
+
+    migrated = migrate_v0_to_v1(config)
+
+    assert migrated == {"config_version": 1, "electric_vehicle": [entry]}
+    assert config == original
+
+
+@pytest.mark.parametrize("old_key", ["entity_stop_laden", "entity stop laden"])
+def test_ev_migration_renames_stop_charging_without_mutating_input(old_key):
+    config = {
+        "config_version": 0,
+        "electric_vehicle": [{old_key: "input_boolean.stop_charging"}],
+    }
+    original = copy.deepcopy(config)
+
+    migrated = migrate_v0_to_v1(config)
+
+    assert migrated == {
+        "config_version": 1,
+        "electric_vehicle": [{"entity_stop_charging": "input_boolean.stop_charging"}],
+    }
+    assert config == original
+
 
 def test_migrate_unversioned_to_v0():
     """Test migration from unversioned config to v0."""

@@ -190,26 +190,31 @@ def migrate_unversioned_to_v0(config: dict[str, Any]) -> dict[str, Any]:
                         f"Normalized {context}.orientation from {val} to {solar_obj[key]}"
                     )
 
-    for i, solar in enumerate(migrated.get("solar", []) or []):
-        if not isinstance(solar, dict):
-            continue
-        _normalize_orientation(solar, f"solar[{i}]")
-        for j, string in enumerate(solar.get("strings", []) or []):
-            if isinstance(string, dict):
-                _normalize_orientation(string, f"solar[{i}].strings[{j}]")
-
-    for b, battery in enumerate(migrated.get("battery", []) or []):
-        if not isinstance(battery, dict):
-            continue
-        for i, solar in enumerate(battery.get("solar", []) or []):
+    # Leave malformed arrays intact for the loader's Pydantic validation.
+    if isinstance(migrated.get("solar"), list):
+        for i, solar in enumerate(migrated["solar"]):
             if not isinstance(solar, dict):
                 continue
-            _normalize_orientation(solar, f"battery[{b}].solar[{i}]")
-            for j, string in enumerate(solar.get("strings", []) or []):
-                if isinstance(string, dict):
-                    _normalize_orientation(
-                        string, f"battery[{b}].solar[{i}].strings[{j}]"
-                    )
+            _normalize_orientation(solar, f"solar[{i}]")
+            if isinstance(solar.get("strings"), list):
+                for j, string in enumerate(solar["strings"]):
+                    if isinstance(string, dict):
+                        _normalize_orientation(string, f"solar[{i}].strings[{j}]")
+
+    if isinstance(migrated.get("battery"), list):
+        for b, battery in enumerate(migrated["battery"]):
+            if not isinstance(battery, dict) or not isinstance(battery.get("solar"), list):
+                continue
+            for i, solar in enumerate(battery["solar"]):
+                if not isinstance(solar, dict):
+                    continue
+                _normalize_orientation(solar, f"battery[{b}].solar[{i}]")
+                if isinstance(solar.get("strings"), list):
+                    for j, string in enumerate(solar["strings"]):
+                        if isinstance(string, dict):
+                            _normalize_orientation(
+                                string, f"battery[{b}].solar[{i}].strings[{j}]"
+                            )
 
     # Coerce boiler_present and heater_present to boolean.
     # Old configs may have stored these as strings ("True"/"False", "yes"/"no", etc.).

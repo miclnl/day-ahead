@@ -2,10 +2,30 @@
 Tests for configuration loader.
 """
 
+import copy
 import json
 import pytest
 from pathlib import Path
-from dao.prog.config.loader import CURRENT_VERSION, ConfigurationLoader
+from dao.prog.config.loader import (
+    CURRENT_VERSION,
+    ConfigValidationError,
+    ConfigurationLoader,
+    validate_config_data,
+)
+
+
+@pytest.mark.parametrize(("document", "field"), [
+    ({"solar": 1}, "solar"),
+    ({"config_version": 0, "electric_vehicle": [None]}, "electric_vehicle"),
+])
+def test_invalid_legacy_shapes_are_validation_errors(document, field):
+    """Malformed legacy values reach validation without mutating the raw input."""
+    original = copy.deepcopy(document)
+
+    with pytest.raises(ConfigValidationError, match=field):
+        validate_config_data(document)
+
+    assert document == original
 
 
 @pytest.fixture
