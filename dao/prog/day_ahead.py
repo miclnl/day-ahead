@@ -2999,10 +2999,6 @@ class DaCalc(DaBase):
                     for _ in range(U)
                 ]
 
-                hp_on = [
-                    model.add_var(var_type=BINARY) for _ in range(U)
-                ]  # If on the pump will run in that hour
-
                 # verbruik per interval
                 for u in range(U):
                     # som van alle weegfactoren == 1

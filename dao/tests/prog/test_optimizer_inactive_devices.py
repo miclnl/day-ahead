@@ -1,4 +1,4 @@
-"""Inactive EV flags must be constrained, not merely zero in one CBC optimum."""
+"""Device flags must be allocated once and constrained in the real producer."""
 
 import datetime as dt
 import sys
@@ -9,6 +9,7 @@ import pytest
 
 from dao.prog import day_ahead as da
 from dao.prog.config.models.devices.ev import EVConfig
+from dao.prog.config.models.devices.heating import HeatingDisabled, HeatingEnabled
 from dao.tests.settlement.test_optimization_producer import capture as capture
 
 
@@ -132,3 +133,116 @@ def test_ev_flags_after_deadline_cannot_be_on(
             # but may supply at most 2.3 kW * 0.125 h = 0.2875 kWh.
             assert 0.148 <= local["c_ev"][e][ready].x <= 0.2875 + 1e-7
             assert any(row[ready].x == 1 for row in local["stage_on"][e][1:])
+
+
+@pytest.fixture
+def hp_model(capture, monkeypatch):
+    """Observe real allocations, including handles lost by a later hp_on assignment."""
+    instance = capture["instance"]
+    start = capture["locals"]["start_dt"]
+
+    def build(mode):
+        if mode == "absent":
+            instance.heating_options = None
+        elif mode == "disabled":
+            instance.heating_options = HeatingDisabled()
+        else:
+            instance.heating_options = HeatingEnabled.model_validate({
+                "adjustment": mode if mode in ("on/off", "power", "heating curve") else "power",
+                "degree days factor": 0 if mode == "no-heat" else 4,
+                "entity hp enabled": "input_boolean.synthetic_hp_enabled",
+                "stages": [{"max_power": 1000, "cop": 4}, {"max_power": 2000, "cop": 4}],
+            })
+
+        def get_state(entity_id):
+            if entity_id != "input_boolean.synthetic_hp_enabled":
+                pytest.fail(f"unexpected synthetic HA read: {entity_id}")
+            return SimpleNamespace(state="off" if mode == "switched-off" else "on")
+
+        monkeypatch.setattr(instance, "get_state", get_state)
+        instance.meteo = SimpleNamespace(calc_graaddagen=lambda **kwargs: 1.0,
+                                         get_avg_temperature=lambda **kwargs: 5.0)
+        found, allocated = {}, {}
+        add_var, bind_cost = mip.Model.add_var, da.bind_day_ahead_cost
+
+        def record_flags(local):
+            for flag in local.get("hp_on", ()):
+                allocated[flag.idx] = flag
+
+        def record_var(model, *args, **kwargs):
+            caller = sys._getframe(1)
+            while caller is not None and caller.f_code is not da.DaCalc.calc_optimum.__code__:
+                caller = caller.f_back
+            if caller is not None:
+                record_flags(caller.f_locals)
+            return add_var(model, *args, **kwargs)
+
+        class Captured(Exception):
+            pass
+
+        def capture_cost(model, **kwargs):
+            bind_cost(model, **kwargs)
+            found.update(sys._getframe(1).f_locals)
+            record_flags(found)
+            raise Captured
+
+        with monkeypatch.context() as spies:
+            spies.setattr(mip.Model, "add_var", record_var)
+            spies.setattr(da, "bind_day_ahead_cost", capture_cost)
+            with pytest.raises(Captured):
+                instance.calc_optimum(_start_dt=start)
+        model = found["model"]
+        assert model.solver_name == mip.CBC and found["U"] == 12
+        model.verbose = 0
+        model.objective = mip.minimize(found["cost"])
+        found["allocated_hp_on"] = tuple(allocated.values())
+        return found
+
+    return build
+
+
+@pytest.mark.parametrize("mode,enabled,energy_kwh,heat_kwh", [
+    pytest.param("absent", False, 0, 0, id="absent"),
+    pytest.param("disabled", False, 0, 0, id="disabled"),
+    pytest.param("switched-off", False, 0, 0, id="switched-off"),
+    pytest.param("no-heat", False, 0, 0, id="no-heat"),
+    pytest.param("on/off", True, 1.5, 6, id="on-off"),
+    pytest.param("power", True, 1, 4, id="power"),
+    pytest.param("heating curve", True, 1, 4, id="heating-curve"),
+])
+def test_hp_allocates_one_on_flag_per_interval(hp_model, mode, enabled, energy_kwh, heat_kwh):
+    """A second allocation leaves real orphan columns; every retained flag must control load."""
+    local = hp_model(mode)
+    model, flags, allocated = local["model"], local["hp_on"], local["allocated_hp_on"]
+    assert len(allocated) == local["U"]
+    assert {flag.idx for flag in allocated} == {flag.idx for flag in flags}
+    used = {var.idx for constraint in model.constrs for var in constraint.expr.expr}
+    for flag in allocated:
+        assert model.vars[flag.idx] is flag and flag.var_type == mip.BINARY
+        assert flag.idx in used
+
+    assert local["self"].hp_enabled is enabled
+    if enabled:
+        # A disabled flag cannot supply electricity, even under a forced load.
+        forced = [model.add_constr(flags[0] == 0), model.add_constr(local["c_hp"][0] >= 0.001)]
+        assert model.optimize() == mip.OptimizationStatus.INFEASIBLE
+        model.remove(forced)
+        # One ordinary hour avoids asserting new B5 block-duration semantics.
+        for u, flag in enumerate(flags):
+            model += flag == int(u < 4)
+    else:
+        forced = model.add_constr(mip.xsum(flags) >= 1)
+        assert model.optimize() == mip.OptimizationStatus.INFEASIBLE
+        model.remove(forced)
+
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    assert [flag.x for flag in flags] == [int(enabled and u < 4) for u in range(12)]
+    assert [var.x for var in local["c_hp"]] == pytest.approx(
+        [energy_kwh / 4 if u < 4 else 0 for u in range(12)])
+    assert sum(var.x for var in local["c_hp"]) == pytest.approx(energy_kwh)
+    if enabled:
+        assert sum(var.x for var in local["h_hp"]) == pytest.approx(heat_kwh)
+        if mode != "on/off":
+            assert [stage["max_power"] for stage in local["hp_stages"]] == [0, 1000, 2000]
+            assert [stage.max_power for stage in local["self"].heating_options.stages] == [1000, 2000]
