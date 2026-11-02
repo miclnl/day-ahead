@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 from dao.prog import day_ahead as da
-from dao.prog.config.models.devices.boiler import BoilerEnabled
+from dao.prog.config.models.devices.boiler import BoilerDisabled, BoilerEnabled
 from dao.prog.config.models.devices.heating import HeatingEnabled
 from dao.tests.settlement.test_optimization_bonus import ts
 from dao.tests.settlement.test_optimization_producer import capture as capture
@@ -35,7 +35,7 @@ def power_hp_model(capture, monkeypatch):
         monkeypatch.setattr(instance, name, forbidden_write)
 
     def build(*, prices, heat_kwh, minimum_hours, adjustment, demand="eco", run_hours=None,
-              boiler=None, stages=None, with_batteries=False):
+              boiler=None, boiler_states=None, stages=None, with_batteries=False):
         instance.battery_options = batteries if with_batteries else []
         configured_stages = stages if stages is not None else [{"max_power": 1000, "cop": 4}]
         instance.heating_options = HeatingEnabled.model_validate({
@@ -48,7 +48,9 @@ def power_hp_model(capture, monkeypatch):
         })
         states = {"sensor.synthetic_hp_demand": demand, "sensor.synthetic_hp_heat": "0"}
         states.update({battery.entity_actual_level: "50" for battery in instance.battery_options})
-        if boiler is not None:
+        if boiler is False:
+            instance.boiler_options = BoilerDisabled()
+        elif boiler is not None:
             instance.boiler_options = BoilerEnabled.model_validate({
                 "entity actual temp.": "sensor.synthetic_boiler_temp",
                 "entity setpoint": "input_number.synthetic_boiler_setpoint",
@@ -58,8 +60,9 @@ def power_hp_model(capture, monkeypatch):
                 "cop": 4, "elec. power": 1000, **boiler,
             })
             states.update({"sensor.synthetic_boiler_temp": "40",
-                           "input_number.synthetic_boiler_setpoint": "50",
-                           "input_number.synthetic_boiler_hysteresis": "5"})
+                            "input_number.synthetic_boiler_setpoint": "50",
+                            "input_number.synthetic_boiler_hysteresis": "5"})
+        states.update(boiler_states or {})
 
         def get_state(entity_id):
             if entity_id not in states:
@@ -328,7 +331,230 @@ def test_zero_available_hours_keeps_no_block_route(power_hp_model, adjustment, p
     assert local["heat_needed"] == 0  # Existing physical-cap route, not missing demand.
     assert_schedule(local, heat_kwh=0, runtime_hours=0, hp_cost=0)
     assert [flag.x for flag in local["hp_on"]] == pytest.approx([0] * local["U"])
-    assert sum(var.x for var in local["c_b"]) > 0
+    # The original assertions establish only heuristic availability, not execution.
+    required = 0.1 + 1.1 * (200 * 4.2 + 100 * 0.5) * 10 / (3600 * 4)
+    capacity = power * local["self"].interval_s / 3_600_000
+    full, tail = divmod(required, capacity)
+    expected = [capacity] * int(full) + [tail]
+    expected += [0] * (local["U"] - len(expected))
+    assert_boiler_output(local, start_index=0, required_kwh=required, expected=expected)
+
+
+def assert_boiler_output(local, *, start_index, required_kwh, expected):
+    """Independent physical/cost checks, not an assertion against the profile helper."""
+    assert sum(var.x for var in local["c_b"]) == pytest.approx(required_kwh)
+    assert [var.x for var in local["c_b"]] == pytest.approx(expected)
+    assert [flag.x for flag in local["boiler_st"]] == pytest.approx([
+        int(u == start_index) for u in range(local["U"])])
+    assert [flag.x for flag in local["boiler_on"]] == pytest.approx([
+        int(energy > 0) for energy in expected])
+    power = local["self"].boiler_options.elec_power
+    for u, var in enumerate(local["c_b"]):
+        capacity = power * (local["interval_ts"][u] + local["self"].interval_s
+                            - local["ts"][u]) / 3_600_000
+        assert var.ub == pytest.approx(capacity)
+        assert -1e-7 <= var.x <= capacity + 1e-7
+    assert local["est_needed_intv"][start_index] == sum(energy > 0 for energy in expected)
+    boiler_cost = sum(energy * price for energy, price in zip(expected, local["pl"], strict=True))
+    assert local["est_elec_cost"][start_index] == pytest.approx(boiler_cost)
+    hp_cost = sum(var.x * price for var, price in zip(local["c_hp"], local["pl"], strict=True))
+    heat_capacity = 1.1 * (local["self"].boiler_options.volume * 4.2 + 100 * 0.5)
+    stored_kwh = required_kwh - local["U"] * local["boiler_cooling"] * heat_capacity / (
+        3600 * local["cop_boiler"])
+    assert local["cost"].x == pytest.approx(boiler_cost + hp_cost - stored_kwh * local["p_avg"])
+    assert all(hp.x + boiler.x <= 1 + 1e-7 for hp, boiler in zip(
+        local["hp_on"], local["boiler_on"], strict=True))
+    assert local["ha_writes"] == []
+
+
+def test_long_boiler_reservation_is_not_full_boiler_execution(power_hp_model):
+    """Native feasibility alone previously accepted only 0.15 of 0.779861 kWh."""
+    local = power_hp_model(
+        prices=[0.10] * 3, heat_kwh=4, minimum_hours=1, adjustment="power",
+        boiler={"elec. power": 300},
+    )
+    assert local["boiler_int"] == local["U"] == 12
+    model = local["model"]
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    required = 0.1 + 1.1 * (200 * 4.2 + 100 * 0.5) * 10 / (3600 * 4)
+    assert required == pytest.approx(0.7798611111111111)
+    assert sum(var.x for var in local["c_b"]) == pytest.approx(0.7798611111111111)
+    assert_boiler_output(local, start_index=0, required_kwh=required,
+                         expected=[0.075] * 10 + [0.0298611111111111, 0])
+    assert sum(flag.x for flag in local["boiler_on"]) == 11
+
+
+@pytest.mark.parametrize("adjustment", ["power", "heating curve"])
+@pytest.mark.parametrize("start_index,power,full,tail", [
+    (0, 300, 4, 0.003958333333333333),
+    (12, 300, 5, 0.0309375),
+    (0, 1000, 1, 0.05395833333333333),
+    (12, 1000, 1, 0.1559375),
+])
+def test_selected_boiler_start_binds_every_output_interval(
+    power_hp_model, adjustment, start_index, power, full, tail,
+):
+    """A late output interval must use the selected start's length, not its own length."""
+    local = power_hp_model(
+        prices=[0.60, 0.10, 0.20, 0.40, 0.30, 0.50], heat_kwh=4, minimum_hours=1,
+        adjustment=adjustment, boiler={"elec. power": power},
+        boiler_states={"sensor.synthetic_boiler_temp": "47"},
+    )
+    model = local["model"]
+    model += local["boiler_st"][start_index] == 1
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    required = 0.1 + 1.1 * (200 * 4.2 + 100 * 0.5) * (50 - (47 - 0.5 * start_index / 4)) / (3600 * 4)
+    expected = [0] * start_index + [power / 4000] * full + [tail]
+    expected += [0] * (local["U"] - len(expected))
+    assert_boiler_output(local, start_index=start_index, required_kwh=required, expected=expected)
+    assert sum(var.x for var in local["h_hp"]) == pytest.approx(4)
+
+
+@pytest.mark.parametrize("interval,energy", [(10, 0), (11, 0.001)], ids=["underfill", "extra-tail"])
+def test_boiler_underfill_and_extra_tail_are_infeasible(power_hp_model, interval, energy):
+    """Missing tail energy or energy after completion must contradict the selected cycle."""
+    local = power_hp_model(
+        prices=[0.10] * 3, heat_kwh=4, minimum_hours=1, adjustment="power",
+        boiler={"elec. power": 300},
+    )
+    model = local["model"]
+    model += local["boiler_st"][0] == 1
+    model += local["c_b"][interval] == energy
+    assert model.optimize() == mip.OptimizationStatus.INFEASIBLE
+    assert model.num_solutions == 0
+    assert local["ha_writes"] == []
+
+
+@pytest.mark.parametrize("prices,power,volume,temp,cooling,start_index,expected", [
+    pytest.param([0.10] * 3, 1000, 200, 47, 0.5, 10,
+                 [0] * 10 + [0.25, 0.1389409722222222], id="last-complete-start"),
+    pytest.param([0.10] * 3, 300, 237.44588744588742, 40, 0, 0,
+                 [0.075] * 12, id="exact-horizon-end"),
+])
+def test_boiler_start_at_last_complete_boundary_is_allowed(
+    power_hp_model, prices, power, volume, temp, cooling, start_index, expected,
+):
+    """Requiring one extra nominal slot incorrectly excludes the final complete cycle."""
+    local = power_hp_model(
+        prices=prices, heat_kwh=4, minimum_hours=1, adjustment="power",
+        boiler={"elec. power": power, "volume": volume, "cooling rate": cooling},
+        boiler_states={"sensor.synthetic_boiler_temp": str(temp)},
+    )
+    model = local["model"]
+    model += local["boiler_st"][start_index] == 1
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    # The exact-end tank has 1152 kJ/K: 0.1 + 1152 * 10 / (3600 * 4) = 0.9 kWh.
+    required = 0.1 + 1.1 * (volume * 4.2 + 100 * 0.5) * (50 - (temp - cooling * start_index / 4)) / (3600 * 4)
+    assert_boiler_output(local, start_index=start_index, required_kwh=required, expected=expected)
+    assert local["boiler_int"] <= local["U"]
+
+
+@pytest.mark.parametrize("capture,prices,power,cooling,temp,allowed", [
+    pytest.param({}, [0.10] * 3, 200, 0.5, 40, 50, id="too-long"),
+    pytest.param({}, [0.10] * 3, 200, 0, 40, 50, id="zero-cooling-too-long"),
+    pytest.param({"start": ts(minute=7) + 30}, [0.10] * 3, 270, 0.5, 40, 50,
+                 id="partial-first-shortfall"),
+    pytest.param({}, [0.10] * 3, 300, 0.5, 47, 46, id="only-premature-starts-fit"),
+], indirect=["capture"])
+def test_boiler_without_complete_cycle_is_rejected(
+    power_hp_model, monkeypatch, prices, power, cooling, temp, allowed,
+):
+    """An active request cannot be silently dropped or solved with a clipped cycle."""
+    def forbidden(*args, **kwargs):
+        pytest.fail("incomplete boiler cycle reached solve/cost publication")
+
+    monkeypatch.setattr(mip.Model, "optimize", forbidden)
+    monkeypatch.setattr(da, "bind_day_ahead_cost", forbidden)
+    with pytest.raises(da.OptimizationInputError, match="^boiler_cycle_exceeds_horizon$"):
+        power_hp_model(
+            prices=prices, heat_kwh=4, minimum_hours=1, adjustment="power",
+            boiler={"elec. power": power, "cooling rate": cooling, "heating allowed below": allowed},
+            boiler_states={"sensor.synthetic_boiler_temp": str(temp)},
+        )
+
+
+@pytest.mark.parametrize("boiler,states", [
+    pytest.param(None, {}, id="absent"),
+    pytest.param(False, {}, id="disabled"),
+    pytest.param({"entity boiler enabled": "input_boolean.synthetic_boiler_enabled"},
+                 {"input_boolean.synthetic_boiler_enabled": "off"}, id="switched-off"),
+    pytest.param({}, {"sensor.synthetic_boiler_temp": "55"}, id="no-heat"),
+    pytest.param({"cooling rate": 0}, {"sensor.synthetic_boiler_temp": "50"},
+                 id="zero-cooling-no-heat"),
+])
+def test_boiler_disabled_and_no_heat_bind_zero(power_hp_model, boiler, states):
+    """Inactive boiler flags and energy must all be zero, not unused free columns."""
+    local = power_hp_model(
+        prices=[0.10] * 3, heat_kwh=4, minimum_hours=1, adjustment="power",
+        boiler=boiler, boiler_states=states,
+    )
+    model = local["model"]
+    for name in ("boiler_st", "boiler_on", "c_b"):
+        forced = model.add_constr(mip.xsum(local[name]) >= 0.001)
+        assert model.optimize() == mip.OptimizationStatus.INFEASIBLE
+        model.remove(forced)
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    for name in ("boiler_st", "boiler_on", "c_b"):
+        assert [var.x for var in local[name]] == [0] * local["U"]
+    assert local["ha_writes"] == []
+
+
+@pytest.mark.parametrize("cooling", [0, 0.5])
+def test_boiler_instant_start_keeps_only_start_zero(power_hp_model, cooling):
+    """Instant-start cannot be delayed by a cheaper later interval, even without cooling."""
+    local = power_hp_model(
+        prices=[0.60, 0.10, 0.20, 0.30], heat_kwh=4, minimum_hours=1, adjustment="power",
+        boiler={"entity instant start": "input_boolean.synthetic_boiler_instant", "cooling rate": cooling},
+        boiler_states={"sensor.synthetic_boiler_temp": "47", "input_boolean.synthetic_boiler_instant": "on"},
+    )
+    model = local["model"]
+    forced = model.add_constr(local["boiler_st"][4] == 1)
+    assert model.optimize() == mip.OptimizationStatus.INFEASIBLE
+    model.remove(forced)
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    required = 0.1 + 1.1 * (200 * 4.2 + 100 * 0.5) * 3 / (3600 * 4)
+    assert_boiler_output(local, start_index=0, required_kwh=required,
+                         expected=[0.25, 0.05395833333333333] + [0] * 14)
+
+
+def test_boiler_zero_cooling_keeps_temperature_window_unlimited(power_hp_model):
+    """With heat allowed but no cooling, no elapsed-time boundary may forbid a later start."""
+    local = power_hp_model(
+        prices=[0.60, 0.20, 0.10, 0.30], heat_kwh=4, minimum_hours=1, adjustment="power",
+        boiler={"cooling rate": 0}, boiler_states={"sensor.synthetic_boiler_temp": "47"},
+    )
+    assert local["boiler_start"] == 8  # First of the equally cheap, fully fitting starts.
+    model = local["model"]
+    model += local["boiler_st"][8] == 1
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    required = 0.1 + 1.1 * (200 * 4.2 + 100 * 0.5) * 3 / (3600 * 4)
+    assert_boiler_output(local, start_index=8, required_kwh=required,
+                         expected=[0] * 8 + [0.25, 0.05395833333333333] + [0] * 6)
+
+
+@pytest.mark.parametrize("capture,prices,power,expected", [
+    pytest.param({"start": ts(minute=7) + 30}, [0.10] * 3, 300,
+                 [0.0375] + [0.075] * 9 + [0.0673611111111111, 0], id="partial-quarter"),
+    pytest.param({"hourly": True, "start": ts(minute=30)}, [0.10] * 8, 125,
+                 [0.0625] + [0.125] * 5 + [0.0923611111111111, 0], id="partial-hour"),
+], indirect=["capture"])
+def test_boiler_partial_first_interval_keeps_partial_tail(power_hp_model, prices, power, expected):
+    """Actual first-slot capacity and a partial tail must survive producer binding."""
+    local = power_hp_model(
+        prices=prices, heat_kwh=4, minimum_hours=1, adjustment="power",
+        boiler={"elec. power": power},
+    )
+    model = local["model"]
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    model.check_optimization_results()
+    required = 0.1 + 1.1 * (200 * 4.2 + 100 * 0.5) * 10 / (3600 * 4)
+    assert_boiler_output(local, start_index=0, required_kwh=required, expected=expected)
 
 
 @pytest.mark.parametrize("capture,heat,runtime,cost", [
