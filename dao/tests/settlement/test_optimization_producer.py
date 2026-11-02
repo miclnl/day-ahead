@@ -788,16 +788,24 @@ def test_cell_direction_audit_rejects_native_model_check_failure(monkeypatch):
 
 
 @pytest.mark.parametrize("financial", [False, True])
-@pytest.mark.parametrize("fault", ["off_charge", "off_discharge", "negative", "nonfinite", "wrong_y", "fractional_y"])
+@pytest.mark.parametrize("fault", ["off_charge", "off_discharge", "negative", "nonfinite", "wrong_y", "fractional_y", "valid"])
 def test_final_cell_direction_audit_precedes_every_consumer(capture, snapshot, bonus_rules, monkeypatch, financial, fault):
-    """Even a tiny disabled-direction value must fail before arrays or an accepted debug selection."""
+    """Capture accepts audited directions only; rejection must preserve the previous debug selection."""
     model, local = capture["model"], capture["locals"]
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    previous_solution, previous_terms = object(), object()
+    instance._debug_finalized_solution = previous_solution
+    instance._debug_financial_terms = previous_terms
     namespace = new_route_cost_namespace(capture, snapshot, bonus_rules) if financial else {**da.__dict__, **local}
-    exec(pre_strategy_cost_binding(), namespace)
     for key in ("dc_to_bat", "dc_from_bat"):
         for row in local[key]:
             for var in row:
+                if fault == "valid":
+                    # Fix the control fixture before binding; equality-only CBC readback can have tiny residuals.
+                    var.ub = 0
                 model += var == 0
+    exec(pre_strategy_cost_binding(), namespace)
     y = local["cell_charge_on"][0][0]
     model += y == (1 if fault == "off_discharge" else 0)
     model.verbose = 0
@@ -806,6 +814,8 @@ def test_final_cell_direction_audit_precedes_every_consumer(capture, snapshot, b
     audit = da._audit_battery_cell_direction
 
     def inspect_direction(*args, **kwargs):
+        if fault == "valid":
+            return audit(*args, **kwargs)
         if fault in ("off_charge", "negative", "nonfinite"):
             var = local["dc_to_bat"][0][0]
             value = {"off_charge": 1e-12, "negative": -1e-12, "nonfinite": float("nan")}[fault]
@@ -818,7 +828,16 @@ def test_final_cell_direction_audit_precedes_every_consumer(capture, snapshot, b
 
     namespace.update(_audit_battery_cell_direction=inspect_direction, native={"cbc_log": ""})
     monkeypatch.setattr(model, "optimize", lambda: pytest.fail("Direction audit must not solve"))
-    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+    if fault == "valid":
         exec(post_strategy_consumers(), namespace)
-    assert not {"accu_in_sum", "org_l", "org_t", "financial_audit"} & namespace.keys()
-    assert not getattr(capture["instance"], "_debug_finalized_solution", None)
+        assert (namespace["finalized_solution"] is not None) == financial
+    else:
+        with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+            exec(post_strategy_consumers(), namespace)
+        assert not {"accu_in_sum", "org_l", "org_t", "financial_audit"} & namespace.keys()
+    if fault == "valid" and financial:
+        assert instance._debug_finalized_solution is namespace["finalized_solution"]
+        assert instance._debug_financial_terms is namespace["financial_terms"]
+    else:
+        assert instance._debug_finalized_solution is previous_solution
+        assert instance._debug_financial_terms is previous_terms
