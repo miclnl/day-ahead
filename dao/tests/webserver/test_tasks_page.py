@@ -14,6 +14,8 @@ resolves ``min-height:auto`` to 0.
 """
 
 import re
+from html.parser import HTMLParser
+from pathlib import Path
 
 import pytest
 
@@ -21,7 +23,7 @@ from dao.prog import task_state
 from dao.prog import tasks as task_registry
 from dao.webserver.app.v2 import routes as v2_routes
 
-from .conftest import INGRESS, SUPERVISOR
+from .conftest import INGRESS, SUPERVISOR, csrf_token
 
 STYLESHEET = "dao/webserver/assets/main.scss"
 TASKS_TEMPLATE = "dao/webserver/app/templates/v2/tasks.html"
@@ -150,6 +152,59 @@ class TestLayout:
 
 
 class TestCancel:
+    def test_cancel_one_run_leaves_other_tasks_running(self, client):
+        task_state.claim("prices", "scheduler")
+        other = task_state.running_tasks()["prices"]
+        shown = task_state.claim("meteo", "scheduler")
+        fields = _cancel_form(client)
+        assert fields["task_key"] == "meteo"
+        assert fields["run_id"] == shown.run_id
+        response = client.post(
+            "/v2/task-cancel", data=fields, headers=INGRESS, environ_base=SUPERVISOR
+        )
+        assert response.status_code == 200
+        running = task_state.running_tasks()
+        assert running["meteo"]["run_id"] == shown.run_id
+        assert running["meteo"]["cancel"] is True
+        assert running["prices"] == other
+
+    def test_stale_cancel_form_cannot_cancel_replacement_run(self, client):
+        old = task_state.claim("meteo", "scheduler")
+        fields = _cancel_form(client)
+        task_state.release(old, "done")
+        replacement = task_state.claim("meteo", "scheduler")
+        before = Path(task_state.STATE_PATH).read_bytes()
+        response = client.post(
+            "/v2/task-cancel", data=fields, headers=INGRESS, environ_base=SUPERVISOR
+        )
+        assert response.status_code == 409
+        assert replacement.run_id != fields["run_id"]
+        assert Path(task_state.STATE_PATH).read_bytes() == before
+
+    def test_cancel_form_cannot_target_another_task_with_the_shown_run_id(self, client):
+        task_state.claim("prices", "scheduler")
+        task_state.claim("meteo", "scheduler")
+        fields = _cancel_form(client)
+        fields["task_key"] = "prices"
+        before = Path(task_state.STATE_PATH).read_bytes()
+        response = client.post(
+            "/v2/task-cancel", data=fields, headers=INGRESS, environ_base=SUPERVISOR
+        )
+        assert response.status_code == 409
+        assert Path(task_state.STATE_PATH).read_bytes() == before
+
+    @pytest.mark.parametrize("missing", ["task_key", "run_id"])
+    def test_cancel_requires_both_displayed_identity_fields(self, client, missing):
+        task_state.claim("meteo", "scheduler")
+        fields = _cancel_form(client)
+        fields.pop(missing)
+        before = Path(task_state.STATE_PATH).read_bytes()
+        response = client.post(
+            "/v2/task-cancel", data=fields, headers=INGRESS, environ_base=SUPERVISOR
+        )
+        assert response.status_code == 400
+        assert Path(task_state.STATE_PATH).read_bytes() == before
+
     def test_cancel_returns_a_fragment_not_the_whole_page(self, client):
         """It rendered ``tasks.html`` into the output pane.
 
@@ -157,10 +212,15 @@ class TestCancel:
         ``id="status-target"`` and a second cancel button -- into the small
         pane the output was supposed to use.
         """
-        task_state.claim("calc_optimum", source="dashboard")
+        claim = task_state.claim("calc_optimum", source="dashboard")
 
-        response = client.get(
-            "/v2/task-cancel", headers=INGRESS, environ_base=SUPERVISOR
+        response = client.post(
+            "/v2/task-cancel",
+            data={
+                "task_key": "calc_optimum", "run_id": claim.run_id,
+                "csrf_token": csrf_token(client, "/v2/tasks"),
+            },
+            headers=INGRESS, environ_base=SUPERVISOR,
         )
 
         assert response.status_code == 200
@@ -178,11 +238,11 @@ class TestCancel:
         assert "run-cancel" not in page
         assert "<script" not in _rendered_fragment(client)
 
-        task_state.claim("calc_optimum", source="dashboard")
+        claim = task_state.claim("calc_optimum", source="dashboard")
         running = _rendered_fragment(client)
         assert "task-cancel" in running, "a running task offers no way to stop it"
 
-        task_state.release("calc_optimum", "done")
+        task_state.release(claim, "done")
         finished = _rendered_fragment(client)
         assert "task-cancel" not in finished, "nothing is running to cancel"
 
@@ -191,3 +251,28 @@ def _rendered_fragment(client) -> str:
     response = client.get("/v2/task-state", headers=INGRESS, environ_base=SUPERVISOR)
     assert response.status_code == 200
     return response.data.decode()
+
+
+def _cancel_form(client):
+    class CancelForm(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.form = None
+            self.fields = {}
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "form" and attrs.get("action", "").endswith("/task-cancel"):
+                self.form = attrs
+            if tag == "input" and self.form is not None:
+                self.fields[attrs.get("name")] = attrs.get("value", "")
+
+    parser = CancelForm()
+    parser.feed(_rendered_fragment(client))
+    assert parser.form is not None, "the shown run needs its own cancel form"
+    assert parser.form["action"] == INGRESS["X-Ingress-Path"] + "/v2/task-cancel"
+    assert parser.form["method"].lower() == "post"
+    assert parser.form["hx-post"] == parser.form["action"]
+    assert parser.form["hx-target"] == "#status-target"
+    assert parser.fields["csrf_token"]
+    return parser.fields

@@ -143,7 +143,7 @@ class DaScheduler(DaBase):
         return os.path.join("../data/log", max(names))
 
     def run_task_process(
-        self, key_task: str, parameters: dict | None = None
+        self, claim: task_state.TaskClaim, parameters: dict | None = None
     ) -> tuple[str, int | None, str | None]:
         """Run the task and report (status, returncode, logfile).
 
@@ -151,6 +151,7 @@ class DaScheduler(DaBase):
         from start to finish, so there is one place responsible for
         releasing it however the run ends.
         """
+        key_task = claim.task_key
         run_task = self.tasks[key_task]
         cmd = task_registry.build_cmd(key_task, parameters) or list(run_task["cmd"])
         # Pin CWD to the prog directory: the calc and forecast tasks use
@@ -176,7 +177,7 @@ class DaScheduler(DaBase):
                 found = self._newest_log_for(key_task)
                 if found is not None and found != before:
                     logfile = found
-            entry = task_state.heartbeat(key_task, logfile=logfile)
+            entry = task_state.heartbeat(claim, logfile=logfile)
             if entry.get("cancel"):
                 logging.warning(f"Taak {key_task} wordt afgebroken op verzoek")
                 task_registry.kill_process_group(proc)
@@ -214,9 +215,9 @@ class DaScheduler(DaBase):
                 f"(gestart door {holder.get('source', 'onbekend')})"
             )
             return
-        self._run_claimed(key_task)
+        self._run_claimed(granted)
 
-    def _run_claimed(self, key_task: str, parameters: dict | None = None) -> None:
+    def _run_claimed(self, claim: task_state.TaskClaim, parameters: dict | None = None) -> None:
         """Run a task whose claim this process already holds, and release it.
 
         Shared by the cron path (_run_exclusive, which just claimed) and the
@@ -225,14 +226,14 @@ class DaScheduler(DaBase):
         """
         try:
             status, returncode, logfile = self.run_task_process(
-                key_task, parameters
+                claim, parameters
             )
         except Exception:  # noqa: BLE001 - the scheduler must keep running
-            logging.exception(f"Taak {key_task} is mislukt")
-            task_state.release(key_task, "error")
+            logging.exception(f"Taak {claim.task_key} is mislukt")
+            task_state.release(claim, "error")
         else:
             task_state.release(
-                key_task, status, returncode=returncode, logfile=logfile
+                claim, status, returncode=returncode, logfile=logfile
             )
 
     # -- requests from the dashboards ---------------------------------------
@@ -254,14 +255,15 @@ class DaScheduler(DaBase):
         """
         task_state.expire_overdue_pending()
         self._note_alive()
-        for key_task in task_state.pending_requests():
+        for key_task, pending in task_state.pending_requests().items():
+            claim = task_state.TaskClaim(key_task, pending.get("run_id", ""))
             if key_task not in self.tasks:
                 logging.error(
                     f"Aanvraag voor onbekende taak {key_task!r}, overgeslagen"
                 )
-                task_state.release(key_task, "error")
+                task_state.release(claim, "error")
                 continue
-            entry = task_state.take_pending(key_task)
+            entry = task_state.take_pending(claim)
             if entry is None:
                 continue  # another poll got there first
             logging.info(
@@ -270,8 +272,8 @@ class DaScheduler(DaBase):
             )
             self.scheduler.add_job(
                 self._run_claimed,
-                args=[key_task, entry.get("parameters") or {}],
-                id=f"request-{key_task}-{int(time.time() * 1000)}",
+                args=[claim, entry.get("parameters") or {}],
+                id=f"request-{key_task}-{claim.run_id}",
                 misfire_grace_time=None,
             )
 

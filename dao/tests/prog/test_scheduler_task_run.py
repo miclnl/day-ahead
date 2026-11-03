@@ -15,9 +15,12 @@ These tests cover the run itself: process group isolation, cancellation,
 claim release on every path, and discovering the log file the task writes.
 """
 
+import json
 import os
 import signal
 import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -82,9 +85,9 @@ class TestProcessIsolation:
             return FakeProc(cmd, **kwargs)
 
         monkeypatch.setattr(da_scheduler, "Popen", fake_popen)
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        instance.run_task_process("meteo")
+        instance.run_task_process(claim)
 
         assert captured.get("start_new_session") is True
 
@@ -98,9 +101,9 @@ class TestProcessIsolation:
             return FakeProc(cmd, **kwargs)
 
         monkeypatch.setattr(da_scheduler, "Popen", fake_popen)
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        instance.run_task_process("meteo")
+        instance.run_task_process(claim)
 
         assert captured["cwd"] == DaScheduler.PROG_DIR
 
@@ -115,19 +118,47 @@ class TestParameters:
             return FakeProc(cmd, **kwargs)
 
         monkeypatch.setattr(da_scheduler, "Popen", fake_popen)
-        task_state.claim("fast_control_simulate", "dashboard")
+        claim = task_state.claim("fast_control_simulate", "dashboard")
 
-        instance.run_task_process("fast_control_simulate", {"days": "21"})
+        instance.run_task_process(claim, {"days": "21"})
 
         assert captured["cmd"][-2:] == ["--days", "21"]
 
 
 class TestOutcome:
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_old_runner_cannot_update_or_release_a_replacement(self, instance, monkeypatch, raises):
+        old = task_state.claim("meteo", "scheduler")
+        replacement_bytes = []
+        killed = []
+
+        def replace_during_spawn(cmd, **kwargs):
+            path = Path(task_state.STATE_PATH)
+            state = json.loads(path.read_text())
+            state["running"]["meteo"]["heartbeat"] = time.time() - task_state.STALE_AFTER_S - 1
+            path.write_text(json.dumps(state))
+            new = task_state.claim("meteo", "dashboard")
+            task_state.request_cancel(new)
+            replacement_bytes.append(path.read_bytes())
+            if raises:
+                raise OSError("synthetic spawn failure after replacement")
+            return FakeProc()
+
+        monkeypatch.setattr(da_scheduler, "Popen", replace_during_spawn)
+        monkeypatch.setattr(da_scheduler.task_registry, "kill_process_group", killed.append)
+
+        instance._run_claimed(old)
+
+        assert replacement_bytes
+        assert Path(task_state.STATE_PATH).read_bytes() == replacement_bytes[0]
+        assert killed == []
+        assert task_state.last_result("meteo") == {}
+
     def test_a_clean_run_reports_done(self, instance, monkeypatch):
         monkeypatch.setattr(da_scheduler, "Popen", lambda cmd, **kw: FakeProc())
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        status, returncode, _logfile = instance.run_task_process("meteo")
+        status, returncode, _logfile = instance.run_task_process(claim)
 
         assert (status, returncode) == ("done", 0)
 
@@ -135,17 +166,17 @@ class TestOutcome:
         proc = FakeProc()
         proc.returncode = 2
         monkeypatch.setattr(da_scheduler, "Popen", lambda cmd, **kw: proc)
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        status, returncode, _logfile = instance.run_task_process("meteo")
+        status, returncode, _logfile = instance.run_task_process(claim)
 
         assert (status, returncode) == ("error", 2)
 
     def test_the_claim_is_released_on_success(self, instance, monkeypatch):
         monkeypatch.setattr(da_scheduler, "Popen", lambda cmd, **kw: FakeProc())
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        instance._run_claimed("meteo")
+        instance._run_claimed(claim)
 
         assert task_state.is_running("meteo") is False
         assert task_state.last_result("meteo")["status"] == "done"
@@ -158,9 +189,9 @@ class TestOutcome:
             raise OSError("cannot spawn")
 
         monkeypatch.setattr(da_scheduler, "Popen", boom)
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        instance._run_claimed("meteo")
+        instance._run_claimed(claim)
 
         assert task_state.is_running("meteo") is False
         assert task_state.last_result("meteo")["status"] == "error"
@@ -176,10 +207,10 @@ class TestCancel:
         )
         monkeypatch.setattr(os, "getpgid", lambda pid: pid)
 
-        task_state.claim("meteo", "dashboard")
-        task_state.request_cancel("meteo")
+        claim = task_state.claim("meteo", "dashboard")
+        task_state.request_cancel(claim)
 
-        status, _returncode, _logfile = instance.run_task_process("meteo")
+        status, _returncode, _logfile = instance.run_task_process(claim)
 
         assert killed == {"pgid": proc.pid, "sig": signal.SIGKILL}
         assert status == "cancelled"
@@ -196,9 +227,9 @@ class TestLogFileDiscovery:
             return FakeProc(cmd, **kwargs)
 
         monkeypatch.setattr(da_scheduler, "Popen", popen_that_writes)
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        _status, _returncode, logfile = instance.run_task_process("meteo")
+        _status, _returncode, logfile = instance.run_task_process(claim)
 
         assert logfile == "../data/log/meteo_2026-09-29__12:00:00.log"
 
@@ -213,9 +244,9 @@ class TestLogFileDiscovery:
             return FakeProc(cmd, **kwargs)
 
         monkeypatch.setattr(da_scheduler, "Popen", popen_that_writes)
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        _status, _returncode, logfile = instance.run_task_process("meteo")
+        _status, _returncode, logfile = instance.run_task_process(claim)
 
         assert logfile is None
 
@@ -227,30 +258,55 @@ class TestLogFileDiscovery:
             os.path.join(instance.log_dir, "meteo_2026-09-28__08:00:00.log"), "w"
         ).close()
         monkeypatch.setattr(da_scheduler, "Popen", lambda cmd, **kw: FakeProc())
-        task_state.claim("meteo", "scheduler")
+        claim = task_state.claim("meteo", "scheduler")
 
-        _status, _returncode, logfile = instance.run_task_process("meteo")
+        _status, _returncode, logfile = instance.run_task_process(claim)
 
         assert logfile is None
 
 
 class TestPickUpRequests:
+    @pytest.mark.parametrize("key", ["meteo", "no_such_task"])
+    def test_stale_pending_snapshot_cannot_take_or_release_replacement(self, instance, monkeypatch, key):
+        old = task_state.request(key, "dashboard")
+        pending_requests = task_state.pending_requests
+        replacement_bytes = []
+        jobs = []
+
+        def replace_after_snapshot():
+            snapshot = pending_requests()
+            task_state.release(old, "done")
+            task_state.request(key, "api")
+            replacement_bytes.append(Path(task_state.STATE_PATH).read_bytes())
+            return snapshot
+
+        monkeypatch.setattr(task_state, "pending_requests", replace_after_snapshot)
+        instance.scheduler = type(
+            "S", (), {"add_job": lambda self, *args, **kw: jobs.append((args, kw))}
+        )()
+
+        instance._pick_up_requests()
+
+        assert replacement_bytes
+        assert Path(task_state.STATE_PATH).read_bytes() == replacement_bytes[0]
+        assert jobs == []
+
     def test_a_pending_request_is_taken_and_run(self, instance, monkeypatch):
         ran = []
         monkeypatch.setattr(
             instance,
             "_run_claimed",
-            lambda key, parameters=None: ran.append((key, parameters)),
+            lambda claim, parameters=None: ran.append((claim, parameters)),
         )
         # add_job normally hands it to the thread pool; run it straight away.
         instance.scheduler = type(
             "S", (), {"add_job": lambda self, fn, args=(), **kw: fn(*args)}
         )()
 
-        task_state.request("meteo", source="dashboard", parameters={"x": "1"})
+        claim = task_state.request("meteo", source="dashboard", parameters={"x": "1"})
         instance._pick_up_requests()
 
-        assert ran == [("meteo", {"x": "1"})]
+        assert ran == [(claim, {"x": "1"})]
 
     def test_taking_it_flips_the_state_so_a_second_poll_skips_it(
         self, instance, monkeypatch

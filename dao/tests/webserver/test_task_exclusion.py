@@ -130,14 +130,60 @@ class TestV2Dashboard:
         assert task_state.running_tasks() == {}
 
     def test_cancel_flags_the_running_task(self, client):
-        task_state.claim("calc_optimum", source="dashboard")
+        claim = task_state.claim("calc_optimum", source="dashboard")
 
-        response = client.get(
-            "/v2/task-cancel", headers=INGRESS, environ_base=SUPERVISOR
+        response = client.post(
+            "/v2/task-cancel",
+            data={
+                "task_key": "calc_optimum",
+                "run_id": claim.run_id,
+                "csrf_token": csrf_token(client, "/v2/tasks"),
+            },
+            headers=INGRESS, environ_base=SUPERVISOR,
         )
 
         assert response.status_code == 200
-        assert task_state.cancel_requested("calc_optimum") is True
+        assert task_state.running_tasks()["calc_optimum"]["cancel"] is True
+
+    @pytest.mark.parametrize("with_identity", [False, True])
+    def test_cancel_get_does_not_mutate_any_run(self, client, with_identity):
+        claim = task_state.claim("meteo", "scheduler")
+        task_state.claim("prices", "scheduler")
+        before = Path(task_state.STATE_PATH).read_bytes()
+        response = client.get(
+            "/v2/task-cancel",
+            query_string={"task_key": "meteo", "run_id": claim.run_id} if with_identity else {},
+            headers=INGRESS, environ_base=SUPERVISOR,
+        )
+        assert Path(task_state.STATE_PATH).read_bytes() == before
+        assert response.status_code == 405
+
+    @pytest.mark.parametrize("token", [None, "incorrect-csrf"])
+    def test_cancel_requires_correct_csrf(self, client, token):
+        claim = task_state.claim("meteo", "scheduler")
+        assert csrf_token(client, "/v2/task-state")  # Establish the real form/session first.
+        data = {"task_key": "meteo", "run_id": claim.run_id}
+        if token is not None:
+            data["csrf_token"] = token
+        before = Path(task_state.STATE_PATH).read_bytes()
+        response = client.post(
+            "/v2/task-cancel", data=data, headers=INGRESS, environ_base=SUPERVISOR
+        )
+        assert response.status_code == 400
+        assert Path(task_state.STATE_PATH).read_bytes() == before
+
+    def test_cancel_keeps_ingress_protection(self, client):
+        claim = task_state.claim("meteo", "scheduler")
+        before = Path(task_state.STATE_PATH).read_bytes()
+        response = client.post(
+            "/v2/task-cancel",
+            data={
+                "task_key": "meteo", "run_id": claim.run_id,
+                "csrf_token": csrf_token(client, "/v2/task-state"),
+            },
+        )
+        assert response.status_code == 401
+        assert Path(task_state.STATE_PATH).read_bytes() == before
 
 
 class TestV2Api:
@@ -152,6 +198,7 @@ class TestV2Api:
         pending = task_state.pending_requests()
         assert pending.keys() == {task}
         entry = pending[task]
+        assert isinstance(entry["run_id"], str) and entry["run_id"]
         assert entry["state"] == "pending"
         assert entry["source"] == "api"
         assert entry["parameters"] == {}

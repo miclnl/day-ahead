@@ -449,7 +449,7 @@ class TestTaskParameters:
         assert backend_calls == ([] if config_zone else [v2_routes.app_datapath + "options.json"])
         # Requesting must not execute the fetch; the scheduler owns that work.
         assert provider_calls == [] and db.saved == []
-        pending = task_state.take_pending("prices")
+        pending = task_state.take_pending(task_state.TaskClaim("prices", entry["run_id"]))
         cmd = task_registry.build_cmd("prices", pending["parameters"])
         assert cmd == ["python3", "../prog/day_ahead.py", "prices", day]
         monkeypatch.setattr(sys, "argv", cmd[1:])

@@ -13,9 +13,13 @@
     </span>
     {% endif %}
     {% if cancellable %}
-    <a class="btn btn-sm btn-outline-danger ms-auto"
-       href="{{url_for('v2.task_cancel')}}" hx-boost="false"
-       hx-get="{{url_for('v2.task_cancel')}}" hx-target="#status-target">Afbreken</a>
+    <form class="ms-auto" method="post" action="{{url_for('v2.task_cancel')}}"
+          hx-boost="false" hx-post="{{url_for('v2.task_cancel')}}" hx-target="#status-target">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="task_key" value="{{ task_key }}">
+        <input type="hidden" name="run_id" value="{{ run_id }}">
+        <button type="submit" class="btn btn-sm btn-outline-danger">Afbreken</button>
+    </form>
     {% endif %}
 </div>
 

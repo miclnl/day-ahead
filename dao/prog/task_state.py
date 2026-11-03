@@ -44,7 +44,9 @@ import logging
 import os
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Optional
+from uuid import uuid4
 
 #: Both paths are relative to the working directory every entry point uses
 #: (dao/prog for the scheduler and the task subprocesses, dao/webserver for
@@ -70,7 +72,28 @@ PENDING_TIMEOUT_S = 60
 #: say "the planner is not running" instead of letting a request sit there.
 SCHEDULER_SEEN_KEY = "scheduler_seen"
 
-_EMPTY: dict[str, Any] = {"running": {}, "last": {}, "last_update": 0.0}
+
+@dataclass(frozen=True)
+class TaskClaim:
+    """Identity of one claim, retained by its runner until release."""
+
+    task_key: str
+    run_id: str
+
+
+def _empty_state() -> dict[str, Any]:
+    # Never share nested mappings between independent state files.
+    return {"running": {}, "last": {}, "last_update": 0.0}
+
+
+def _matching_entry(state: dict[str, Any], claim: TaskClaim) -> Optional[dict[str, Any]]:
+    """Match both identity fields; mutation callers hold the sidecar lock."""
+    if not isinstance(claim, TaskClaim) or not claim.run_id:
+        return None
+    entry = state["running"].get(claim.task_key)
+    if entry is None or entry.get("run_id") != claim.run_id:
+        return None
+    return entry
 
 
 @contextmanager
@@ -93,19 +116,19 @@ def _read_raw() -> dict[str, Any]:
         with open(STATE_PATH, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except FileNotFoundError:
-        return dict(_EMPTY)
+        return _empty_state()
     except (json.JSONDecodeError, OSError) as exception:
         logging.warning(f"Taakstatus onleesbaar ({exception}), als leeg behandeld")
-        return dict(_EMPTY)
+        return _empty_state()
     if not isinstance(data, dict):
-        return dict(_EMPTY)
+        return _empty_state()
     if "running" not in data:
         # A state file from before this module: a single flat record of the
         # one task the dashboard was tracking. There is no reliable way to
         # know whether that task is still alive, and the old writers are
         # gone, so start clean rather than import a claim nobody will
         # release.
-        return dict(_EMPTY)
+        return _empty_state()
     running = data.get("running")
     last = data.get("last")
     result = {
@@ -188,12 +211,13 @@ def claim(
     pid: Optional[int] = None,
     state_name: str = "running",
     parameters: Optional[dict[str, Any]] = None,
-) -> bool:
+) -> TaskClaim | None:
     """Register *task_key* as claimed, unless it already is.
 
-    Returns True when the caller may start the task and is now responsible
+    Returns its identity when the caller may start the task and is responsible
     for calling :func:`release` (and :func:`heartbeat` while it runs).
-    Returns False when somebody else holds the claim.
+    Returns None when somebody else holds the claim. Updates must use the
+    returned identity, never a fresh lookup by task name.
 
     *source* is recorded purely so a log line or the dashboard can say where
     a run came from ("scheduler", "dashboard", "api").
@@ -207,8 +231,10 @@ def claim(
     with _locked():
         current = _drop_stale(_read_raw(), now)
         if task_key in current["running"]:
-            return False
+            return None
+        granted = TaskClaim(task_key, uuid4().hex)
         current["running"][task_key] = {
+            "run_id": granted.run_id,
             "state": state_name,
             "started": now,
             "heartbeat": now,
@@ -219,14 +245,14 @@ def claim(
             "parameters": parameters or {},
         }
         _write(current)
-    return True
+    return granted
 
 
 def request(
     task_key: str,
     source: str,
     parameters: Optional[dict[str, Any]] = None,
-) -> bool:
+) -> TaskClaim | None:
     """Ask the scheduler to run *task_key*.
 
     The dashboards used to run tasks themselves, in a daemon thread inside a
@@ -237,7 +263,7 @@ def request(
 
     Now they record what should happen and the scheduler process, which is
     long-lived and already owns task execution for the cron schedule, does
-    it. Returns False when the task is already claimed.
+    it. Returns the claim identity, or None when the task is already claimed.
     """
     return claim(task_key, source, state_name="pending", parameters=parameters)
 
@@ -251,8 +277,8 @@ def pending_requests() -> dict[str, Any]:
     }
 
 
-def take_pending(task_key: str) -> Optional[dict[str, Any]]:
-    """Move *task_key* from pending to running and return its entry.
+def take_pending(claim: TaskClaim) -> Optional[dict[str, Any]]:
+    """Move this exact claim from pending to running and return its entry.
 
     Only succeeds for a claim that is still pending, so two scheduler
     threads polling at the same time cannot both start the same request.
@@ -261,7 +287,7 @@ def take_pending(task_key: str) -> Optional[dict[str, Any]]:
     now = time.time()
     with _locked():
         current = _read_raw()
-        entry = current["running"].get(task_key)
+        entry = _matching_entry(current, claim)
         if entry is None or entry.get("state") != "pending":
             return None
         entry["state"] = "running"
@@ -295,6 +321,7 @@ def expire_overdue_pending() -> list[str]:
                 continue
             current["running"].pop(key)
             current["last"][key] = {
+                "run_id": entry.get("run_id"),
                 "status": "error",
                 "returncode": None,
                 "finished": now,
@@ -339,8 +366,8 @@ def scheduler_alive(within_s: float = PENDING_TIMEOUT_S) -> Optional[bool]:
     return (time.time() - seen) <= within_s
 
 
-def heartbeat(task_key: str, logfile: Optional[str] = None) -> dict[str, Any]:
-    """Refresh the claim on *task_key* so it is not mistaken for dead.
+def heartbeat(claim: TaskClaim, logfile: Optional[str] = None) -> dict[str, Any]:
+    """Refresh this exact claim so it is not mistaken for dead.
 
     Returns the task's entry as it is on disk after the update, so a runner
     that is polling anyway can read the cancel flag from the same call
@@ -348,7 +375,7 @@ def heartbeat(task_key: str, logfile: Optional[str] = None) -> dict[str, Any]:
     """
     with _locked():
         state = _read_raw()
-        entry = state["running"].get(task_key)
+        entry = _matching_entry(state, claim)
         if entry is None:
             return {}
         entry["heartbeat"] = time.time()
@@ -359,21 +386,26 @@ def heartbeat(task_key: str, logfile: Optional[str] = None) -> dict[str, Any]:
 
 
 def release(
-    task_key: str,
+    claim: TaskClaim,
     status: str,
     returncode: Optional[int] = None,
     logfile: Optional[str] = None,
 ) -> None:
-    """Give up the claim on *task_key* and record how the run ended.
+    """Give up this exact claim and record how the run ended.
 
     *status* is one of "done", "error" or "cancelled". The outcome is kept
     under "last" so the dashboard can still show the result of a task that
-    is no longer running.
+    is no longer running. A missing or superseded identity is a no-op, not
+    a result for a run the caller does not own.
     """
     with _locked():
         state = _read_raw()
-        entry = state["running"].pop(task_key, {})
-        state["last"][task_key] = {
+        entry = _matching_entry(state, claim)
+        if entry is None:
+            return
+        state["running"].pop(claim.task_key)
+        state["last"][claim.task_key] = {
+            "run_id": claim.run_id,
             "status": status,
             "returncode": returncode,
             "finished": time.time(),
@@ -384,15 +416,15 @@ def release(
         _write(state)
 
 
-def request_cancel(task_key: str) -> bool:
-    """Ask the process running *task_key* to stop.
+def request_cancel(claim: TaskClaim) -> bool:
+    """Ask the runner holding this exact claim to stop.
 
     Only sets a flag; the runner notices it on its next heartbeat and kills
-    its own subprocess. Returns False when the task is not running.
+    its own subprocess. Returns False for a missing or superseded identity.
     """
     with _locked():
         state = _read_raw()
-        entry = state["running"].get(task_key)
+        entry = _matching_entry(state, claim)
         if entry is None:
             return False
         entry["cancel"] = True
@@ -400,8 +432,8 @@ def request_cancel(task_key: str) -> bool:
     return True
 
 
-def cancel_requested(task_key: str) -> bool:
-    entry = running_tasks().get(task_key)
+def cancel_requested(claim: TaskClaim) -> bool:
+    entry = _matching_entry(read(), claim)
     return bool(entry and entry.get("cancel"))
 
 
@@ -427,7 +459,7 @@ def claimed(task_key: str, source: str, logfile: Optional[str] = None):
     try:
         yield True
     except BaseException:
-        release(task_key, "error")
+        release(granted, "error")
         raise
     else:
-        release(task_key, "done")
+        release(granted, "done")

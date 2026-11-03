@@ -101,7 +101,8 @@ def test_the_same_task_never_overlaps_itself(monkeypatch, caplog):
     release = threading.Event()
     runs = []
 
-    def slow_task(key_task, parameters=None):
+    def slow_task(claim, parameters=None):
+        key_task = claim.task_key
         runs.append(key_task)
         if key_task == "calc_optimum" and not release.is_set():
             running.set()
@@ -130,7 +131,7 @@ def test_the_same_task_never_overlaps_itself(monkeypatch, caplog):
 def test_a_failing_task_does_not_propagate(monkeypatch, caplog):
     instance = _bare_scheduler(monkeypatch, [])
 
-    def boom(key_task, parameters=None):
+    def boom(claim, parameters=None):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(instance, "run_task_process", boom)
@@ -151,7 +152,7 @@ def test_the_scheduler_claim_is_visible_outside_this_process(monkeypatch):
     running = threading.Event()
     release = threading.Event()
 
-    def slow_task(key_task, parameters=None):
+    def slow_task(claim, parameters=None):
         running.set()
         release.wait(5)
         return "done", 0, None
@@ -163,13 +164,13 @@ def test_the_scheduler_claim_is_visible_outside_this_process(monkeypatch):
     try:
         assert running.wait(5)
         # This is what a dashboard request does before starting a task.
-        assert task_state.claim("calc_optimum", "dashboard") is False
+        assert task_state.claim("calc_optimum", "dashboard") is None
         assert task_state.running_tasks()["calc_optimum"]["source"] == "scheduler"
     finally:
         release.set()
         worker.join(5)
 
-    assert task_state.claim("calc_optimum", "dashboard") is True
+    assert task_state.claim("calc_optimum", "dashboard") is not None
 
 
 def test_a_task_started_elsewhere_makes_the_scheduler_skip(monkeypatch, caplog):
@@ -180,7 +181,7 @@ def test_a_task_started_elsewhere_makes_the_scheduler_skip(monkeypatch, caplog):
     monkeypatch.setattr(
         instance,
         "run_task_process",
-        lambda key, parameters=None: (runs.append(key), ("done", 0, None))[1],
+        lambda claim, parameters=None: (runs.append(claim.task_key), ("done", 0, None))[1],
     )
 
     task_state.claim("calc_optimum", "dashboard")

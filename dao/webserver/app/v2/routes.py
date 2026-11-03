@@ -125,6 +125,7 @@ def get_task_state() -> dict:
             "status": "cancelled" if entry.get("cancel") else "running",
             "running": True,
             "task": key,
+            "run_id": entry.get("run_id"),
             "logfile": entry.get("logfile"),
             "started": entry.get("started"),
             "returncode": None,
@@ -137,6 +138,7 @@ def get_task_state() -> dict:
             "status": entry.get("status", "idle"),
             "running": False,
             "task": key,
+            "run_id": entry.get("run_id"),
             "logfile": entry.get("logfile"),
             "started": entry.get("started"),
             "returncode": entry.get("returncode"),
@@ -145,6 +147,7 @@ def get_task_state() -> dict:
         "status": "idle",
         "running": False,
         "task": None,
+        "run_id": None,
         "logfile": None,
         "started": None,
     }
@@ -267,11 +270,15 @@ def tasks():
     return render_template("v2/tasks.html", groups=task_page_groups())
 
 
-@v2.route("/task-cancel")
+@v2.route("/task-cancel", methods=["POST"])
 def task_cancel():
+    canonical = task_registry.resolve(request.form.get("task_key", ""))
+    run_id = request.form.get("run_id", "").strip()
+    if canonical is None or not run_id:
+        return "Invalid task run", 400
     try:
-        for key in task_state.running_tasks():
-            task_state.request_cancel(key)
+        if not task_state.request_cancel(task_state.TaskClaim(canonical, run_id)):
+            return "Task run is no longer current", 409
     except Exception:
         logging.exception("Afbreken van de taak is mislukt")
         return "Error cancelling task", 500
@@ -433,7 +440,9 @@ def task_state_page():
         # down, so the poll has to carry on; only "running" may be cancelled
         # again.
         polling=current_state["running"],
-        cancellable=status == "running",
+        cancellable=status == "running" and bool(current_state.get("run_id")),
+        task_key=task_key,
+        run_id=current_state.get("run_id"),
         started=started_label,
         seconds_running=seconds_running,
         content=content,
