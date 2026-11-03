@@ -14,10 +14,12 @@ from types import SimpleNamespace
 import mip
 import pandas as pd
 import pytest
+from sqlalchemy import create_engine
 
 import dao.prog.day_ahead as da
 from dao.prog.config.models.base import FlexFloat
 from dao.prog.config.models.devices.battery import BatteryConfig
+from dao.prog.config.models.devices.heating import HeatingEnabled
 from dao.prog.config.models.pricing import PricingConfig
 from dao.prog.config.models.production_bonus import ProductionBonusConfig
 from dao.prog.fastctrl.plan import FinancialBasis
@@ -26,9 +28,9 @@ from dao.prog.settlement.optimization_audit import (
     PlanningSolutionRejected,
     validate_source_solution,
 )
-from dao.prog.settlement.publication import FinancialPlanBlocked
-from dao.prog.settlement.service import PlanningContext
-from dao.prog.settlement.tariffs import quote
+from dao.prog.settlement.publication import FinancialPlanBlocked, make_publication
+from dao.prog.settlement.service import PlanningContext, SettlementService
+from dao.prog.settlement.tariffs import make_snapshot, quote
 from dao.prog.settlement.types import (
     BonusState,
     MonthState,
@@ -70,8 +72,16 @@ def context_for(snapshot, bonus_rules, intervals, *, meter="synthetic-meter", to
 @pytest.fixture
 def capture(monkeypatch, tmp_path, request):
     """No DaBase construction or external reads; every output surface fails hard."""
+    found = {"ha_writes": [], "report_reads": [], "report_constructions": [], "runtime_reads": [],
+             "prepare_calls": [], "gate_horizons": [],
+             "output_bases": [], "ready_publications": []}
+
     def forbidden(*args, **kwargs):
         raise AssertionError("offline producer attempted I/O")
+
+    def ha_write(*args, **kwargs):
+        found["ha_writes"].append((args, kwargs))
+        forbidden()
 
     monkeypatch.setattr(socket.socket, "connect", forbidden)
     monkeypatch.setattr(da, "FAST_PLAN_FILE", str(tmp_path / "fast_plan.json"))
@@ -99,30 +109,168 @@ def capture(monkeypatch, tmp_path, request):
     }) for b, efficiency in enumerate((0.8, 1.0))]
     instance.ev_options, instance.machines, instance.solar = [], [], []
     instance.boiler_options = instance.heating_options = None
+    if settings.get("heating"):
+        instance.heating_options = HeatingEnabled.model_validate({
+            "adjustment": "power", "degree days factor": 1, "min run length": 1,
+            "stages": [{"max_power": 1000, "cop": 4}],
+            "entity hp heat demand": "sensor.synthetic_hp_demand",
+            "entity hp heat produced": "sensor.synthetic_hp_heat",
+        })
+        instance.meteo = SimpleNamespace(calc_graaddagen=lambda **kwargs: 1.0)
+        instance.get_state = lambda entity: SimpleNamespace(
+            state="eco" if entity == "sensor.synthetic_hp_demand" else "0")
     instance.salderen = False
     instance.grid_max_power = 17.0
     instance.production_bonus = ProductionBonusConfig(enabled=False)
     instance.strategy = "minimize cost"
+    instance._solver_threads = 1
     instance.use_calc_baseload = False
     instance.baseload_service = lambda: SimpleNamespace(record_presence=forbidden)
-    instance.get_float = lambda entity, *args: 50.0
+    instance.get_float = lambda entity, *args: 0.0 if entity == "sensor.synthetic_hp_heat" else 50.0
     instance.ha_getter = forbidden
     instance.notify = lambda *args: None  # No notification entity in this fixture.
     for name in ("set_value", "call_service", "turn_on", "turn_off", "set_entity_value",
-                 "set_entity_state", "set_entity_option", "select_option", "save_df", "export_fast_plan"):
+                 "set_entity_state", "set_entity_option", "select_option"):
+        monkeypatch.setattr(instance, name, ha_write)
+    for name in ("save_df", "export_fast_plan"):
         monkeypatch.setattr(instance, name, forbidden)
     start = settings.get("start", ts())
+    monkeypatch.setattr(da.time, "time", lambda: start)
+    if settings.get("solve"):
+        instance.battery_options = []
+        instance._debug_capture_vars = True
+        # _start_dt normally selects debug; exercise the operational output barrier offline.
+        instance._debug_record_start = lambda *args: setattr(instance, "debug", False)
+        instance.baseload_service = lambda: SimpleNamespace(record_presence=lambda: None)
     grid_start = start // instance.interval_s * instance.interval_s
     stamps = [grid_start + instance.interval_s * i for i in range(12)]
     dates = [dt.datetime.fromtimestamp(at) for at in stamps]
     prices = pd.DataFrame({"time": dates, "da_ex": [0.1] * 12,
                            "da_cons": [0.2] * 12, "da_prod": [0.1] * 12, "da_bonus": [0.0] * 12})
     forecast = pd.DataFrame({"time": stamps, "tijd": dates, "glob_rad": [0.0] * 12, "temp": [5.0] * 12})
-    monkeypatch.setattr(da, "Report", lambda *args: SimpleNamespace(get_price_data=lambda *a, **k: prices.copy()))
+    def report_prices(*args, **kwargs):
+        found["report_reads"].append((args, kwargs))
+        return prices.copy()
+
+    def heatpump_run_hours(entity):
+        found["runtime_reads"].append(entity)
+        return 1
+
+    def report(*args):
+        found["report_constructions"].append(args)
+        return SimpleNamespace(get_price_data=report_prices, get_heatpump_run_hours=heatpump_run_hours)
+
+    monkeypatch.setattr(da, "Report", report)
     instance.db_da = SimpleNamespace(get_prognose_data=lambda **kwargs: forecast.copy())
     instance.calc_solar_predictions = lambda *args: pd.DataFrame({"prediction": [0.5] * 12})
-    found = {}
+    engine = None
+    if settings.get("active"):
+        pricing = pricing_config()
+        data = pricing.model_dump()
+        data["production_bonus"] = ProductionBonusConfig(enabled=True, cap_basis="ex_vat", vat_percent="0")
+        data["settlement"]["planning_source_policy"] = POLICY
+        data["settlement"]["contracts"][0]["monthly_export_floor"] = "spot_zero"
+        pricing = PricingConfig.model_validate(data)
+        found["configured_pricing"] = pricing
+        instance.config.prices = pricing
+        snap = make_snapshot(pricing, pricing.settlement.contracts[0])
+        engine = create_engine(f"sqlite:///{tmp_path / 'producer.db'}")
+        repo, publication = make_publication(engine, plan_path=tmp_path / "fast_plan.json",
+                                             pricing=pricing, max_plan_age=600)
+        repo.ensure_schema()
+        for module in ("service", "repository", "publication"):
+            monkeypatch.setattr(f"dao.prog.settlement.{module}.time", lambda: start)
+
+        class Meter:
+            meter_id = pricing.settlement.meter_id
+
+            def __call__(self, lower, upper):
+                return ()  # Unknown history, never invented zero energy.
+
+        def spots(lower, upper):
+            return tuple(SpotInterval(at, at + 3600, D("0.13"), "synthetic-hour", "measured")
+                         for at in range(lower, upper, 3600))
+
+        service = SettlementService(repo, Meter(), spots, (snap,), publication=publication)
+        prepare = service.prepare_planning
+
+        def prepare_planning(lower, upper):
+            found["prepare_calls"].append((lower, upper))
+            context = prepare(lower, upper)
+            if settings.get("misaligned"):
+                # A valid context for a different horizon must not partly bind this model.
+                context = prepare(lower + 60, upper)
+            if settings.get("prefix_contradiction"):
+                # Contradict only prefix knowledge, not quote/grid/batch identity.
+                state = SettlementState(lower, None, None)
+                if settings["prefix_contradiction"] == "bonus":
+                    state = replace(state, bonus=BonusState(ts(hour=0), ts("2028-01-01", 0), lower, D("1")))
+                else:
+                    state = replace(state, month=MonthState(
+                        "synthetic-2027", ts(hour=0), ts("2027-02-01", 0), D("1"), (), True))
+                context = replace(context, state=state)
+            found["context"] = context
+            return context
+
+        monkeypatch.setattr(service, "prepare_planning", prepare_planning)
+        instance._settlement_service = service
+        instance._settlement_repository, instance._settlement_publication = repo, publication
+        found["publication"] = publication
+        if settings.get("service_factory"):
+            del instance._settlement_service
+            instance.db_ha = SimpleNamespace()
+            instance.config.report = None
+            monkeypatch.setattr("dao.prog.settlement.service.HAMeteringAdapter", lambda *args: Meter())
+            monkeypatch.setattr("dao.prog.settlement.service.DatabasePriceAdapter", lambda *args: spots)
+            original_prepare = SettlementService.prepare_planning
+
+            def factory_prepare(service, lower, upper):
+                found["prepare_calls"].append((lower, upper))
+                context = original_prepare(service, lower, upper)
+                found["context"] = context
+                return context
+
+            monkeypatch.setattr(SettlementService, "prepare_planning", factory_prepare)
+            components = instance.settlement_components
+
+            def selected_components(**kwargs):
+                found["components_pricing"] = kwargs.get("pricing")
+                return components(**kwargs)
+
+            monkeypatch.setattr(instance, "settlement_components", selected_components)
+            found["config_price_reads"] = 0
+
+            class CountedConfig(SimpleNamespace):
+                @property
+                def prices(self):
+                    found["config_price_reads"] += 1
+                    return pricing
+
+            instance.config = CountedConfig(**{key: value for key, value in vars(instance.config).items()
+                                               if key != "prices"})
+        def publish(*args, **kwargs):
+            found["ready_publications"].append((args, kwargs))
+            forbidden()
+
+        monkeypatch.setattr(publication, "publish", publish)
+
+    check_gate = instance._check_legacy_financial_gate
+
+    def check_legacy_gate(**kwargs):
+        found["gate_horizons"].append(getattr(instance, "_financial_horizon", None))
+        return check_gate(**kwargs)
+
+    monkeypatch.setattr(instance, "_check_legacy_financial_gate", check_legacy_gate)
+    check_output = instance._check_financial_output
+
+    def check_financial_output(**kwargs):
+        found["output_bases"].append(kwargs["basis"])
+        return check_output(**kwargs)
+
+    monkeypatch.setattr(instance, "_check_financial_output", check_financial_output)
     add_sos = mip.Model.add_sos
+    bind_finance = da.bind_day_ahead_finance
+    bind_cost = da.bind_day_ahead_cost
 
     def record_sos(model, members, sos_type):
         found.setdefault("sos", []).append((model, tuple((var.idx, weight) for var, weight in members), sos_type))
@@ -133,12 +281,17 @@ def capture(monkeypatch, tmp_path, request):
 
     def finance(model, **kwargs):
         found.update(model=model, finance=kwargs, locals=dict(sys._getframe(1).f_locals))
+        if settings.get("active"):
+            found["terms"] = bind_finance(model, **kwargs)
+            return found["terms"]
         return None
 
     def cost(model, **kwargs):
         assert model is found["model"]
         found["cost"] = kwargs
         found["locals"].update(sys._getframe(1).f_locals)
+        if settings.get("solve"):
+            return bind_cost(model, **kwargs)
         raise Captured
 
     # Feature absence, rather than a fixture/network failure, owns the RED.
@@ -148,10 +301,18 @@ def capture(monkeypatch, tmp_path, request):
         spies.setattr(mip.Model, "add_sos", record_sos)
         spies.setattr(da, "bind_day_ahead_finance", finance)
         spies.setattr(da, "bind_day_ahead_cost", cost)
-        with pytest.raises(Captured):
-            instance.calc_optimum(_start_dt=dt.datetime.fromtimestamp(start))
+        if settings.get("active") or settings.get("blocked"):
+            try:
+                instance.calc_optimum(_start_dt=dt.datetime.fromtimestamp(start))
+            except (Captured, FinancialPlanBlocked, OptimizationInputError, UnboundLocalError) as exc:
+                found["error"] = exc
+        else:
+            with pytest.raises(Captured):
+                instance.calc_optimum(_start_dt=dt.datetime.fromtimestamp(start))
     found["instance"] = instance
-    return found
+    yield found
+    if engine is not None:
+        engine.dispose()
 
 
 def signature(expr):
@@ -171,6 +332,148 @@ def test_real_producer_accepts_legacy_pricing_without_settlement(capture):
     model.objective = capture["cost"]["cost"]
     model.verbose = 0
     assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+
+
+@pytest.mark.parametrize("capture", [
+    {"active": True}, {"active": True, "start": ts(minute=7) + 30},
+    {"active": True, "hourly": True},
+    {"active": True, "start": ts("2027-03-28", 1, 52) + 30},
+    {"active": True, "start": ts("2027-10-31", 2, 7) + 30},
+], indirect=True)
+def test_f1a_real_producer_pins_actual_energy_horizon_and_context(capture):
+    """The normal entrypoint, not an injected context helper, must bind the real service selection."""
+    assert "finance" in capture, capture.get("error")
+    local, context = capture["locals"], capture["context"]
+    first, last = int(local["ts"][0]), int(local["interval_ts"][-1]) + capture["instance"].interval_s
+    assert capture["prepare_calls"] == [(first, last)]
+    assert capture["finance"]["context"] is context
+    assert capture["terms"].context is context
+    assert (context.basis.planning_start_ts, context.basis.horizon_end_ts) == (first, last)
+    assert tuple((q.start_ts, q.end_ts) for q in capture["terms"].quotes) == capture["finance"]["intervals"]
+    assert context.basis.input_revision == context.price_batch.input_revision > 0
+    assert capture["ha_writes"] == []
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "start": ts(minute=7) + 30}], indirect=True)
+def test_f1a_partial_prefix_never_creates_bonus_or_month_rights(capture):
+    assert "terms" in capture, capture.get("error")
+    terms, local = capture["terms"], capture["locals"]
+    assert local["ts"][0] != local["interval_ts"][0]
+    state = terms.context.state
+    assert state.asof_ts == ts(minute=7) + 30
+    assert state.bonus is None or state.bonus.total_export_kwh is None
+    assert state.month is None or (state.month.spot_export_eur is None and not state.month.complete)
+    assert any(q.bonus_rate > 0 for q in terms.quotes)  # No bonus is not merely an off-window fixture.
+    model = capture["model"]
+    model.objective = mip.maximize(mip.xsum(terms.bonus.eligible_kwh))
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    assert sum(v.x for v in terms.bonus.eligible_kwh) == 0
+    assert local["period_terms"].credit.x == 0
+
+
+@pytest.mark.parametrize("capture", [{"active": True}], indirect=True)
+def test_f1a_context_quotes_are_the_only_financial_price_source(capture):
+    assert "terms" in capture, capture.get("error")
+    assert capture["report_reads"] == []  # Report prices remain necessary only for legacy.
+    terms, local, cost = capture["terms"], capture["locals"], capture["cost"]
+    assert cost["financial_terms"] is terms
+    assert local["pl"] == local["pt"] == [0.13] * 12  # Report would return 0.20 / 0.10.
+    coeffs = terms.energy_cost.expr
+    for imp, exp in zip(terms.grid_import, terms.bonus.grid_export, strict=True):
+        assert coeffs[imp] == 0.13 and coeffs[exp] == -0.13
+    da.bind_day_ahead_cost(capture["model"], **cost)
+    expr = capture["model"].constrs[-1].expr.expr
+    assert all(expr[v] == -0.13 for v in terms.grid_import)
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "service_factory": True}], indirect=True)
+def test_f1a_service_adapter_does_not_reread_process_pricing(capture):
+    assert "terms" in capture, capture.get("error")
+    assert capture["config_price_reads"] == 1
+    assert capture["terms"].context is capture["context"]
+    assert capture["report_reads"] == []
+    instance = capture["instance"]
+    assert capture["components_pricing"] is instance._financial_pricing
+    assert instance._financial_pricing == capture["configured_pricing"]
+    assert instance._financial_pricing.settlement.contracts == capture["configured_pricing"].settlement.contracts
+    expected = make_snapshot(capture["configured_pricing"], capture["configured_pricing"].settlement.contracts[0])
+    assert instance._settlement_service.snapshots == (expected,)
+    assert capture["publication"]._pricing == capture["configured_pricing"]
+    assert all(q.snapshot == expected and q.spot_ex_vat == D("0.13") for q in capture["terms"].quotes)
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "heating": True}], indirect=True)
+def test_f1a_existing_heatpump_runtime_read_remains_available_without_price_reread(capture):
+    assert "cost" in capture, capture.get("error")
+    assert capture["report_constructions"] == [("synthetic-unused-options",)]
+    assert capture["runtime_reads"] == ["sensor.synthetic_hp_heat"]
+    assert capture["instance"].hp_enabled
+    assert capture["locals"]["run_hours"] == 1
+    assert capture["report_reads"] == []
+
+
+@pytest.mark.parametrize("capture", [
+    {"active": True, "start": ts(minute=7) + 30, "prefix_contradiction": "bonus"},
+    {"active": True, "start": ts(minute=7) + 30, "prefix_contradiction": "month"},
+], indirect=True)
+def test_f1a_partial_known_prefix_contradiction_has_own_reason(capture):
+    assert isinstance(capture.get("error"), OptimizationInputError), capture.get("error")
+    assert str(capture["error"]) == "planning_prefix_unknown"
+    assert "finance" not in capture and "cost" not in capture
+    assert capture["ha_writes"] == capture["ready_publications"] == []
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "misaligned": True}], indirect=True)
+def test_f1a_misaligned_service_context_rejected_before_model_binding(capture):
+    assert isinstance(capture.get("error"), OptimizationInputError), capture.get("error")
+    assert str(capture["error"]) == "planning_grid_invalid"
+    assert "finance" not in capture and "cost" not in capture
+    assert capture["ha_writes"] == []
+
+
+@pytest.mark.parametrize("capture", [
+    {"prices": pricing_config(mode="off"), "start": ts("2026-12-31", 22), "blocked": True},
+    {"prices": pricing_config(), "start": ts("2026-12-31", 22), "blocked": True},
+], indirect=True)
+def test_f1a_legacy_crossing_contract_start_is_denied_on_real_horizon(capture):
+    assert isinstance(capture.get("error"), FinancialPlanBlocked)
+    assert str(capture["error"]) == "legacy_horizon_crosses_contract_start"
+    assert capture["instance"]._financial_horizon == (ts("2026-12-31", 22), ts("2027-01-01", 1))
+    assert "finance" not in capture and capture["ha_writes"] == []
+
+
+@pytest.mark.parametrize("capture", [
+    {"prices": pricing_config(mode="off"), "start": ts("2026-12-31", 21, 7) + 30},
+], indirect=True)
+def test_f1a_legacy_equal_boundary_uses_no_guessed_one_interval_horizon(capture):
+    actual = (ts("2026-12-31", 21, 7) + 30, ts("2027-01-01", 0))
+    assert capture["instance"]._financial_horizon == actual
+    assert all(horizon is None or horizon == actual for horizon in capture["gate_horizons"])
+    assert capture["finance"]["context"] is None
+    assert len(capture["report_reads"]) == 1
+
+
+@pytest.mark.parametrize("capture", [{"active": True}], indirect=True)
+def test_f1a_valid_basis_still_denies_actuation_and_never_publishes_ready(capture):
+    assert "context" in capture, capture.get("error")
+    instance = capture["instance"]
+    instance.debug = False
+    with pytest.raises(FinancialPlanBlocked, match="actuation_gates_unproven"):
+        instance._check_financial_output(basis=capture["context"].basis, now_ts=ts())
+    assert capture["ha_writes"] == []
+    assert capture["ready_publications"] == []
+    assert capture["locals"]["financial_context"] is None  # F1c, not a guessed ready-v2 DTO.
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "solve": True}], indirect=True)
+def test_f1a_normal_producer_solves_audits_then_refuses_output_with_pinned_basis(capture):
+    assert str(capture.get("error")) == "actuation_gates_unproven"
+    instance = capture["instance"]
+    assert instance._debug_planning_audit.parity_complete
+    assert instance._debug_period_audit is not None
+    assert capture["output_bases"] == [capture["context"].basis]
+    assert capture["ha_writes"] == capture["ready_publications"] == []
 
 
 @pytest.mark.parametrize("capture,cell_power,residual", [
@@ -326,11 +629,11 @@ def test_final_selected_solution_audited_before_consumers(snapshot, bonus_rules,
     assert preview_calls == prognosis_writes == plan_writes == ha_writes == []
 
 
-def test_new_regime_denied_even_debug_and_valid_offline_audit(capture, snapshot, bonus_rules, monkeypatch):
+def test_shadow_regime_denied_even_debug_and_valid_offline_audit(capture, snapshot, bonus_rules, monkeypatch):
     _, terms = financial_case(snapshot, bonus_rules)
     assert da.finish_day_ahead_finance(da.finalize_day_ahead_finance(terms, cbc_log=""), org_l=(0.0,), org_t=(-1.0,)).parity_complete
     instance = capture["instance"]
-    instance.config.prices = pricing_config()
+    instance.config.prices = pricing_config(mode="shadow")
     for attr in ("_financial_pricing", "_financial_policy", "_financial_plan_path"):
         if hasattr(instance, attr):
             delattr(instance, attr)
@@ -658,7 +961,7 @@ def test_period_debug_is_cleared_even_when_preflight_denies(capture):
              "_debug_period_terms", "_debug_period_audit")
     for name in names:
         setattr(instance, name, object())
-    instance.config.prices = pricing_config()
+    instance.config.prices = pricing_config(mode="shadow")
     for attr in ("_financial_pricing", "_financial_policy", "_financial_plan_path"):
         if hasattr(instance, attr):
             delattr(instance, attr)

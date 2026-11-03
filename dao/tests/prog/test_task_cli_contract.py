@@ -523,7 +523,9 @@ def test_fatal_optimizer_abort_is_not_done(capture, sandbox, monkeypatch, reason
 
 def test_financial_gate_exception_remains_failure_after_cleanup(capture, sandbox, monkeypatch):
     optimizer = capture["instance"]
-    optimizer.config.prices = pricing_config()
+    # Active/confirmed may now plan. Shadow keeps the legacy financial denial;
+    # exception propagation, logger cleanup and its logged reason remain the contract.
+    optimizer.config.prices = pricing_config(mode="shadow")
     for name in ("_financial_pricing", "_financial_policy", "_financial_plan_path"):
         delattr(optimizer, name)
     start = capture["locals"]["start_dt"]

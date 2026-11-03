@@ -14,6 +14,7 @@ from dao.prog.config.models.devices.heating import HeatingEnabled
 from dao.prog.config.models.fastcontrol import FastControlConfig
 from dao.prog.fastctrl.publication import invalidate_plan, publication_lock, read_publication
 from dao.prog.settlement.publication import FinancialPlanBlocked
+from dao.tests.settlement.test_optimization_producer import capture as capture
 from dao.tests.settlement.test_publication import pricing_config
 
 GATE = 1798758000
@@ -48,16 +49,23 @@ def planner(tmp_path, monkeypatch):
     engine.dispose()
 
 
-@pytest.mark.parametrize("mode", ["off", "shadow", "active"])
+@pytest.mark.parametrize("mode,before_contract", [("off", False), ("shadow", False), ("active", True)])
 @pytest.mark.parametrize("status", ["draft", "confirmed"])
-def test_calc_preflight_blocks_before_report_or_any_ha_write(planner, monkeypatch, mode, status):
-    instance, path, _ = planner
+def test_calc_preflight_blocks_before_report_or_any_ha_write(planner, monkeypatch, mode, before_contract, status):
+    instance, path, clock = planner
     if mode == "active" and status == "draft":
         with pytest.raises(ValueError, match="draft"):
             pricing_config(mode=mode, status=status)
         assert instance.ha_calls == []
         return
     instance.config.prices = pricing_config(mode=mode, status=status)
+    # Off/shadow at the gate still deny before Report/HA. Before the contract,
+    # active uses legacy too: an existing invalidation must deny just as early.
+    # Active/confirmed at/after the gate has planning rights, tested separately.
+    if before_contract:
+        clock[0] = GATE - 3600
+        with publication_lock(path) as lease:
+            invalidate_plan(lease=lease, now_ts=clock[0], reason="registered_financial_inputs_changed")
     report_calls = []
     def report(*args):
         report_calls.append(args)
@@ -67,6 +75,20 @@ def test_calc_preflight_blocks_before_report_or_any_ha_write(planner, monkeypatc
         instance.calc_optimum()
     assert read_publication(path).status == "blocked"
     assert instance.ha_calls == report_calls == []
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "solve": True}], indirect=True)
+def test_calc_active_confirmed_reaches_planning_but_never_ha_or_ready_publication(capture):
+    # Active/confirmed no longer denies before Report construction/planning.
+    # It constructs the legacy object for non-price reads, skips its price API,
+    # solves on the real service context and still denies output before any HA write.
+    assert "context" in capture, capture.get("error")
+    assert capture["prepare_calls"] == [(GATE + 12 * 3600, GATE + 15 * 3600)]
+    assert capture["report_constructions"] == [("synthetic-unused-options",)]
+    assert capture["report_reads"] == []
+    assert str(capture.get("error")) == "actuation_gates_unproven"
+    assert capture["output_bases"] == [capture["context"].basis]
+    assert capture["ha_writes"] == capture["ready_publications"] == []
 
 
 @pytest.mark.parametrize("end,blocked", [(GATE, False), (GATE + 1, True)])
@@ -108,6 +130,7 @@ def test_planner_does_not_treat_an_unreadable_prices_property_as_legacy(planner)
 
 def test_debug_preflight_cannot_mutate_the_operational_artifact(planner):
     instance, path, _ = planner
+    instance.config.prices = pricing_config(mode="shadow")
     path.write_text("operator artifact")
     instance.debug = True
     with pytest.raises(FinancialPlanBlocked):

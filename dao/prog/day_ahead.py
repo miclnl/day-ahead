@@ -131,19 +131,8 @@ def _log_native_output(text: str) -> None:
             logging.info(line)
 
 
-def bind_day_ahead_finance(
-    model: Model, *, context: PlanningContext | None,
-    intervals: Sequence[tuple[int, int]], meter_id: str,
-    dc_from_bat: Sequence[Sequence[Var]], installation_battery_count: int,
-    battery_indices: Sequence[int], no_battery_evidence: str | None,
-    hour_fractions: Sequence[Decimal], discharge_efficiencies: Sequence[Decimal],
-    grid_import: Sequence[Var], grid_export: Sequence[Var],
-    export_bounds_kwh: Sequence[Decimal], origins: Sequence[Origin],
-    source_policy: SourcePolicy | None,
-) -> FinancialModelTerms | None:
-    """Pure offline modelgrens; ontbrekende context behoudt de legacyroute."""
-    if context is None:
-        return None
+def _planning_prices(context: PlanningContext, intervals: Sequence[tuple[int, int]], meter_id: str):
+    """Valideer en lijn dezelfde gepinde quotes uit vóór enige modelmutatie."""
     intervals = tuple(intervals)
     try:
         prices = context.quotes
@@ -183,6 +172,23 @@ def bind_day_ahead_finance(
         if isinstance(exc, OptimizationInputError):
             raise
         raise OptimizationInputError("planning_quote_invalid") from exc
+    return tuple(aligned)
+
+
+def bind_day_ahead_finance(
+    model: Model, *, context: PlanningContext | None,
+    intervals: Sequence[tuple[int, int]], meter_id: str,
+    dc_from_bat: Sequence[Sequence[Var]], installation_battery_count: int,
+    battery_indices: Sequence[int], no_battery_evidence: str | None,
+    hour_fractions: Sequence[Decimal], discharge_efficiencies: Sequence[Decimal],
+    grid_import: Sequence[Var], grid_export: Sequence[Var],
+    export_bounds_kwh: Sequence[Decimal], origins: Sequence[Origin],
+    source_policy: SourcePolicy | None,
+) -> FinancialModelTerms | None:
+    """Pure offline modelgrens; ontbrekende context behoudt de legacyroute."""
+    if context is None:
+        return None
+    aligned = _planning_prices(context, intervals, meter_id)
     cell = make_cell_discharge_input(model, dc_from_bat, meter_id=meter_id,
         installation_battery_count=installation_battery_count, battery_indices=battery_indices,
         no_battery_evidence=no_battery_evidence, hour_fractions=hour_fractions,
@@ -564,13 +570,16 @@ class DaCalc(DaBase):
             self.interval_s * math.floor(start_ts / self.interval_s)
         )
         start_interval_dt = datetime.datetime.fromtimestamp(start_interval_ts)
-        # A7/A10b leveren later een echte gepinde context; nooit een v2-default verzinnen.
+        # Planningsrecht is geen uitvoerrecht. F1c levert pas de publiceerbare DTO.
         financial_context: FinancialContext | None = None
         settlement_context: PlanningContext | None = None
-        self._financial_preflight(
-            planning_start_ts=start_interval_ts,
-            horizon_end_ts=start_interval_ts + self.interval_s,
-        )
+        policy = self._financial_settings()
+        settlement_cfg = None if self._financial_pricing is None else self._financial_pricing.settlement
+        financial_planning = (settlement_cfg is not None and settlement_cfg.mode == "active"
+                              and (policy.required_from_ts is None or start_ts >= policy.required_from_ts))
+        if not financial_planning:
+            # Nog geen rooster: expliciet lege horizon, nooit een verzonnen interval.
+            self._financial_preflight()
         # loopt af van 1 (starts_ds == start_interval) naar
         # 0 (start_interval is bijna bij begin volgend interval)
         interval_fraction_first_interval = (
@@ -588,30 +597,31 @@ class DaCalc(DaBase):
 
         report = Report(self.file_name)
         start = dt.datetime.fromtimestamp(start_hour)
-        price_data = report.get_price_data(
-            dt.datetime.fromtimestamp(start_hour), end=None, interval=self.interval
-        )
-
-        if len(price_data) <= 5:
-            logging.error(
-                f"Er ontbreken kwartier- of uurwaarden van de day-ahead tarieven, "
-                f"de berekening wordt afgebroken"
+        if not financial_planning:
+            price_data = report.get_price_data(
+                dt.datetime.fromtimestamp(start_hour), end=None, interval=self.interval
             )
-            return False
 
-        end_prog = price_data["time"].iloc[-1]
-        if self.interval == "15min":
-            num_quaters = round((end_prog - start).total_seconds() / 900)
-            if len(price_data) < num_quaters - 5:
+            if len(price_data) <= 5:
                 logging.error(
-                    f"Er ontbreken kwartierwaarden van de day-ahead tarieven, "
+                    f"Er ontbreken kwartier- of uurwaarden van de day-ahead tarieven, "
                     f"de berekening wordt afgebroken"
                 )
                 return False
 
-        while price_data.iloc[0]["time"] < start_interval_dt:
-            price_data = price_data.iloc[1:]
-        price_data.index = pd.to_datetime(price_data["time"])
+            end_prog = price_data["time"].iloc[-1]
+            if self.interval == "15min":
+                num_quaters = round((end_prog - start).total_seconds() / 900)
+                if len(price_data) < num_quaters - 5:
+                    logging.error(
+                        f"Er ontbreken kwartierwaarden van de day-ahead tarieven, "
+                        f"de berekening wordt afgebroken"
+                    )
+                    return False
+
+            while price_data.iloc[0]["time"] < start_interval_dt:
+                price_data = price_data.iloc[1:]
+            price_data.index = pd.to_datetime(price_data["time"])
         prog_data = self.db_da.get_prognose_data(
             start=start_hour, end=None, interval=self.interval
         )
@@ -623,7 +633,7 @@ class DaCalc(DaBase):
         while len(prog_data) > 0 and prog_data.iloc[0]["tijd"] < start_interval_dt:
             prog_data = prog_data.iloc[1:]
         u_data = len(prog_data)
-        u_prices = len(price_data)
+        u_prices = u_data if financial_planning else len(price_data)
         if self.interval == "15min":
             u_prices = u_prices / 4
         if u_data <= 2 or u_prices <= 2:
@@ -647,13 +657,14 @@ class DaCalc(DaBase):
         self.notify("DAO calc gestart")
 
         prog_data = prog_data.reset_index(drop=True)
-        price_data = price_data.reset_index(drop=True)
-        prog_data["da_ex"] = price_data["da_ex"]
-        prog_data["da_cons"] = price_data["da_cons"]
-        prog_data["da_prod"] = price_data["da_prod"]
-        prog_data["da_bonus"] = (
-            price_data["da_bonus"] if "da_bonus" in price_data.columns else 0.0
-        )
+        if not financial_planning:
+            price_data = price_data.reset_index(drop=True)
+            prog_data["da_ex"] = price_data["da_ex"]
+            prog_data["da_cons"] = price_data["da_cons"]
+            prog_data["da_prod"] = price_data["da_prod"]
+            prog_data["da_bonus"] = (
+                price_data["da_bonus"] if "da_bonus" in price_data.columns else 0.0
+            )
 
         logging.debug("Prognose data:\n{}".format(prog_data.to_string()))
         pd.options.display.float_format = "{:.3f}".format
@@ -667,19 +678,21 @@ class DaCalc(DaBase):
         # prog_data = prog_data.reset_index()
         # make sure indexes pair with number of rows
         for row in prog_data.itertuples():
-            if math.isnan(row.da_ex):
+            if not financial_planning and math.isnan(row.da_ex):
                 break
             uur.append(row.tijd)
-            p_spot.append(row.da_ex)
-            pl.append(row.da_cons)
-            pt.append(row.da_prod)
-            pb.append(0.0 if math.isnan(row.da_bonus) else row.da_bonus)
+            if not financial_planning:
+                p_spot.append(row.da_ex)
+                pl.append(row.da_cons)
+                pt.append(row.da_prod)
+                pb.append(0.0 if math.isnan(row.da_bonus) else row.da_bonus)
 
         B = len(self.battery_options)
-        U = len(pl)
-        p_avg = sum(pl) / U  # max(pl) #
-        for u in range(U):
-            pl_avg.append(p_avg)
+        U = len(uur)
+        if not financial_planning:
+            p_avg = sum(pl) / U  # max(pl) #
+            for u in range(U):
+                pl_avg.append(p_avg)
 
         # base load
         b_l = self._baseload_for_horizon(start_interval_dt, U)
@@ -786,7 +799,7 @@ class DaCalc(DaBase):
         # prog_data = prog_data.reset_index()
         # make sure indexes pair with number of rows
         for row in prog_data.itertuples():
-            if math.isnan(row.da_ex):
+            if not financial_planning and math.isnan(row.da_ex):
                 break
             dtime = row.tijd
             hour = dtime.strftime("%H:%M")
@@ -830,6 +843,23 @@ class DaCalc(DaBase):
             pv_org_dc.append(pv_total)
             first_interval = False
 
+        if financial_planning:
+            intervals = tuple((int(ts[u]), int(interval_ts[u]) + self.interval_s) for u in range(U))
+            settlement_context = self._financial_input_check(intervals=intervals)
+            prices = _planning_prices(settlement_context, intervals, settlement_cfg.meter_id)
+            # Ook prijsafhankelijke device-/terminaltermen krijgen alleen deze selectie.
+            pl = [float(price.import_rate) for price in prices]
+            pt = [float(price.export_rate) for price in prices]
+            p_spot = [float(price.spot_ex_vat) for price in prices]
+            pb = [float(price.bonus_rate) for price in prices]
+            p_avg = sum(pl) / U
+            pl_avg = [p_avg] * U
+        else:
+            self._financial_preflight(
+                planning_start_ts=int(ts[0]),
+                horizon_end_ts=int(interval_ts[U - 1]) + self.interval_s,
+            )
+
         try:
             if self.debug or self.log_level <= logging.DEBUG:
                 start_df = pd.DataFrame(
@@ -858,10 +888,6 @@ class DaCalc(DaBase):
             logging.info(f"pv_ac: {len(pv_org_ac)}")
             logging.info(f"pv_dc: {len(pv_org_dc)}")
 
-        self._financial_preflight(
-            planning_start_ts=interval_ts[0],
-            horizon_end_ts=interval_ts[U - 1] + self.interval_s,
-        )
         model = Model()
 
         ##############################################################
@@ -2630,7 +2656,7 @@ class DaCalc(DaBase):
                         )
                     elif not self.debug:
                         self._check_financial_output(
-                            basis=financial_context.basis if financial_context is not None else None,
+                            basis=settlement_context.basis if settlement_context is not None else None,
                             now_ts=int(time.time()),
                         )
                         self.set_value(entity_avg_temp, round(avg_temp, 1))
@@ -4360,7 +4386,7 @@ class DaCalc(DaBase):
         if not self.debug:
             # Buiten alle devicecatches: een weigering beëindigt de volledige uitvoerroute.
             self._check_financial_output(
-                basis=financial_context.basis if financial_context is not None else None,
+                basis=settlement_context.basis if settlement_context is not None else None,
                 now_ts=int(time.time()),
             )
             logging.info("Doorzetten van alle settings naar HA")
@@ -5126,7 +5152,7 @@ class DaCalc(DaBase):
         #############################################
         if not self.debug:
             self._check_financial_output(
-                basis=financial_context.basis if financial_context is not None else None,
+                basis=settlement_context.basis if settlement_context is not None else None,
                 now_ts=int(time.time()),
             )
         try:
@@ -5813,15 +5839,33 @@ class DaCalc(DaBase):
             self._financial_publication().block(now_ts=now_ts, reason=reason)
         raise FinancialPlanBlocked(reason)
 
-    def _financial_preflight(self, *, planning_start_ts: int, horizon_end_ts: int) -> None:
-        _integer(planning_start_ts, "planning_start_ts")
-        _integer(horizon_end_ts, "horizon_end_ts")
-        if horizon_end_ts <= planning_start_ts:
-            raise ValueError("Expected a nonempty planning horizon")
-        self._financial_horizon = planning_start_ts, horizon_end_ts
+    def _financial_preflight(self, *, planning_start_ts: int | None = None,
+                             horizon_end_ts: int | None = None) -> None:
+        """Legacycontrole; zonder rooster is de horizon expliciet leeg tot de finale toets."""
+        if planning_start_ts is None and horizon_end_ts is None:
+            self._financial_horizon = None
+        else:
+            _integer(planning_start_ts, "planning_start_ts")
+            _integer(horizon_end_ts, "horizon_end_ts")
+            if horizon_end_ts <= planning_start_ts:
+                raise ValueError("Expected a nonempty planning horizon")
+            self._financial_horizon = planning_start_ts, horizon_end_ts
         self._check_legacy_financial_gate(now_ts=int(time.time()))
         if not self.debug:
             self._check_legacy_publication()
+
+    def _financial_input_check(self, *, intervals: Sequence[tuple[int, int]]) -> PlanningContext:
+        """Bouw de enige gepinde context op het echte energierooster, zonder uitvoerrecht."""
+        start, end = intervals[0][0], intervals[-1][1]
+        context = self.settlement_service().prepare_planning(start, end)
+        _planning_prices(context, intervals, self._financial_pricing.settlement.meter_id)
+        if start % self.interval_s:
+            state = context.state
+            if ((state.bonus is not None and state.bonus.total_export_kwh is not None)
+                or (state.month is not None and (state.month.complete or state.month.spot_export_eur is not None))):
+                raise OptimizationInputError("planning_prefix_unknown")
+        self._financial_horizon = start, end
+        return context
 
     def _check_legacy_publication(self) -> None:
         # Ook vóór de datum mag een lokale invalidatie niet via directe writes worden omzeild.
@@ -5833,7 +5877,7 @@ class DaCalc(DaBase):
     def _check_legacy_financial_gate(self, *, now_ts: int) -> None:
         policy = self._financial_settings()
         required = policy.required_from_ts
-        start, end = getattr(self, "_financial_horizon", (now_ts, now_ts + 1))
+        start, end = getattr(self, "_financial_horizon", None) or (now_ts, now_ts)
         if required is not None:
             if now_ts >= required or start >= required:
                 self._refuse_financial_output(now_ts=now_ts, reason="financial_plan_required")

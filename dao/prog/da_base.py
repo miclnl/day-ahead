@@ -684,8 +684,8 @@ class DaBase:
             from dao.prog.settlement.tariffs import make_snapshot
             from dao.prog.settlement.types import MeterSelection
 
-            repository, publication = self.settlement_components()
-            pricing = getattr(self, "_financial_pricing", self.config.prices)
+            pricing = self._financial_pricing if hasattr(self, "_financial_pricing") else self.config.prices
+            repository, publication = self.settlement_components(pricing=pricing)
             cfg = pricing.settlement
             report = self.config.report
             if not cfg.meter_id:
