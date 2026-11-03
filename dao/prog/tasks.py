@@ -263,7 +263,30 @@ def api_timeout_s(key: str) -> int:
     return min(int(task.get("timeout_s", API_RUN_TIMEOUT_S)), API_RUN_TIMEOUT_S)
 
 
-def kill_process_group(proc) -> None:
+def process_group_id(proc) -> int | None:
+    """The id of the process group that *proc* leads, or None.
+
+    Tasks are started with ``start_new_session=True``, so a task leads a
+    process group of its own. The id has to be taken while the leader is
+    still there: once it has been reaped its pid is gone -- and may even
+    have been given to another process -- so the group can no longer be
+    found through it.
+    """
+    pid = getattr(proc, "pid", None)
+    if pid is None:
+        return None
+    try:
+        group = os.getpgid(pid)
+    except OSError:
+        return None
+    if group == os.getpgrp():
+        # The task is not in a session of its own (yet). Stopping that
+        # group would stop the scheduler along with it.
+        return None
+    return group
+
+
+def kill_process_group(proc, group: int | None = None) -> None:
     """Kill a task subprocess and everything it spawned.
 
     Tasks are started with ``start_new_session=True``, which gives them
@@ -271,15 +294,28 @@ def kill_process_group(proc) -> None:
     process; if the script it runs forks or execs a helper of its own, that
     helper would be left running as an orphan after a cancel.
 
+    *group* is the id of that group, as recorded when the task was
+    started. Without it the group is looked up through the pid of *proc*,
+    which only works while that pid is still there: a task that ended
+    before the stop has been reaped, and the members that outlived it
+    would then keep running.
+
     Lives here rather than in either dashboard because both of them cancel
     tasks and the two copies had already started to differ.
     """
+    if group is None:
+        group = process_group_id(proc)
+    if group is None:
+        logging.warning(
+            f"Kon procesgroep van pid {getattr(proc, 'pid', None)} niet vinden"
+        )
+        return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(group, signal.SIGKILL)
     except ProcessLookupError:
         pass  # already exited
     except OSError as exception:
-        logging.warning(f"Kon procesgroep van pid {proc.pid} niet stoppen: {exception}")
+        logging.warning(f"Kon procesgroep {group} niet stoppen: {exception}")
 
 
 def menu_entries(keys: Optional[Iterable[str]] = None) -> dict[str, dict[str, Any]]:

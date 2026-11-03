@@ -1,4 +1,5 @@
-import time, os, fnmatch, re, datetime, json, logging
+import time, os, fnmatch, re, datetime, json, logging, stat
+from contextlib import contextmanager
 from flask import Blueprint, abort, render_template, request, redirect, url_for
 
 from dao.prog.version import __version__
@@ -58,6 +59,21 @@ def vite_tags(entry: str) -> str:
     return "\n".join(tags)
 
 
+def _is_regular_file(path: str) -> bool:
+    """Whether *path* is a regular file, and not a link or something else.
+
+    The name comes out of a directory listing, so the path stays inside
+    that directory; but a name in it may still be a symlink to somewhere
+    else, a directory or a fifo. None of those is a file of the
+    directory itself.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode)
+
+
 def get_file_list_with_ts(path: str, pattern: str) -> list:
     """
     get a time-ordered file list with name and timestamp from filename
@@ -67,6 +83,11 @@ def get_file_list_with_ts(path: str, pattern: str) -> list:
     flist = []
     for f in os.listdir(path):
         if fnmatch.fnmatch(f, pattern):
+            # Only a plain file of the folder itself is a file of this
+            # kind: a name in it may also be a symlink to somewhere else,
+            # a directory or a fifo, and none of those is served.
+            if not _is_regular_file(os.path.join(path, f)):
+                continue
             # Extract timestamp from filename (e.g. calc_2026-02-17__08-45.png) because datetime picker works with
             # absolute timestamps and the file modification date might differ from the timestamp in the filename, which is the intended reference time for the user
             m = re.search(r"(\d{4}-\d{2}-\d{2})__(\d{2})[:-](\d{2})(?:[:-](\d{2}))?", f)
@@ -90,6 +111,30 @@ def get_file_list_with_ts(path: str, pattern: str) -> list:
 
     flist.sort(key=lambda x: (x["time"], x["name"].lower()))
     return flist
+
+
+@contextmanager
+def _open_log_file(path: str):
+    """Open a log file out of the log directory, without following a link.
+
+    The name comes from the log directory or from the claim file, and a
+    name in that directory may be a link to somewhere else entirely. The
+    file is therefore opened inside the log directory itself, without
+    following a symlink, and only a regular file is accepted. O_NONBLOCK
+    keeps a fifo from blocking the reader while it is refused.
+    """
+    full = os.path.join(app_datapath + "log", os.path.basename(path))
+    descriptor = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"is geen regulier bestand: {full}")
+        with os.fdopen(descriptor, "r", errors="replace") as handle:
+            descriptor = None  # the file object owns it now
+            yield handle
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def get_closest_index_from_list(flist: list, ts: float) -> int:
@@ -236,9 +281,17 @@ def log():
     if kwargs is None:
         return render_template("v2/no-task.html", )
 
-    log_file = app_datapath + "log/" + kwargs["filename"]
-    with open(log_file, "r") as f:
-        kwargs["logdata"] = f.read()
+    # The file is opened inside the log directory, without following a
+    # link and with a check on the type of the opened file: a name in the
+    # log directory may be a link to somewhere else, a directory or a fifo.
+    try:
+        with _open_log_file(kwargs["filename"]) as handle:
+            kwargs["logdata"] = handle.read()
+    except OSError as exception:
+        logging.warning(
+            f"Logbestand {kwargs['filename']} kon niet worden gelezen: {exception}"
+        )
+        kwargs["logdata"] = "Logbestand kon niet worden gelezen."
 
     return render_template(
         "v2/log.html",
@@ -358,10 +411,17 @@ TASK_STATUS_DISPLAY = {
 
 
 def read_task_log(path: str) -> str:
-    """The tail of a task log, with a note when the head was left out."""
+    """The tail of a task log, with a note when the head was left out.
+
+    The file is opened inside the log directory itself and without
+    following a symlink: the path comes from the claim file, and a name
+    in the log directory may be a link to somewhere else entirely. Only a
+    regular file is a task log; O_NONBLOCK keeps a fifo from blocking the
+    poll while it is being refused.
+    """
     try:
-        size = os.path.getsize(path)
-        with open(path, errors="replace") as handle:
+        with _open_log_file(path) as handle:
+            size = os.fstat(handle.fileno()).st_size
             if size > TASK_LOG_TAIL_BYTES:
                 handle.seek(size - TASK_LOG_TAIL_BYTES)
                 handle.readline()  # drop the half line the seek landed in

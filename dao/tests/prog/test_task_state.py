@@ -110,6 +110,14 @@ def _age_run(key):
     path.write_text(json.dumps(state))
 
 
+def _age_heartbeat(key, seconds):
+    """Make the claim of *key* look *seconds* old."""
+    path = Path(task_state.STATE_PATH)
+    state = json.loads(path.read_text())
+    state["running"][key]["heartbeat"] = time.time() - seconds
+    path.write_text(json.dumps(state))
+
+
 class TestRunIdentity:
     def test_claim_and_request_return_non_reusable_run_id(self, monkeypatch):
         monkeypatch.setattr(task_state.time, "time", lambda: 1800000000.0)
@@ -312,6 +320,114 @@ class TestCancel:
         missing = task_state.TaskClaim("meteo", "nonexistent-run")
         assert task_state.request_cancel(missing) is False
         assert task_state.cancel_requested(missing) is False
+
+
+class TestPendingCancel:
+    """The race between cancelling a request and the scheduler picking it up.
+
+    Both happen under the same sidecar slot, so exactly one of them owns
+    the claim. A request that is cancelled while it is still waiting is
+    finished there and then: it can never be spawned afterwards, and it
+    ends as "cancelled" rather than as a failure.
+    """
+
+    def test_cancelling_a_pending_request_finishes_it_as_cancelled(self):
+        granted = task_state.request("meteo", "dashboard")
+
+        assert task_state.request_cancel(granted) is True
+
+        assert task_state.pending_requests() == {}
+        assert task_state.is_running("meteo") is False
+        result = task_state.last_result("meteo")
+        assert result.get("status") == "cancelled"
+        assert result["run_id"] == granted.run_id
+
+    def test_a_cancelled_request_is_never_taken(self):
+        """The pickup of a request that was already cancelled finds nothing:
+        the task is not started at all."""
+        granted = task_state.request("meteo", "dashboard")
+        task_state.request_cancel(granted)
+
+        assert task_state.take_pending(granted) is None
+        assert task_state.is_running("meteo") is False
+        assert task_state.last_result("meteo").get("status") == "cancelled"
+
+    def test_the_pickup_wins_when_it_happens_first(self):
+        """Then the cancel is a running one: the start owns the spawn, and
+        the cancel is the flag its runner will answer with a process group
+        stop."""
+        granted = task_state.request("meteo", "dashboard")
+
+        entry = task_state.take_pending(granted)
+        assert entry is not None
+        assert task_state.request_cancel(granted) is True
+
+        assert task_state.is_running("meteo") is True
+        assert task_state.running_tasks()["meteo"]["cancel"] is True
+        assert task_state.last_result("meteo") == {}
+
+    def test_a_cancelled_request_does_not_expire_as_a_failure(self):
+        """It was cancelled, so it did not fail. The dashboard has to be able
+        to say so."""
+        granted = task_state.request("meteo", "dashboard")
+        task_state.request_cancel(granted)
+
+        assert task_state.expire_overdue_pending() == []
+        assert task_state.last_result("meteo").get("status") == "cancelled"
+
+    def test_a_cancelled_waiting_request_from_an_earlier_version_expires_as_cancelled(
+        self,
+    ):
+        """A claim that was cancelled while it was waiting used to keep a
+        cancel flag and nothing else; such a claim must not be reported as
+        a failure either."""
+        granted = task_state.request("meteo", "dashboard")
+        path = Path(task_state.STATE_PATH)
+        state = json.loads(path.read_text())
+        state["running"]["meteo"]["cancel"] = True
+        path.write_text(json.dumps(state))
+        _age_heartbeat("meteo", task_state.PENDING_TIMEOUT_S + 1)
+
+        expired = task_state.expire_overdue_pending()
+
+        assert expired == ["meteo"]
+        result = task_state.last_result("meteo")
+        assert result["status"] == "cancelled"
+        assert result["run_id"] == granted.run_id
+
+
+class TestTakenRequest:
+    """A request the scheduler has taken is not a waiting request anymore.
+
+    It belongs to the scheduler from that moment on, so it may not be
+    expired like a request nobody picked up, and it is not waiting for
+    anything any more either.
+    """
+
+    def test_it_is_no_longer_a_pending_request(self):
+        granted = task_state.request("meteo", "dashboard")
+        task_state.take_pending(granted)
+
+        assert task_state.pending_requests() == {}
+
+    def test_it_does_not_get_the_short_pending_timeout(self):
+        """A pending request that nobody picks up is given up after a
+        minute. A request the scheduler took is somebody's task now, even
+        if the process has not been spawned yet."""
+        granted = task_state.request("meteo", "dashboard")
+        task_state.take_pending(granted)
+        _age_heartbeat("meteo", task_state.PENDING_TIMEOUT_S + 1)
+
+        assert task_state.is_running("meteo") is True
+
+    def test_it_is_not_expired_by_the_pending_expiry(self):
+        granted = task_state.request("meteo", "dashboard")
+        task_state.take_pending(granted)
+        _age_heartbeat("meteo", task_state.PENDING_TIMEOUT_S + 1)
+
+        assert task_state.expire_overdue_pending() == []
+        assert task_state.is_running("meteo") is True
+        assert task_state.last_result("meteo") == {}
 
 
 class TestClaimedContextManager:

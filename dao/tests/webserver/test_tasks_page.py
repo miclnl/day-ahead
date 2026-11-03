@@ -246,6 +246,109 @@ class TestCancel:
         finished = _rendered_fragment(client)
         assert "task-cancel" not in finished, "nothing is running to cancel"
 
+    def test_a_request_the_scheduler_took_is_still_cancellable(self, client):
+        """The planner has taken the request but has not spawned it yet; the
+        console still offers to cancel it, with the identity of that run."""
+        claim = task_state.request("meteo", source="dashboard")
+        task_state.take_pending(claim)
+
+        fields = _cancel_form(client)
+
+        assert fields["task_key"] == "meteo"
+        assert fields["run_id"] == claim.run_id
+
+    def test_a_cancelled_request_is_shown_as_finished(self, client):
+        """A request that was cancelled before the planner picked it up will
+        never run, so the console says it is over and stops polling."""
+        claim = task_state.request("meteo", source="dashboard")
+        assert task_state.request_cancel(claim) is True
+
+        fragment = _rendered_fragment(client)
+
+        assert "Afbreken" in fragment
+        assert "task-cancel" not in fragment
+        assert "hx-get" not in fragment, "the console keeps polling a dead run"
+
+
+class TestLogConfinement:
+    """The console reads the task log out of the log directory.
+
+    The path comes from the claim file, and a name in the log directory
+    may be a link to somewhere else entirely. The reader therefore opens
+    the file itself, inside the log directory, without following a link,
+    and accepts only a regular file.
+
+    This is local log confinement: it says nothing about the web server
+    as a whole and nothing about any device.
+    """
+
+    OUTSIDE = "not the output of the task"
+
+    def _claim(self, name):
+        task_state.claim(
+            "meteo", source="dashboard", logfile=f"../data/log/{name}"
+        )
+
+    def test_a_log_replaced_by_a_symlink_after_the_selection_is_not_read(
+        self, client, site
+    ):
+        """The claim recorded a regular file; by the time the console
+        reads it, it is a link to somewhere else. The link is not
+        followed."""
+        log_dir = Path(site) / "data" / "log"
+        name = "meteo_2026-09-29__12:00:00.log"
+        log = log_dir / name
+        log.write_text("the output of the task", encoding="utf-8")
+        outside = Path(site) / "outside.log"
+        outside.write_text(self.OUTSIDE, encoding="utf-8")
+        self._claim(name)
+
+        log.unlink()
+        log.symlink_to(outside)
+
+        fragment = _rendered_fragment(client)
+
+        assert self.OUTSIDE not in fragment
+        assert "Logbestand kon niet worden gelezen." in fragment
+
+    def test_a_stored_symlink_path_is_not_read(self, client, site):
+        """A claim that already carries a link is not followed either."""
+        log_dir = Path(site) / "data" / "log"
+        name = "meteo_2026-09-29__12:00:01.log"
+        outside = Path(site) / "outside.log"
+        outside.write_text(self.OUTSIDE, encoding="utf-8")
+        (log_dir / name).symlink_to(outside)
+        self._claim(name)
+
+        fragment = _rendered_fragment(client)
+
+        assert self.OUTSIDE not in fragment
+        assert "Logbestand kon niet worden gelezen." in fragment
+
+    def test_a_non_regular_file_with_a_task_log_name_is_not_read(self, client, site):
+        """A directory in the place of the log is not a task log either."""
+        log_dir = Path(site) / "data" / "log"
+        name = "meteo_2026-09-29__12:00:02.log"
+        (log_dir / name).mkdir()
+        self._claim(name)
+
+        fragment = _rendered_fragment(client)
+
+        assert "Logbestand kon niet worden gelezen." in fragment
+
+    def test_a_regular_log_is_still_read(self, client, site):
+        """The confinement may not keep the console from showing what a
+        task wrote."""
+        log_dir = Path(site) / "data" / "log"
+        name = "meteo_2026-09-29__12:00:03.log"
+        (log_dir / name).write_text("the output of the task", encoding="utf-8")
+        self._claim(name)
+
+        fragment = _rendered_fragment(client)
+
+        assert "the output of the task" in fragment
+        assert "Logbestand kon niet worden gelezen." not in fragment
+
 
 def _rendered_fragment(client) -> str:
     response = client.get("/v2/task-state", headers=INGRESS, environ_base=SUPERVISOR)

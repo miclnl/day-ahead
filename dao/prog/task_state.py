@@ -111,6 +111,39 @@ def _locked():
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _finish(
+    state: dict[str, Any],
+    claim: TaskClaim,
+    status: str,
+    returncode: Optional[int] = None,
+    logfile: Optional[str] = None,
+    message: Optional[str] = None,
+) -> bool:
+    """Take the claim out of the state and record how the run ended.
+
+    Only the run that holds the identity may finish it, so a stale runner
+    cannot record a result for somebody else's run. The caller holds the
+    lock.
+    """
+    entry = _matching_entry(state, claim)
+    if entry is None:
+        return False
+    state["running"].pop(claim.task_key)
+    result = {
+        "run_id": claim.run_id,
+        "status": status,
+        "returncode": returncode,
+        "finished": time.time(),
+        "started": entry.get("started"),
+        "source": entry.get("source"),
+        "logfile": logfile if logfile is not None else entry.get("logfile"),
+    }
+    if message is not None:
+        result["message"] = message
+    state["last"][claim.task_key] = result
+    return True
+
+
 def _read_raw() -> dict[str, Any]:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as handle:
@@ -311,6 +344,7 @@ def expire_overdue_pending() -> list[str]:
     """
     now = time.time()
     expired = []
+    cancelled_keys = set()
     with _locked():
         current = _read_raw()
         for key, entry in list(current["running"].items()):
@@ -320,27 +354,43 @@ def expire_overdue_pending() -> list[str]:
             if waited <= PENDING_TIMEOUT_S:
                 continue
             current["running"].pop(key)
+            # A request that was cancelled while it was waiting did not
+            # fail; it was called off. An earlier version only set the
+            # flag, so a claim can still carry it.
+            cancelled = bool(entry.get("cancel"))
+            if cancelled:
+                cancelled_keys.add(key)
             current["last"][key] = {
                 "run_id": entry.get("run_id"),
-                "status": "error",
+                "status": "cancelled" if cancelled else "error",
                 "returncode": None,
                 "finished": now,
                 "started": entry.get("started"),
                 "source": entry.get("source"),
                 "logfile": None,
                 "message": (
-                    f"Niet opgepakt binnen {PENDING_TIMEOUT_S} s; "
-                    f"de planner draaide op dat moment niet."
+                    "Geannuleerd voordat de planner hem oppakte."
+                    if cancelled
+                    else (
+                        f"Niet opgepakt binnen {PENDING_TIMEOUT_S} s; "
+                        f"de planner draaide op dat moment niet."
+                    )
                 ),
             }
             expired.append(key)
         if expired:
             _write(current)
     for key in expired:
-        logging.warning(
-            f"Aanvraag voor taak {key} is verlopen: de planner heeft hem niet "
-            f"opgepakt en hij wordt niet meer uitgevoerd."
-        )
+        if key in cancelled_keys:
+            logging.warning(
+                f"Aanvraag voor taak {key} is geannuleerd en verlopen; "
+                f"hij wordt niet meer uitgevoerd."
+            )
+        else:
+            logging.warning(
+                f"Aanvraag voor taak {key} is verlopen: de planner heeft hem niet "
+                f"opgepakt en hij wordt niet meer uitgevoerd."
+            )
     return expired
 
 
@@ -400,34 +450,38 @@ def release(
     """
     with _locked():
         state = _read_raw()
-        entry = _matching_entry(state, claim)
-        if entry is None:
-            return
-        state["running"].pop(claim.task_key)
-        state["last"][claim.task_key] = {
-            "run_id": claim.run_id,
-            "status": status,
-            "returncode": returncode,
-            "finished": time.time(),
-            "started": entry.get("started"),
-            "source": entry.get("source"),
-            "logfile": logfile if logfile is not None else entry.get("logfile"),
-        }
-        _write(state)
+        if _finish(state, claim, status, returncode=returncode, logfile=logfile):
+            _write(state)
 
 
 def request_cancel(claim: TaskClaim) -> bool:
     """Ask the runner holding this exact claim to stop.
 
-    Only sets a flag; the runner notices it on its next heartbeat and kills
-    its own subprocess. Returns False for a missing or superseded identity.
+    A request the scheduler has not picked up yet is finished here. That
+    happens under the same lock as the pickup, so the two cannot both
+    win: whoever gets the slot first owns the claim. A cancelled request
+    is never spawned, and it ends as "cancelled" rather than as a failure.
+
+    A claim that is already running only gets the flag, which its runner
+    notices on the next heartbeat and answers with a process group stop.
+
+    Returns False for a missing or superseded identity.
     """
     with _locked():
         state = _read_raw()
         entry = _matching_entry(state, claim)
         if entry is None:
             return False
-        entry["cancel"] = True
+        if entry.get("state") == "pending":
+            if not _finish(
+                state,
+                claim,
+                "cancelled",
+                message="Geannuleerd voordat de planner hem oppakte.",
+            ):
+                return False
+        else:
+            entry["cancel"] = True
         _write(state)
     return True
 

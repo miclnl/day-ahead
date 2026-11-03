@@ -17,7 +17,9 @@ job that was delayed by a few minutes still runs.
 import datetime
 import logging
 import os
+import re
 import signal
+import stat
 import sys
 import time
 from subprocess import Popen
@@ -93,6 +95,25 @@ def cron_trigger(pattern: str, timezone) -> CronTrigger:
     )
 
 
+#: The form the rest of a task's log file takes: the moment the run
+#: started. DaBase.run_task_function writes "<file_name>_<timestamp>.log"
+#: with exactly this timestamp, so the registry prefix and this form are
+#: one boundary.
+LOG_TIME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}__\d{2}:\d{2}:\d{2}\.log$")
+
+
+def _is_task_log(name: str, prefix: str) -> bool:
+    """Whether *name* is the log of the task with registry prefix *prefix*.
+
+    The whole prefix and the timestamp form together, not the prefix on
+    its own: "calc_debug_..." starts with "calc_", so a prefix match
+    alone let the regular optimisation pick up the debug run's log.
+    """
+    if not name.startswith(prefix + "_"):
+        return False
+    return LOG_TIME_PATTERN.match(name[len(prefix) + 1:]) is not None
+
+
 class DaScheduler(DaBase):
     # Resolve once at import time so all subprocesses share the same
     # working directory regardless of where the watchdog started us.
@@ -131,16 +152,43 @@ class DaScheduler(DaBase):
         """
         prefix = self.tasks[key_task]["file_name"]
         try:
-            names = [
-                name
-                for name in os.listdir(self.log_dir)
-                if name.startswith(prefix + "_") and name.endswith(".log")
-            ]
+            names = os.listdir(self.log_dir)
         except OSError:
             return None
-        if not names:
+        matching = [
+            name
+            for name in names
+            if _is_task_log(name, prefix) and self._is_plain_log_file(name)
+        ]
+        if not matching:
             return None
-        return os.path.join("../data/log", max(names))
+        return os.path.join("../data/log", max(matching))
+
+    def _log_written_since(self, key_task: str, before: str | None) -> str | None:
+        """The log this run wrote, or None if it has not written one.
+
+        *before* is the newest log that existed before the run started;
+        whatever else shows up afterwards is this run's output.
+        """
+        found = self._newest_log_for(key_task)
+        if found is None or found == before:
+            return None
+        return found
+
+    def _is_plain_log_file(self, name: str) -> bool:
+        """Whether *name* is a regular file of the log directory itself.
+
+        The directory holds files the add-on wrote, but a name in it may
+        also be a symlink to somewhere else, a directory or a fifo. None
+        of those is a task log, so none of them is offered as this task's
+        output. The name comes from the directory listing, so it cannot
+        point outside it.
+        """
+        try:
+            info = os.lstat(os.path.join(self.log_dir, name))
+        except OSError:
+            return False
+        return stat.S_ISREG(info.st_mode)
 
     def run_task_process(
         self, claim: task_state.TaskClaim, parameters: dict | None = None
@@ -165,6 +213,11 @@ class DaScheduler(DaBase):
         # cancel reaches anything it spawned rather than just the direct
         # child.
         proc = Popen(cmd, cwd=self.PROG_DIR, start_new_session=True)
+        # The id of the process group is recorded here, while the leader
+        # is certainly still there. Once it has been reaped its pid is
+        # gone, so the group can no longer be found through it, and the
+        # members that outlived the leader would keep running.
+        group = task_registry.process_group_id(proc)
         logfile = None
         cancelled = False
         # Keep the claim fresh while the task runs, so a long one (ML
@@ -174,17 +227,32 @@ class DaScheduler(DaBase):
         # noticed.
         while proc.poll() is None:
             if logfile is None:
-                found = self._newest_log_for(key_task)
-                if found is not None and found != before:
-                    logfile = found
+                logfile = self._log_written_since(key_task, before)
             entry = task_state.heartbeat(claim, logfile=logfile)
             if entry.get("cancel"):
-                logging.warning(f"Taak {key_task} wordt afgebroken op verzoek")
-                task_registry.kill_process_group(proc)
                 cancelled = True
                 break
             time.sleep(HEARTBEAT_S)
+        if not cancelled:
+            # The cancel flag is read here as well. A task that ends
+            # before its first heartbeat never enters the loop above, and
+            # a cancellation that was accepted must still be answered
+            # instead of being reported as a finished or a failed run.
+            entry = task_state.heartbeat(claim, logfile=logfile)
+            if entry.get("cancel"):
+                cancelled = True
+        if cancelled:
+            logging.warning(f"Taak {key_task} wordt afgebroken op verzoek")
+            # The group can hold members that outlived the child, so it
+            # is stopped even when the child itself is already gone. The
+            # group is the one that was recorded when the task started.
+            task_registry.kill_process_group(proc, group)
         proc.wait()
+        if logfile is None:
+            # A task that finishes immediately never reaches the loop
+            # above, so its log is looked up here as well. Otherwise the
+            # output of a short run disappears from the dashboard.
+            logfile = self._log_written_since(key_task, before)
         duration = (datetime.datetime.now() - started).total_seconds()
         if cancelled:
             return "cancelled", proc.returncode, logfile
@@ -252,6 +320,12 @@ class DaScheduler(DaBase):
         Requests are claims in the "pending" state, so they already exclude
         everything else; take_pending flips one to "running" atomically,
         which is what stops two poll cycles from starting the same request.
+
+        A request that was cancelled while it was waiting is finished by
+        the cancel itself, under the same slot as this pickup: whoever
+        gets there first owns the claim. A cancelled request is therefore
+        never spawned, and a request that is taken here is a running one
+        whose cancel is answered by the runner that starts it.
         """
         task_state.expire_overdue_pending()
         self._note_alive()
