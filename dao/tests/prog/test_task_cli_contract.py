@@ -21,7 +21,7 @@ import requests
 
 from dao.forecast.weather.service import WeatherStatus
 from dao.lib import da_prices, db_connections
-from dao.prog import da_base, da_scheduler, day_ahead, task_state, utils
+from dao.prog import da_base, da_scheduler, day_ahead, task_state, tasks, utils
 from dao.prog.config import loader
 from dao.prog.da_base import DaBase
 from dao.prog.da_scheduler import DaScheduler
@@ -135,6 +135,35 @@ def scheduled(sandbox, monkeypatch, key):
     scheduler._run_exclusive(key)
     assert not task_state.is_running(key)
     return task_state.last_result(key)
+
+
+@pytest.mark.parametrize("args,canonical,debug", [
+    pytest.param([word], key, False, id=f"spelling-{word}")
+    for key, task in tasks.TASKS.items()
+    for word in (key, *task["aliases"])
+] + [
+    pytest.param(task["cmd"][2:], key, "debug" in task["cmd"][2:], id=f"command-{key}")
+    for key, task in tasks.TASKS.items()
+    if Path(task["cmd"][1]).name == SCRIPT.name
+])
+def test_every_registered_command_dispatches_once(monkeypatch, args, canonical, debug):
+    """Missing/wrong aliases or duplicate dispatch fail without running any task."""
+    dispatched = []
+
+    class FakeDaCalc:
+        def __init__(self, file_name):
+            self.config = object()
+            self.debug = False
+            self.db_da = FakeDb()
+
+        def run_task_function(self, key):
+            dispatched.append((key, self.debug))
+            return 0
+
+    monkeypatch.setattr(day_ahead, "DaCalc", FakeDaCalc)
+
+    assert cli(monkeypatch, *args) == 0
+    assert dispatched == [(canonical, debug)]
 
 
 def test_false_task_reaches_scheduler_as_error(sandbox, monkeypatch):
