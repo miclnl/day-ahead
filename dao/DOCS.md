@@ -2213,11 +2213,17 @@ een poort hebt toegewezen. Zonder die optie antwoordt de add-on met `401 Unautho
 Met dit onderdeel van de api kun je alle berekeningen en bewerkingen
 van het programma starten. Dit kan met **curl** maar ook kun je hiermee vanuit Home Assistant een bewerking of berekening uitvoeren. <br/>
 
+De bestaande `/api/run/<commando>` (GET of POST) en
+`/v2/api/run/<commando>` (GET) gebruiken dezelfde wachtrij en taaknamen/aliases.
 De aanroep zet de taak in de wachtrij en antwoordt direct met
-`202 Accepted`; de planner pikt hem binnen enkele seconden op en voert
-hem uit. Draait die taak al, dan is het antwoord `409 Conflict`. Het
+`202 Accepted`; de planner moet draaien om hem binnen enkele seconden op te
+pikken en uit te voeren. Draait die taak al of staat hij nog in de wachtrij,
+dan is het antwoord `409 Conflict`, ook bij een andere alias voor dezelfde
+taak. Een onbekend commando geeft `404 Not Found`. De tekstrespons bevestigt
+alleen de aanvraag, niet de uitvoering, en bevat geen taakuitvoer. Het
 resultaat komt in het logbestand van de taak, te zien op de
-takenpagina van het dashboard.<br/>
+takenpagina van het dashboard. De ingress-/direct-accessregels hierboven
+gelden voor beide paden.<br/>
 Voorheen draaide de taak in het verzoek zelf, waardoor een lange
 berekening werd afgebroken door de tijdslimiet van de webserver.<br/>
 Bij ```<commando>``` vul je een van de volgende commando's in:<br />

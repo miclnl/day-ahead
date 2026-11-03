@@ -12,17 +12,37 @@ covers the guard as a request actually hits it rather than the helper
 underneath.
 """
 
+import importlib
+import json
+import socket
+import subprocess
+import threading
+from pathlib import Path
+
 import pytest
 
-from dao.prog import task_state
+from dao.prog import da_scheduler, task_state
 from dao.prog import tasks as task_registry
+from dao.prog.da_base import DaBase
 
 from .conftest import INGRESS, SUPERVISOR, csrf_token
 
 
-# No fixture needed to stop the routes running anything: they only record a
-# request now. Starting the task is the scheduler process's job, which is
-# exactly the point of moving it out of the gunicorn worker.
+@pytest.fixture(autouse=True)
+def no_web_task_workers(client, monkeypatch):
+    """Keep HTTP and the sandbox queue real; any worker/backend startup fails."""
+    def forbidden(*args, **kwargs):
+        pytest.fail("Task HTTP routes must not start processes, threads or backend I/O")
+
+    monkeypatch.setattr(DaBase, "__init__", forbidden)
+    monkeypatch.setattr(da_scheduler, "Popen", forbidden)
+    monkeypatch.setattr(da_scheduler.DaScheduler, "scheduler_loop", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(threading.Thread, "start", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(socket.socket, "connect_ex", forbidden)
 
 
 class TestV2Dashboard:
@@ -121,15 +141,76 @@ class TestV2Dashboard:
 
 
 class TestV2Api:
-    def test_it_refuses_a_task_that_is_already_running(self, client):
+    @pytest.mark.parametrize("task", task_registry.TASKS)
+    def test_v2_api_run_enqueues_without_process(self, client, task):
+        response = client.get(
+            f"/v2/api/run/{task}", headers=INGRESS, environ_base=SUPERVISOR
+        )
+
+        assert response.status_code == 202
+        assert response.content_type.startswith("text/plain")
+        pending = task_state.pending_requests()
+        assert pending.keys() == {task}
+        entry = pending[task]
+        assert entry["state"] == "pending"
+        assert entry["source"] == "api"
+        assert entry["parameters"] == {}
+        assert entry["pid"] is None
+        assert entry["logfile"] is None
+        saved = json.loads(Path(task_state.STATE_PATH).read_text(encoding="utf-8"))
+        assert saved["running"] == pending
+        assert saved["last"] == {}
+
+    @pytest.mark.parametrize("first_api", ["/v2/api/run", "/api/run"])
+    @pytest.mark.parametrize("second_api", ["/v2/api/run", "/api/run"])
+    @pytest.mark.parametrize("alias", ["calc_zonder_debug", "optimize_regular", "calc"])
+    def test_aliases_share_the_canonical_queue_claim(
+        self, client, first_api, second_api, alias
+    ):
+        response = client.get(
+            f"{first_api}/{alias}", headers=INGRESS, environ_base=SUPERVISOR
+        )
+        assert response.status_code == 202
+        pending = task_state.pending_requests()
+        assert pending.keys() == {"calc_optimum"}
+        assert pending["calc_optimum"]["source"] == "api"
+        before = Path(task_state.STATE_PATH).read_bytes()
+
+        for spelling in ("calc_optimum", "calc_zonder_debug", "optimize_regular", "calc"):
+            response = client.get(
+                f"{second_api}/{spelling}", headers=INGRESS, environ_base=SUPERVISOR
+            )
+            assert response.status_code == 409
+            assert response.content_type.startswith("text/plain")
+            assert b"api" in response.data
+            assert task_state.pending_requests() == pending
+            assert Path(task_state.STATE_PATH).read_bytes() == before
+
+    @pytest.mark.parametrize("task", ["calc_optimum", "calc_zonder_debug", "optimize_regular", "calc"])
+    def test_it_refuses_a_task_that_is_already_running(self, client, task):
         task_state.claim("calc_optimum", source="scheduler")
+        before = Path(task_state.STATE_PATH).read_bytes()
 
         response = client.get(
-            "/v2/api/run/calc_optimum", headers=INGRESS, environ_base=SUPERVISOR
+            f"/v2/api/run/{task}", headers=INGRESS, environ_base=SUPERVISOR
         )
 
         assert response.status_code == 409
         assert b"scheduler" in response.data
+        assert task_state.pending_requests() == {}
+        assert Path(task_state.STATE_PATH).read_bytes() == before
+
+    def test_a_different_task_can_still_be_queued(self, client):
+        task_state.claim("calc_optimum", source="scheduler")
+        holder = task_state.running_tasks()["calc_optimum"]
+
+        response = client.get(
+            "/v2/api/run/get_meteo", headers=INGRESS, environ_base=SUPERVISOR
+        )
+
+        assert response.status_code == 202
+        assert task_state.pending_requests().keys() == {"meteo"}
+        assert task_state.running_tasks()["calc_optimum"] == holder
 
     def test_an_unknown_task_is_a_404(self, client):
         response = client.get(
@@ -137,12 +218,56 @@ class TestV2Api:
         )
 
         assert response.status_code == 404
+        assert task_state.running_tasks() == {}
+        assert not Path(task_state.STATE_PATH).exists()
+
+    @pytest.mark.parametrize("api", ["/v2/api/run", "/api/run"])
+    @pytest.mark.parametrize("headers, environ", [({}, {}), (INGRESS, {}), ({}, SUPERVISOR)])
+    def test_run_requires_ingress_unless_direct_access_is_enabled(
+        self, client, api, headers, environ
+    ):
+        response = client.get(f"{api}/get_meteo", headers=headers, environ_base=environ)
+
+        assert response.status_code == 401
+        assert task_state.running_tasks() == {}
+        assert not Path(task_state.STATE_PATH).exists()
+
+    @pytest.mark.parametrize("api", ["/v2/api/run", "/api/run"])
+    def test_run_accepts_opted_in_direct_access(self, client, monkeypatch, api):
+        monkeypatch.setattr(importlib.import_module("app"), "ALLOW_DIRECT", True)
+
+        response = client.get(f"{api}/get_meteo")
+
+        assert response.status_code == 202
+        assert task_state.pending_requests().keys() == {"meteo"}
+        assert task_state.pending_requests()["meteo"]["source"] == "api"
+
+    def test_v2_run_keeps_its_get_only_contract(self, client):
+        response = client.post(
+            "/v2/api/run/get_meteo", headers=INGRESS, environ_base=SUPERVISOR
+        )
+
+        assert response.status_code == 405
+        assert task_state.running_tasks() == {}
 
 
 class TestDocumentedApi:
     """/api/run and /api/report are documented in DOCS.md with worked Home
     Assistant examples, so they kept their paths when the v1 interface was
     removed. They live in app/public_api.py now."""
+
+    def test_post_still_enqueues_without_a_csrf_token(self, client):
+        response = client.post(
+            "/api/run/get_meteo", headers=INGRESS, environ_base=SUPERVISOR
+        )
+
+        assert response.status_code == 202
+        assert response.content_type.startswith("text/plain")
+        assert response.get_data(as_text=True) == "Taak Meteoprognoses ophalen aangevraagd.\n"
+        pending = task_state.pending_requests()
+        assert pending.keys() == {"meteo"}
+        assert pending["meteo"]["state"] == "pending"
+        assert pending["meteo"]["source"] == "api"
 
     def test_it_refuses_a_task_that_is_already_running(self, client):
         task_state.claim("calc_optimum", source="scheduler")
