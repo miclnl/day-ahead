@@ -33,7 +33,7 @@ from utils import (
     interpolate,
 )
 
-from dao.prog import production_bonus
+from dao.prog import production_bonus, task_execution
 from dao.prog import tasks as task_registry
 from dao.prog.boiler_profile import boiler_profile
 from dao.prog.config.models.pricing import PricingConfig
@@ -6076,26 +6076,46 @@ def main(argv=None) -> int:
     previous_argv = sys.argv
     try:
         sys.argv = [previous_argv[0], *args]
-        da_calc = DaCalc("../data/options.json")
-        if da_calc.config is None:
+        first_arg = next((
+            arg for arg in args
+            if arg.lower() != "debug" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg)
+        ), None)
+        if first_arg is None:
+            config, _loader = DaBase.load_configuration("../data/options.json")
+            return 1 if config is None else 0
+        first_key = task_registry.resolve(first_arg.lower())
+        if first_key is None:
+            logging.error(f"Onbekende taak: {first_arg}")
             return 1
-        for arg in args:
-            if arg.lower() == "debug":
-                da_calc.debug = not da_calc.debug
-                continue
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg):
-                continue  # The price/consolidation/provider wrapper parses dates.
-            key = task_registry.resolve(arg.lower())
-            if key is None:
-                logging.error(f"Onbekende taak: {arg}")
+        # Construction publishes last_activity. Hold the FIRST registry
+        # resource over both bootstrap and dispatch, without a release gap.
+        # Debug toggles below remain argv-ordered; both optimiser keys share
+        # their resource through task_registry.resource_key().
+        with task_execution.execution(first_key):
+            da_calc = DaCalc("../data/options.json")
+            if da_calc.config is None:
                 return 1
-            if key == "calc_optimum" and da_calc.debug:
-                key = "calc_optimum_met_debug"
-            status = da_calc.run_task_function(key)
-            if status != 0:
-                return status
-        da_calc.db_da.log_pool_status()
-        return 0
+            for arg in args:
+                if arg.lower() == "debug":
+                    da_calc.debug = not da_calc.debug
+                    continue
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg):
+                    continue  # The price/consolidation/provider wrapper parses dates.
+                key = task_registry.resolve(arg.lower())
+                if key is None:
+                    logging.error(f"Onbekende taak: {arg}")
+                    return 1
+                if key == "calc_optimum" and da_calc.debug:
+                    key = "calc_optimum_met_debug"
+                with task_execution.execution(key):
+                    status = da_calc.run_task_function(key)
+                if status != 0:
+                    return status
+            da_calc.db_da.log_pool_status()
+            return 0
+    except task_execution.LeaseError as exc:
+        logging.error(f"Taak niet uitgevoerd: {exc}")
+        return 1
     finally:
         sys.argv = previous_argv
 

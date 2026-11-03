@@ -39,6 +39,8 @@ from dao.prog.config.models.base import UNUSABLE_STATES
 from dao.prog.utils import error_handling, get_tibber_data
 from dao.prog.version import __version__
 
+DATA_PATH_TARGET = "/config/dao_data"
+
 
 @dataclass
 class HAContext:
@@ -143,27 +145,9 @@ class DaBase:
         self.config = None
         self.loader = None
         self._owns_root_logger = self._configure_root_logging()
-        # Load config exactly once, even when multiple threads construct a
-        # DaBase subclass concurrently (e.g. gunicorn workers sharing a process).
-        # DB singletons are managed separately in db_connections.py.
-        with DaBase._init_lock:
-            if DaBase._config is None:
-                try:
-                    DaBase._loader = ConfigurationLoader(
-                        Path(self.file_name)
-                        if self.file_name
-                        else Path("../data/options.json")
-                    )
-                    DaBase._config = DaBase._loader.load_and_validate()
-                except FileNotFoundError as e:
-                    logging.error(f"Configuratiebestand niet gevonden: {e}")
-                    return
-                except (ValueError, TypeError, RuntimeError) as e:
-                    logging.error(f"Configuratie kon niet worden geladen: {e}")
-                    return
-
-        self.config = DaBase._config
-        self.loader = DaBase._loader
+        self.config, self.loader = self.load_configuration(self.file_name)
+        if self.config is None:
+            return
 
         self.db_da = make_db_da(self.config, self.loader.secrets)
         if self.db_da is None:
@@ -592,11 +576,32 @@ class DaBase:
             )
 
     @staticmethod
-    def make_data_path():
-        if os.path.lexists("../data"):
+    def make_data_path(data_path="../data"):
+        if os.path.lexists(data_path):
             return
         else:
-            os.symlink("/config/dao_data", "../data")
+            os.symlink(DATA_PATH_TARGET, data_path)
+
+    @staticmethod
+    def load_configuration(file_name=None):
+        """Load the app's shared configuration without constructing/publishing."""
+        DaBase.make_data_path()
+        # Load exactly once across constructors and no-task CLI calls.
+        # DB singletons are managed separately in db_connections.py.
+        with DaBase._init_lock:
+            if DaBase._config is None:
+                try:
+                    DaBase._loader = ConfigurationLoader(
+                        Path(file_name) if file_name else Path("../data/options.json")
+                    )
+                    DaBase._config = DaBase._loader.load_and_validate()
+                except FileNotFoundError as e:
+                    logging.error(f"Configuratiebestand niet gevonden: {e}")
+                    return None, None
+                except (ValueError, TypeError, RuntimeError) as e:
+                    logging.error(f"Configuratie kon niet worden geladen: {e}")
+                    return None, None
+            return DaBase._config, DaBase._loader
 
     def set_last_activity(self):
         if self.last_activity_entity is not None:
@@ -1258,12 +1263,22 @@ class DaBase:
             logger.setLevel(previous_level)
 
     def run_task_cmd(self, task):
+        from dao.prog import task_execution
+
         if task not in self.tasks:
             logging.error(f"Onbekende taak: {task}")
             return
+        try:
+            with task_execution.execution(task) as lease:
+                return self._run_leased_task_cmd(task, lease)
+        except task_execution.LeaseError as exc:
+            logging.error(f"Taak niet uitgevoerd: {exc}")
+            return 1
+
+    def _run_leased_task_cmd(self, task, lease):
         run_task = self.tasks[task]
         cmd = run_task["cmd"]
-        proc = run(cmd, stdout=PIPE, stderr=PIPE)
+        proc = run(cmd, stdout=PIPE, stderr=PIPE, **lease.child_kwargs())
         data = proc.stdout.decode()
         err = proc.stderr.decode()
         log_content = data + err

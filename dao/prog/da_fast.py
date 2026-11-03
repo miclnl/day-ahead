@@ -37,6 +37,7 @@ if __package__ in (None, ""):
     if _ROOT not in sys.path:
         sys.path.insert(0, _ROOT)
 
+from dao.prog import task_execution  # noqa: E402
 from dao.prog.fastctrl.plan import BatterySpec, FAST_PLAN_FILE, load_plan  # noqa: E402
 from dao.prog.fastctrl.policy import PolicyLimits  # noqa: E402
 from dao.prog.fastctrl.runner import FastControlRunner  # noqa: E402
@@ -311,7 +312,17 @@ def main(argv=None) -> int:
         "simulate": cmd_simulate,
         "demo": cmd_demo,
     }
-    return handlers[args.command](args)
+    # Only these commands are registered tasks; the continuous fast-control
+    # loop is not an actuator-fencing boundary supplied by this writer lease.
+    key = {"once": "fast_once", "simulate": "fast_control_simulate"}.get(args.command)
+    if key is None:
+        return handlers[args.command](args)
+    try:
+        with task_execution.execution(key):
+            return handlers[args.command](args)
+    except task_execution.LeaseError as exc:
+        logging.error(f"Taak niet uitgevoerd: {exc}")
+        return 1
 
 
 if __name__ == "__main__":

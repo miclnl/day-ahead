@@ -307,10 +307,14 @@ class TestOutcome:
 
         def replace_during_spawn(cmd, **kwargs):
             path = Path(task_state.STATE_PATH)
-            state = json.loads(path.read_text())
-            state["running"]["meteo"]["heartbeat"] = time.time() - task_state.STALE_AFTER_S - 1
-            path.write_text(json.dumps(state))
-            new = task_state.claim("meteo", "dashboard")
+            # Force a superseded identity to exercise B10b's no-op updates.
+            # Timeout recovery cannot legitimately replace a pre-spawn lease
+            # holder any more; B10d tests prove that separate OS invariant.
+            with task_state._locked():
+                state = json.loads(path.read_text())
+                state["running"]["meteo"]["run_id"] = "replacement-under-sidecar"
+                task_state._write(state)
+            new = task_state.TaskClaim("meteo", "replacement-under-sidecar")
             task_state.request_cancel(new)
             replacement_bytes.append(path.read_bytes())
             if raises:

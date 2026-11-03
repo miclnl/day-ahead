@@ -54,12 +54,14 @@ API_RUN_TIMEOUT_S = 110
 #: timeout_s   optional override of API_RUN_TIMEOUT_S, never above it
 #: schedulable whether the task may appear in the scheduler configuration
 #: aliases     historical keys from the v1/v2 dashboards
+#: resource    optional shared writer resource; otherwise the canonical key
 TASKS: dict[str, dict[str, Any]] = {
     "calc_optimum_met_debug": {
         "name": "Optimaliseringsberekening met debug",
         "cmd": [_PY, _DAY_AHEAD, "debug", "calc"],
         "function": "calc_optimum_met_debug",
         "file_name": "calc_debug",
+        "resource": "calc_optimum",
         "schedulable": True,
         "aliases": ("calc_met_debug", "optimize_debug"),
     },
@@ -210,6 +212,14 @@ def get(key: str) -> Optional[dict[str, Any]]:
     """The task definition for *key* (canonical or alias), or None."""
     canonical = resolve(key)
     return TASKS[canonical] if canonical is not None else None
+
+
+def resource_key(key: str) -> Optional[str]:
+    """The writer resource, derived only from this registry (including aliases)."""
+    canonical = resolve(key)
+    if canonical is None:
+        return None
+    return TASKS[canonical].get("resource", canonical)
 
 
 def schedulable_functions() -> frozenset[str]:

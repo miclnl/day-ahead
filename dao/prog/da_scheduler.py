@@ -30,7 +30,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from da_base import DaBase
-from dao.prog import task_state
+from dao.prog import task_execution, task_state
 from dao.prog import tasks as task_registry
 from dao.prog.fastctrl.runner import start_if_enabled
 
@@ -212,7 +212,18 @@ class DaScheduler(DaBase):
         # start_new_session=True: the task gets its own process group, so a
         # cancel reaches anything it spawned rather than just the direct
         # child.
-        proc = Popen(cmd, cwd=self.PROG_DIR, start_new_session=True)
+        lease = task_execution.acquire(key_task)
+        try:
+            if not task_state.execution_allowed(claim):
+                raise task_execution.LeaseError("Taakclaim is niet meer uitvoerbaar")
+            proc = Popen(
+                cmd, cwd=self.PROG_DIR, start_new_session=True,
+                **lease.child_kwargs(),
+            )
+        finally:
+            # pass_fds transferred the shared open-file-description. NEVER
+            # LOCK_UN here: that would unlock the child's lease as well.
+            lease.close()
         # The id of the process group is recorded here, while the leader
         # is certainly still there. Once it has been reaped its pid is
         # gone, so the group can no longer be found through it, and the
@@ -298,6 +309,9 @@ class DaScheduler(DaBase):
             )
         except Exception:  # noqa: BLE001 - the scheduler must keep running
             logging.exception(f"Taak {claim.task_key} is mislukt")
+            # release probes the writer lease under the state lock. A child
+            # (or descendant) still holding it keeps an unconfirmed claim;
+            # neither registration nor heartbeat errors imply writer exit.
             task_state.release(claim, "error")
         else:
             task_state.release(

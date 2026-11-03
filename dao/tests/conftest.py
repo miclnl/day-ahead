@@ -17,7 +17,8 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolate_task_state(tmp_path, monkeypatch):
-    from dao.prog import task_state
+    from dao.prog import task_execution, task_state
 
     monkeypatch.setattr(task_state, "STATE_PATH", str(tmp_path / "task_state.json"))
     monkeypatch.setattr(task_state, "LOCK_PATH", str(tmp_path / "task_state.lock"))
+    monkeypatch.setattr(task_execution, "LEASE_DIR", str(tmp_path / "task_lease"))

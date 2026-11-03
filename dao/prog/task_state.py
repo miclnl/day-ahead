@@ -16,7 +16,8 @@ dashboard wrote the shared state file non-atomically while v2 treated a
 ``JSONDecodeError`` as "nothing is running", so a poll landing during a v1
 write opened the guard as well.
 
-Everything that starts a task now claims it here first.
+This module owns requests/run identities, not the execution mutex. Actual
+writers must hold the process-lifetime lease owned by task_execution.
 
 Two properties matter:
 
@@ -24,9 +25,9 @@ Two properties matter:
   and does the read-check-write inside it, so the check-then-act race that
   let two near-simultaneous requests both pass the "is something running"
   test cannot happen, not even across processes.
-* **Exclusion is per task, not global.** That matches what the scheduler
-  already did: two different tasks may overlap (the optimisation should not
-  have to wait for ML training), the same task never overlaps itself. A
+* **Exclusion is per registry resource, not global.** Different tasks may
+  overlap (the optimisation should not have to wait for ML training), but
+  regular/debug optimisation share their writer resource. A
   dashboard that wants to present "one at a time" can still do so by looking
   at :func:`running_tasks`; that is a presentation choice, not the lock.
 
@@ -43,10 +44,13 @@ import json
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
 from uuid import uuid4
+
+from dao.prog import task_execution
+from dao.prog import tasks as task_registry
 
 #: Both paths are relative to the working directory every entry point uses
 #: (dao/prog for the scheduler and the task subprocesses, dao/webserver for
@@ -54,11 +58,9 @@ from uuid import uuid4
 STATE_PATH = "../data/task_state.json"
 LOCK_PATH = "../data/task_state.lock"
 
-#: A running task that has not been heard from for this long is treated as
-#: dead and no longer blocks a new claim. A task subprocess that is killed
-#: (gunicorn recycling its worker, the watchdog restarting the scheduler,
-#: OOM) never gets to release its claim, and without this the task would be
-#: unstartable until someone deleted the file by hand.
+#: After this age a claim is unconfirmed, NOT dead. Recovery additionally
+#: requires a successful OS writer-lease acquire; old unleased writers require
+#: a quiescent upgrade/explicit termination, never timeout migration.
 STALE_AFTER_S = 600
 
 #: A request that the scheduler has not picked up within this many seconds
@@ -156,12 +158,13 @@ def _read_raw() -> dict[str, Any]:
     if not isinstance(data, dict):
         return _empty_state()
     if "running" not in data:
-        # A state file from before this module: a single flat record of the
-        # one task the dashboard was tracking. There is no reliable way to
-        # know whether that task is still alive, and the old writers are
-        # gone, so start clean rather than import a claim nobody will
-        # release.
-        return _empty_state()
+        result = _empty_state()
+        if data.get("status") == "running":
+            # No lease evidence: even a free sidecar cannot prove this old
+            # writer stopped. Preserve the barrier until quiescent upgrade.
+            key = task_registry.resolve(data.get("task", "")) or "*"
+            result["running"][key] = {**data, "state": "unconfirmed"}
+        return result
     running = data.get("running")
     last = data.get("last")
     result = {
@@ -175,7 +178,7 @@ def _read_raw() -> dict[str, Any]:
 
 
 def _age_limit(entry: dict[str, Any]) -> float:
-    """How long *entry* may go without an update before it is dead.
+    """How long *entry* may go without an update before it is unconfirmed.
 
     A pending request gets much less rope than a running task: the
     scheduler polls every few seconds, so a request still pending after a
@@ -187,24 +190,15 @@ def _age_limit(entry: dict[str, Any]) -> float:
 
 
 def _drop_stale(state: dict[str, Any], now: float) -> dict[str, Any]:
-    fresh = {}
     for key, entry in state["running"].items():
         heartbeat = entry.get("heartbeat", entry.get("started", 0.0))
         limit = _age_limit(entry)
-        if now - heartbeat > limit:
-            if entry.get("state") == "pending":
-                logging.warning(
-                    f"Aanvraag voor taak {key} is na {now - heartbeat:.0f} s "
-                    f"niet opgepakt; draait de planner?"
-                )
-            else:
-                logging.warning(
-                    f"Taak {key} stond nog als lopend geregistreerd maar is "
-                    f"{now - heartbeat:.0f} s niet meer bijgewerkt; claim vrijgegeven"
-                )
-            continue
-        fresh[key] = entry
-    state["running"] = fresh
+        if now - heartbeat > limit and entry.get("state") != "unconfirmed":
+            logging.warning(
+                f"Taak {key} is {now - heartbeat:.0f} s niet bijgewerkt; "
+                "claim onbevestigd, writerlease blijft leidend"
+            )
+            entry["state"] = "unconfirmed"
     return state
 
 
@@ -219,7 +213,7 @@ def _write(state: dict[str, Any]) -> None:
 
 
 def read() -> dict[str, Any]:
-    """The current state, with dead claims already filtered out.
+    """The current state, with stale claims marked unconfirmed, never erased.
 
     Takes no lock: the state file is only ever replaced atomically, so a
     reader sees either the previous or the next version, never a half-written
@@ -235,6 +229,48 @@ def running_tasks() -> dict[str, Any]:
 
 def is_running(task_key: str) -> bool:
     return task_key in running_tasks()
+
+
+def _resource(task_key: str) -> str:
+    return task_registry.resource_key(task_key) or task_key
+
+
+def _resource_entries(state: dict[str, Any], task_key: str) -> dict[str, Any]:
+    return {
+        key: entry for key, entry in state["running"].items()
+        if key == "*" or _resource(key) == _resource(task_key)
+    }
+
+
+def upgrade_safe(task_key: str) -> bool:
+    """Read-only legacy barrier; a free sidecar cannot prove old writer exit.
+
+    Like read(), this observes an atomic state snapshot. The caller already
+    holds the writer lease, so compatible claim writers cannot acquire their
+    probe. Do not create a bookkeeping lock merely to inspect a direct CLI.
+    """
+    return all(
+        entry.get("lease_protocol") == task_execution.LEASE_PROTOCOL
+        for entry in _resource_entries(_read_raw(), task_key).values()
+    )
+
+
+def execution_allowed(claim: TaskClaim) -> bool:
+    """Revalidate identity AFTER acquiring the lease, before spawning a writer.
+
+    An arbitrarily delayed runner must not execute a superseded claim just
+    because it can eventually acquire the OS slot.
+    """
+    with _locked():
+        current = _read_raw()
+        entry = _matching_entry(current, claim)
+        return bool(
+            entry and entry.get("state") != "pending"
+            and all(
+                item.get("lease_protocol") == task_execution.LEASE_PROTOCOL
+                for item in _resource_entries(current, claim.task_key).values()
+            )
+        )
 
 
 def claim(
@@ -259,25 +295,49 @@ def claim(
     itself, or "pending" for a request the scheduler still has to pick up
     (see :func:`request`). Either way the claim blocks everyone else, so the
     exclusion is the same.
+
+    A grant is bookkeeping, not permission for task I/O without the writer
+    lease. Unconfirmed claims can be replaced only with a successful OS probe.
     """
     now = time.time()
     with _locked():
         current = _drop_stale(_read_raw(), now)
-        if task_key in current["running"]:
+        conflicting = _resource_entries(current, task_key)
+        if any(
+            entry.get("state") != "unconfirmed"
+            or entry.get("lease_protocol") != task_execution.LEASE_PROTOCOL
+            for entry in conflicting.values()
+        ):
             return None
-        granted = TaskClaim(task_key, uuid4().hex)
-        current["running"][task_key] = {
-            "run_id": granted.run_id,
-            "state": state_name,
-            "started": now,
-            "heartbeat": now,
-            "source": source,
-            "logfile": logfile,
-            "pid": pid,
-            "cancel": False,
-            "parameters": parameters or {},
-        }
-        _write(current)
+        probe = None
+        try:
+            if task_registry.resolve(task_key) is not None:
+                try:
+                    probe = task_execution.acquire(task_key)
+                except task_execution.LeaseBusy:
+                    return None
+            elif conflicting:
+                return None  # Unknown resources have no recoverable OS lease.
+            # Hold the successful OS probe through the state replacement.
+            for key in conflicting:
+                current["running"].pop(key)
+            granted = TaskClaim(task_key, uuid4().hex)
+            current["running"][task_key] = {
+                "run_id": granted.run_id,
+                "state": state_name,
+                "started": now,
+                "heartbeat": now,
+                "source": source,
+                "logfile": logfile,
+                "pid": pid,
+                "cancel": False,
+                "parameters": parameters or {},
+                "lease_protocol": task_execution.LEASE_PROTOCOL,
+            }
+            _write(current)
+        finally:
+            if probe is not None:
+                probe.close()
     return granted
 
 
@@ -319,9 +379,10 @@ def take_pending(claim: TaskClaim) -> Optional[dict[str, Any]]:
     """
     now = time.time()
     with _locked():
-        current = _read_raw()
+        current = _drop_stale(_read_raw(), now)
         entry = _matching_entry(current, claim)
-        if entry is None or entry.get("state") != "pending":
+        if (entry is None or entry.get("state") != "pending"
+                or entry.get("lease_protocol") != task_execution.LEASE_PROTOCOL):
             return None
         entry["state"] = "running"
         entry["heartbeat"] = now
@@ -344,15 +405,28 @@ def expire_overdue_pending() -> list[str]:
     """
     now = time.time()
     expired = []
+    changed = False
     cancelled_keys = set()
-    with _locked():
+    with _locked(), ExitStack() as probes:
         current = _read_raw()
         for key, entry in list(current["running"].items()):
             if entry.get("state") != "pending":
                 continue
+            if entry.get("lease_protocol") != task_execution.LEASE_PROTOCOL:
+                entry["state"] = "unconfirmed"
+                changed = True
+                continue
             waited = now - entry.get("heartbeat", entry.get("started", now))
             if waited <= PENDING_TIMEOUT_S:
                 continue
+            if task_registry.resolve(key) is not None:
+                try:
+                    probe = task_execution.acquire(key)
+                except task_execution.LeaseBusy:
+                    entry["state"] = "unconfirmed"
+                    changed = True
+                    continue
+                probes.callback(probe.close)
             current["running"].pop(key)
             # A request that was cancelled while it was waiting did not
             # fail; it was called off. An earlier version only set the
@@ -378,7 +452,7 @@ def expire_overdue_pending() -> list[str]:
                 ),
             }
             expired.append(key)
-        if expired:
+        if expired or changed:
             _write(current)
     for key in expired:
         if key in cancelled_keys:
@@ -441,17 +515,40 @@ def release(
     returncode: Optional[int] = None,
     logfile: Optional[str] = None,
 ) -> None:
-    """Give up this exact claim and record how the run ended.
+    """Finish this exact claim only after the OS writer resource is free.
 
     *status* is one of "done", "error" or "cancelled". The outcome is kept
     under "last" so the dashboard can still show the result of a task that
     is no longer running. A missing or superseded identity is a no-op, not
-    a result for a run the caller does not own.
+    a result for a run the caller does not own. A still-held writer lease
+    keeps the claim unconfirmed instead (also after a leader/runner error).
     """
     with _locked():
         state = _read_raw()
-        if _finish(state, claim, status, returncode=returncode, logfile=logfile):
+        entry = _matching_entry(state, claim)
+        if entry is None:
+            return
+        if entry.get("lease_protocol") != task_execution.LEASE_PROTOCOL:
+            entry["state"] = "unconfirmed"
             _write(state)
+            return
+        probe = None
+        try:
+            if task_registry.resolve(claim.task_key) is not None:
+                try:
+                    probe = task_execution.acquire(claim.task_key)
+                except task_execution.LeaseBusy:
+                    # A scheduler error/leader exit is not writer exit.
+                    # Preserve the exact identity and exclusion, even if an
+                    # orphan or writing descendant is all that remains.
+                    entry["state"] = "unconfirmed"
+                    _write(state)
+                    return
+            if _finish(state, claim, status, returncode=returncode, logfile=logfile):
+                _write(state)
+        finally:
+            if probe is not None:
+                probe.close()
 
 
 def request_cancel(claim: TaskClaim) -> bool:
@@ -472,7 +569,10 @@ def request_cancel(claim: TaskClaim) -> bool:
         entry = _matching_entry(state, claim)
         if entry is None:
             return False
-        if entry.get("state") == "pending":
+        if entry.get("lease_protocol") != task_execution.LEASE_PROTOCOL:
+            entry["state"] = "unconfirmed"
+            entry["cancel"] = True
+        elif entry.get("state") == "pending":
             if not _finish(
                 state,
                 claim,

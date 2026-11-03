@@ -255,20 +255,19 @@ class TestRunIdentity:
 
 
 class TestStaleClaims:
-    def test_a_claim_nobody_released_stops_blocking_after_the_timeout(self):
-        """A task subprocess that is killed -- gunicorn recycling its worker
-        on a config change, the watchdog restarting the scheduler, the OOM
-        killer -- never releases its claim. Without expiry the task would be
-        unstartable until someone deleted the file by hand."""
-        task_state.claim("calc_optimum", "dashboard")
+    def test_stale_claim_is_unconfirmed_and_recoverable_only_with_free_lease(self):
+        """Age is not writer-exit evidence; this sandbox has no live writer."""
+        granted = task_state.claim("calc_optimum", "dashboard")
 
         state = json.loads(Path(task_state.STATE_PATH).read_text())
         old = time.time() - task_state.STALE_AFTER_S - 1
         state["running"]["calc_optimum"]["heartbeat"] = old
         Path(task_state.STATE_PATH).write_text(json.dumps(state))
 
-        assert task_state.is_running("calc_optimum") is False
-        assert task_state.claim("calc_optimum", "scheduler") is not None
+        assert task_state.is_running("calc_optimum") is True
+        assert task_state.running_tasks()["calc_optimum"]["state"] == "unconfirmed"
+        replacement = task_state.claim("calc_optimum", "scheduler")
+        assert replacement is not None and replacement != granted
 
     def test_a_heartbeat_keeps_a_long_task_alive(self):
         granted = task_state.claim("train_ml_predictions", "scheduler")
@@ -296,7 +295,8 @@ class TestStaleClaims:
         task_state.heartbeat(granted)
 
         assert task_state.is_running("meteo") is True
-        assert task_state.is_running("prices") is False
+        assert task_state.is_running("prices") is True
+        assert task_state.running_tasks()["prices"]["state"] == "unconfirmed"
 
 
 class TestCancel:
@@ -479,10 +479,8 @@ class TestCorruptAndLegacyState:
         assert task_state.running_tasks() == {}
         assert task_state.claim("calc_optimum", "scheduler") is not None
 
-    def test_a_legacy_flat_state_file_does_not_block_anything(self):
-        """The old format was a single flat record of whichever task the
-        dashboard was tracking. The writers of that format are gone, so an
-        inherited claim would never be released."""
+    def test_a_legacy_flat_state_file_requires_quiescent_upgrade(self):
+        """No timeout or free new sidecar proves an old unleased writer exited."""
         Path(task_state.STATE_PATH).write_text(
             json.dumps(
                 {
@@ -494,8 +492,8 @@ class TestCorruptAndLegacyState:
             )
         )
 
-        assert task_state.running_tasks() == {}
-        assert task_state.claim("calc_optimum", "dashboard") is not None
+        assert task_state.running_tasks()["calc_optimum"]["state"] == "unconfirmed"
+        assert task_state.claim("calc_optimum", "dashboard") is None
 
     def test_a_missing_state_file_is_empty_not_an_error(self):
         assert task_state.running_tasks() == {}
@@ -519,9 +517,10 @@ class TestCrossProcessAtomicity:
         script.write_text(
             "import sys\n"
             f"sys.path.insert(0, {str(REPO)!r})\n"
-            "from dao.prog import task_state\n"
+            "from dao.prog import task_execution, task_state\n"
             f"task_state.STATE_PATH = {str(state_in_tmp / 'task_state.json')!r}\n"
             f"task_state.LOCK_PATH = {str(state_in_tmp / 'task_state.lock')!r}\n"
+            f"task_execution.LEASE_DIR = {str(state_in_tmp / 'task_lease')!r}\n"
             "barrier = sys.argv[1]\n"
             "import os, time\n"
             "while not os.path.exists(barrier):\n"

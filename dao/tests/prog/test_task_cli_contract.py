@@ -5,6 +5,7 @@ not a canned scheduler returncode. No personal configuration is constructed.
 """
 
 import datetime as dt
+import json
 import logging
 import platform
 import runpy
@@ -30,6 +31,7 @@ from dao.tests.settlement.test_optimization_producer import capture as capture
 from dao.tests.settlement.test_publication import pricing_config
 
 SCRIPT = Path(day_ahead.__file__).resolve()
+REAL_CONFIG_LOAD = loader.ConfigurationLoader.load_and_validate
 
 
 class FakeDb:
@@ -112,10 +114,22 @@ def cli(monkeypatch, *args):
 
 def scheduled(sandbox, monkeypatch, key):
     class CliProcess:
-        def __init__(self, cmd, *, cwd, start_new_session):
+        def __init__(self, cmd, *, cwd, start_new_session, pass_fds, env):
             assert cwd == str(sandbox.prog)
             assert start_new_session is True
-            result = cli(monkeypatch, *cmd[2:])
+            # Model a separate child's fd table/environment: dup shares the
+            # open-file-description but child close must not close the parent.
+            import os
+
+            from dao.prog import task_execution
+
+            assert pass_fds == (int(env[task_execution.ENV_FD]),)
+            child_fd = os.dup(pass_fds[0])
+            with monkeypatch.context() as child_env:
+                for name, value in env.items():
+                    child_env.setenv(name, value)
+                child_env.setenv(task_execution.ENV_FD, str(child_fd))
+                result = cli(monkeypatch, *cmd[2:])
             # This is the OS meaning of sys.exit(None), including on the RED.
             self.returncode = 0 if result is None else result
             self.polls = 0
@@ -551,3 +565,32 @@ def test_real_script_entrypoint_preserves_os_status(sandbox, monkeypatch, machin
         runpy.run_path(str(SCRIPT), run_name="__main__")
     assert caught.value.code == status
     assert isinstance(caught.value, HardExit) is (machine in ("arm64", "aarch64"))
+
+
+@pytest.mark.parametrize("argv", [[], ["debug"]])
+@pytest.mark.parametrize("configuration,want", [("missing", 1), ("invalid", 1), ("valid", 0)])
+def test_no_task_configuration_status_without_publishing_constructor(sandbox, monkeypatch, argv, configuration, want):
+    path = sandbox.prog.parent / "data" / "options.json"
+    if configuration != "missing":
+        path.write_text(json.dumps({"config_version": 3 if configuration == "valid" else 999}))
+    (path.parent / "secrets.json").write_text("{}")
+    monkeypatch.setattr(DaBase, "_config", None)
+    monkeypatch.setattr(DaBase, "_loader", None)
+    loaded = []
+
+    def load(instance):
+        # Permit the real app loader only for this synthetic sandbox file;
+        # the suite's other network/DB/constructor guards remain in force.
+        assert instance.config_path.resolve() == path.resolve()
+        loaded.append(instance.config_path.resolve())
+        return REAL_CONFIG_LOAD(instance)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("no-task CLI constructed a publishing app")
+
+    monkeypatch.setattr(loader.ConfigurationLoader, "load_and_validate", load)
+    monkeypatch.setattr(day_ahead, "DaCalc", forbidden)
+    assert day_ahead.main(argv) == want
+    assert loaded == [path.resolve()]
+    assert (DaBase._config is not None) is (configuration == "valid")
+    assert not list(sandbox.logs.iterdir())

@@ -12,6 +12,7 @@ if __package__ in (None, ""):
     # Het geregistreerde script draait vanuit dao/webserver, zonder installatie.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from dao.prog import task_execution  # noqa: E402
 from dao.prog.da_base import DaBase  # noqa: E402
 from dao.prog.settlement.tariffs import _canonical_default  # noqa: E402
 
@@ -38,20 +39,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                            or args.start is not None or args.end is not None):
         parser.error("--scheduled vereist reconcile --publish --reason scheduled zonder bereik")
     try:
-        if args.scheduled:
-            DaBase.local_settlement_app(args.config).consolidate_settlement()
-            print(json.dumps({"message": "Scheduleradapter uitgevoerd"}))
-            return 0
-        service = load_service(args.config)
-        lower, upper = service.scheduled_range() if args.start is None or args.end is None else (args.start, args.end)
-        start = lower if args.start is None else args.start
-        end = upper if args.end is None else args.end
-        result = service.consolidate(start, end, publish=args.publish, reason=args.reason or "local-preview")
-        print(json.dumps(asdict(result), default=_canonical_default, sort_keys=True))
-        return 0
+        with task_execution.execution("settlement_consolidate"):
+            return _execute(args)
     except Exception as exc:
         logging.error(f"Afrekening niet uitgevoerd: {exc}")
         return 1
+
+
+def _execute(args) -> int:
+    if args.scheduled:
+        DaBase.local_settlement_app(args.config).consolidate_settlement()
+        print(json.dumps({"message": "Scheduleradapter uitgevoerd"}))
+        return 0
+    service = load_service(args.config)
+    lower, upper = service.scheduled_range() if args.start is None or args.end is None else (args.start, args.end)
+    start = lower if args.start is None else args.start
+    end = upper if args.end is None else args.end
+    result = service.consolidate(start, end, publish=args.publish, reason=args.reason or "local-preview")
+    print(json.dumps(asdict(result), default=_canonical_default, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
