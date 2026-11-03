@@ -1,11 +1,15 @@
 from flask import Blueprint, abort, render_template, request, redirect, url_for
 from markupsafe import escape
-from dao.prog.da_report import Report
+from dao.prog.da_report import AGGREGATE_DELTAS, Report
 from dao.prog import task_state
 from dao.prog import tasks as task_registry
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import json
+import base64
+import logging
+import re
+import unicodedata
 from zoneinfo import ZoneInfo, available_timezones
 
 api = Blueprint("api", __name__)
@@ -25,33 +29,104 @@ def _requested_timezone() -> str:
         abort(400, description=f"Unknown timezone: {raw!r}")
     return raw
 
+
+def _parse_query_timestamp(raw: str, zone: ZoneInfo) -> datetime:
+    """Preserve aware instants; accept only unique, existing naive local times."""
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(zone)
+
+    # A gap has no UTC round-trip; a fold has two distinct UTC instants.
+    # Outside transitions both fold values identify the same instant.
+    instants = set()
+    for fold in (0, 1):
+        instant = parsed.replace(tzinfo=zone, fold=fold).astimezone(UTC)
+        if instant.astimezone(zone).replace(tzinfo=None) == parsed:
+            instants.add(instant)
+    if len(instants) != 1:
+        raise ValueError("Ambiguous or nonexistent local timestamp")
+    return instants.pop().astimezone(zone)
+
+
+def _parse_data_query(args, timezone_raw: str):
+    """Pure shared query validation, without constructing a backend or doing I/O."""
+    if not args.get("start") or not args.get("end"):
+        raise ValueError("Start and end are required")
+    aggregate = args.get("aggregate")
+    if aggregate not in AGGREGATE_DELTAS:
+        raise ValueError("Invalid aggregate interval")
+    zone = ZoneInfo(timezone_raw)
+    start = _parse_query_timestamp(args["start"], zone)
+    end = _parse_query_timestamp(args["end"], zone)
+    # Same-zone datetime comparisons ignore fold and compare wall-clock labels.
+    if end.astimezone(UTC) <= start.astimezone(UTC):
+        raise ValueError("End must be later than start")
+    fields = args.get("fields")
+    if fields:
+        fields = fields.split(",")
+    return start, end, aggregate, fields
+
+
+def _validated_data_query():
+    try:
+        return _parse_data_query(request.args, _requested_timezone())
+    except (TypeError, ValueError, OverflowError):
+        abort(400, description="Invalid data query")
+
+
+def _sanitized_backend_error(error: Exception) -> str:
+    """Bound diagnostic details to one line, without credential values/userinfo."""
+    detail = f"{type(error).__name__}: {error}"
+    detail = " ".join("".join(
+        " " if unicodedata.category(char).startswith("C") else char for char in detail
+    ).split())
+    detail = re.sub(
+        r"((?:[a-z][a-z0-9+.-]*:)?//)[^\s/?#]*@",
+        r"\1<redacted>@", detail, flags=re.IGNORECASE,
+    )
+    credential_core = (
+        r"(?:password|passwd|passphrase|pwd|token|secret|"
+        r"(?:api|private|access|secret)[_-]?key|authorization|credential|wachtwoord)"
+    )
+    # A core ends the key (digits allowed), or occupies a complete segment.
+    # The short, ambiguous name 'pass' is sensitive only as the entire key.
+    credential_key = (
+        rf"(?:pass|[\w.-]*{credential_core}[0-9]*|"
+        rf"(?:[\w.-]*[_.-])?{credential_core}[0-9]*[_.-][\w.-]*)"
+    )
+    detail = re.sub(
+        rf"((?<![\w.-]){credential_key}\s*(?:=|:(?!//))\s*)"
+        r'''(?:(?:Bearer|Basic)\s+)?(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)''',
+        r"\1<redacted>", detail, flags=re.IGNORECASE,
+    )
+    detail = re.sub(
+        r"(?<![\w.-])((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/-]+=*(?![\w./~+=-])",
+        r"\1<redacted>", detail, flags=re.IGNORECASE,
+    )
+
+    def redact_jwt(match):
+        # Dotted identifiers/DSN hosts are not JWTs: require a JSON object header.
+        try:
+            header = match[1] + "=" * (-len(match[1]) % 4)
+            header = json.loads(base64.urlsafe_b64decode(header))
+        except (ValueError, UnicodeError):
+            return match[0]
+        return "<redacted>" if isinstance(header, dict) else match[0]
+
+    detail = re.sub(
+        r"(?<![\w./+-])([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![\w./+-])",
+        redact_jwt, detail,
+    )
+    return detail if len(detail) <= 512 else detail[:509] + "..."
+
+
 @api.route("/data/")
 def data():
     """
     Retourneert in json de data
     :return: de gevraagde data in json formaat
     """
-    data_report = Report()
-    start = request.args.get('start')
-    end = request.args.get('end')
-    aggregate = request.args.get('aggregate')
-    fields = request.args.get('fields')
-
-    if fields:
-        fields = fields.split(",")
-
-    timezone_raw = _requested_timezone()
-
-    try:
-        data = data_report.get_data(
-            start=datetime.fromisoformat(start).replace(tzinfo=ZoneInfo(timezone_raw)),
-            end=datetime.fromisoformat(end).replace(tzinfo=ZoneInfo(timezone_raw)),
-            aggregate=aggregate,
-            var_codes=fields,
-        )
-
-    except Exception as e:
-        return {"error": str(e)}, 500
+    start, end, aggregate, fields = _validated_data_query()
 
     def format_ts(dt, aggregate: str) -> str:
         if aggregate == "15min":
@@ -61,12 +136,15 @@ def data():
         else:
             return dt.strftime("%Y-%m-%d")
 
-    data = [
-        {**row, "ts": format_ts(row["ts"], aggregate)}
-        for row in data
-    ]
-
-    return data
+    try:
+        data_report = Report()
+        data = data_report.get_data(
+            start=start, end=end, aggregate=aggregate, var_codes=fields
+        )
+        return [{**row, "ts": format_ts(row["ts"], aggregate)} for row in data]
+    except Exception as error:
+        logging.error("Data backend failed (%s)", _sanitized_backend_error(error))
+        return {"error": "Internal server error"}, 500
 
 @api.route("/run/<string:task>")
 def run(task: str):
@@ -99,25 +177,21 @@ def data_sql_ha():
     Retourneert in json de data
     :return: de gevraagde data in json formaat
     """
-    data_report = Report()
-    start = request.args.get('start')
-    end = request.args.get('end')
-    aggregate = request.args.get('aggregate')
-    fields = request.args.get('fields')
+    start, end, _aggregate, fields = _validated_data_query()
 
-    if fields:
-        fields = fields.split(",")
-
-    timezone_raw = _requested_timezone()
-
-    query = data_report.get_ha_data_query(
-            start=datetime.fromisoformat(start).replace(tzinfo=ZoneInfo(timezone_raw)),
-            end=datetime.fromisoformat(end).replace(tzinfo=ZoneInfo(timezone_raw)),
+    try:
+        data_report = Report()
+        query = data_report.get_ha_data_query(
+            start=start,
+            end=end,
             var_codes=fields,
             step=timedelta(days=1)
         )
+        return str(query)
+    except Exception as error:
+        logging.error("HA data query backend failed (%s)", _sanitized_backend_error(error))
+        return {"error": "Internal server error"}, 500
 
-    return str(query)
 
 _DATA_PATH = Path("../data")
 

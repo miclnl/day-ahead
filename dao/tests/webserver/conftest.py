@@ -5,10 +5,12 @@ builds a small site directory (data copied from the shipped example, app
 package linked) and imports the app from there.
 """
 
+import importlib
 import os
 import shutil
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -21,6 +23,19 @@ EXAMPLE = REPO / "dao" / "data" / "options_example.json"
 
 SUPERVISOR = {"REMOTE_ADDR": "172.30.32.2"}
 INGRESS = {"X-Ingress-Path": "/api/hassio_ingress/token"}
+
+
+# Some tests import dao.webserver.app during collection, before site/client run.
+# Preload that package with a synthetic ../data, never the worktreeparent's key.
+with TemporaryDirectory(prefix="dao-web-import-") as _import_root:
+    _import_cwd = Path(_import_root) / "webserver"
+    _import_cwd.mkdir()
+    _previous_cwd = os.getcwd()
+    try:
+        os.chdir(_import_cwd)
+        importlib.import_module("dao.webserver.app")
+    finally:
+        os.chdir(_previous_cwd)
 
 
 @pytest.fixture(scope="module")

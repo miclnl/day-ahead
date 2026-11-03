@@ -35,6 +35,14 @@ from dao.prog import production_bonus
 from dao.prog.da_base import DaBase
 from dao.prog.utils import get_value_from_dict
 
+AGGREGATE_DELTAS = {
+    "15min": datetime.timedelta(minutes=15),
+    "hour": datetime.timedelta(hours=1),
+    "day": datetime.timedelta(days=1),
+    "week": datetime.timedelta(days=7),
+    "month": datetime.timedelta(days=31),
+}
+
 
 def legacy_prognosis_revenue(objective_profit):
     """prognoses.profit bewaart de negatieve objectivebijdrage, niet ontvangst.
@@ -4266,21 +4274,13 @@ class Report(DaBase):
             aggregate: str = "hour",
             var_codes: list[str] = None
     ):
-        deltas = {
-            "15min": datetime.timedelta(minutes=15),
-            "hour": datetime.timedelta(hours=1),
-            "day": datetime.timedelta(days=1),
-            "week": datetime.timedelta(days=7),
-            "month": datetime.timedelta(days=31),
-        }
-
-        if aggregate not in deltas:
+        if aggregate not in AGGREGATE_DELTAS:
             raise ValueError(f"Invalid aggregate interval: {aggregate}")
 
         query_da = self.get_da_data_query(
             start=start,
             end=end,
-            step=deltas[aggregate],
+            step=AGGREGATE_DELTAS[aggregate],
             var_codes=var_codes,
         )
 
@@ -4291,7 +4291,7 @@ class Report(DaBase):
         query_ha = self.get_ha_data_query(
             start=start,
             end=end,
-            step=deltas[aggregate],
+            step=AGGREGATE_DELTAS[aggregate],
             var_codes=var_codes,
         )
 
