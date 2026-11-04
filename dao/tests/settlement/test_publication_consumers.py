@@ -77,8 +77,9 @@ def test_calc_preflight_blocks_before_report_or_any_ha_write(planner, monkeypatc
     assert instance.ha_calls == report_calls == []
 
 
-@pytest.mark.parametrize("capture", [{"active": True, "solve": True}], indirect=True)
-def test_calc_active_confirmed_reaches_planning_but_never_ha_or_ready_publication(capture):
+@pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True,
+                                       "supported": True}], indirect=True)
+def test_calc_active_confirmed_publishes_planning_but_never_ha(capture):
     # Active/confirmed no longer denies before Report construction/planning.
     # It constructs the legacy object for non-price reads, skips its price API,
     # solves on the real service context and still denies output before any HA write.
@@ -88,7 +89,8 @@ def test_calc_active_confirmed_reaches_planning_but_never_ha_or_ready_publicatio
     assert capture["report_reads"] == []
     assert str(capture.get("error")) == "actuation_gates_unproven"
     assert capture["output_bases"] == [capture["context"].basis]
-    assert capture["ha_writes"] == capture["ready_publications"] == []
+    assert capture["ha_writes"] == []
+    assert read_publication(capture["plan_path"]).status == "ready"
 
 
 @pytest.mark.parametrize("end,blocked", [(GATE, False), (GATE + 1, True)])

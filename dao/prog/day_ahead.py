@@ -16,9 +16,10 @@ import tempfile
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
+from functools import wraps
 from inspect import getattr_static
 from zoneinfo import ZoneInfo
 
@@ -49,6 +50,8 @@ from dao.prog.fastctrl.plan import (
     write_plan,
 )
 from dao.prog.fastctrl.publication import (
+    PublicationError,
+    PublicationLockBusy,
     canonical_plan_path,
     gate_policy,
     publication_lock,
@@ -90,6 +93,41 @@ from dao.prog.settlement.tariffs import quote
 from dao.prog.settlement.types import Origin
 
 _libc = ctypes.CDLL(None)
+
+
+@dataclass(frozen=True)
+class DeviceWriteIntent:
+    """Voorgenomen helperaanroep; geen verzending of ACK."""
+
+    operation: str
+    args: tuple
+    kwargs: dict
+
+
+class _FinancialActuationDenied(FinancialPlanBlocked):
+    """Geldige publicatie behouden; uitsluitend de afzonderlijke actuatie geweigerd."""
+
+
+def _financial_run(method):
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except _FinancialActuationDenied:
+            raise
+        except (FinancialPlanBlocked, PublicationError, PublicationLockBusy):
+            # Adapterweigeringen zijn al duurzaam blocked; een mislukte
+            # invalidatie mag niet worden herhaald of verborgen.
+            # Lockbusy breekt juist zonder mutatie of tweede slotpoging af.
+            raise
+        except Exception as exc:
+            if getattr(self, "_collect_device_intents", False) and not self.debug:
+                # Ook audit-/publicatiefouten invalideren; invalidatieschrijffouten
+                # blijven PublicationError en worden hier niet opnieuw gevangen.
+                self._refuse_financial_output(
+                    now_ts=int(time.time()), reason=str(exc).strip() or type(exc).__name__)
+            raise
+    return run
 
 
 @contextmanager
@@ -532,12 +570,15 @@ class DaCalc(DaBase):
             b_l.append(b_l[-1])
         return b_l
 
+    @_financial_run
     def calc_optimum(
         self,
         _start_dt: dt.datetime | None = None,
         _start_soc: float | None = None,
         _start_ev_soc: float | None = None,
     ):
+        self.device_intents: list[DeviceWriteIntent] = []
+        self._collect_device_intents = False
         if getattr(self, "_debug_capture_vars", False):
             self._debug_financial_terms = None
             self._debug_planning_audit = None
@@ -570,13 +611,15 @@ class DaCalc(DaBase):
             self.interval_s * math.floor(start_ts / self.interval_s)
         )
         start_interval_dt = datetime.datetime.fromtimestamp(start_interval_ts)
-        # Planningsrecht is geen uitvoerrecht. F1c levert pas de publiceerbare DTO.
+        # Planningsrecht is geen uitvoerrecht.
         financial_context: FinancialContext | None = None
         settlement_context: PlanningContext | None = None
         policy = self._financial_settings()
         settlement_cfg = None if self._financial_pricing is None else self._financial_pricing.settlement
         financial_planning = (settlement_cfg is not None and settlement_cfg.mode == "active"
                               and (policy.required_from_ts is None or start_ts >= policy.required_from_ts))
+        self._collect_device_intents = financial_planning
+        deferred_temperature = None
         if not financial_planning:
             # Nog geen rooster: expliciet lege horizon, nooit een verzonnen interval.
             self._financial_preflight()
@@ -2655,11 +2698,11 @@ class DaCalc(DaBase):
                             f"Geen entity om gem. temperatuur te exporteren"
                         )
                     elif not self.debug:
-                        self._check_financial_output(
-                            basis=settlement_context.basis if settlement_context is not None else None,
-                            now_ts=int(time.time()),
-                        )
-                        self.set_value(entity_avg_temp, round(avg_temp, 1))
+                        if financial_planning:
+                            deferred_temperature = (entity_avg_temp, round(avg_temp, 1))
+                        else:
+                            self._check_financial_output(basis=None, now_ts=int(time.time()))
+                            self._device_write("set_value", entity_avg_temp, round(avg_temp, 1))
                     logging.info(
                         f"Voorspelde gemiddelde buiten temperatuur: {avg_temp:.1f} °C"
                     )
@@ -3931,7 +3974,16 @@ class DaCalc(DaBase):
                 *(() if period_audit is None else period_audit.issues), "terminal_export_mean_v1_heuristic")
             if planning_economics["net_model_advantage_eur"] is None:
                 economics_issues += ("planning_economics_incomplete",)
-            planning_economics.update(estimated=True, economics_supported=False,
+            # Geen nieuwe contractfeatures positief verklaren: alleen de volledig
+            # geaudite basiseconomie zonder bonus/maandvloer is hier onderbouwd.
+            economics_supported = (financial_audit.parity_complete
+                and period_audit is not None and period_audit.exact
+                and planning_economics["net_model_advantage_eur"] is not None
+                and not battery_wear_issues
+                and all((q.snapshot.bonus is None or not q.snapshot.bonus.enabled)
+                        and q.snapshot.monthly_export_floor == "none"
+                        for q in financial_terms.quotes))
+            planning_economics.update(estimated=True, economics_supported=economics_supported,
                 constraints=planning_constraints, issues=tuple(dict.fromkeys(economics_issues)))
             _check_solution_version(model, finalized_solution.model_digest, finalized_solution.solution_digest)
             if getattr(self, "_debug_capture_vars", False):
@@ -3953,7 +4005,7 @@ class DaCalc(DaBase):
                 logging.info("A9 conservatief model: CBC-optimaliteit geldt alleen voor de gekozen objective; "
                     "na bronverfijning alleen voor de vernauwde ruimte. Geen globaal oorspronkelijk optimum. "
                     "export_mean_v1 is een eindwaardeheuristiek; enginebedragen zijn estimated, "
-                    "geen leveranciersgarantie; economics_supported=false.")
+                    "geen leveranciersgarantie; geen actuatietoestemming.")
             logging.info("Totale modelobjective (inclusief niet-A8-termen): %s", cost.x)
             logging.info("W2 nettomodelvergelijking (estimated, geen gerealiseerde kaswinst): %s", planning_economics)
         else:
@@ -4383,7 +4435,11 @@ class DaCalc(DaBase):
             )
 
         # doorzetten van alle settings naar HA
-        if not self.debug:
+        if financial_planning:
+            logging.info("Apparaatintenties verzamelen; geen HA-uitvoer")
+            if deferred_temperature is not None:
+                self._device_write("set_value", *deferred_temperature)
+        elif not self.debug:
             # Buiten alle devicecatches: een weigering beëindigt de volledige uitvoerroute.
             self._check_financial_output(
                 basis=settlement_context.basis if settlement_context is not None else None,
@@ -4443,12 +4499,12 @@ class DaCalc(DaBase):
                                 "Er zijn geen entities gedefinieerd voor het opwarmen van de boiler"
                             )
                         if boiler_activate_entity:
-                            self.call_service(
+                            self._device_write("call_service",
                                 self.boiler_options.activate_service,
                                 boiler_activate_entity,
                             )
                         if boiler_switch_entity:
-                            self.turn_on(boiler_switch_entity)
+                            self._device_write("turn_on", boiler_switch_entity)
                         # "input_button.hw_trigger")
                         logging.info("Boiler opwarmen geactiveerd")
                 else:
@@ -4476,6 +4532,8 @@ class DaCalc(DaBase):
                 )
 
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Publiceren naar HA mislukt voor boiler: {ex}")
 
@@ -4486,13 +4544,13 @@ class DaCalc(DaBase):
             if self.debug:
                 logging.info(f"Grid balanceren zou zijn: {balance_state}")
             else:
-                self.set_entity_state("entity balance switch", self.grid, balance_state)
+                self._device_write("set_entity_state", "entity balance switch", self.grid, balance_state)
                 logging.info(f"Grid balanceren: {balance_state}")
             grid_set_point = round(1000 * (c_l[0].x - c_t[0].x) / hour_fraction[0], 0)
             logging.info(f"Grid set point: {grid_set_point} W")
             if not self.debug:
                 # export the ess grid setpoint in W
-                self.set_entity_value(
+                self._device_write("set_entity_value",
                     "entity_grid_setpoint",
                     self.grid,
                     grid_set_point,
@@ -4500,6 +4558,8 @@ class DaCalc(DaBase):
             #####################################
 
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Publiceren naar HA mislukt voor grid: {ex}")
 
@@ -4662,12 +4722,12 @@ class DaCalc(DaBase):
                                     f"met {new_ampere_state} ampere via "
                                     f"'{entity_charging_ampere}'"
                                 )
-                                self.set_value(entity_charging_ampere, new_ampere_state)
-                                self.turn_on(entity_charge_switch)
+                                self._device_write("set_value", entity_charging_ampere, new_ampere_state)
+                                self._device_write("turn_on", entity_charge_switch)
                                 if not (entity_stop_laden is None) and not (
                                     new_state_stop_laden is None
                                 ):
-                                    self.call_service(
+                                    self._device_write("call_service",
                                         "set_datetime",
                                         entity_id=entity_stop_laden,
                                         datetime=new_state_stop_laden,
@@ -4683,11 +4743,11 @@ class DaCalc(DaBase):
                                     f"Laden van {ev_name} is doorgegaan "
                                     f"met {new_ampere_state} A"
                                 )
-                                self.set_value(entity_charging_ampere, new_ampere_state)
+                                self._device_write("set_value", entity_charging_ampere, new_ampere_state)
                                 if not (entity_stop_laden is None) and not (
                                     new_state_stop_laden is None
                                 ):
-                                    self.call_service(
+                                    self._device_write("call_service",
                                         "set_datetime",
                                         entity_id=entity_stop_laden,
                                         datetime=new_state_stop_laden,
@@ -4697,13 +4757,13 @@ class DaCalc(DaBase):
                             if self.debug:
                                 logging.info(f"Laden van {ev_name} zou zijn uitgezet")
                             else:
-                                self.set_value(entity_charging_ampere, 0)
-                                self.turn_off(entity_charge_switch)
+                                self._device_write("set_value", entity_charging_ampere, 0)
+                                self._device_write("turn_off", entity_charge_switch)
                                 logging.info(f"Laden van {ev_name} uitgezet")
                                 if not (entity_stop_laden is None) and not (
                                     new_state_stop_laden is None
                                 ):
-                                    self.call_service(
+                                    self._device_write("call_service",
                                         "set_datetime",
                                         entity_id=entity_stop_laden,
                                         datetime=new_state_stop_laden,
@@ -4725,6 +4785,8 @@ class DaCalc(DaBase):
                 )
 
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Publiceren naar HA mislukt voor EV: {ex}")
 
@@ -4744,17 +4806,19 @@ class DaCalc(DaBase):
                             if self.debug:
                                 logging.info(f"PV {pv_name} zou zijn aangezet")
                             else:
-                                self.turn_on(entity_pv_switch)
+                                self._device_write("turn_on", entity_pv_switch)
                                 logging.info(f"PV {pv_name} aangezet")
                     else:
                         if switch_state == "on":
                             if self.debug:
                                 logging.info(f"PV {pv_name} zou zijn uitgezet")
                             else:
-                                self.turn_off(entity_pv_switch)
+                                self._device_write("turn_off", entity_pv_switch)
                                 logging.info(f"PV {pv_name} uitgezet")
 
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Publiceren naar HA mislukt voor PV-schakelaars: {ex}")
 
@@ -4876,12 +4940,12 @@ class DaCalc(DaBase):
                     if stop_omvormer:
                         logging.info(f"tot: {stop_str}")
                 else:
-                    self.set_entity_value(
+                    self._device_write("set_entity_value",
                         "entity set power feedin",
                         self.battery_options[b],
                         netto_vermogen_bat,
                     )
-                    self.set_entity_option(
+                    self._device_write("set_entity_option",
                         "entity set operating mode", self.battery_options[b], new_state
                     )
                     tot_str = f" tot: {stop_str}" if stop_omvormer else ""
@@ -4890,24 +4954,24 @@ class DaCalc(DaBase):
                         f"{netto_vermogen_bat} W {tot_str}"
                     )
                     if stop_inverter_id is not None:
-                        self.call_service(
+                        self._device_write("call_service",
                             "set_datetime",
                             entity_id=stop_inverter_id,
                             datetime=stop_str,
                         )
-                    self.set_entity_value(
+                    self._device_write("set_entity_value",
                         "entity from battery", self.battery_options[b], from_battery
                     )
                     logging.info(f"Vermogen uit batterij: {from_battery}W")
-                    self.set_entity_value(
+                    self._device_write("set_entity_value",
                         "entity from pv", self.battery_options[b], from_pv
                     )
                     logging.info(f"Vermogen dat binnenkomt van pv: {from_pv}W")
-                    self.set_entity_value(
+                    self._device_write("set_entity_value",
                         "entity from ac", self.battery_options[b], from_ac
                     )
                     logging.info(f"Vermogen dat binnenkomt van ac: {from_ac}W")
-                    self.set_entity_value(
+                    self._device_write("set_entity_value",
                         "entity calculated soc", self.battery_options[b], calculated_soc
                     )
                     logging.info(f"Waarde SoC na eerste uur: {calculated_soc}%")
@@ -4926,17 +4990,19 @@ class DaCalc(DaBase):
                                 if self.debug:
                                     logging.info(f"PV {pv_name} zou zijn aangezet")
                                 else:
-                                    self.turn_on(entity_pv_switch)
+                                    self._device_write("turn_on", entity_pv_switch)
                                     logging.info(f"PV {pv_name} aangezet")
                         else:
                             if switch_state == "on":
                                 if self.debug:
                                     logging.info(f"PV {pv_name} zou zijn uitgezet")
                                 else:
-                                    self.turn_off(entity_pv_switch)
+                                    self._device_write("turn_off", entity_pv_switch)
                                     logging.info(f"PV {pv_name} uitgezet")
 
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Publiceren naar HA mislukt voor batterij: {ex}")
 
@@ -4991,13 +5057,15 @@ class DaCalc(DaBase):
                         f"{next_action_str}"
                     )
                 else:
-                    self.call_service(
+                    self._device_write("call_service",
                         "set_datetime",
                         entity_id=entity_battery_next_action,
                         datetime=next_action_str,
                     )
 
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Publiceren naar HA mislukt voor batterij volgende actie: {ex}")
 
@@ -5024,14 +5092,14 @@ class DaCalc(DaBase):
                                 logging.info(f"Warmtepomp zou zijn ingeschakeld")
                             else:
                                 logging.info(f"Warmtepomp ingeschakeld")
-                                self.turn_on(entity_hp_switch)
+                                self._device_write("turn_on", entity_hp_switch)
                     else:
                         if switch_state == "on":
                             if self.debug:
                                 logging.info(f"Warmtepomp zou zijn uitgeschakeld")
                             else:
                                 logging.info(f"Warmtepomp uitgeschakeld")
-                                self.turn_off(entity_hp_switch)
+                                self._device_write("turn_off", entity_hp_switch)
                 #  power, als entity er is altijd doorzetten
                 entity_hp_power = self.heating_options.entity_hp_power
                 if entity_hp_power is not None and self.hp_adjustment != "on/off":
@@ -5043,7 +5111,7 @@ class DaCalc(DaBase):
                             f"op {hp_power:<0.0f} kW"
                         )
                     else:
-                        self.set_value(entity_hp_power, hp_power)
+                        self._device_write("set_value", entity_hp_power, hp_power)
                         logging.info(
                             f"Elektrisch vermogen warmtepomp ingesteld "
                             f"op {hp_power:<0.3f} kW"
@@ -5070,9 +5138,11 @@ class DaCalc(DaBase):
                         )
                     else:
                         logging.info(f"Aanpassing stooklijn: {adjustment:<0.2f}")
-                        self.set_value(entity_curve_adjustment, adjustment)
+                        self._device_write("set_value", entity_curve_adjustment, adjustment)
 
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Publiceren naar HA mislukt voor warmtepomp: {ex}")
 
@@ -5101,7 +5171,7 @@ class DaCalc(DaBase):
                                         f"Zou zijn gestart op {start_machine_str}"
                                     )
                                 else:
-                                    self.call_service(
+                                    self._device_write("call_service",
                                         "set_datetime",
                                         entity_id=ma_entity_plan_start[m],
                                         datetime=start_machine_str,
@@ -5114,7 +5184,7 @@ class DaCalc(DaBase):
                                 if self.debug:
                                     logging.info(f"Zou klaar zijn op {end_machine_str}")
                                 else:
-                                    self.call_service(
+                                    self._device_write("call_service",
                                         "set_datetime",
                                         entity_id=ma_entity_plan_end[m],
                                         datetime=end_machine_str,
@@ -5144,18 +5214,25 @@ class DaCalc(DaBase):
                         )
 
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Publiceren naar HA mislukt voor apparaten: {ex}")
 
         #############################################
         # hand-off naar de snelle regellaag
         #############################################
-        if not self.debug:
+        if not self.debug and not financial_planning:
             self._check_financial_output(
                 basis=settlement_context.basis if settlement_context is not None else None,
                 now_ts=int(time.time()),
             )
         try:
+            if financial_planning:
+                financial_context = self._planning_financial_context(
+                    financial_terms, terminal_terms, planning_economics, created_ts=int(time.time()))
+                if not self.debug:
+                    self._financial_publication().check_basis(financial_context.basis, now_ts=int(time.time()))
             # interval_ts, not tijd: the fast layer compares its boundaries
             # against time.time(), and tijd holds naive pandas Timestamps,
             # which convert to epoch as if they were UTC. See export_fast_plan.
@@ -5177,7 +5254,7 @@ class DaCalc(DaBase):
                 upper_limit=upper_limit,
                 eff_dc_to_bat=eff_dc_to_bat,
                 eff_bat_to_dc=eff_bat_to_dc,
-                published_battery=published_battery,
+                published_battery=[] if financial_planning else published_battery,
                 p_avg=p_avg,
                 U=U,
                 B=B,
@@ -5186,8 +5263,15 @@ class DaCalc(DaBase):
         except FinancialPlanBlocked:
             raise
         except Exception as ex:
+            if financial_planning:
+                raise
             error_handling(ex)
             logging.error(f"Plan voor de snelle regellaag kon niet worden weggeschreven: {ex}")
+
+        if financial_planning and not self.debug:
+            # Afzonderlijke uitvoerpoging, pas ná een volledige geldige publicatie.
+            self._check_financial_output(
+                basis=settlement_context.basis, now_ts=int(time.time()), publication_ready=True)
 
         #############################################
         # graphs
@@ -5815,6 +5899,39 @@ class DaCalc(DaBase):
         self.notify("DAO calc afgerond", self.notification_berekening)
         return None
 
+    def _device_write(self, operation: str, *args, **kwargs):
+        """Het enige device-schrijfpad: verzamelen óf ongewijzigd delegeren."""
+        if self._collect_device_intents:
+            self.device_intents.append(DeviceWriteIntent(operation, args, dict(kwargs)))
+            return None
+        return getattr(self, operation)(*args, **kwargs)
+
+    def _planning_financial_context(self, terms, terminal, economics, *, created_ts):
+        basis = terms.context.basis
+        snapshots = terms.context.price_batch.snapshots
+        intervals = {snapshot.price_interval_seconds for snapshot in snapshots
+                     if snapshot.valid_from_ts < basis.horizon_end_ts
+                     and (snapshot.valid_to_ts is None or snapshot.valid_to_ts > basis.planning_start_ts)}
+        if len(intervals) != 1:
+            raise ValueError("contract_price_interval_mismatch")
+        boundaries = [boundary for snapshot in snapshots
+                      for boundary in (snapshot.valid_from_ts, snapshot.valid_to_ts)
+                      if boundary is not None and boundary > created_ts]
+        not_after = min(basis.horizon_end_ts, created_ts + self.config.fast_control.max_plan_age,
+                        min(boundaries, default=basis.horizon_end_ts))
+        issues = economics["issues"]
+        supported = economics["economics_supported"]
+        if tuple(name for name, _ in terminal.reference_efficiency_by_battery) != tuple(
+                battery.name for battery in self.battery_options):
+            # Mapping van terminalreferenties is F1c; nooit gokken of herlabelen.
+            supported = False
+            issues = (*issues, "terminal_reference_identity_unproven")
+        if not supported:
+            issues = (*issues, "producer_economics_unproven")
+            logging.warning("Financiële economie niet onderbouwd: %s", ", ".join(issues))
+        return FinancialContext(basis, not_after, intervals.pop(), terminal, supported,
+                                tuple(dict.fromkeys(issues)))
+
     def _financial_settings(self):
         """Processtartsnapshot, geen tweede options-lezing of impliciete modefallback."""
         if not hasattr(self, "_financial_pricing"):
@@ -5884,12 +6001,15 @@ class DaCalc(DaBase):
             if end > required:
                 self._refuse_financial_output(now_ts=now_ts, reason="legacy_horizon_crosses_contract_start")
 
-    def _check_financial_output(self, *, basis: FinancialBasis | None, now_ts: int) -> None:
+    def _check_financial_output(self, *, basis: FinancialBasis | None, now_ts: int,
+                                publication_ready: bool = False) -> None:
         _integer(now_ts, "now_ts")
         if basis is not None:
             if not self.debug:
                 self._financial_publication().check_basis(basis, now_ts=now_ts)
             # Een verse basis is geen eigendom, gatewayrespons of G1–G3-bewijs.
+            if publication_ready and not self.debug:
+                raise _FinancialActuationDenied("actuation_gates_unproven")
             self._refuse_financial_output(now_ts=now_ts, reason="actuation_gates_unproven")
         self._check_legacy_financial_gate(now_ts=now_ts)
         if not self.debug:
@@ -5959,7 +6079,7 @@ class DaCalc(DaBase):
                 "optimalisering leverde geen intervallen op"
             )
             return
-        if B <= 0:
+        if B <= 0 and financial_context is None:
             logging.info(
                 "Plan voor de snelle regellaag niet opgeslagen: geen batterij "
                 "geconfigureerd"
@@ -5987,6 +6107,13 @@ class DaCalc(DaBase):
             )
             for b in range(B)
         ]
+        if financial_context is not None:
+            # Config-EntityId is een str-subklasse; v2 verlangt native str,
+            # ook vóór de JSON-roundtrip in de publicatieadapter.
+            specs = [replace(spec, **{
+                name: None if getattr(spec, name) is None else str(getattr(spec, name))
+                for name in ("setpoint_entity", "mode_entity", "stop_inverter_entity", "soc_entity")
+            }) for spec in specs]
 
         created_ts = int(time.time())
         plan = build_plan(
@@ -6008,6 +6135,11 @@ class DaCalc(DaBase):
             strategy=str(self.strategy),
             price_average=float(p_avg),
         )
+        if financial_context is not None:
+            # De v2-basis begint bij het werkelijk berekende restant van het
+            # eerste interval, niet bij de legacy-roostergrens ervoor.
+            plan.intervals[0] = replace(plan.intervals[0],
+                                        start_ts=financial_context.basis.planning_start_ts)
         if financial_context is None:
             # write_plan neemt hetzelfde slot en kan blocked/v2 niet herstellen.
             self._check_financial_output(basis=None, now_ts=int(time.time()))
@@ -6015,7 +6147,7 @@ class DaCalc(DaBase):
         else:
             self._financial_settings()
             if canonical_plan_path(path) != self._financial_plan_path:
-                raise FinancialPlanBlocked("financial_publication_path_mismatch")
+                self._refuse_financial_output(now_ts=int(time.time()), reason="financial_publication_path_mismatch")
             plan.format_version = 2
             plan.financial_context = financial_context
             self._financial_publication().publish(plan, now_ts=int(time.time()))

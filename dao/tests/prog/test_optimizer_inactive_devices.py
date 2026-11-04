@@ -1,7 +1,11 @@
 """Device flags must be allocated once and constrained in the real producer."""
 
+import ast
+import copy
 import datetime as dt
+import inspect
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import mip
@@ -171,7 +175,7 @@ def hp_model(capture, monkeypatch):
 
         def record_var(model, *args, **kwargs):
             caller = sys._getframe(1)
-            while caller is not None and caller.f_code is not da.DaCalc.calc_optimum.__code__:
+            while caller is not None and caller.f_code is not inspect.unwrap(da.DaCalc.calc_optimum).__code__:
                 caller = caller.f_back
             if caller is not None:
                 record_flags(caller.f_locals)
@@ -183,6 +187,7 @@ def hp_model(capture, monkeypatch):
         def capture_cost(model, **kwargs):
             bind_cost(model, **kwargs)
             found.update(sys._getframe(1).f_locals)
+            found["intermediate_hp_on"] = tuple(allocated.values())
             record_flags(found)
             raise Captured
 
@@ -214,6 +219,8 @@ def test_hp_allocates_one_on_flag_per_interval(hp_model, mode, enabled, energy_k
     """A second allocation leaves real orphan columns; every retained flag must control load."""
     local = hp_model(mode)
     model, flags, allocated = local["model"], local["hp_on"], local["allocated_hp_on"]
+    assert local["intermediate_hp_on"], "allocation observer saw no intermediate hp_on handles"
+    assert {flag.idx for flag in local["intermediate_hp_on"]} == {flag.idx for flag in allocated}
     assert len(allocated) == local["U"]
     assert {flag.idx for flag in allocated} == {flag.idx for flag in flags}
     used = {var.idx for constraint in model.constrs for var in constraint.expr.expr}
@@ -246,3 +253,27 @@ def test_hp_allocates_one_on_flag_per_interval(hp_model, mode, enabled, energy_k
         if mode != "on/off":
             assert [stage["max_power"] for stage in local["hp_stages"]] == [0, 1000, 2000]
             assert [stage.max_power for stage in local["self"].heating_options.stages] == [1000, 2000]
+
+
+def test_hp_allocation_observer_exposes_real_orphans_from_second_allocation(hp_model, monkeypatch):
+    """A controlled duplicate of the real allocation must not disappear in final capture."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(inspect.unwrap(da.DaCalc.calc_optimum))))
+    body = tree.body[0].body
+    index = next(i for i, node in enumerate(body) if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "hp_on" for target in node.targets))
+    body.insert(index, copy.deepcopy(body[index]))
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(tree), da.__file__, "exec"), da.__dict__, namespace)
+    monkeypatch.setattr(da.DaCalc, "calc_optimum", namespace["calc_optimum"])
+
+    local = hp_model("absent")
+    model, flags, allocated = local["model"], local["hp_on"], local["allocated_hp_on"]
+    assert local["intermediate_hp_on"], "allocation observer saw no intermediate hp_on handles"
+    assert len(flags) == local["U"] == 12
+    assert len(allocated) == 2 * local["U"]
+    assert {flag.idx for flag in local["intermediate_hp_on"]} == {flag.idx for flag in allocated}
+    final_indices = {flag.idx for flag in flags}
+    orphaned = [flag for flag in allocated if flag.idx not in final_indices]
+    used = {var.idx for constraint in model.constrs for var in constraint.expr.expr}
+    assert len(orphaned) == local["U"]
+    assert all(model.vars[flag.idx] is flag and flag.idx not in used for flag in orphaned)

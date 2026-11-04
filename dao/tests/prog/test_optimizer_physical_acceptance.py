@@ -6,6 +6,7 @@ actuation safety; notifications/presence before solve are separately isolated.
 """
 
 import datetime as dt
+import inspect
 import logging
 import socket
 import sys
@@ -143,7 +144,7 @@ def physical_producer(capture, monkeypatch, tmp_path):
                 value = overrides.get(var.idx, raw_get(var))
                 # Observe real .x extraction in calc, not reads inside the audit
                 # or a second, manually reconstructed result consumer.
-                if sys._getframe(2).f_code is da.DaCalc.calc_optimum.__code__:
+                if sys._getframe(2).f_code is inspect.unwrap(da.DaCalc.calc_optimum).__code__:
                     found["consumer_reads"].append((var.idx, value, "accepted" in events))
                 return value
 

@@ -32,6 +32,14 @@ class FinancialPlanBlocked(Exception):
     """Kandidaat geweigerd; duurzaam blocked, geen herlabeling van oud token."""
 
 
+class ReadyPublicationFailed(FinancialPlanBlocked, PublicationError):
+    """Ready-write mislukt, maar invalidatie is duurzaam voltooid.
+
+    Blijft PublicationError voor bestaande adapterconsumenten; de producer kan
+    dit als mislukte financiële run afhandelen zonder invalidatie te herhalen.
+    """
+
+
 def _overlaps(start, end, left, right):
     if type(start) is not int or (end is not None and (type(end) is not int or end <= start)):
         raise ValueError("Undecidable change range")
@@ -197,9 +205,9 @@ class SettlementPublication:
                 self._refuse(lease=lease, now_ts=now_ts, error=exc)
             try:
                 _write_verified_ready(candidate, lease=lease)
-            except PublicationError:
+            except PublicationError as exc:
                 invalidate_plan(lease=lease, now_ts=now_ts, reason="ready_publication_failed")
-                raise
+                raise ReadyPublicationFailed("ready_publication_failed") from exc
 
     def block(self, *, now_ts: int, reason: str) -> None:
         with publication_lock(self._plan_path) as lease:
