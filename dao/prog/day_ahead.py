@@ -54,7 +54,8 @@ from dao.prog.fastctrl.publication import (
     PublicationLockBusy,
     canonical_plan_path,
     gate_policy,
-    publication_lock,
+    publication_attempts,
+    publication_deadline_ns,
     read_publication,
 )
 from dao.prog.heatpump_blocks import block_durations, block_spans
@@ -6014,8 +6015,10 @@ class DaCalc(DaBase):
 
     def _check_legacy_publication(self) -> None:
         # Ook vóór de datum mag een lokale invalidatie niet via directe writes worden omzeild.
-        with publication_lock(self._financial_plan_path):
-            read = read_publication(self._financial_plan_path)
+        # Alleen de acquisitie wordt herhaald; de controle zelf loopt exact eenmaal.
+        with publication_attempts(self._financial_plan_path,
+                                  deadline_ns=publication_deadline_ns()) as lease:
+            read = read_publication(lease.path)
         if read.status in ("blocked", "invalid") or (read.plan is not None and read.plan.format_version != 1):
             raise FinancialPlanBlocked(read.reason if read.status != "ready" else "explicit_financial_context_required")
 

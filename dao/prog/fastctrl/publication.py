@@ -15,10 +15,12 @@ import os
 import tempfile
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
+from time import CLOCK_BOOTTIME, clock_gettime_ns
+from time import sleep as _sleep
 from typing import TYPE_CHECKING, Literal, Protocol
 from zoneinfo import ZoneInfo
 
@@ -90,6 +92,23 @@ class PublicationLockBusy(Exception):
 
 class PublicationError(Exception):
     """Het publicatiebewijs of de duurzame invalidatie is mislukt."""
+
+
+#: Bounded acquisition window for one publication attempt (six seconds).
+ACQUISITION_DEADLINE_NS = 6_000_000_000
+#: Cadence between two acquisition attempts (fifty milliseconds).
+ACQUISITION_INTERVAL_NS = 50_000_000
+
+
+def publication_deadline_ns(*, window_ns: int = ACQUISITION_DEADLINE_NS) -> int:
+    """The absolute monotone deadline of one bounded acquisition attempt.
+
+    The clock is `CLOCK_BOOTTIME`, never the wall clock, so a clock jump can
+    neither shorten nor extend the bounded window. The name is deliberately
+    not `time`: callers that replace their own wall clock keep this clock.
+    """
+    _integer(window_ns, "window_ns")
+    return clock_gettime_ns(CLOCK_BOOTTIME) + window_ns
 
 
 class PublicationLease:
@@ -177,6 +196,44 @@ def publication_lock(path: str | Path) -> Iterator[PublicationLease]:
         if fd is not None:
             os.close(fd)
         thread_lock.release()
+
+
+@contextmanager
+def publication_attempts(path: str | Path, *, deadline_ns: int) -> Iterator[PublicationLease]:
+    """Herhaal alleen de acquisitie; de body van de caller loopt exact eenmaal.
+
+    Dit is een extra acquirebeleid, geen tweede slot. `publication_lock()` blijft
+    nonblocking en gedragelijk exact gelijk; hier wordt alleen de *acquisitie*
+    herhaald tot de absolute monotone deadline. Een vreemde fout wordt nooit
+    herhaald en een geneste aanroep nest nooit: de threadlock van
+    `publication_lock()` blijft de enige slotbron.
+    """
+    _integer(deadline_ns, "deadline_ns")
+    while True:
+        remaining = deadline_ns - clock_gettime_ns(CLOCK_BOOTTIME)
+        if remaining <= 0:
+            # De kandidaat wordt geweigerd: geen mutatie, geen halve lease.
+            raise PublicationLockBusy("Publication path stayed busy until the deadline")
+        stack = ExitStack()
+        try:
+            lease = stack.enter_context(publication_lock(path))
+        except PublicationLockBusy:
+            stack.close()
+            _sleep(min(ACQUISITION_INTERVAL_NS, remaining) / 1_000_000_000)
+            continue
+        except BaseException:
+            stack.close()
+            raise
+        if deadline_ns - clock_gettime_ns(CLOCK_BOOTTIME) <= 0:
+            # The deadline expired during the acquisition: the lease is closed
+            # again and the body of the caller never runs.
+            stack.close()
+            raise PublicationLockBusy("Publication path stayed busy until the deadline")
+        try:
+            yield lease
+        finally:
+            stack.close()
+        return
 
 
 def _reject_constant(value):

@@ -7,7 +7,6 @@ import logging
 import socket
 import sys
 import textwrap
-from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal, localcontext
 from types import SimpleNamespace
@@ -444,7 +443,7 @@ def test_f1b_publication_precedes_closed_actuation_without_ha_calls(capture):
 @pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True,
                                        "supported": True}], indirect=True)
 @pytest.mark.parametrize("debug", [False, True], ids=["financial", "debug"])
-def test_f1b_lockbusy_never_retries_or_invalidates_existing_ready(capture, monkeypatch, debug):
+def test_f1b_acquisition_exhaustion_never_retries_producer_or_invalidates_ready(capture, monkeypatch, debug):
     import dao.prog.settlement.publication as publication_module
 
     instance, publication = capture["instance"], capture["publication"]
@@ -453,22 +452,19 @@ def test_f1b_lockbusy_never_retries_or_invalidates_existing_ready(capture, monke
     before = path.read_bytes()
     busy = PublicationLockBusy("synthetic_first_attempt_busy")
     attempts, blocks = [], []
-    real_lock, real_block = publication_module.publication_lock, publication.block
+    real_block = publication.block
 
-    @contextmanager
-    def first_busy_then_available(*args, **kwargs):
-        attempts.append((args, kwargs))
-        if len(attempts) == 1:
-            raise busy
-        # No contention/timing: only the first acquisition is synthetically busy.
-        with real_lock(*args, **kwargs) as lease:
-            yield lease
+    def busy_acquisition(target, *, deadline_ns):
+        # F2c4: alleen de acquisitie mag worden herhaald. De body van de caller
+        # (solve, publicatie of registratie) wordt nooit herhaald.
+        attempts.append((target, deadline_ns))
+        raise busy
 
     def block(**kwargs):
         blocks.append(kwargs)
         return real_block(**kwargs)
 
-    monkeypatch.setattr(publication_module, "publication_lock", first_busy_then_available)
+    monkeypatch.setattr(publication_module, "publication_attempts", busy_acquisition)
     monkeypatch.setattr(publication, "block", block)
     monkeypatch.setattr(instance, "_debug_record_start", lambda *args: setattr(instance, "debug", debug))
     error = None
@@ -480,6 +476,7 @@ def test_f1b_lockbusy_never_retries_or_invalidates_existing_ready(capture, monke
     assert read_publication(path).status == "ready"
     assert blocks == []
     assert len(attempts) == 1
+    assert len(capture["ready_publications"]) == 1
     assert error is busy
     assert instance.debug is debug and capture["ha_writes"] == []
 

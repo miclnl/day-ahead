@@ -21,7 +21,8 @@ from dao.prog.fastctrl.publication import (
     _write_verified_ready,
     gate_policy,
     invalidate_plan,
-    publication_lock,
+    publication_attempts,
+    publication_deadline_ns,
     read_publication,
 )
 from dao.prog.settlement.replay import ReplayBasis, verify_durable_replay_basis, write_replay_basis
@@ -47,6 +48,11 @@ def _overlaps(start, end, left, right):
     return left < right and start < right and (end is None or left < end)
 
 
+def _acquisition_deadline_ns() -> int:
+    """The absolute monotone deadline of one bounded acquisition attempt."""
+    return publication_deadline_ns()
+
+
 class _RegistrationGuard:
     def __init__(self, adapter):
         self._adapter = adapter
@@ -54,7 +60,10 @@ class _RegistrationGuard:
 
     @contextmanager
     def hold(self):
-        with publication_lock(self._adapter._plan_path) as lease:
+        # The repetition happens before the book lock and before any database
+        # transaction: waiting never happens inside an open transaction.
+        with publication_attempts(self._adapter._plan_path,
+                                  deadline_ns=_acquisition_deadline_ns()) as lease:
             self._held.lease = lease
             try:
                 yield
@@ -171,7 +180,7 @@ class SettlementPublication:
 
     def check_basis(self, basis: FinancialBasis, *, now_ts: int) -> None:
         _integer(now_ts, "now_ts")
-        with publication_lock(self._plan_path) as lease:
+        with publication_attempts(self._plan_path, deadline_ns=_acquisition_deadline_ns()) as lease:
             try:
                 self._check_basis_locked(basis, lease=lease, now_ts=now_ts)
             except Exception as exc:
@@ -179,7 +188,7 @@ class SettlementPublication:
 
     def publish(self, plan: FastPlan, *, now_ts: int, replay_basis: ReplayBasis | None = None) -> None:
         _integer(now_ts, "now_ts")
-        with publication_lock(self._plan_path) as lease:
+        with publication_attempts(self._plan_path, deadline_ns=_acquisition_deadline_ns()) as lease:
             try:
                 if type(plan) is not FastPlan or plan.format_version != 2:
                     raise ValueError("financial_publication_requires_complete_ready_v2")
@@ -217,7 +226,7 @@ class SettlementPublication:
                 raise ReadyPublicationFailed("ready_publication_failed") from exc
 
     def block(self, *, now_ts: int, reason: str) -> None:
-        with publication_lock(self._plan_path) as lease:
+        with publication_attempts(self._plan_path, deadline_ns=_acquisition_deadline_ns()) as lease:
             invalidate_plan(lease=lease, now_ts=now_ts, reason=reason)
 
 

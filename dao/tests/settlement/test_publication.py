@@ -5,12 +5,13 @@ import json
 import multiprocessing
 import os
 import stat
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -698,6 +699,77 @@ def join(process):
         process.terminate()
         process.join(timeout=5)
         pytest.fail("barrier worker did not finish")
+
+
+def test_bounded_acquisition_repeats_the_lock_and_runs_the_body_once(system, local, monkeypatch):
+    """Alleen de acquisitie wordt herhaald; de body van de caller loopt eenmaal."""
+    import dao.prog.settlement.publication as publication
+    from dao.prog.fastctrl import publication as fast
+
+    real_lock = fast.publication_lock
+    real_invalidate = publication.invalidate_plan
+    holder_ready, release = Event(), Event()
+    attempts, writes = [], []
+
+    def holder():
+        with real_lock(system.path):
+            holder_ready.set()
+            assert release.wait(timeout=30)
+
+    def counting(target):
+        attempts.append(target)
+        if len(attempts) == 3:
+            release.set()
+        return real_lock(target)
+
+    def counting_invalidate(**kwargs):
+        writes.append(kwargs)
+        return real_invalidate(**kwargs)
+
+    thread = Thread(target=holder)
+    thread.start()
+    assert holder_ready.wait(timeout=30)
+    monkeypatch.setattr(fast, "publication_lock", counting)
+    monkeypatch.setattr(publication, "invalidate_plan", counting_invalidate)
+    try:
+        system.adapter.block(now_ts=NOW, reason="bounded-acquisition")
+    finally:
+        thread.join(timeout=30)
+    assert len(attempts) >= 3
+    assert len(writes) == 1
+    assert local.read_publication(system.path).status == "blocked"
+
+
+def test_bounded_acquisition_refuses_at_the_deadline_without_mutation(system, local):
+    with local.publication_lock(system.path):
+        before = system.path.read_bytes()
+        with pytest.raises(local.PublicationLockBusy):
+            system.adapter.block(now_ts=NOW, reason="never-acquired")
+        assert system.path.read_bytes() == before
+    assert local.read_publication(system.path).status == "ready"
+
+
+def test_the_acquisition_deadline_is_monotone_and_bounded():
+    """The bounded window counts on the monotone clock, never on the wall clock."""
+    from dao.prog.fastctrl import publication as fast
+
+    before = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    deadline = fast.publication_deadline_ns()
+    after = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+    assert before + fast.ACQUISITION_DEADLINE_NS <= deadline <= after + fast.ACQUISITION_DEADLINE_NS
+    assert fast.publication_deadline_ns(window_ns=0) >= before
+
+
+def test_an_expired_acquisition_deadline_refuses_without_touching_the_slot(system, local):
+    """An expired window refuses immediately: no lease, no mutation, no body."""
+    from dao.prog.fastctrl import publication as fast
+
+    before = system.path.read_bytes()
+    with pytest.raises(local.PublicationLockBusy):
+        with fast.publication_attempts(system.path, deadline_ns=0):
+            pytest.fail("the caller body must never run")
+    assert system.path.read_bytes() == before
+    assert local.read_publication(system.path).status == "ready"
 
 
 def ordering_worker(url, path, pricing, candidate, barrier, first_done, role, result):

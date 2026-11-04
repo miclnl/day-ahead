@@ -246,9 +246,28 @@ class OwnerCoordinator:
         self.recovery_required = True
         return RecoveryRequired(reason)
 
-    def report_failure(self, reason: str) -> RecoveryRequired:
-        """Report a lifecycle failure without granting or restoring any right."""
-        return self._inhibit(reason)
+    def report_failure(self, reason: str, *, durable: bool = False) -> RecoveryRequired:
+        """Report a lifecycle failure without granting or restoring any right.
+
+        Without `durable` the outcome stays in memory only, exactly as before:
+        the runner hooks call it that way and can therefore never create or
+        rewrite a mirror. With `durable` the inhibited phase and the recovery
+        duty are written through the existing mirror route, but only when the
+        mirror already exists; a mirror is never created here. A write failure
+        is never propagated: the in-memory state stays inhibited and the
+        recovery duty stays visible. The reason stays visible in the returned
+        outcome.
+        """
+        result = self._inhibit(reason)
+        if durable and self.state is not None:
+            try:
+                self._write(self.state)
+            except Exception:
+                # The mirror could not be written. The in-memory state stays
+                # inhibited and the recovery duty stays visible; the reason
+                # stays visible in the returned outcome.
+                pass
+        return result
 
     def _write(self, state):
         # A failed replace/fsync may already be visible. Never let a later
@@ -355,8 +374,16 @@ class OwnerCoordinator:
         self.recovery_required = False
         return binding
 
-    def stop(self, *, reason: str) -> BarrierReceipt | None:
+    def stop(self, *, reason: str, deadline: Deadline | None = None) -> BarrierReceipt | None:
+        """Withdraw the epoch; the caller may hand in the remaining section budget.
+
+        Without `deadline` the behaviour is exactly as before: the revocation
+        gets its own 750 ms window. With `deadline` the caller keeps the
+        authority over the budget; no second window is ever created.
+        """
         _reason(reason, "owner_reason_invalid")
+        if deadline is not None and type(deadline) is not Deadline:
+            raise ValueError("owner_deadline_invalid")
         self.binding = None
         self.recovery_required = True
         if self.state is None or self.state.owner_epoch == 0:
@@ -366,7 +393,8 @@ class OwnerCoordinator:
             self._inhibit("owner_lease_missing")
             return None
         now_ms = self.now_ms()
-        deadline = Deadline(self.now_ns() + 750_000_000, now_ms + 750)
+        if deadline is None:
+            deadline = Deadline(self.now_ns() + 750_000_000, now_ms + 750)
         request = RevokeRequest(self.state.installation_id, self.state.owner_epoch,
                                 uuid.uuid4().hex, reason, now_ms)
         self._write(replace(self.state, phase="revoking", pending_barrier_id=request.barrier_id))
@@ -391,3 +419,34 @@ class OwnerCoordinator:
         sequence = self._sequence_high_water + 1
         self._write(replace(self.state, last_reserved_sequence=sequence))
         return sequence
+
+    def record_pending_command(self, command: BatteryCommand) -> None:
+        """Record the immutable pending command durably, before any send.
+
+        The phase stays what the lifecycle determined and the recovery duty is
+        never cleared here: this is operational evidence, not a right.
+        """
+        if type(command) is not BatteryCommand:
+            raise ValueError("owner_pending_command_invalid")
+        if self.state is None:
+            raise RecoveryRequired("owner_state_missing")
+        self._write(replace(self.state, pending_command=command))
+
+    def record_receipt(self, receipt: ActuationReceipt, *, terminal: bool = True) -> None:
+        """Record the receiver result durably.
+
+        An accepted or rejected order clears the pending command; an uncertain
+        order stays visible. The phase and the recovery duty are untouched.
+        With `terminal=False` the receipt is kept as history only and the
+        pending command always stays visible.
+        """
+        if type(receipt) is not ActuationReceipt:
+            raise ValueError("owner_receipt_invalid")
+        if type(terminal) is not bool:
+            raise ValueError("owner_receipt_terminal_invalid")
+        if self.state is None:
+            raise RecoveryRequired("owner_state_missing")
+        pending = self.state.pending_command
+        if terminal and receipt.status in ("accepted", "rejected"):
+            pending = None
+        self._write(replace(self.state, pending_command=pending, last_receipt=receipt))
