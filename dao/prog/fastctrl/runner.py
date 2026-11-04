@@ -31,7 +31,8 @@ from dao.prog.config.models.fastcontrol import (
 )
 from dao.prog.config.models.pricing import PricingConfig
 
-from .plan import FAST_PLAN_FILE, NO_STOP_SENTINEL, FastPlan, load_plan
+from .actuator import ActuationReceipt, execute_battery_command
+from .plan import FAST_PLAN_FILE, FastPlan, load_plan
 from .policy import (
     BatteryMeasurement,
     ControllerState,
@@ -39,6 +40,7 @@ from .policy import (
     FastControlPolicy,
     Measurement,
     PolicyLimits,
+    apply_accepted_command,
 )
 from .publication import (
     FallbackReceipt,
@@ -304,6 +306,7 @@ class FastControlRunner:
         self.fallback = fallback
         self.last_gate: GateVerdict | None = None
         self.last_fallback: FallbackReceipt | None = None
+        self.last_receipts: list[ActuationReceipt] = []
         self.fallback_pending = False
         self._last_fallback_at: float | None = None
         self.config: FastControlConfig = config or getattr(
@@ -518,13 +521,18 @@ class FastControlRunner:
             # Alleen lokale eigendom intrekken, geen nulvermogen of fysieke stop claimen.
             battery.override_active = False
             battery.stop_inverter_cleared = False
+            battery.held_stop_inverter_cleared = False
+        return self._request_fallback(verdict.reason, now_ts=now_ts)
+
+    def _request_fallback(self, reason: str, *, now_ts: int) -> FallbackReceipt:
+        """Share the existing sink and monotonic throttle for every failure."""
         self.fallback_pending = True
         monotonic_now = time.monotonic()
         if (self._last_fallback_at is not None
                 and monotonic_now - self._last_fallback_at < max(1, self.config.interval)):
             return self.last_fallback
         self._last_fallback_at = monotonic_now
-        request = FallbackRequest(reason=verdict.reason, requested_ts=now_ts)
+        request = FallbackRequest(reason=reason, requested_ts=now_ts)
         receipt = FallbackReceipt("unconfirmed", "no_fallback_sink")
         if self.fallback is not None:
             try:
@@ -537,12 +545,13 @@ class FastControlRunner:
                 receipt = FallbackReceipt("unconfirmed", f"fallback_failed: {exc}")
         self.last_fallback = receipt
         if receipt.status == "unconfirmed":
-            logging.error(f"Fast control: fallback unconfirmed ({verdict.reason}): {receipt.reason}; fysieke stop niet bewezen")
+            logging.error(f"Fast control: fallback unconfirmed ({reason}): {receipt.reason}; fysieke stop niet bewezen")
         return receipt
 
     def tick(self, now: Optional[float] = None) -> Optional[Decision]:
         """Run one control cycle. Returns the decision, or None when idle."""
         now = time.time() if now is None else now
+        self.last_receipts = []
 
         # Geen mtime-/inodescache als autorisatie. Geen sensor-/sink-I/O onder dit slot.
         try:
@@ -628,11 +637,10 @@ class FastControlRunner:
         # it. Without this saved_today_eur would always integrate over
         # elapsed_h = 0 (policy.account sets state.last_tick_ts = now).
         previous_tick_ts = self.state.last_tick_ts
-        # The setpoints the batteries were left at before this tick; decide()
-        # overwrites last_command_w, so the baseline for the event log has to
-        # be taken here. After a restart this comes from the persisted state.
+        # In-force setpoints before this tick, preserved as the event baseline
+        # across both policy proposals and subsequent helper acceptance.
         previous_setpoints = tuple(
-            self.state.battery(index).last_command_w for index in range(len(plan.specs))
+            self.state.battery(index).held_setpoint_w for index in range(len(plan.specs))
         )
 
         policy = FastControlPolicy(self.limits())
@@ -706,13 +714,25 @@ class FastControlRunner:
 
         Without this the inverter kept the overridden setpoint, with the
         optimizer's stop moment cleared, until the next optimisation run.
-        The restore is only written when the previous mode was active; in
-        shadow mode nothing was ever written, so there is nothing to undo.
+        A shadow-only projection is not a restore obligation. Confirmed stop
+        ownership and failed restores remain due even after transitioning off.
         """
-        pending = any(
-            b.override_active or b.stop_inverter_cleared for b in self.state.batteries
+        # Preserve the first release of a partially failed active override:
+        # helpers may have written even though no command was confirmed (R19).
+        active_override = self._last_mode == MODE_ACTIVE and any(
+            b.override_active for b in self.state.batteries
         )
-        if not pending:
+        for battery in self.state.batteries:
+            if not battery.stop_inverter_cleared and not battery.restore_pending:
+                battery.held_stop_inverter_cleared = False
+                if battery.last_command_ts == 0 and not active_override:
+                    battery.override_active = False
+        pending = any(
+            b.restore_pending or b.stop_inverter_cleared
+            or (b.override_active and b.last_command_ts > 0)
+            for b in self.state.batteries
+        )
+        if not pending and not active_override:
             self._last_mode = mode
             return
         measurement = Measurement(
@@ -724,9 +744,14 @@ class FastControlRunner:
         decision = FastControlPolicy(self.limits()).release(
             plan, measurement, self.state, "mode_off"
         )
-        if self._last_mode == MODE_ACTIVE:
+        if self._last_mode == MODE_ACTIVE or any(
+            b.stop_inverter_cleared or b.restore_pending for b in self.state.batteries
+        ):
+            # A failed off-release keeps its confirmed stop status. Retry that
+            # restore even after the mode event has already transitioned to off.
             logging.info("Fast control: uitgeschakeld, plan-setpoint hersteld")
             self._actuate(decision, plan, MODE_ACTIVE)
+        self._publish(decision, mode, measurement)
         self._record_events(decision, mode)
         self._persist_state(now, force=True)
 
@@ -834,7 +859,9 @@ class FastControlRunner:
         self._state_signature = signature
 
     def _actuate(self, decision: Decision, plan: FastPlan, mode: str) -> None:
+        self.last_receipts = []
         for battery in decision.batteries:
+            battery.actuation_status = None
             if not battery.write:
                 continue
             spec = plan.spec(battery.index)
@@ -848,17 +875,35 @@ class FastControlRunner:
             )
             if mode != MODE_ACTIVE:
                 logging.info(f"[schaduw] {message}")
+                if mode == MODE_SHADOW:
+                    # Project the in-force command, never helper acceptance.
+                    controller = self.state.battery(battery.index)
+                    controller.held_setpoint_w = battery.setpoint_w
+                    if battery.accepted is not None:
+                        controller.held_stop_inverter_cleared = battery.accepted.stop_inverter_cleared
                 continue
             logging.info(message)
-            if spec.setpoint_entity:
-                self.gateway.write_number(spec.setpoint_entity, battery.setpoint_w)
-            if battery.mode is not None and spec.mode_entity:
-                self.gateway.select_option(spec.mode_entity, battery.mode)
-            if battery.stop_inverter is not None and spec.stop_inverter_entity:
-                self.gateway.set_datetime(
-                    spec.stop_inverter_entity,
-                    battery.stop_inverter or NO_STOP_SENTINEL,
-                )
+            try:
+                receipt = execute_battery_command(self.gateway, plan, battery, decision.timestamp)
+            except ValueError:
+                # Identity failure occurs before any helpercall; no receipt or
+                # implicit acceptance, but keep the same diagnostic/fallback path.
+                battery.actuation_status = "unconfirmed"
+                self._request_fallback("actuation_identity_invalid", now_ts=int(decision.timestamp))
+                continue
+            if receipt is None:
+                continue
+            self.last_receipts.append(receipt)
+            battery.actuation_status = receipt.status
+            controller = self.state.battery(battery.index)
+            if battery.restores:
+                controller.restore_pending = receipt.status != "confirmed"
+            if receipt.status == "confirmed":
+                apply_accepted_command(controller, battery)
+            else:
+                # Keep accepted facts, held setpoint and decision-owned mode
+                # intact so a failed override/restore can be retried next tick.
+                self._request_fallback(f"actuation_{receipt.status}", now_ts=int(decision.timestamp))
 
     def _publish(self, decision: Decision, mode: str, measurement: Measurement) -> None:
         diagnostics = self.config.diagnostics
@@ -928,7 +973,7 @@ class FastControlRunner:
             baseline = previous_setpoints
         else:
             baseline = tuple(
-                self.state.battery(b.index).last_command_w for b in decision.batteries
+                self.state.battery(b.index).held_setpoint_w for b in decision.batteries
             )
         if any(abs(new - old) >= 1.0 for new, old in zip(new_setpoints, baseline)):
             events.append(self._event_dict(decision, mode, EVENTS_KIND_SETPOINT))

@@ -21,6 +21,7 @@ from dao.prog.fastctrl.policy import (
     FastControlPolicy,
     Measurement,
     PolicyLimits,
+    apply_accepted_command,
     estimate_storage_value,
 )
 
@@ -52,7 +53,7 @@ def test_fix1_local_stop_affects_only_legacy_decisions(version, limiter):
         candidate = deepcopy(plan)
         candidate.intervals[0].battery(0).stop_inverter = stop_text
         state = ControllerState()
-        state.battery(0).last_command_w = -400
+        state.battery(0).held_setpoint_w = -400
         state.battery(0).last_change_ts = now - 10
         decision = FastControlPolicy(limits).decide(
             candidate, measure(grid_w=3400, battery_w=-400, timestamp=now), state).batteries[0]
@@ -191,6 +192,158 @@ def run(plan, measurement, limits=None, state=None, enabled=None):
     policy = FastControlPolicy(limits or PolicyLimits(min_benefit=0.0, deadband=0.0))
     state = state or ControllerState()
     return policy.decide(plan, measurement, state, enabled), state
+
+
+def accepted_facts(controller):
+    return (controller.last_command_w, controller.last_command_ts,
+            controller.stop_inverter_cleared)
+
+
+def test_f2b_r17_two_ticks_match_base_exactly():
+    plan = make_plan([0.3] * 4, [-250] * 4)
+    policy, state = FastControlPolicy(PolicyLimits(min_benefit=0)), ControllerState()
+    observed = []
+    for tick, grid in [(60, 0), (120, -105)]:
+        battery = policy.decide(
+            plan, measure(grid_w=grid, battery_w=-250, timestamp=T0 + tick), state,
+        ).batteries[0]
+        apply_accepted_command(state.battery(0), battery)
+        observed.append((battery.setpoint_w, battery.write, battery.reason))
+    assert observed == [(-250, False, "deadband"), (-250, False, "deadband")]
+    assert accepted_facts(state.battery(0)) == (0, 0, False)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_f2b_r19_pending_restore_bypasses_deadband_not_command_interval(fallback):
+    plan = make_plan([0.3] * 4, [-400] * 4)
+    step = plan.intervals[0].battery(0)
+    step.mode, step.stop_inverter = "Aan", "2030-01-01 00:00:00"
+    policy = FastControlPolicy(PolicyLimits(min_benefit=0, deadband=150, min_command_interval=60))
+    state = ControllerState()
+    controller = state.battery(0)
+    controller.restore_pending = True
+    controller.held_setpoint_w = -400
+    controller.last_change_ts = T0 + 300
+    for tick, expected_write in [(330, False), (360, True)]:
+        sample = measure(grid_w=0, battery_w=-400, timestamp=T0 + tick, grid_valid=not fallback)
+        decision = policy.decide(plan, sample, state).batteries[0]
+        assert decision.write is expected_write
+        if expected_write:
+            assert decision.restores is True
+            assert (decision.mode, decision.stop_inverter) == ("Aan", "2030-01-01 00:00:00")
+        else:
+            assert "rate_limited" in decision.reason
+        assert controller.restore_pending is True  # Policy never discharges the obligation.
+
+
+def test_f2b_r19_r20_new_state_fields_roundtrip_with_defaults():
+    from dao.prog.fastctrl.policy import BatteryControllerState
+
+    state = BatteryControllerState.from_dict({"restore_pending": True, "held_stop_inverter_cleared": True})
+    assert state.to_dict().get("restore_pending") is True
+    assert state.to_dict().get("held_stop_inverter_cleared") is True
+    old = BatteryControllerState.from_dict({})
+    assert old.restore_pending is old.held_stop_inverter_cleared is False
+
+
+def test_f2b_held_state_roundtrip_and_old_state_default():
+    from dao.prog.fastctrl.policy import BatteryControllerState
+
+    state = BatteryControllerState.from_dict({"held_setpoint_w": -675, "last_command_w": 123})
+    assert state.to_dict().get("held_setpoint_w") == -675
+    assert BatteryControllerState.from_dict(state.to_dict()).held_setpoint_w == -675
+    old = BatteryControllerState.from_dict({"last_command_w": 123})
+    assert old.to_dict().get("held_setpoint_w") == 0.0
+    assert old.last_command_w == 123
+
+
+@pytest.mark.parametrize("valid,power", [(True, None), (False, 9999)])
+def test_f2b_account_uses_held_power_when_measurement_is_missing_or_stale(valid, power):
+    plan = make_plan([0.3] * 4, [0] * 4)
+    policy, state = FastControlPolicy(PolicyLimits()), ControllerState()
+    controller = state.battery(0)
+    controller.last_command_w, controller.held_setpoint_w = 777, -1500
+    first = measure(grid_w=1000, battery_w=power, timestamp=T0 + 60)
+    first.batteries[0].valid = valid
+    policy.account(state, plan, first, "fixed")
+    second = measure(grid_w=1000, battery_w=power, timestamp=T0 + 120)
+    second.batteries[0].valid = valid
+    policy.account(state, plan, second, "fixed")
+    assert controller.interval_deviation_kwh == -0.025
+    assert controller.daily_deviation_kwh == 0.025
+    assert controller.last_command_w == 777
+
+
+@pytest.mark.parametrize("path", ["missing_measurement", "ramp", "disabled", "no_step"])
+def test_f2b_control_law_reads_held_not_accepted_power(path):
+    plan = make_plan([0.3] * 4, [0] * 4)
+    policy = FastControlPolicy(PolicyLimits(min_benefit=0, deadband=150,
+                                          max_ramp=500 if path == "ramp" else None))
+    state = ControllerState()
+    controller = state.battery(0)
+    controller.last_command_w, controller.held_setpoint_w = 777, -1000
+    if path == "disabled":
+        for row in plan.intervals:
+            row.battery(0).ac_power_w = -1000
+    sample = measure(grid_w=3000 if path == "ramp" else 1000,
+                     battery_w=None if path == "missing_measurement" else -1000,
+                     timestamp=T0 + (5000 if path == "no_step" else 60))
+    decision = policy.decide(plan, sample, state, enabled=[path != "disabled"])
+    expected = {"missing_measurement": -2000, "ramp": -1500, "disabled": -1000, "no_step": -1000}
+    assert decision.batteries[0].setpoint_w == expected[path]
+    if path in ("disabled", "no_step"):
+        assert decision.batteries[0].write is False
+    assert controller.last_command_w == 777
+
+
+@pytest.mark.parametrize("path", ["override", "fallback", "release"])
+def test_f2b_policy_only_proposes_accepted_command(path):
+    plan = make_plan([0.3] * 4, [0] * 4)
+    state = ControllerState()
+    controller = state.battery(0)
+    controller.last_command_w, controller.last_change_ts, controller.last_command_ts = -250, T0 - 20, T0 - 20
+    if path != "override":
+        controller.override_active = controller.stop_inverter_cleared = True
+    before = accepted_facts(controller)
+    policy = FastControlPolicy(PolicyLimits(min_benefit=0, deadband=0, release_time=0))
+    sample = measure(grid_w=1500 if path == "override" else 0, grid_valid=path != "fallback")
+    decision = (policy.release(plan, sample, state, "mode_off") if path == "release"
+                else policy.decide(plan, sample, state)).batteries[0]
+    assert decision.write
+    assert accepted_facts(controller) == before
+    assert decision.accepted is not None
+    from dataclasses import FrozenInstanceError
+    with pytest.raises(FrozenInstanceError):
+        decision.accepted.last_command_w = 123
+    apply_accepted_command(controller, decision)
+    assert accepted_facts(controller) == (decision.setpoint_w, T0 + 60, path == "override")
+    assert controller.last_change_ts == T0 + 60  # Issued by the policy, not the receipt.
+    assert controller.held_setpoint_w == decision.setpoint_w
+
+
+@pytest.mark.parametrize("releasing", [False, True])
+def test_f2b_plan_reconciliation_updates_held_not_accepted_state(releasing):
+    plan = make_plan([0.3] * 4, [500] * 4)
+    state = ControllerState()
+    controller = state.battery(0)
+    controller.last_command_w, controller.last_change_ts, controller.last_command_ts = -250, T0 - 20, T0 - 20
+    controller.held_setpoint_w = -250
+    controller.override_active = controller.stop_inverter_cleared = releasing
+    before = accepted_facts(controller)
+    decision, _ = run(plan, measure(grid_w=500, battery_w=500),
+                      PolicyLimits(min_benefit=1e9, deadband=150, release_time=0), state)
+    battery = decision.batteries[0]
+    assert battery.setpoint_w == 500
+    assert battery.write is releasing  # Release still restores mode/stop.
+    assert accepted_facts(controller) == before
+    assert controller.override_active is False
+    assert controller.quiet_since is None
+    if not releasing:
+        assert battery.accepted is None
+        assert controller.held_setpoint_w == 500
+    else:
+        assert controller.held_setpoint_w == -250  # Release still awaits confirmation.
+
 
 
 class TestCostModel:
@@ -495,7 +648,7 @@ class TestStability:
         plan = make_plan([0.30] * 8, [0.0] * 8)
         limits = PolicyLimits(min_benefit=0.0, deadband=200.0)
         state = ControllerState()
-        state.battery(0).last_command_w = -1000.0
+        state.battery(0).held_setpoint_w = -1000.0
         # house = 100 - (-1000) = 1100 W, so the ideal setpoint is -1100 W:
         # only 100 W away from the standing command.
         decision, _ = run(plan, measure(grid_w=100.0, battery_w=-1000.0), limits, state)
@@ -511,7 +664,7 @@ class TestStability:
             urgent_deviation=5000.0,
         )
         state = ControllerState()
-        state.battery(0).last_command_w = -1000.0
+        state.battery(0).held_setpoint_w = -1000.0
         state.battery(0).last_change_ts = T0 + 50
         decision, _ = run(
             plan,
@@ -531,7 +684,7 @@ class TestStability:
             urgent_deviation=1500.0,
         )
         state = ControllerState()
-        state.battery(0).last_command_w = 0.0
+        state.battery(0).held_setpoint_w = 0.0
         state.battery(0).last_change_ts = T0 + 50
         decision, _ = run(
             plan, measure(grid_w=4000.0, timestamp=T0 + 60), limits, state
@@ -551,7 +704,7 @@ class TestStability:
         plan = make_plan([0.30] * 8, [0.0] * 8)
         limits = PolicyLimits(min_benefit=0.0, deadband=0.0, max_ramp=500.0)
         state = ControllerState()
-        state.battery(0).last_command_w = 0.0
+        state.battery(0).held_setpoint_w = 0.0
         decision, _ = run(plan, measure(grid_w=4000.0), limits, state)
         assert decision.batteries[0].setpoint_w == pytest.approx(-500.0, abs=1.0)
 
@@ -565,9 +718,11 @@ class TestStability:
 
         engaged = policy.decide(plan, measure(grid_w=3000.0), state)
         assert engaged.batteries[0].override
+        apply_accepted_command(state.battery(0), engaged.batteries[0])
 
         quiet = policy.decide(plan, measure(grid_w=0.0, timestamp=T0 + 100), state)
         assert quiet.batteries[0].override  # still inside the quiet window
+        apply_accepted_command(state.battery(0), quiet.batteries[0])
 
         released = policy.decide(plan, measure(grid_w=0.0, timestamp=T0 + 400), state)
         assert not released.batteries[0].override
@@ -720,13 +875,14 @@ class TestInverterRestore:
         assert battery.write
         assert battery.stop_inverter == "2000-01-01 00:00:00"
         assert battery.mode == "Aan"
-        assert state.battery(0).stop_inverter_cleared
+        assert not state.battery(0).stop_inverter_cleared
+        assert battery.accepted.stop_inverter_cleared
 
     def test_the_deadband_may_not_swallow_the_first_clearing_write(self):
         plan = self.plan_with_duty_cycle()
         limits = PolicyLimits(min_benefit=0.0, deadband=5000.0)
         state = ControllerState()
-        state.battery(0).last_command_w = -400.0
+        state.battery(0).held_setpoint_w = -400.0
         decision, _ = run(
             plan, measure(grid_w=3400.0, battery_w=-400.0), limits, state
         )
@@ -740,7 +896,8 @@ class TestInverterRestore:
         )
         policy = FastControlPolicy(limits)
         state = ControllerState()
-        policy.decide(plan, measure(grid_w=3400.0, battery_w=-400.0), state)
+        engaged = policy.decide(plan, measure(grid_w=3400.0, battery_w=-400.0), state)
+        apply_accepted_command(state.battery(0), engaged.batteries[0])
         released = policy.decide(
             plan, measure(grid_w=0.0, battery_w=-400.0, timestamp=T0 + 300), state
         )
@@ -748,13 +905,15 @@ class TestInverterRestore:
         assert not battery.override
         assert battery.stop_inverter == "2026-01-15 18:07"
         assert battery.mode == "Aan"
-        assert not state.battery(0).stop_inverter_cleared
+        assert state.battery(0).stop_inverter_cleared
+        assert not battery.accepted.stop_inverter_cleared
 
     def test_a_stale_sensor_also_restores_the_published_command(self):
         plan = self.plan_with_duty_cycle()
         policy = FastControlPolicy(PolicyLimits(min_benefit=0.0, deadband=0.0))
         state = ControllerState()
-        policy.decide(plan, measure(grid_w=3400.0, battery_w=-400.0), state)
+        engaged = policy.decide(plan, measure(grid_w=3400.0, battery_w=-400.0), state)
+        apply_accepted_command(state.battery(0), engaged.batteries[0])
         fallback = policy.decide(
             plan,
             measure(grid_w=3400.0, timestamp=T0 + 120, grid_valid=False),
@@ -788,10 +947,10 @@ class TestMissingMeasurements:
         assert decision.batteries[0].reason == "soc_unknown"
         assert decision.batteries[0].setpoint_w == pytest.approx(-500.0)
 
-    def test_a_missing_power_sensor_falls_back_to_the_last_command(self):
+    def test_a_missing_power_sensor_falls_back_to_the_held_setpoint(self):
         plan = make_plan([0.30] * 8, [0.0] * 8, house_w=[500.0] * 8)
         state = ControllerState()
-        state.battery(0).last_command_w = -1500.0
+        state.battery(0).held_setpoint_w = -1500.0
         measurement = Measurement(
             timestamp=T0 + 60,
             grid_w=2000.0,
@@ -802,10 +961,10 @@ class TestMissingMeasurements:
         assert decision.house_w == pytest.approx(3500.0)
         assert decision.batteries[0].setpoint_w == pytest.approx(-3500.0, abs=1.0)
 
-    def test_a_stale_power_sensor_falls_back_to_the_last_command(self):
+    def test_a_stale_power_sensor_falls_back_to_the_held_setpoint(self):
         plan = make_plan([0.30] * 8, [0.0] * 8, house_w=[500.0] * 8)
         state = ControllerState()
-        state.battery(0).last_command_w = -1500.0
+        state.battery(0).held_setpoint_w = -1500.0
         measurement = Measurement(
             timestamp=T0 + 60,
             grid_w=2000.0,

@@ -174,6 +174,13 @@ class BatteryControllerState:
     daily_deviation_kwh: float = 0.0
     #: Whether the inverter stop moment has been cleared by this layer.
     stop_inverter_cleared: bool = False
+    #: Setpoint currently considered in force, including plan reconciliation.
+    #: Unlike last_command_w, this is not a helper-acceptance fact.
+    held_setpoint_w: float = 0.0
+    #: In-force stop ownership, projected in shadow and accepted in active mode.
+    held_stop_inverter_cleared: bool = False
+    #: A proposed optimizer restore remains due until explicitly confirmed.
+    restore_pending: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -185,6 +192,9 @@ class BatteryControllerState:
             "interval_deviation_kwh": self.interval_deviation_kwh,
             "daily_deviation_kwh": self.daily_deviation_kwh,
             "stop_inverter_cleared": self.stop_inverter_cleared,
+            "held_setpoint_w": self.held_setpoint_w,
+            "held_stop_inverter_cleared": self.held_stop_inverter_cleared,
+            "restore_pending": self.restore_pending,
         }
 
     @classmethod
@@ -289,6 +299,15 @@ class ControllerState:
         )
 
 
+@dataclass(frozen=True)
+class AcceptedCommand:
+    """Proposed bookkeeping, applied only after helper acceptance."""
+
+    last_command_w: float
+    last_command_ts: float
+    stop_inverter_cleared: bool
+
+
 @dataclass
 class BatteryDecision:
     """The controller's verdict for one battery."""
@@ -313,6 +332,23 @@ class BatteryDecision:
     soc: Optional[float] = None
     budget_used_kwh: float = 0.0
     daily_used_kwh: float = 0.0
+    accepted: AcceptedCommand | None = None
+    #: This tick's helper acceptance, not a physical response or execution right.
+    actuation_status: str | None = None
+    #: This command restores the optimizer's mode/stop, rather than clearing it.
+    restores: bool = False
+
+
+def apply_accepted_command(controller: BatteryControllerState, decision: BatteryDecision) -> None:
+    """Apply the proposal without I/O; the caller owns confirmation."""
+    accepted = decision.accepted
+    if accepted is None:
+        return
+    controller.last_command_w = accepted.last_command_w
+    controller.last_command_ts = accepted.last_command_ts
+    controller.stop_inverter_cleared = accepted.stop_inverter_cleared
+    controller.held_setpoint_w = accepted.last_command_w
+    controller.held_stop_inverter_cleared = accepted.stop_inverter_cleared
 
 
 @dataclass
@@ -361,6 +397,7 @@ class Decision:
                     "storage_value": round(b.storage_value, 4),
                     "budget_used_kwh": round(b.budget_used_kwh, 3),
                     "daily_used_kwh": round(b.daily_used_kwh, 3),
+                    "actuation_status": b.actuation_status,
                 }
                 for b in self.batteries
             ],
@@ -568,7 +605,7 @@ class FastControlPolicy:
             actual_w = (
                 measured.power_w
                 if use_measured and measured.valid and measured.power_w is not None
-                else controller.last_command_w
+                else controller.held_setpoint_w
             )
             if plan.format_version == 2:
                 # Split only at actual profile/interval edges; do not charge the
@@ -648,8 +685,8 @@ class FastControlPolicy:
 
         # Slew rate.
         if limits.max_ramp:
-            high = min(high, controller.last_command_w + limits.max_ramp)
-            low = max(low, controller.last_command_w - limits.max_ramp)
+            high = min(high, controller.held_setpoint_w + limits.max_ramp)
+            low = max(low, controller.held_setpoint_w - limits.max_ramp)
 
         # The plan is always feasible.
         high = max(high, plan_w)
@@ -714,7 +751,7 @@ class FastControlPolicy:
             if measured.valid and measured.power_w is not None:
                 house_w -= measured.power_w
             else:
-                house_w -= state.battery(index).last_command_w
+                house_w -= state.battery(index).held_setpoint_w
 
         decision = Decision(
             timestamp=now,
@@ -902,6 +939,7 @@ class FastControlPolicy:
         """
         limits = self.limits
         deviating = abs(target_w - plan_w) > limits.release_deviation
+        baseline_w = controller.held_setpoint_w
 
         if deviating:
             controller.quiet_since = None
@@ -912,23 +950,20 @@ class FastControlPolicy:
             override = (now - controller.quiet_since) < limits.release_time
             if not override:
                 controller.quiet_since = None
-                # Sync last_command_w to the released value so the next
-                # tick's deadband check sees change = 0 instead of an
-                # invented |plan - last_command| delta. Without this we
-                # force a redundant write on every release transition.
-                controller.last_command_w = plan_w
                 target_w = plan_w
                 reasons.append("released")
         else:
             controller.quiet_since = None
             override = False
-            # Same reasoning as above: keep last_command_w in lockstep
-            # with the non-override target so the deadband stays closed.
-            controller.last_command_w = plan_w
+            # Reconcile the in-force plan fact across ticks, without claiming
+            # helper acceptance or forcing a redundant write.
+            controller.held_setpoint_w = plan_w
+            baseline_w = plan_w
             target_w = plan_w
 
         releasing = controller.override_active and not override
-        change = abs(target_w - controller.last_command_w)
+        restoring = controller.restore_pending and not override
+        change = abs(target_w - baseline_w)
         write = True
 
         # The legacy optimizer duty-cycles the inverter through the stop moment when it
@@ -937,33 +972,33 @@ class FastControlPolicy:
         pending_stop = (
             not profiled
             and override
-            and not controller.stop_inverter_cleared
+            and not controller.held_stop_inverter_cleared
             and bool(step.stop_inverter)
             and step.stop_inverter != NO_STOP_SENTINEL
         )
 
-        if not releasing and not pending_stop:
-            if change < limits.deadband:
-                target_w = controller.last_command_w
+        if (not releasing and not pending_stop) or restoring:
+            if not restoring and change < limits.deadband:
+                target_w = baseline_w
                 write = False
                 reasons.append("deadband")
             elif (
                 now - controller.last_change_ts < limits.min_command_interval
-                and (limits.urgent_deviation <= 0 or change < limits.urgent_deviation)
+                and (restoring or limits.urgent_deviation <= 0 or change < limits.urgent_deviation)
             ):
-                target_w = controller.last_command_w
+                target_w = baseline_w
                 write = False
                 reasons.append("rate_limited")
 
         target_w = round(target_w)
         if write:
-            controller.last_command_w = target_w
             controller.last_change_ts = now
-            controller.last_command_ts = now
         controller.override_active = override
 
         mode: Optional[str] = None
         stop_inverter: Optional[str] = None
+        stop_cleared = controller.held_stop_inverter_cleared
+        restores = False
         if write:
             if override:
                 # While overriding, the inverter must be enabled and must not
@@ -971,13 +1006,14 @@ class FastControlPolicy:
                 # a sub-minimum-power setpoint.
                 mode = spec.mode_off if abs(target_w) < POWER_EPS else spec.mode_on
                 stop_inverter = NO_STOP_SENTINEL
-                controller.stop_inverter_cleared = True
-            elif controller.stop_inverter_cleared or releasing:
+                stop_cleared = True
+            elif controller.held_stop_inverter_cleared or releasing or restoring:
                 mode = step.mode if step.mode else (
                     spec.mode_off if abs(target_w) < POWER_EPS else spec.mode_on
                 )
                 stop_inverter = None if profiled else step.stop_inverter
-                controller.stop_inverter_cleared = False
+                stop_cleared = False
+                restores = True
 
         if not reasons:
             reasons.append("override" if override else "plan")
@@ -997,6 +1033,8 @@ class FastControlPolicy:
             soc=soc,
             budget_used_kwh=controller.interval_deviation_kwh,
             daily_used_kwh=controller.daily_deviation_kwh,
+            accepted=AcceptedCommand(target_w, now, stop_cleared) if write else None,
+            restores=restores,
         )
 
     def _plan_decision(
@@ -1013,10 +1051,17 @@ class FastControlPolicy:
     ) -> BatteryDecision:
         """Fall back to exactly what the optimizer published."""
         plan_w = round(profile_power_at(step, now) if profiled else step.ac_power_w)
-        releasing = controller.override_active or controller.stop_inverter_cleared
+        releasing = (controller.override_active or controller.held_stop_inverter_cleared
+                     or controller.restore_pending)
         write = (
-            releasing or abs(plan_w - controller.last_command_w) >= self.limits.deadband
+            releasing or abs(plan_w - controller.held_setpoint_w) >= self.limits.deadband
         )
+        if (controller.restore_pending
+                and now - controller.last_change_ts < self.limits.min_command_interval):
+            write = False
+            reason += "+rate_limited"
+        if write:
+            controller.last_change_ts = now
         mode: Optional[str] = None
         stop_inverter: Optional[str] = None
         if releasing:
@@ -1026,11 +1071,6 @@ class FastControlPolicy:
                 else (spec.mode_off if abs(plan_w) < POWER_EPS else spec.mode_on)
             )
             stop_inverter = None if profiled else step.stop_inverter
-            controller.stop_inverter_cleared = False
-        if write:
-            controller.last_command_w = plan_w
-            controller.last_change_ts = now
-            controller.last_command_ts = now
         controller.override_active = False
         controller.quiet_since = None
         return BatteryDecision(
@@ -1046,6 +1086,11 @@ class FastControlPolicy:
             soc=soc,
             budget_used_kwh=controller.interval_deviation_kwh,
             daily_used_kwh=controller.daily_deviation_kwh,
+            accepted=(
+                AcceptedCommand(plan_w, now, False if releasing else controller.held_stop_inverter_cleared)
+                if write else None
+            ),
+            restores=releasing,
         )
 
     def _all_plan(
@@ -1073,8 +1118,8 @@ class FastControlPolicy:
                     BatteryDecision(
                         index=index,
                         name=spec.name,
-                        setpoint_w=controller.last_command_w,
-                        plan_w=controller.last_command_w,
+                        setpoint_w=controller.held_setpoint_w,
+                        plan_w=controller.held_setpoint_w,
                         write=False,
                         override=False,
                         reason=reason,

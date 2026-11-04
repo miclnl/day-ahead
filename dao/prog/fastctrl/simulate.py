@@ -42,6 +42,7 @@ from .policy import (
     FastControlPolicy,
     Measurement,
     PolicyLimits,
+    apply_accepted_command,
 )
 
 #: Default AC/DC conversion efficiency used by the simulation battery model when
@@ -448,6 +449,10 @@ def simulate(
             day_key = _day_key(sample.timestamp, timezone)
             policy.account(state, sim_plan, measurement, day_key)
             decision = policy.decide(sim_plan, measurement, state)
+            for proposal in decision.batteries:
+                # Simulated helper writes always succeed, using the same
+                # acceptance bookkeeping as the production runner.
+                apply_accepted_command(state.battery(proposal.index), proposal)
             command = decision.batteries[0].setpoint_w
             wrote = decision.batteries[0].write
             overriding = decision.batteries[0].override

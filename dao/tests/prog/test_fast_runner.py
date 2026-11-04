@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -22,7 +23,7 @@ from dao.prog.fastctrl.plan import (
     PlanInterval,
     write_plan,
 )
-from dao.prog.fastctrl.policy import ControllerState
+from dao.prog.fastctrl.policy import ControllerState, FastControlPolicy
 from dao.prog.fastctrl.runner import (
     FastControlRunner,
     HomeAssistantGateway,
@@ -566,6 +567,493 @@ class RecordingFallback:
         if isinstance(self.result, str):
             return publication.FallbackReceipt(self.result, "synthetic gateway acceptance only")
         return self.result
+
+
+class F2bHass(FakeHass):
+    def __init__(self, failures=None, readback=None):
+        super().__init__({"sensor.p1_power": "1500", "sensor.soc": "60",
+                          "sensor.battery_power": "0", **(readback or {})})
+        self.failures = {key: list(value) for key, value in (failures or {}).items()}
+        self.attempts = []
+
+    def attempt(self, helper):
+        self.attempts.append(helper)
+        outcomes = self.failures.get(helper, [True])
+        ok = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+        if not ok:
+            raise RuntimeError("synthetic failed helper")
+
+    def set_value(self, entity_id, value):
+        if entity_id == "input_number.feedin":
+            self.attempt("setpoint")
+        super().set_value(entity_id, value)
+
+    def select_option(self, entity_id, option):
+        self.attempt("mode")
+        super().select_option(entity_id, option)
+
+    def call_service(self, service, **kwargs):
+        self.attempt("stop_inverter")
+        super().call_service(service, **kwargs)
+
+
+@pytest.mark.parametrize("failures,status", [
+    ({}, "confirmed"),
+    ({"mode": [False, True]}, "confirmed"),
+    ({"mode": [False]}, "unknown"),
+    ({"setpoint": [False], "mode": [False], "stop_inverter": [False]}, "unconfirmed"),
+])
+def test_f2b_runner_updates_accepted_facts_only_on_confirmation(workspace, failures, status):
+    make_plan(workspace["plan_path"])
+    hass, sink = F2bHass(failures), RecordingFallback()
+    runner = FastControlRunner(hass, make_config(), fallback=sink, **workspace)
+    controller = runner.state.battery(0)
+    controller.last_command_w, controller.last_change_ts, controller.last_command_ts = -250, T0 - 20, T0 - 20
+    controller.held_setpoint_w = -250
+    controller.stop_inverter_cleared = True
+    before = (controller.last_command_w, controller.last_command_ts)
+    decision = runner.tick(T0 + 60)
+    after = (controller.last_command_w, controller.last_command_ts)
+    assert controller.last_change_ts == T0 + 60
+    if status == "confirmed":
+        assert after == (-1500, T0 + 60)
+        assert controller.stop_inverter_cleared is True
+        assert controller.held_setpoint_w == -1500
+        assert sink.requests == []
+    else:
+        assert after == before
+        assert controller.override_active is controller.stop_inverter_cleared is True
+        assert controller.held_setpoint_w == -250
+        assert sink.requests[0].reason == f"actuation_{status}"
+        assert runner.fallback_pending is True
+    receipt, = runner.last_receipts
+    assert receipt.status == status
+    assert decision.as_attributes()["batteries"][0]["actuation_status"] == status
+    assert runner.state.last_decision["batteries"][0]["actuation_status"] == status
+    for helper in ("setpoint", "mode", "stop_inverter"):
+        assert hass.attempts.count(helper) == (2 if helper in failures else 1)
+
+
+def test_f2b_readback_confirmation_reaches_runner_state(workspace):
+    make_plan(workspace["plan_path"])
+    hass = F2bHass({"mode": [False]}, {"input_select.mode": "Aan"})
+    sink = RecordingFallback()
+    runner = FastControlRunner(hass, make_config(), fallback=sink, **workspace)
+    runner.tick(T0 + 60)
+    assert runner.state.battery(0).last_command_w == -1500
+    assert runner.last_receipts[0].status == "confirmed"
+    assert hass.attempts.count("mode") == 2
+    assert hass.template_calls == 2  # initial measurements + one fresh readback
+    assert sink.requests == []
+
+
+@pytest.mark.parametrize("mode", ["active", "shadow"])
+def test_f2b_no_writes_preserve_accepted_state_and_clear_this_tick_receipts(workspace, mode):
+    make_plan(workspace["plan_path"], battery_w=500)
+    hass = F2bHass()
+    hass.states.update({"sensor.p1_power": "500", "sensor.battery_power": "500"})
+    runner = FastControlRunner(hass, make_config(mode=mode, **{"deadband": 150, "min benefit": 1e9}), **workspace)
+    controller = runner.state.battery(0)
+    controller.last_command_w, controller.last_command_ts, controller.last_change_ts = -250, T0 - 20, T0 - 20
+    before = json.dumps({key: value for key, value in controller.to_dict().items()
+                         if key != "held_setpoint_w"}, sort_keys=True)
+    runner.last_receipts = ["previous tick"]
+    decision = runner.tick(T0 + 60)
+    assert not decision.batteries[0].write
+    assert json.dumps({key: value for key, value in controller.to_dict().items()
+                       if key != "held_setpoint_w"}, sort_keys=True) == before
+    assert controller.held_setpoint_w == 500
+    assert runner.last_receipts == []
+    assert hass.attempts == []
+
+
+def test_f2b_shadow_proposal_is_not_accepted(workspace):
+    make_plan(workspace["plan_path"])
+    runner = FastControlRunner(F2bHass(), make_config(mode="shadow"), **workspace)
+    decision = runner.tick(T0 + 60)
+    assert decision.batteries[0].write
+    controller = runner.state.battery(0)
+    assert (controller.last_command_w, controller.last_command_ts,
+            controller.stop_inverter_cleared) == (0, 0, False)
+    assert controller.last_change_ts == T0 + 60
+    assert runner.last_receipts == []
+
+
+def test_f2b_r18_shadow_projection_matches_base_six_ticks_exactly(workspace):
+    make_plan(workspace["plan_path"], battery_w=-400, price=0.30)
+    hass = FakeHass({"sensor.soc": "60", "sensor.p1_power": "0",
+                     "sensor.battery_power": "-400"})
+    runner = FastControlRunner(
+        hass, make_config(mode="shadow", **{"max sensor age": 999999, "deadband": 150}),
+        **workspace,
+    )
+    controller = runner.state.battery(0)
+    controller.last_command_w = -987
+    controller.last_change_ts, controller.last_command_ts = T0 - 30, T0 - 20
+    accepted_before = (controller.last_command_w, controller.last_command_ts,
+                       controller.stop_inverter_cleared)
+    observed = []
+    for tick in range(1, 7):
+        hass.states["sensor.p1_power"] = str(-100 * tick)
+        hass.states["sensor.battery_power"] = str(-400 + 10 * tick)
+        held_before = controller.held_setpoint_w
+        decision = runner.tick(T0 + 60 * tick)
+        battery = decision.batteries[0]
+        observed.append((battery.setpoint_w, battery.write, battery.reason))
+        if not battery.write:
+            assert controller.held_setpoint_w == held_before
+        assert (controller.last_command_w, controller.last_command_ts,
+                controller.stop_inverter_cleared) == accepted_before
+        assert runner.last_receipts == []
+    assert observed == [
+        (-290, True, "override"), (-290, False, "deadband"),
+        (-70, True, "override"), (-70, False, "deadband"),
+        (150, True, "override"), (150, False, "deadband"),
+    ]
+    assert controller.held_setpoint_w == 150
+    assert "input_number.feedin" not in hass.values
+    assert hass.options == {}
+    assert hass.services == []
+
+
+@pytest.mark.parametrize("kind,step_s,reason", [("rate", 30, "rate_limited"),
+                                              ("stop", 60, "deadband")])
+def test_f2b_r20_shadow_control_law_matches_base_exactly(workspace, kind, step_s, reason):
+    plan = make_plan(workspace["plan_path"], battery_w=-400, price=0.3)
+    if kind == "stop":
+        plan.intervals[0].battery(0).stop_inverter = "2030-01-01 00:00:00"
+        write_plan(plan, workspace["plan_path"])
+    hass = FakeHass({"sensor.soc": "60"})
+    runner = FastControlRunner(hass, make_config(mode="shadow", **{
+        "max sensor age": 999999,
+        "deadband": 0 if kind == "rate" else 150,
+        "min command interval": 60 if kind == "rate" else 0,
+    }), **workspace)
+    observed = []
+    for tick in range(1, 5):
+        hass.states.update({"sensor.p1_power": str(-100 * tick),
+                            "sensor.battery_power": str(-400 + 10 * tick)})
+        battery = runner.tick(T0 + step_s * tick).batteries[0]
+        observed.append((battery.setpoint_w, battery.write, battery.reason))
+    assert observed == [(-290, True, "override"), (-290, False, reason),
+                        (-70, True, "override"), (-70, False, reason)]
+    controller = runner.state.battery(0)
+    assert controller.last_change_ts == T0 + step_s * 3
+    assert controller.held_stop_inverter_cleared is True
+    assert (controller.last_command_w, controller.last_command_ts,
+            controller.stop_inverter_cleared) == (0, 0, False)
+
+
+def test_f2b_r19_normal_restore_repeats_until_confirmed(workspace):
+    plan = make_plan(workspace["plan_path"], battery_w=-400)
+    plan.intervals[0].battery(0).stop_inverter = "2030-01-01 00:00:00"
+    write_plan(plan, workspace["plan_path"])
+    hass = F2bHass()
+    hass.states["sensor.battery_power"] = "-400"
+    runner = FastControlRunner(hass, make_config(**{"max sensor age": 999999, "deadband": 150}), **workspace)
+    runner.tick(T0 + 60)
+    hass.states["sensor.p1_power"] = "0"
+    runner.tick(T0 + 180)
+    hass.failures = {h: [False] for h in ("setpoint", "mode", "stop_inverter")}
+    release = runner.tick(T0 + 300).batteries[0]
+    assert (release.write, release.reason, release.mode, release.stop_inverter) == (
+        True, "released", "Aan", "2030-01-01 00:00:00")
+    assert runner.last_receipts[0].status == "unconfirmed"
+    retry = runner.tick(T0 + 360).batteries[0]
+    assert retry.write is True
+    assert (retry.mode, retry.stop_inverter) == ("Aan", "2030-01-01 00:00:00")
+    controller = runner.state.battery(0)
+    assert retry.restores is True
+    assert controller.restore_pending is True
+    hass.failures = {}
+    runner.tick(T0 + 420)
+    assert controller.restore_pending is False
+    assert controller.stop_inverter_cleared is False
+    assert controller.held_stop_inverter_cleared is False
+    assert runner.tick(T0 + 480).batteries[0].write is False
+
+
+def test_f2b_r19_off_restore_retries_after_partial_override(workspace):
+    make_plan(workspace["plan_path"], battery_w=-400)
+    hass = F2bHass({"mode": [False]})
+    runner = FastControlRunner(hass, make_config(), **workspace)
+    runner.tick(T0 + 60)
+    controller = runner.state.battery(0)
+    assert controller.override_active is True
+    assert controller.stop_inverter_cleared is False
+    runner.config = make_config(mode="off")
+    runner.tick(T0 + 120)
+    assert runner.last_receipts[0].status == "unknown"
+    runner.tick(T0 + 180)
+    assert runner.last_receipts  # Not silently forgotten with the override flag.
+    assert runner.last_receipts[0].status == "unknown"
+    assert controller.restore_pending is True
+    hass.failures = {}
+    runner.tick(T0 + 240)
+    assert controller.restore_pending is False
+
+
+def test_f2b_r25_shadow_off_does_no_release_publish_or_persist(workspace):
+    plan = make_plan(workspace["plan_path"], battery_w=-400)
+    plan.intervals[0].battery(0).stop_inverter = "2030-01-01 00:00:00"
+    write_plan(plan, workspace["plan_path"])
+    hass = F2bHass()
+    runner = FastControlRunner(hass, make_config(mode="shadow", **{
+        "deadband": 150, "max sensor age": 999999,
+    }), **workspace)
+    for tick in range(1, 5):
+        hass.states.update({"sensor.p1_power": str(-100 * tick),
+                            "sensor.battery_power": str(-400 + 10 * tick)})
+        runner.tick(T0 + 60 * tick)
+    controller = runner.state.battery(0)
+    assert (controller.override_active, controller.held_stop_inverter_cleared) == (True, True)
+    assert (controller.last_command_ts, controller.stop_inverter_cleared,
+            controller.restore_pending) == (0, False, False)
+    assert hass.attempts == []
+    snapshot = json.loads(json.dumps(runner.state.last_decision))
+    persisted = Path(workspace["state_path"]).read_bytes()
+    # Apart from the required withdrawal of unconfirmed ownership, all state
+    # stays as at the last shadow tick (including the diagnostic snapshot).
+    expected = runner.state.to_dict()
+    expected["batteries"][0]["override_active"] = False
+    expected["batteries"][0]["held_stop_inverter_cleared"] = False
+    runner.config = make_config(mode="off")
+    with (
+        patch.object(FastControlPolicy, "release", autospec=True,
+                     side_effect=FastControlPolicy.release) as release,
+        patch.object(runner, "_publish", wraps=runner._publish) as publish,
+        patch.object(runner, "_persist_state", wraps=runner._persist_state) as persist,
+    ):
+        for tick in range(5, 9):
+            assert runner.tick(T0 + 60 * tick) is None
+            # BASE has exactly zero diagnostic publications on every off tick.
+            assert (publish.call_count, persist.call_count, release.call_count) == (0, 0, 0)
+            assert runner.state.last_decision == snapshot
+            assert runner.state.to_dict() == expected
+            assert Path(workspace["state_path"]).read_bytes() == persisted
+            assert hass.attempts == []
+
+
+@pytest.mark.parametrize("failures,status", [
+    ({}, "confirmed"),
+    ({"mode": [False]}, "unknown"),
+    ({h: [False] for h in ("setpoint", "mode", "stop_inverter")}, "unconfirmed"),
+])
+def test_f2b_r25_active_off_restores_and_only_retries_failures(workspace, failures, status):
+    plan = make_plan(workspace["plan_path"], battery_w=-400)
+    plan.intervals[0].battery(0).stop_inverter = "2030-01-01 00:00:00"
+    write_plan(plan, workspace["plan_path"])
+    hass = F2bHass()
+    runner = FastControlRunner(hass, make_config(), **workspace)
+    runner.tick(T0 + 60)
+    assert runner.last_receipts[0].status == "confirmed"
+    controller = runner.state.battery(0)
+    assert (controller.last_command_ts, controller.stop_inverter_cleared) == (T0 + 60, True)
+    runner.config = make_config(mode="off")
+    hass.failures = failures
+    with (
+        patch.object(runner, "_publish", wraps=runner._publish) as publish,
+        patch.object(runner, "_persist_state", wraps=runner._persist_state) as persist,
+    ):
+        for tick in (2, 3, 4):
+            hass.attempts.clear()
+            assert runner.tick(T0 + 60 * tick) is None
+            if tick > 2 and status == "confirmed":
+                assert runner.last_receipts == []
+                assert hass.attempts == []
+                assert publish.call_count == persist.call_count == 1
+                continue
+            assert set(hass.attempts) == {"setpoint", "mode", "stop_inverter"}
+            assert runner.last_receipts[0].status == status
+            assert controller.restore_pending is (status != "confirmed")
+            assert controller.stop_inverter_cleared is (status != "confirmed")
+            assert runner.state.last_decision["batteries"][0]["actuation_status"] == status
+            assert runner.state.last_decision["mode"] == "off"
+            assert load_state(workspace["state_path"]).last_decision == runner.state.last_decision
+            entity = runner.config.diagnostics.entity_status
+            assert hass.published[entity][1]["batteries"][0]["actuation_status"] == status
+            assert publish.call_count == persist.call_count == tick - 1
+            persist.assert_called_with(T0 + 60 * tick, force=True)
+        if status != "confirmed":
+            hass.failures = {}
+            runner.tick(T0 + 300)
+            assert runner.last_receipts[0].status == "confirmed"
+            assert controller.restore_pending is False
+            calls = publish.call_count
+            runner.tick(T0 + 360)
+            assert runner.last_receipts == []
+            assert publish.call_count == persist.call_count == calls
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_f2b_r19_override_clear_does_not_discharge_restore(workspace, fails):
+    make_plan(workspace["plan_path"])
+    hass = F2bHass({"mode": [False]} if fails else {})
+    runner = FastControlRunner(hass, make_config(), **workspace)
+    controller = runner.state.battery(0)
+    controller.restore_pending = True
+    decision = runner.tick(T0 + 60).batteries[0]
+    assert decision.override is True
+    assert decision.restores is False
+    assert controller.restore_pending is True
+
+
+def test_f2b_r20_denied_gate_revokes_both_stop_facts(workspace):
+    runner = FastControlRunner(FakeHass(), make_config(), **workspace)
+    controller = runner.state.battery(0)
+    controller.stop_inverter_cleared = controller.held_stop_inverter_cleared = True
+    runner.tick(T0 + 60)
+    assert controller.stop_inverter_cleared is controller.held_stop_inverter_cleared is False
+
+
+@pytest.mark.parametrize("all_fail,status", [(False, "unknown"), (True, "unconfirmed")])
+def test_f2b_r21_failed_off_restore_updates_snapshot_and_operator(workspace, all_fail, status):
+    make_plan(workspace["plan_path"], battery_w=-400)
+    hass = F2bHass()
+    runner = FastControlRunner(hass, make_config(), **workspace)
+    runner.tick(T0 + 60)
+    assert runner.state.last_decision["batteries"][0]["actuation_status"] == "confirmed"
+    hass.failures = {h: [False] for h in (("setpoint", "mode", "stop_inverter") if all_fail else ("mode",))}
+    runner.config = make_config(mode="off")
+    runner.tick(T0 + 120)
+    assert runner.state.last_decision["batteries"][0]["actuation_status"] == status
+    assert runner.state.last_decision["mode"] == "off"
+    assert load_state(workspace["state_path"]).last_decision == runner.state.last_decision
+    entity = runner.config.diagnostics.entity_status
+    assert hass.published[entity][1]["batteries"][0]["actuation_status"] == status
+
+
+def test_f2b_r24_shadow_restart_uses_projection_without_accepting_it(workspace):
+    make_plan(workspace["plan_path"], battery_w=-400)
+    hass = FakeHass({"sensor.soc": "60", "sensor.p1_power": "-100", "sensor.battery_power": "-390"})
+    shadow = FastControlRunner(hass, make_config(mode="shadow", **{"deadband": 150}), **workspace)
+    shadow.tick(T0 + 60)
+    save_state(shadow.state, workspace["state_path"])
+    active = FastControlRunner(hass, make_config(**{"max sensor age": 999999, "deadband": 150}), **workspace)
+    controller = active.state.battery(0)
+    assert controller.held_setpoint_w == -290
+    assert (controller.last_command_w, controller.last_command_ts,
+            controller.stop_inverter_cleared) == (0, 0, False)
+    assert controller.held_stop_inverter_cleared is True
+    hass.states.update({"sensor.p1_power": "-200", "sensor.battery_power": "-380"})
+    first = active.tick(T0 + 120).batteries[0]
+    assert (first.setpoint_w, first.write, first.reason) == (-290, False, "deadband")
+    assert active.last_receipts == []
+    assert controller.last_command_ts == 0
+    hass.states.update({"sensor.p1_power": "-300", "sensor.battery_power": "-370"})
+    active.tick(T0 + 180)
+    assert active.last_receipts[0].status == "confirmed"
+    assert (controller.last_command_w, controller.last_command_ts,
+            controller.stop_inverter_cleared) == (-70, T0 + 180, True)
+
+
+def test_f2b_r22_invalid_identity_fails_before_helpers_and_escalates(workspace):
+    from dataclasses import replace
+
+    from dao.prog.fastctrl.policy import BatteryDecision, Decision
+
+    plan = ready_plan()
+    plan.specs[0] = replace(plan.specs[0], setpoint_entity="input_number.feedin")
+    plan.financial_context = None
+    hass, sink = F2bHass(), RecordingFallback()
+    runner = FastControlRunner(hass, make_config(), fallback=sink, **workspace)
+    decision = Decision(T0, [BatteryDecision(0, "accu", -1000, 0, True, True, "override")])
+    runner._actuate(decision, plan, "active")
+    assert hass.attempts == []
+    assert runner.last_receipts == []
+    assert decision.as_attributes()["batteries"][0]["actuation_status"] == "unconfirmed"
+    assert sink.requests[0].reason == "actuation_identity_invalid"
+
+
+def test_f2b_missing_helper_entities_do_not_accept_proposed_state(workspace):
+    from dataclasses import replace
+
+    plan = make_plan(workspace["plan_path"])
+    plan.specs[0] = replace(plan.specs[0], setpoint_entity=None, mode_entity=None, stop_inverter_entity=None)
+    write_plan(plan, workspace["plan_path"])
+    runner = FastControlRunner(F2bHass(), make_config(), **workspace)
+    decision = runner.tick(T0 + 60)
+    assert decision.batteries[0].write
+    assert decision.batteries[0].accepted is not None
+    controller = runner.state.battery(0)
+    assert (controller.last_command_w, controller.last_command_ts,
+            controller.stop_inverter_cleared) == (0, 0, False)
+    assert controller.last_change_ts == T0 + 60
+    assert runner.last_receipts == []
+
+
+@pytest.mark.parametrize("off", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_f2b_release_uses_the_same_acceptance_route(workspace, off, fails):
+    make_plan(workspace["plan_path"], battery_w=-400)
+    hass, sink = F2bHass(), RecordingFallback()
+    runner = FastControlRunner(hass, make_config(), fallback=sink, **workspace)
+    runner.tick(T0 + 60)
+    controller = runner.state.battery(0)
+    before = (controller.last_command_w, controller.last_command_ts)
+    assert controller.stop_inverter_cleared
+    hass.failures = {"mode": [False]} if fails else {}
+    if off:
+        runner.config = make_config(mode="off")
+    else:
+        hass.states["sensor.p1_power"] = "unavailable"
+    runner.tick(T0 + 120)
+    if fails:
+        assert (controller.last_command_w, controller.last_command_ts) == before
+        assert sink.requests[0].reason == "actuation_unknown"
+        assert controller.held_setpoint_w == before[0]
+        assert controller.stop_inverter_cleared is True
+        # A failed restore must be retried next tick, even in mode off.
+        runner.tick(T0 + 121)
+        assert runner.last_receipts
+        assert runner.last_receipts[0].status == "unknown"
+        assert hass.attempts.count("mode") == 5  # engagement + 2 + 2 attempts
+    else:
+        assert (controller.last_command_w, controller.last_command_ts) == (-400, T0 + 120)
+        assert controller.held_setpoint_w == -400
+        assert controller.stop_inverter_cleared is False
+    assert controller.override_active is False
+    assert runner.last_receipts[0].status == ("unknown" if fails else "confirmed")
+
+
+def test_f2b_event_baseline_uses_held_setpoint_not_last_accepted(workspace):
+    from dao.prog.fastctrl.runner import EVENTS_KIND_SETPOINT
+
+    make_plan(workspace["plan_path"], battery_w=-250)
+    hass = F2bHass()
+    hass.states.update({"sensor.p1_power": "0", "sensor.battery_power": "-250"})
+    runner = FastControlRunner(hass, make_config(**{"deadband": 150}), **workspace)
+    controller = runner.state.battery(0)
+    controller.last_command_w, controller.held_setpoint_w = 777, -250
+    decision = runner.tick(T0 + 60)
+    assert decision.batteries[0].setpoint_w == -250
+    assert decision.batteries[0].write is False
+    assert not [e for e in runner.state.events if e["kind"] == EVENTS_KIND_SETPOINT]
+    # The direct event path (e.g. off-release) has the same held baseline.
+    runner._last_setpoints = ()
+    runner._record_events(decision, "active")
+    assert not [e for e in runner.state.events if e["kind"] == EVENTS_KIND_SETPOINT]
+
+
+def test_f2b_actuation_fallback_shares_monotonic_throttle_with_gate(workspace, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("dao.prog.fastctrl.runner.time.monotonic", lambda: clock[0])
+    make_plan(workspace["plan_path"])
+    sink = RecordingFallback()
+    runner = FastControlRunner(F2bHass({"mode": [False]}), make_config(interval=15),
+                               fallback=sink, **workspace)
+    runner.tick(T0 + 60)
+    runner.tick(T0 + 61)
+    assert [r.reason for r in sink.requests] == ["actuation_unknown"]
+    assert runner.last_receipts[0].timestamp == T0 + 61
+    Path(workspace["plan_path"]).unlink()
+    runner.tick(T0 + 62)
+    assert len(sink.requests) == 1
+    assert runner.last_receipts == []
+    clock[0] = 115.0
+    runner.tick(T0 + 63)
+    assert len(sink.requests) == 2
+
 
 
 @pytest.mark.parametrize("artifact", ["blocked", "missing", "corrupt", "expired_v1", "expired_v2", "ready_v2", "v1_at_gate"])

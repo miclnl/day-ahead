@@ -25,6 +25,74 @@ from dao.prog.fastctrl.simulate import (
 T0 = 1_700_000_000
 
 
+def f2b_fixed_synthetic_datetime():
+    """Freeze only this module's date/local-zone dependency, not process clocks."""
+    import datetime as dt
+    from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Europe/Amsterdam")
+
+    class FixedDate(dt.date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 11, 4)
+
+    class LocalDatetime(dt.datetime):
+        @classmethod
+        def combine(cls, date, time, tzinfo=zone):
+            return super().combine(date, time, tzinfo)
+
+        @classmethod
+        def fromtimestamp(cls, timestamp, tz=None):
+            return super().fromtimestamp(timestamp, zone if tz is None else tz)
+
+    return SimpleNamespace(datetime=LocalDatetime, date=FixedDate,
+                           time=dt.time, timedelta=dt.timedelta)
+
+
+def test_f2b_r17_two_day_synthetic_matches_base_exactly(monkeypatch):
+    from importlib import import_module
+
+    module = import_module("dao.prog.fastctrl.simulate")
+    monkeypatch.setattr(module, "datetime", f2b_fixed_synthetic_datetime())
+    plan, samples, soc = synthetic_case(make_spec(), days=2)
+    assert plan.created_ts == 1793574000
+    result = simulate(plan, samples, PolicyLimits(), soc, "R17 BASE", use_fast_layer=True)
+    assert (result.import_kwh, result.export_kwh, result.throughput_kwh,
+            result.writes, result.override_s) == (
+        8.446337648469072, 8.5749187089622, 31.693455013242342, 158, 30000.0,
+    )
+
+
+def test_f2b_simulator_applies_proposal_between_decisions_without_io(monkeypatch):
+    from dao.prog.fastctrl.policy import FastControlPolicy
+
+    observations = []
+    original = FastControlPolicy.decide
+
+    def observe(policy, plan, measurement, state, *args, **kwargs):
+        controller = state.battery(0)
+        before = (controller.last_command_w, controller.last_command_ts)
+        decision = original(policy, plan, measurement, state, *args, **kwargs)
+        after = (controller.last_command_w, controller.last_command_ts)
+        observations.append((before, after))
+        return decision
+
+    monkeypatch.setattr(FastControlPolicy, "decide", observe)
+    plan = flat_plan(make_spec(charge_efficiency=1, discharge_efficiency=1),
+                     price=0.4, export=0.1)
+    result = simulate(plan, [Sample(T0, 1000), Sample(T0 + 60, 1000), Sample(T0 + 120, 1000)],
+                      PolicyLimits(min_benefit=0, deadband=150), 80, "acceptance", True,
+                      inverter_efficiency=1)
+    assert observations == [((0, 0), (0, 0)), ((-1000, T0), (-1000, T0))]
+    assert result.import_kwh == 0
+    assert result.export_kwh == 0
+    assert result.throughput_kwh == pytest.approx(1 / 30)
+    assert result.soc_end == pytest.approx(80 - 1 / 3)
+    assert result.writes == 1
+
+
 @pytest.mark.parametrize("multiple", [False, True])
 @pytest.mark.parametrize("split", [False, True])
 def test_fix1_simulation_preserves_interval_soc_in_real_storage_valuation(monkeypatch, multiple, split):
