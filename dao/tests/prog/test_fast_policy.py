@@ -27,6 +27,20 @@ from dao.prog.fastctrl.policy import (
 T0 = 1_700_000_000
 
 
+def test_limited_v2_still_hits_the_separate_actuation_gate():
+    from dataclasses import replace
+
+    from dao.prog.fastctrl.publication import GatePolicy, PlanRead, following_verdict
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    plan = ready_plan()
+    plan.financial_context = replace(plan.financial_context, economics_supported=False,
+                                     issues=("bonus_prefix_unknown",))
+    verdict = following_verdict(PlanRead("ready", plan, "ready"), policy=GatePolicy(None),
+                                now_ts=plan.created_ts)
+    assert not verdict.allowed and verdict.reason == "actuation_gates_unproven"
+
+
 def make_spec(**overrides) -> BatterySpec:
     defaults = dict(
         name="accu",

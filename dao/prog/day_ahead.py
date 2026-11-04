@@ -88,9 +88,10 @@ from dao.prog.settlement.optimization_refinement import (
     solution_digest,
 )
 from dao.prog.settlement.publication import FinancialPlanBlocked
+from dao.prog.settlement.replay import ReplayBasis
 from dao.prog.settlement.service import PlanningContext
 from dao.prog.settlement.tariffs import quote
-from dao.prog.settlement.types import Origin
+from dao.prog.settlement.types import Origin, TerminalValue
 
 _libc = ctypes.CDLL(None)
 
@@ -731,6 +732,8 @@ class DaCalc(DaBase):
                 pb.append(0.0 if math.isnan(row.da_bonus) else row.da_bonus)
 
         B = len(self.battery_options)
+        # Pin identity with the model installation order, not at the later export.
+        terminal_battery_names = tuple(getattr(battery, "name", None) for battery in self.battery_options)
         U = len(uur)
         if not financial_planning:
             p_avg = sum(pl) / U  # max(pl) #
@@ -3658,6 +3661,7 @@ class DaCalc(DaBase):
         )
         period_terms = None
         terminal_terms = None
+        publication_terminal = None
         if financial_terms is not None:
             period_terms = build_month_floor_terms(model, financial_terms.quotes,
                 financial_terms.bonus.grid_export, financial_terms.bonus.export_bounds_kwh,
@@ -3669,6 +3673,7 @@ class DaCalc(DaBase):
                 decimal_context.prec = 36
                 terminal_terms = terminal_value(financial_terms.quotes,
                     tuple(Decimal(str(eff_bat_to_dc[b])) * Decimal(str(avg_eff_dc_to_ac[b])) for b in range(B)))
+            publication_terminal = self._map_terminal_references(terminal_terms, terminal_battery_names)
         bonus_cfg = getattr(self, "production_bonus", None)
         bonus_active = any(p > 0 for p in pb)
         if financial_terms is not None:
@@ -5228,9 +5233,13 @@ class DaCalc(DaBase):
                 now_ts=int(time.time()),
             )
         try:
+            replay_basis = None
             if financial_planning:
+                replay_basis = ReplayBasis(financial_terms.context.basis, financial_terms.context.state,
+                    financial_terms.quotes, financial_terms.context.price_batch, publication_terminal)
                 financial_context = self._planning_financial_context(
-                    financial_terms, terminal_terms, planning_economics, created_ts=int(time.time()))
+                    financial_terms, publication_terminal, planning_economics, created_ts=int(time.time()),
+                    replay_basis_hash=replay_basis.content_hash)
                 if not self.debug:
                     self._financial_publication().check_basis(financial_context.basis, now_ts=int(time.time()))
             # interval_ts, not tijd: the fast layer compares its boundaries
@@ -5259,6 +5268,7 @@ class DaCalc(DaBase):
                 U=U,
                 B=B,
                 financial_context=financial_context,
+                replay_basis=replay_basis,
             )
         except FinancialPlanBlocked:
             raise
@@ -5906,7 +5916,25 @@ class DaCalc(DaBase):
             return None
         return getattr(self, operation)(*args, **kwargs)
 
-    def _planning_financial_context(self, terms, terminal, economics, *, created_ts):
+    @staticmethod
+    def _map_terminal_references(terminal, battery_names):
+        references = terminal.reference_efficiency_by_battery
+        if len(references) != len(battery_names):
+            raise ValueError("terminal_reference_count_mismatch")
+        if any(type(name) is not str for name in battery_names):
+            raise ValueError("terminal_battery_name_missing")
+        if any(not name.strip() for name in battery_names):
+            raise ValueError("terminal_battery_name_empty")
+        if len(battery_names) != len(set(battery_names)):
+            raise ValueError("terminal_battery_name_duplicate")
+        if tuple(name for name, _ in references) != tuple(str(b) for b in range(len(battery_names))):
+            raise ValueError("terminal_reference_index_identity_unknown")
+        # Keep the optimizer's actual Decimal instances. No new efficiency calculation.
+        return TerminalValue(terminal.policy_version, terminal.eur_per_ac_kwh,
+                             tuple((name, efficiency) for name, (_, efficiency)
+                                   in zip(battery_names, references, strict=True)))
+
+    def _planning_financial_context(self, terms, terminal, economics, *, created_ts, replay_basis_hash):
         basis = terms.context.basis
         snapshots = terms.context.price_batch.snapshots
         intervals = {snapshot.price_interval_seconds for snapshot in snapshots
@@ -5923,14 +5951,14 @@ class DaCalc(DaBase):
         supported = economics["economics_supported"]
         if tuple(name for name, _ in terminal.reference_efficiency_by_battery) != tuple(
                 battery.name for battery in self.battery_options):
-            # Mapping van terminalreferenties is F1c; nooit gokken of herlabelen.
+            # Independent of the earlier mapping: configuration drift must stay visible.
             supported = False
             issues = (*issues, "terminal_reference_identity_unproven")
         if not supported:
             issues = (*issues, "producer_economics_unproven")
             logging.warning("Financiële economie niet onderbouwd: %s", ", ".join(issues))
         return FinancialContext(basis, not_after, intervals.pop(), terminal, supported,
-                                tuple(dict.fromkeys(issues)))
+                                tuple(dict.fromkeys(issues)), replay_basis_hash)
 
     def _financial_settings(self):
         """Processtartsnapshot, geen tweede options-lezing of impliciete modefallback."""
@@ -6041,6 +6069,7 @@ class DaCalc(DaBase):
         path: str = FAST_PLAN_FILE,
         *,
         financial_context: FinancialContext | None = None,
+        replay_basis: ReplayBasis | None = None,
     ) -> None:
         """Serialise the solution for the fast control layer.
 
@@ -6150,7 +6179,7 @@ class DaCalc(DaBase):
                 self._refuse_financial_output(now_ts=int(time.time()), reason="financial_publication_path_mismatch")
             plan.format_version = 2
             plan.financial_context = financial_context
-            self._financial_publication().publish(plan, now_ts=int(time.time()))
+            self._financial_publication().publish(plan, now_ts=int(time.time()), replay_basis=replay_basis)
         logging.info(
             f"Plan voor de snelle regellaag opgeslagen: {len(plan.intervals)} "
             f"intervallen, {len(specs)} batterij(en)"

@@ -21,7 +21,7 @@ def ready_plan(*, hashes=("a" * 64,), revision=1, start=START_TS + 900):
     context = plans.FinancialContext(
         basis, start + 600, 3600,
         TerminalValue("synthetic-explicit-v1", Decimal("0.123456789012345678901234567890123456"),
-                      (("accu", Decimal("0.94")),)), True, (),
+                      (("accu", Decimal("0.94")),)), True, (), "b" * 64,
     )
     return FastPlan(
         created_ts=start, interval_s=900,
@@ -46,6 +46,7 @@ def test_ready_roundtrip_retains_explicit_terminal_decimal_and_detaches_basis():
         restored = FastPlan.from_dict(json.loads(json.dumps(payload)))
     assert restored.financial_context == plan.financial_context
     assert restored.to_dict() == payload
+    assert payload["financial_context"].get("replay_basis_hash") == "b" * 64
     with pytest.raises(FrozenInstanceError):
         restored.financial_context.basis.input_revision = 9
     hashes = ["a" * 64]
@@ -86,6 +87,9 @@ def test_basis_requires_canonical_unique_pinned_hashes(hashes):
     (("financial_context", "price_interval_s"), 123),
     (("financial_context", "economics_supported"), 1),
     (("financial_context", "issues"), {}),
+    (("financial_context", "replay_basis_hash"), None),
+    (("financial_context", "replay_basis_hash"), "B" * 64),
+    (("financial_context", "replay_basis_hash"), "../archive"),
     (("financial_context", "terminal_value", "eur_per_ac_kwh"), 0.12),
     (("financial_context", "terminal_value", "eur_per_ac_kwh"), "NaN"),
     (("financial_context", "terminal_value", "eur_per_ac_kwh"), "0.1200"),
@@ -115,6 +119,15 @@ def test_partial_ready_is_rejected(field):
     del payload[field]
     with pytest.raises((ValueError, TypeError)):
         FastPlan.from_dict(payload)
+
+
+def test_missing_replay_hash_is_explicitly_rejected_but_v1_remains_readable():
+    payload = ready_plan().to_dict()
+    payload["financial_context"].pop("replay_basis_hash", None)
+    with pytest.raises(ValueError, match="replay_basis_hash"):
+        FastPlan.from_dict(payload)
+    legacy = FastPlan(START_TS, 900)
+    assert FastPlan.from_dict(legacy.to_dict()).to_dict() == legacy.to_dict()
 
 
 @pytest.mark.parametrize("version", [2.0, "2", True])

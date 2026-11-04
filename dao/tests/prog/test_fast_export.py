@@ -23,7 +23,7 @@ from dao.prog.config.models.fastcontrol import FastControlConfig  # noqa: E402
 from dao.prog.fastctrl.plan import load_plan  # noqa: E402
 from dao.prog.fastctrl.publication import PublicationError, read_publication  # noqa: E402
 from dao.prog.settlement.publication import FinancialPlanBlocked  # noqa: E402
-from dao.tests.settlement.test_publication import NOW, START_TS, item  # noqa: E402
+from dao.tests.settlement.test_publication import NOW, START_TS, item, replay_for_plan  # noqa: E402
 from dao.tests.settlement.test_publication import system as system  # noqa: E402
 
 
@@ -291,12 +291,18 @@ def financial_exporter(exporter, system, monkeypatch):
     context = replace(context, terminal_value=replace(
         context.terminal_value, reference_efficiency_by_battery=(("Accu1", context.terminal_value.reference_efficiency_by_battery[0][1]),),
     ))
+    from dao.prog.settlement.replay import write_replay_basis
+
+    replay = replay_for_plan(replace(system.plan, financial_context=context), (system.snapshot,))
+    digest = write_replay_basis(replay, plan_path=system.path)
+    context = replace(context, replay_basis_hash=digest)
     return exporter, context
 
 
 def financial_call(exporter, system, context):
     return call(exporter, str(system.path), steps=3,
-                interval_ts=[NOW, NOW + 900, NOW + 1800], hour_fraction=[0.25] * 3,
+                 interval_ts=[NOW, NOW + 900, NOW + 1800], hour_fraction=[0.25] * 3,
+                 pl=[0.1] * 3, pt=[0.1] * 3, p_avg=0.1,
                 financial_context=context)
 
 
@@ -305,6 +311,18 @@ def test_explicit_v2_context_is_published_through_real_adapter(financial_exporte
     plan = financial_call(exporter, system, context)
     assert plan.format_version == 2
     assert plan.financial_context == context
+
+
+def test_limited_v2_export_keeps_unknown_economics_and_base_tick_prices(financial_exporter, system):
+    exporter, context = financial_exporter
+    context = replace(context, economics_supported=False, issues=("bonus_prefix_unknown",))
+    plan = financial_call(exporter, system, context)
+    assert plan is not None and plan.format_version == 2
+    assert plan.financial_context.economics_supported is False
+    assert plan.financial_context.issues == ("bonus_prefix_unknown",)
+    assert [i.price_import for i in plan.intervals] == [0.1] * 3
+    assert [i.price_export for i in plan.intervals] == [0.1] * 3
+    assert plan.price_average == 0.1
 
 
 def test_changed_basis_before_export_is_blocked_not_relabelled(financial_exporter, system):

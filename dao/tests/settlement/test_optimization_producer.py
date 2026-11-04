@@ -121,6 +121,11 @@ def capture(monkeypatch, tmp_path, request):
         **settings.get("battery", {}),
     }) for b, efficiency in enumerate((0.8, 1.0))]
     instance.ev_options, instance.machines, instance.solar = [], [], []
+    if settings.get("reverse_batteries"):
+        instance.battery_options.reverse()  # Move identity AND its own physical configuration.
+    if "invalid_name" in settings:
+        instance.battery_options[0] = instance.battery_options[0].model_copy(
+            update={"name": settings["invalid_name"]})
     instance.boiler_options = instance.heating_options = None
     if settings.get("heating"):
         instance.heating_options = HeatingEnabled.model_validate({
@@ -177,6 +182,10 @@ def capture(monkeypatch, tmp_path, request):
             def reject_ready(*args, **kwargs):
                 raise PublicationError("synthetic_ready_write_failed")
             monkeypatch.setattr("dao.prog.settlement.publication._write_verified_ready", reject_ready)
+        if settings.get("archive_failure"):
+            def reject_archive(*args, **kwargs):
+                raise OSError("replay_archive_synthetic_write_failure")
+            monkeypatch.setattr("dao.prog.settlement.publication.write_replay_basis", reject_archive)
     start = settings.get("start", ts())
     monkeypatch.setattr(da.time, "time", lambda: start)
     if settings.get("solve"):
@@ -344,6 +353,14 @@ def capture(monkeypatch, tmp_path, request):
         return check_output(**kwargs)
 
     monkeypatch.setattr(instance, "_check_financial_output", check_financial_output)
+    if settings.get("terminal_count_mismatch"):
+        real_terminal = da.terminal_value
+
+        def incomplete_terminal(*args, **kwargs):
+            terminal = real_terminal(*args, **kwargs)
+            return replace(terminal, reference_efficiency_by_battery=terminal.reference_efficiency_by_battery[:-1])
+
+        monkeypatch.setattr(da, "terminal_value", incomplete_terminal)
     add_sos = mip.Model.add_sos
     bind_finance = da.bind_day_ahead_finance
     bind_cost = da.bind_day_ahead_cost
@@ -366,6 +383,8 @@ def capture(monkeypatch, tmp_path, request):
         assert model is found["model"]
         found["cost"] = kwargs
         found["locals"].update(sys._getframe(1).f_locals)
+        if settings.get("identity_drift"):
+            instance.battery_options.reverse()  # After model identity was pinned/mapped.
         if settings.get("solve") and not settings.get("stop_at_cost"):
             return bind_cost(model, **kwargs)
         raise Captured
@@ -410,7 +429,7 @@ def test_f1b_publication_precedes_closed_actuation_without_ha_calls(capture):
     context = read.plan.financial_context
     assert context.basis == capture["context"].basis
     assert context.price_interval_s == 3600
-    assert context.terminal_value == capture["export_locals"]["terminal_terms"]
+    assert context.terminal_value.eur_per_ac_kwh == capture["export_locals"]["terminal_terms"].eur_per_ac_kwh
     assert context.economics_supported
     assert context.not_after_ts == read.plan.created_ts + 600
     assert capture["intents_at_publish"] == tuple(capture["instance"].device_intents)
@@ -469,12 +488,13 @@ def test_f1b_lockbusy_never_retries_or_invalidates_existing_ready(capture, monke
     ({"active": True, "solve": True, "f1b": True, "supported": True,
       "with_batteries": True, "battery_names": ("0", "1")}, True),
     ({"active": True, "solve": True, "f1b": True, "supported": True,
-      "with_batteries": True, "battery_names": ("1", "0")}, False),
+      "with_batteries": True, "battery_names": ("0", "1"), "identity_drift": True}, False),
 ], indirect=["capture"], ids=["same-order", "swapped-identities"])
 def test_f1b_terminal_identities_must_match_model_order(capture, ordered):
     context = capture["export"]["financial_context"]
     assert context.terminal_value.reference_efficiency_by_battery == (("0", D("0.8")), ("1", D("1.0")))
-    assert [float(b.bat_to_dc_efficiency) for b in capture["instance"].battery_options] == [0.8, 1.0]
+    assert [float(b.bat_to_dc_efficiency) for b in capture["instance"].battery_options] == (
+        [0.8, 1.0] if ordered else [1.0, 0.8])
     assert context.economics_supported is ordered
     read = read_publication(capture["plan_path"])
     if ordered:
@@ -482,8 +502,8 @@ def test_f1b_terminal_identities_must_match_model_order(capture, ordered):
         assert str(capture["error"]) == "actuation_gates_unproven"
         assert "terminal_reference_identity_unproven" not in context.issues
     else:
-        assert (read.status, read.reason) == ("blocked", "economics_unsupported")
-        assert str(capture["error"]) == "economics_unsupported"
+        assert read.status == "ready" and not read.plan.financial_context.economics_supported
+        assert str(capture["error"]) == "actuation_gates_unproven"
         assert "terminal_reference_identity_unproven" in context.issues
     assert capture["ha_writes"] == []
 
@@ -615,27 +635,120 @@ def test_f1b_battery_profile_is_final_solution_not_claimed_sent_commands(capture
 
 @pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True,
     "supported": True, "with_batteries": True}], indirect=True)
-def test_f1b_unmapped_terminal_identities_are_explicitly_unproven(capture, caplog):
-    assert isinstance(capture.get("error"), FinancialPlanBlocked)
+def test_f1c_real_names_keep_exact_optimizer_terminal_decimals(capture):
+    assert str(capture.get("error")) == "actuation_gates_unproven"
     assert capture["ha_writes"] == []
     context = capture["export"]["financial_context"]
-    assert not context.economics_supported
-    assert "terminal_reference_identity_unproven" in context.issues
-    assert read_publication(capture["plan_path"]).status == "blocked"
-    assert any("terminal_reference_identity_unproven" in record.getMessage()
-               for record in caplog.get_records("setup"))
+    assert context.economics_supported
+    assert context.terminal_value.reference_efficiency_by_battery == (
+        ("synthetic-0", D("0.8")), ("synthetic-1", D("1.0")))
+    raw = capture["export_locals"]["terminal_terms"]
+    assert raw.reference_efficiency_by_battery == (("0", D("0.8")), ("1", D("1.0")))
+    for (_, actual), (_, optimizer) in zip(context.terminal_value.reference_efficiency_by_battery,
+                                          raw.reference_efficiency_by_battery, strict=True):
+        assert actual is optimizer  # No recomputation, rounding or float conversion in producer.
+    assert context.terminal_value.eur_per_ac_kwh is raw.eur_per_ac_kwh
+    assert context.terminal_value.policy_version == raw.policy_version
+    assert read_publication(capture["plan_path"]).status == "ready"
 
 
 @pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True}], indirect=True)
-def test_f1b_unfounded_economics_remain_refused_not_limited_ready(capture):
+def test_f1c_unfounded_economics_publish_limited_ready_without_flag_trick(capture):
     assert isinstance(capture.get("error"), FinancialPlanBlocked)
-    assert str(capture["error"]) == "economics_unsupported"
+    assert str(capture["error"]) == "actuation_gates_unproven"
     read = read_publication(capture["plan_path"])
-    assert (read.status, read.reason) == ("blocked", "economics_unsupported")
+    assert read.status == "ready", read.reason
     assert capture["ha_writes"] == []
     assert capture["instance"].device_intents
     context = capture["export"]["financial_context"]
     assert not context.economics_supported and context.issues
+    assert not read.plan.financial_context.economics_supported
+    assert read.plan.financial_context.issues == context.issues
+    assert capture["export_locals"]["planning_economics"]["economics_supported"] is False
+
+
+@pytest.mark.parametrize("capture", [
+    {"active": True, "solve": True, "f1b": True, "with_batteries": True, "supported": supported}
+    for supported in (False, True)
+], indirect=True)
+def test_f1c_published_tick_prices_are_only_quote_base_rates(capture):
+    read = read_publication(capture["plan_path"])
+    assert read.status == "ready", read.reason
+    quotes = capture["terms"].quotes
+    assert [i.price_import for i in read.plan.intervals] == [float(q.import_rate) for q in quotes]
+    assert [i.price_export for i in read.plan.intervals] == [float(q.export_rate) for q in quotes]
+    assert read.plan.price_average == pytest.approx(sum(float(q.import_rate) for q in quotes) / len(quotes))
+    for q, imp, exp, eligible in zip(quotes, capture["terms"].grid_import,
+            capture["terms"].bonus.grid_export, capture["terms"].bonus.eligible_kwh, strict=True):
+        coefficients = capture["terms"].energy_cost.expr
+        assert coefficients[imp] == float(q.import_rate)
+        assert coefficients[exp] == -float(q.export_rate)
+        if q.bonus_rate:
+            assert coefficients[eligible] == -float(q.bonus_rate)
+    assert read.plan.financial_context.economics_supported is capture["export_locals"]["planning_economics"]["economics_supported"]
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True,
+    "with_batteries": True, "supported": True, "reverse_batteries": True}], indirect=True)
+def test_f1c_reordering_moves_each_identity_with_its_own_physical_efficiency(capture):
+    read = read_publication(capture["plan_path"])
+    assert read.status == "ready", read.reason
+    assert read.plan.financial_context.terminal_value.reference_efficiency_by_battery == (
+        ("synthetic-1", D("1.0")), ("synthetic-0", D("0.8")))
+    assert capture["export_locals"]["terminal_terms"].reference_efficiency_by_battery == (
+        ("0", D("1.0")), ("1", D("0.8")))
+
+
+@pytest.mark.parametrize("capture,reason", [
+    ({"active": True, "solve": True, "f1b": True, "with_batteries": True,
+      "supported": True, "invalid_name": None}, "terminal_battery_name_missing"),
+    ({"active": True, "solve": True, "f1b": True, "with_batteries": True,
+      "supported": True, "invalid_name": " "}, "terminal_battery_name_empty"),
+    ({"active": True, "solve": True, "f1b": True, "with_batteries": True,
+      "supported": True, "battery_names": ("same", "same")}, "terminal_battery_name_duplicate"),
+    ({"active": True, "solve": True, "f1b": True, "with_batteries": True,
+      "supported": True, "terminal_count_mismatch": True}, "terminal_reference_count_mismatch"),
+], indirect=["capture"])
+def test_f1c_invalid_terminal_identity_is_blocked_with_specific_reason(capture, reason):
+    assert isinstance(capture.get("error"), FinancialPlanBlocked)
+    assert str(capture["error"]) == reason
+    read = read_publication(capture["plan_path"])
+    assert (read.status, read.reason) == ("blocked", reason)
+    assert capture["ha_writes"] == []
+
+
+@pytest.mark.parametrize("capture", [
+    {"active": True, "solve": True, "f1b": True, "with_batteries": True},
+    {"active": True, "solve": True, "f1b": True, "with_batteries": True, "hourly": True},
+], indirect=True)
+def test_f1c_producer_archives_its_exact_opening_quotes_and_mapped_terminal(capture):
+    from hashlib import sha256
+
+    from dao.prog.settlement.replay import read_replay_basis, replay_archive_path
+
+    read = read_publication(capture["plan_path"])
+    assert read.status == "ready", read.reason
+    context = read.plan.financial_context
+    path = replay_archive_path(capture["plan_path"], context.replay_basis_hash)
+    assert path.name == sha256(path.read_bytes()).hexdigest() == context.replay_basis_hash
+    replay = read_replay_basis(capture["plan_path"], context.replay_basis_hash,
+                               financial_basis=context.basis, terminal_value=context.terminal_value)
+    assert replay.status == "known"
+    assert replay.basis.opening == capture["context"].state
+    assert replay.basis.quotes == capture["terms"].quotes
+    assert replay.basis.price_batch == capture["context"].price_batch
+    assert replay.basis.terminal_value == context.terminal_value
+    assert replay.basis.terminal_value.reference_efficiency_by_battery == (
+        ("synthetic-0", D("0.8")), ("synthetic-1", D("1.0")))
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True,
+    "supported": True, "archive_failure": True}], indirect=True)
+def test_f1c_producer_archive_failure_blocks_before_any_ready_or_device_output(capture):
+    assert isinstance(capture.get("error"), FinancialPlanBlocked)
+    assert str(capture["error"]) == "replay_archive_synthetic_write_failure"
+    assert read_publication(capture["plan_path"]).status == "blocked"
+    assert capture["ha_writes"] == capture.get("at_actuation", []) == []
 
 
 @pytest.mark.parametrize("capture", [{"prices": PricingConfig.model_validate(
@@ -787,11 +900,11 @@ def test_f1a_valid_basis_still_denies_actuation_and_never_publishes_ready(captur
 
 @pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True}], indirect=True)
 def test_f1a_normal_producer_solves_audits_then_refuses_output_with_pinned_basis(capture):
-    assert str(capture.get("error")) == "economics_unsupported"
+    assert str(capture.get("error")) == "actuation_gates_unproven"
     instance = capture["instance"]
     assert instance._debug_planning_audit.parity_complete
     assert instance._debug_period_audit is not None
-    assert capture["output_bases"] == []  # F1b: refusal is now at publication, before actuation.
+    assert capture["output_bases"] == [capture["context"].basis]
     assert capture["export"]["financial_context"].basis == capture["context"].basis
     assert capture["ha_writes"] == []
 

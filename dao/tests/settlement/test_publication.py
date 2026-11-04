@@ -20,8 +20,14 @@ from sqlalchemy.pool import NullPool
 from dao.prog.config.models.pricing import PricingConfig
 from dao.prog.fastctrl.plan import FastPlan, load_plan, write_plan
 from dao.prog.settlement.engine import settle_series
-from dao.prog.settlement.tariffs import _canonical_default, make_snapshot
-from dao.prog.settlement.types import InputInterval, SettlementState
+from dao.prog.settlement.tariffs import _canonical_default, make_snapshot, quote
+from dao.prog.settlement.types import (
+    InputInterval,
+    PriceBatch,
+    RegisteredSpot,
+    SettlementState,
+    SpotInterval,
+)
 from dao.tests.settlement.conftest import START_TS
 from dao.tests.settlement.test_fast_contract import ready_plan
 
@@ -63,6 +69,37 @@ def connect_publication(url, path, pricing):
     return engine, repo, adapter
 
 
+def replay_for_plan(plan, snapshots):
+    """Explicit synthetic evidence; never reconstruct production evidence from a plan."""
+    from dao.prog.settlement.replay import ReplayBasis
+
+    basis = plan.financial_context.basis
+    quotes = []
+    for interval in plan.intervals:
+        start = interval.start_ts
+        while start < interval.end_ts:
+            snapshot = next(s for s in snapshots if s.valid_from_ts <= start
+                            and (s.valid_to_ts is None or start < s.valid_to_ts))
+            end = min(interval.end_ts, snapshot.valid_to_ts or interval.end_ts)
+            quotes.append(quote(snapshot, start, end, Decimal("0.1")))
+            start = end
+    quotes = tuple(quotes)
+    spots = tuple(RegisteredSpot(SpotInterval(i.start_ts, i.end_ts, Decimal("0.1"),
+                        "synthetic-replay", "estimated"), basis.input_revision, "c" * 64)
+                  for i in plan.intervals)
+    prices = PriceBatch(basis.meter_id, basis.input_revision, basis.planning_start_ts,
+                       basis.horizon_end_ts, spots, snapshots, basis.captured_ts, basis.source_watermark_ts)
+    return ReplayBasis(basis, SettlementState(basis.planning_start_ts, None, None),
+                       quotes, prices, plan.financial_context.terminal_value)
+
+
+def publish_fixture(adapter, plan, snapshots):
+    replay = replay_for_plan(plan, snapshots)
+    plan = replace(plan, financial_context=replace(plan.financial_context, replay_basis_hash=replay.content_hash))
+    adapter.publish(plan, now_ts=plan.created_ts, replay_basis=replay)
+    return plan
+
+
 @pytest.fixture
 def local():
     return importlib.import_module("dao.prog.fastctrl.publication")
@@ -83,7 +120,7 @@ def system(tmp_path, monkeypatch):
     result = settle_series(batch.items, batch.snapshots, SettlementState(START_TS, None, None))
     repo.commit(METER, result, batch, 0, "synthetic-clean-prefix")
     plan = ready_plan(hashes=(snapshot.snapshot_hash,))
-    adapter.publish(plan, now_ts=NOW)
+    plan = publish_fixture(adapter, plan, (snapshot,))
     yield SimpleNamespace(repo=repo, adapter=adapter, plan=plan, path=path, snapshot=snapshot,
                           pricing=pricing, engine=engine, url=url)
     engine.dispose()
@@ -268,7 +305,7 @@ def test_relevant_changes_are_durably_blocked_before_registration(system, local,
         plan = replace(plan, financial_context=context, intervals=[*plan.intervals, *[
             PlanInterval(at, at + 900, 0.1, 0.1, batteries=[BatteryPlanStep(0, 50, 50)])
             for at in range(START_TS + 3600, START_TS + 7200, 900)]])
-        system.adapter.publish(plan, now_ts=NOW)
+        publish_fixture(system.adapter, plan, (system.snapshot,))
         inputs = [item(START_TS + 3600)]
     elif change == "contract":
         pricing = system.pricing.model_copy(deep=True)
@@ -306,8 +343,8 @@ def test_aba_and_explicit_revalidation_use_book_revision_not_immutable_line_revi
     assert system.repo.commit(METER, result, batch, 1, "ABA-revalidation") == 1
     basis = replace(system.plan.financial_context.basis, input_revision=3)
     system.adapter.check_basis(basis, now_ts=NOW)
-    system.adapter.publish(replace(system.plan, financial_context=replace(system.plan.financial_context, basis=basis)),
-                           now_ts=NOW)
+    publish_fixture(system.adapter, replace(system.plan, financial_context=replace(system.plan.financial_context, basis=basis)),
+                    (system.snapshot,))
     assert local.read_publication(system.path).plan.financial_context.basis.input_revision == 3
 
 
@@ -395,7 +432,7 @@ def test_basis_rejections_replace_old_ready_with_blocked(system, local, fault):
     assert local.read_publication(system.path).status == "blocked"
 
 
-@pytest.mark.parametrize("fault", ["expired", "future-created", "too-long", "unsupported", "legacy", "rate"])
+@pytest.mark.parametrize("fault", ["expired", "future-created", "too-long", "legacy", "rate"])
 def test_publish_revalidates_payload_and_lease(system, local, fault):
     from dao.prog.settlement.publication import FinancialPlanBlocked
 
@@ -408,8 +445,6 @@ def test_publish_revalidates_payload_and_lease(system, local, fault):
         plan = replace(plan, created_ts=NOW + 1)
     elif fault == "too-long":
         plan = replace(plan, financial_context=replace(plan.financial_context, not_after_ts=NOW + 601))
-    elif fault == "unsupported":
-        plan = replace(plan, financial_context=replace(plan.financial_context, economics_supported=False))
     elif fault == "legacy":
         plan = FastPlan(NOW, 900, intervals=system_intervals(NOW))
     else:
@@ -417,6 +452,18 @@ def test_publish_revalidates_payload_and_lease(system, local, fault):
     with pytest.raises(FinancialPlanBlocked):
         system.adapter.publish(plan, now_ts=now)
     assert local.read_publication(system.path).status == "blocked"
+
+
+def test_limited_publication_preserves_unknown_economics_without_execution_rights(system, local):
+    context = replace(system.plan.financial_context, economics_supported=False,
+                      issues=("bonus_prefix_unknown", "month_prefix_unknown"))
+    system.adapter.publish(replace(system.plan, financial_context=context), now_ts=NOW)
+    read = local.read_publication(system.path)
+    assert read.status == "ready", read.reason
+    assert read.plan.financial_context.economics_supported is False
+    assert read.plan.financial_context.issues == ("bonus_prefix_unknown", "month_prefix_unknown")
+    verdict = local.following_verdict(read, policy=system.adapter.policy(), now_ts=NOW)
+    assert not verdict.allowed and verdict.reason == "actuation_gates_unproven"
 
 
 @pytest.mark.parametrize("mode,status", [("off", "confirmed"), ("shadow", "confirmed"), ("off", "draft")])
@@ -487,7 +534,7 @@ def test_empty_used_prefix_does_not_treat_a_meter_overlap_as_price_change(system
     plan = replace(system.plan, financial_context=replace(system.plan.financial_context, basis=replace(
         system.plan.financial_context.basis, prefix_start_ts=NOW,
     )))
-    system.adapter.publish(plan, now_ts=NOW)
+    publish_fixture(system.adapter, plan, (system.snapshot,))
     before = system.path.read_bytes()
     # Geen verbruikte prefix; de reeds gepinde uurprijs en contractselectie blijven gelijk.
     system.repo.register_inputs(METER, [replace(item(), end_ts=NOW + 450)], [system.snapshot], 1)
@@ -606,7 +653,7 @@ def test_pinned_source_versions_are_not_replaced_by_config_generated_hashes(syst
     system.repo.commit(METER, result, batch, 1, "explicit-source-version-revalidation")
     basis = FinancialBasis(METER, 2, (selected.snapshot_hash,), START_TS, NOW, START_TS + 3600, NOW, NOW)
     plan = replace(system.plan, financial_context=replace(system.plan.financial_context, basis=basis))
-    system.adapter.publish(plan, now_ts=NOW)
+    publish_fixture(system.adapter, plan, (selected,))
     assert local.read_publication(system.path).plan.financial_context.basis.snapshot_hashes == (selected.snapshot_hash,)
 
 
@@ -637,7 +684,7 @@ def test_next_contract_boundary_caps_publication_lease(system, local):
     adapter.check_basis(basis, now_ts=created)  # Horizon is wel gedekt door beide confirmed-contracten.
     with pytest.raises(FinancialPlanBlocked, match="lease"):
         adapter.publish(plan, now_ts=created)
-    adapter.publish(replace(plan, financial_context=replace(context, not_after_ts=boundary)), now_ts=created)
+    publish_fixture(adapter, replace(plan, financial_context=replace(context, not_after_ts=boundary)), snapshots)
     read = local.read_publication(system.path)
     assert read.plan.financial_context.not_after_ts == boundary
     assert not local.following_verdict(read, policy=adapter.policy(), now_ts=boundary).allowed
@@ -906,7 +953,7 @@ def raw_ready(system, *, rule="native"):
     basis = replace(system.plan.financial_context.basis, input_revision=revision,
                     snapshot_hashes=(snapshot.snapshot_hash,))
     plan = replace(system.plan, financial_context=replace(system.plan.financial_context, basis=basis))
-    system.adapter.publish(plan, now_ts=NOW)
+    plan = publish_fixture(system.adapter, plan, (snapshot,))
     return snapshot, plan
 
 
@@ -930,7 +977,7 @@ def test_equal_registered_hour_price_new_measurement_does_not_invalidate_prognos
                                            batteries=[BatteryPlanStep(0, 50, 50)])
                               for start in range(at, START_TS + 7200, 900)],
         ])
-        system.adapter.publish(plan, now_ts=NOW)
+        plan = publish_fixture(system.adapter, plan, (snapshot,))
     before = system.path.read_bytes()
     revision = plan.financial_context.basis.input_revision
     assert system.repo.register_prices(METER, [price(value="0.100000000000")], revision) == revision
@@ -950,10 +997,10 @@ def test_first_market_quarter_correction_invalidates_plan_starting_later_same_ho
     from dao.tests.settlement.test_price_repository import price
 
     monkeypatch.setattr("dao.prog.settlement.repository.time", lambda: NOW)
-    _, plan = raw_ready(system, rule="mean_quarters")
+    snapshot, plan = raw_ready(system, rule="mean_quarters")
     basis = replace(plan.financial_context.basis, prefix_start_ts=NOW)
     plan = replace(plan, financial_context=replace(plan.financial_context, basis=basis))
-    system.adapter.publish(plan, now_ts=NOW)
+    publish_fixture(system.adapter, plan, (snapshot,))
     observations = []
 
     def observe(connection, cursor, statement, parameters, context, executemany):
@@ -988,7 +1035,8 @@ def test_raw_price_aba_rejects_old_planning_token_after_no_money_version_revalid
     with pytest.raises(FinancialPlanBlocked):
         system.adapter.publish(plan, now_ts=NOW)
     basis = replace(plan.financial_context.basis, input_revision=revision + 2)
-    system.adapter.publish(replace(plan, financial_context=replace(plan.financial_context, basis=basis)), now_ts=NOW)
+    publish_fixture(system.adapter, replace(plan, financial_context=replace(plan.financial_context, basis=basis)),
+                    (system.snapshot,))
     assert local.read_publication(system.path).plan.financial_context.basis.input_revision == revision + 2
 
 

@@ -24,6 +24,7 @@ from dao.prog.fastctrl.publication import (
     publication_lock,
     read_publication,
 )
+from dao.prog.settlement.replay import ReplayBasis, verify_durable_replay_basis, write_replay_basis
 from dao.prog.settlement.repository import InputChange, InputPublicationGuard, SettlementRepository
 from dao.prog.settlement.tariffs import make_snapshot
 
@@ -176,7 +177,7 @@ class SettlementPublication:
             except Exception as exc:
                 self._refuse(lease=lease, now_ts=now_ts, error=exc)
 
-    def publish(self, plan: FastPlan, *, now_ts: int) -> None:
+    def publish(self, plan: FastPlan, *, now_ts: int, replay_basis: ReplayBasis | None = None) -> None:
         _integer(now_ts, "now_ts")
         with publication_lock(self._plan_path) as lease:
             try:
@@ -186,8 +187,6 @@ class SettlementPublication:
                 candidate = FastPlan.from_dict(plan.to_dict())
                 context = candidate.financial_context
                 self._check_basis_locked(context.basis, lease=lease, now_ts=now_ts)
-                if not context.economics_supported:
-                    raise ValueError("economics_unsupported")
                 if candidate.created_ts > now_ts:
                     raise ValueError("clock_before_creation")
                 boundaries = [boundary for snapshot in self._snapshots
@@ -201,6 +200,14 @@ class SettlementPublication:
                        if _overlaps(snapshot.valid_from_ts, snapshot.valid_to_ts,
                                     context.basis.planning_start_ts, context.basis.horizon_end_ts)):
                     raise ValueError("contract_price_interval_mismatch")
+                # Exact producer evidence, durable and verified before any ready replace.
+                # Missing evidence is never reconstructed from today's DB/config.
+                if replay_basis is not None:
+                    if type(replay_basis) is not ReplayBasis:
+                        raise ValueError("replay_basis_required")
+                    replay_basis.check_context(context)
+                    write_replay_basis(replay_basis, plan_path=lease.path)
+                verify_durable_replay_basis(lease.path, context)
             except Exception as exc:
                 self._refuse(lease=lease, now_ts=now_ts, error=exc)
             try:

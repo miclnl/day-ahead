@@ -299,8 +299,6 @@ def following_verdict(read: PlanRead, *, policy: GatePolicy, now_ts: int) -> Gat
             return GateVerdict(False, "missing_financial_context")
         if now_ts >= context.not_after_ts:
             return GateVerdict(False, "plan_lease_expired")
-        if not context.economics_supported:
-            return GateVerdict(False, "economics_unsupported")
         # G1–G3 ontbreken. Ook een synthetisch correcte ready-v2 verleent geen actuatierecht.
         return GateVerdict(False, "actuation_gates_unproven")
     if policy.required_from_ts is not None and now_ts >= policy.required_from_ts:

@@ -25,8 +25,12 @@ from __future__ import annotations
 import datetime
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from decimal import Decimal, localcontext
 from typing import Callable, Optional, Sequence
+
+from dao.prog.settlement.replay import ReplayBasis
+from dao.prog.settlement.types import SettlementState, TerminalValue
 
 from .plan import BatterySpec, BatteryPlanStep, FastPlan, PlanInterval
 from .policy import (
@@ -133,8 +137,8 @@ class SimResult:
     """Outcome of one replay."""
 
     label: str
-    energy_cost: float = 0.0
-    wear_cost: float = 0.0
+    energy_cost: float | None = 0.0
+    wear_cost: float | None = 0.0
     import_kwh: float = 0.0
     export_kwh: float = 0.0
     throughput_kwh: float = 0.0
@@ -143,15 +147,19 @@ class SimResult:
     override_s: float = 0.0
     soc_start: float = 0.0
     soc_end: float = 0.0
-    terminal_value: float = 0.0
+    terminal_value: float | None = 0.0
     capacity_kwh: float = 0.0
     duration_h: float = 0.0
     days: dict[str, DayMetrics] = field(default_factory=dict)
     soc_series: list[tuple[float, float]] = field(default_factory=list)
+    opening_state: SettlementState | None = None
+    replay_terminal_value: TerminalValue | None = None
 
     @property
-    def total_cost(self) -> float:
+    def total_cost(self) -> float | None:
         """Energy plus wear, corrected for the energy left in the battery."""
+        if self.energy_cost is None or self.wear_cost is None or self.terminal_value is None:
+            return None
         return self.energy_cost + self.wear_cost - self.terminal_value
 
     @property
@@ -176,13 +184,19 @@ class Comparison:
     fast: SimResult
 
     @property
-    def saving(self) -> float:
-        return self.baseline.total_cost - self.fast.total_cost
+    def saving(self) -> float | str:
+        base_cost, fast_cost = self.baseline.total_cost, self.fast.total_cost
+        if base_cost is None or fast_cost is None:
+            return "unknown_reconstruction: comparison_unavailable"
+        return base_cost - fast_cost
 
     @property
-    def saving_per_day(self) -> float:
+    def saving_per_day(self) -> float | str:
+        saving = self.saving
+        if isinstance(saving, str):
+            return saving
         days = max(1.0, self.baseline.duration_h / 24.0)
-        return self.saving / days
+        return saving / days
 
     @property
     def extra_cycles(self) -> float:
@@ -190,6 +204,9 @@ class Comparison:
 
     def report(self) -> str:
         """Human readable summary, ready for the log or the console."""
+        saving = self.saving
+        if isinstance(saving, str):
+            return saving
         base, fast = self.baseline, self.fast
         days = max(1.0, base.duration_h / 24.0)
         lines = [
@@ -234,6 +251,9 @@ class Comparison:
 
     def daily_table(self) -> str:
         """Per day breakdown so outliers can be inspected."""
+        saving = self.saving
+        if isinstance(saving, str):
+            return saving
         keys = sorted(set(self.baseline.days) | set(self.fast.days))
         lines = [
             f"{'datum':12}{'zonder':>10}{'met':>10}{'besparing':>11}"
@@ -299,10 +319,49 @@ def simulate(
     use_fast_layer: bool,
     inverter_efficiency: float = DEFAULT_INVERTER_EFFICIENCY,
     timezone: Optional[datetime.tzinfo] = None,
+    *,
+    replay_basis: ReplayBasis | None = None,
 ) -> SimResult:
-    """Replay *samples* against *plan*, with or without the fast layer."""
+    """Replay *samples* against *plan*, with or without the fast layer.
+
+    Explicit replay evidence replaces today's tariffs/terminal assumptions. This
+    remains a base-tariff physical reconstruction, NOT historical settlement or
+    advantage: retain the exact settlement opening without inventing bonus or
+    monthly-credit state transitions. F3 owns those trajectories/comparisons.
+    No archive, DB or solver reads are performed here or in the tick loop.
+    """
     if not plan.specs:
         raise ValueError("het plan bevat geen batterij")
+    if replay_basis is not None:
+        try:
+            if type(replay_basis) is not ReplayBasis or plan.format_version != 2 or plan.financial_context is None:
+                raise ValueError("replay_basis_required")
+            replay_basis.check_context(plan.financial_context)
+            if not samples or samples[0].timestamp != replay_basis.opening.asof_ts:
+                raise ValueError("replay_opening_mismatch")
+            if len(plan.intervals) != len(replay_basis.quotes):
+                raise ValueError("replay_quote_coverage_mismatch")
+            intervals, matched_quotes = [], []
+            cursor = replay_basis.basis.planning_start_ts
+            for interval, quote in zip(plan.intervals, replay_basis.quotes, strict=True):
+                if (interval.start_ts != cursor
+                        or (quote.start_ts, quote.end_ts) != (interval.start_ts, interval.end_ts)):
+                    raise ValueError("replay_quote_coverage_mismatch")
+                matched_quotes.append(quote)
+                intervals.append(replace(interval, price_import=float(quote.import_rate),
+                                         price_export=float(quote.export_rate)))
+                cursor = interval.end_ts
+            if cursor != replay_basis.basis.horizon_end_ts:
+                raise ValueError("replay_quote_coverage_mismatch")
+            if tuple(spec.name for spec in plan.specs) != tuple(
+                    name for name, _ in replay_basis.terminal_value.reference_efficiency_by_battery):
+                raise ValueError("replay_terminal_identity_mismatch")
+            plan = replace(plan, intervals=intervals,
+                           price_average=sum(float(q.import_rate) for q in matched_quotes) / len(matched_quotes))
+        except (ValueError, TypeError, AttributeError):
+            return SimResult("unknown_reconstruction: replay_basis_mismatch", energy_cost=None,
+                             wear_cost=None, terminal_value=None)
+        label = f"reconstruction_base_tariffs: {label}"
     if len(samples) < 2:
         raise ValueError("te weinig meetpunten om te simuleren")
 
@@ -323,6 +382,8 @@ def simulate(
         label=label,
         soc_start=soc_start,
         capacity_kwh=spec.capacity_kwh,
+        opening_state=None if replay_basis is None else replay_basis.opening,
+        replay_terminal_value=None if replay_basis is None else replay_basis.terminal_value,
     )
 
     previous_command = 0.0
@@ -398,6 +459,14 @@ def simulate(
     valuation = plan.price_average * max(
         0.01, spec.discharge_efficiency * inverter_efficiency
     )
+    if replay_basis is not None:
+        with localcontext() as context:
+            context.prec = 36
+            # The archived reference already contains cell→bus→AC efficiency.
+            capacity = sum(Decimal(str(s.capacity_kwh)) for s in plan.specs)
+            valuation = float(replay_basis.terminal_value.eur_per_ac_kwh * sum(
+                Decimal(str(s.capacity_kwh)) * efficiency for s, (_, efficiency)
+                in zip(plan.specs, replay_basis.terminal_value.reference_efficiency_by_battery, strict=True)) / capacity)
     result.terminal_value = (
         (result.soc_end - result.soc_start) * spec.kwh_per_percent * valuation
     )

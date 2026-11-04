@@ -127,6 +127,7 @@ class FinancialContext:
     terminal_value: TerminalValue
     economics_supported: bool
     issues: tuple[str, ...]
+    replay_basis_hash: str
 
     def __post_init__(self):
         if type(self.basis) is not FinancialBasis or type(self.terminal_value) is not TerminalValue:
@@ -138,6 +139,8 @@ class FinancialContext:
             raise ValueError("Unsupported price interval")
         if type(self.economics_supported) is not bool:
             raise TypeError("economics_supported requires bool")
+        if type(self.replay_basis_hash) is not str or not re.fullmatch("[0-9a-f]{64}", self.replay_basis_hash):
+            raise ValueError("replay_basis_hash: expected canonical SHA-256")
         if type(self.issues) not in (tuple, list):
             raise TypeError("issues requires a sequence")
         object.__setattr__(self, "issues", tuple(_text(value, "issue", nonempty=True) for value in self.issues))
@@ -158,11 +161,15 @@ class FinancialContext:
                 ],
             },
             "economics_supported": self.economics_supported, "issues": list(self.issues),
+            "replay_basis_hash": self.replay_basis_hash,
         }
 
     @classmethod
     def from_dict(cls, data):
-        _object(data, ("basis", "not_after_ts", "price_interval_s", "terminal_value", "economics_supported", "issues"))
+        if type(data) is dict and "replay_basis_hash" not in data:
+            raise ValueError("Missing required replay_basis_hash in strict v2")
+        _object(data, ("basis", "not_after_ts", "price_interval_s", "terminal_value", "economics_supported", "issues",
+                       "replay_basis_hash"))
         basis = _object(data["basis"], FinancialBasis.__dataclass_fields__)
         _array(basis["snapshot_hashes"])
         terminal = _object(data["terminal_value"], TerminalValue.__dataclass_fields__)
@@ -173,7 +180,8 @@ class FinancialContext:
             references.append((_text(pair[0], "battery", nonempty=True), _read_decimal(pair[1])))
         return cls(FinancialBasis(**basis), data["not_after_ts"], data["price_interval_s"],
                    TerminalValue(terminal["policy_version"], _read_decimal(terminal["eur_per_ac_kwh"]),
-                                 tuple(references)), data["economics_supported"], _array(data["issues"]))
+                                  tuple(references)), data["economics_supported"], _array(data["issues"]),
+                   data["replay_basis_hash"])
 
 
 @dataclass(frozen=True, slots=True)
