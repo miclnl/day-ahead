@@ -12,21 +12,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from .command import ActuationReceipt, HelperResult
 from .plan import NO_STOP_SENTINEL, FastPlan
 from .policy import BatteryDecision
 
 
 @dataclass(frozen=True)
-class HelperResult:
-    helper: Literal["setpoint", "mode", "stop_inverter"]
-    entity_id: str
-    ok: bool
-    error: Literal["write_failed", "readback_unreadable", "readback_mismatch"] | None
-    attempts: int
-
-
-@dataclass(frozen=True)
-class ActuationReceipt:
+class LegacyActuationReceipt:
     """Helper acceptance only: no measured power, SOC or physical-stop claim."""
 
     command_id: str
@@ -37,6 +29,13 @@ class ActuationReceipt:
     setpoint_w: float
     status: Literal["confirmed", "unconfirmed", "unknown"]
     helpers: tuple[HelperResult, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not str or self.status not in ("confirmed", "unconfirmed", "unknown"):
+            raise ValueError("legacy_receipt_status_invalid")
+
+
+CommandReceipt = ActuationReceipt | LegacyActuationReceipt
 
 
 def plan_identity(plan: FastPlan) -> str:
@@ -88,7 +87,7 @@ def _execute_helper(
 
 def execute_battery_command(
     gateway, plan: FastPlan, battery: BatteryDecision, timestamp: float,
-) -> ActuationReceipt | None:
+) -> LegacyActuationReceipt | None:
     """Execute one proposal in setpoint → mode → stop order, non-atomically."""
     if not battery.write:
         return None
@@ -119,7 +118,7 @@ def execute_battery_command(
     status = (
         "confirmed" if successes == len(helpers) else ("unknown" if successes else "unconfirmed")
     )
-    return ActuationReceipt(
+    return LegacyActuationReceipt(
         command_id=f"{identity}/b{battery.index}/{int(timestamp)}",
         plan_identity=identity,
         timestamp=timestamp,

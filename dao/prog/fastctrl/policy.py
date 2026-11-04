@@ -52,6 +52,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .command import ActuationReceipt, BatteryCommand
 from .plan import (
     NO_STOP_SENTINEL,
     BatterySpec,
@@ -181,6 +182,8 @@ class BatteryControllerState:
     held_stop_inverter_cleared: bool = False
     #: A proposed optimizer restore remains due until explicitly confirmed.
     restore_pending: bool = False
+    #: Last issued canonical command, cached for exact receipt matching only.
+    pending_command: Optional[BatteryCommand] = None
 
     def to_dict(self) -> dict:
         return {
@@ -195,12 +198,15 @@ class BatteryControllerState:
             "held_setpoint_w": self.held_setpoint_w,
             "held_stop_inverter_cleared": self.held_stop_inverter_cleared,
             "restore_pending": self.restore_pending,
+            "pending_command": self.pending_command.to_dict() if self.pending_command is not None else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "BatteryControllerState":
         state = cls()
         for key, value in (data or {}).items():
+            if key == "pending_command" and value is not None:
+                value = BatteryCommand.from_dict(value)
             if hasattr(state, key):
                 setattr(state, key, value)
         return state
@@ -337,6 +343,26 @@ class BatteryDecision:
     actuation_status: str | None = None
     #: This command restores the optimizer's mode/stop, rather than clearing it.
     restores: bool = False
+
+
+def apply_actuation_receipt(state: BatteryControllerState, receipt: ActuationReceipt) -> None:
+    """Apply exact canonical acceptance from the cached command, without I/O."""
+    if type(receipt) is not ActuationReceipt:
+        raise TypeError("canonical_receipt_required")
+    pending = state.pending_command
+    if pending is None:
+        return
+    for name in ("installation_id", "battery_name", "owner_epoch", "sequence", "command_id", "plan_digest"):
+        if getattr(receipt, name) != getattr(pending, name):
+            return
+    if receipt.status != "accepted":
+        return
+    state.last_command_w = float(pending.setpoint_w)
+    state.last_command_ts = receipt.accepted_ts / 1000.0
+    state.stop_inverter_cleared = pending.stop_at_ms is None
+    state.held_setpoint_w = float(pending.setpoint_w)
+    state.held_stop_inverter_cleared = state.stop_inverter_cleared
+    state.pending_command = None
 
 
 def apply_accepted_command(controller: BatteryControllerState, decision: BatteryDecision) -> None:

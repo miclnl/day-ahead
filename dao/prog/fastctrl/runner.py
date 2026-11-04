@@ -31,7 +31,7 @@ from dao.prog.config.models.fastcontrol import (
 )
 from dao.prog.config.models.pricing import PricingConfig
 
-from .actuator import ActuationReceipt, execute_battery_command
+from .actuator import CommandReceipt, execute_battery_command
 from .plan import FAST_PLAN_FILE, FastPlan, load_plan
 from .policy import (
     BatteryMeasurement,
@@ -306,7 +306,7 @@ class FastControlRunner:
         self.fallback = fallback
         self.last_gate: GateVerdict | None = None
         self.last_fallback: FallbackReceipt | None = None
-        self.last_receipts: list[ActuationReceipt] = []
+        self.last_receipts: list[CommandReceipt] = []
         self.fallback_pending = False
         self._last_fallback_at: float | None = None
         self.config: FastControlConfig = config or getattr(
@@ -858,7 +858,7 @@ class FastControlRunner:
         self._last_state_save = now
         self._state_signature = signature
 
-    def _actuate(self, decision: Decision, plan: FastPlan, mode: str) -> None:
+    def _actuate(self, decision: Decision, plan: FastPlan, mode: str) -> tuple[CommandReceipt, ...]:
         self.last_receipts = []
         for battery in decision.batteries:
             battery.actuation_status = None
@@ -904,6 +904,7 @@ class FastControlRunner:
                 # Keep accepted facts, held setpoint and decision-owned mode
                 # intact so a failed override/restore can be retried next tick.
                 self._request_fallback(f"actuation_{receipt.status}", now_ts=int(decision.timestamp))
+        return tuple(self.last_receipts)
 
     def _publish(self, decision: Decision, mode: str, measurement: Measurement) -> None:
         diagnostics = self.config.diagnostics
