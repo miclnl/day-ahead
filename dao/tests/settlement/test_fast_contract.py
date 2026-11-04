@@ -27,7 +27,8 @@ def ready_plan(*, hashes=("a" * 64,), revision=1, start=START_TS + 900):
         created_ts=start, interval_s=900,
         specs=[BatterySpec("accu", 10.0, 5000.0, 5000.0)],
         intervals=[PlanInterval(at, at + 900, 0.1, 0.1,
-                                batteries=[BatteryPlanStep(0.0, 50.0, 50.0)])
+                                batteries=[BatteryPlanStep(0.0, 50.0, 50.0,
+                                    mean_ac_power_w=0.0, on_power_w=0.0, active_from_ts=at, stop_ts=None)])
                    for at in range(start, START_TS + 3600, 900)],
         strategy="minimize cost", price_average=0.1, format_version=2,
         financial_context=context,

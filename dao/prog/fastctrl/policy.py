@@ -52,7 +52,14 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .plan import NO_STOP_SENTINEL, BatterySpec, FastPlan, PlanInterval
+from .plan import (
+    NO_STOP_SENTINEL,
+    BatterySpec,
+    FastPlan,
+    PlanInterval,
+    profile_energy_kwh,
+    profile_power_at,
+)
 
 #: Fraction of the energy budget over which the allowed power is tapered to
 #: zero, instead of dropping to zero in one step.
@@ -557,13 +564,30 @@ class FastControlPolicy:
 
         for index in range(len(plan.specs)):
             controller = state.battery(index)
-            plan_w = interval.battery(index).ac_power_w
             measured = measurement.battery(index)
             actual_w = (
                 measured.power_w
                 if use_measured and measured.valid and measured.power_w is not None
                 else controller.last_command_w
             )
+            if plan.format_version == 2:
+                # Split only at actual profile/interval edges; do not charge the
+                # current mean for the entire elapsed tick (or an earlier row).
+                for row in plan.intervals:
+                    start, end = max(previous, row.start_ts), min(now, row.end_ts)
+                    if start >= end:
+                        continue
+                    step = row.battery(index)
+                    edges = sorted({start, end, *(
+                        edge for edge in (step.active_from_ts, step.stop_ts)
+                        if edge is not None and start < edge < end)})
+                    for a, b in zip(edges, edges[1:], strict=False):
+                        delta = actual_w * (b - a) / 3600000 - profile_energy_kwh(step, a, b)
+                        if row is interval:
+                            controller.interval_deviation_kwh += delta
+                        controller.daily_deviation_kwh += abs(delta)
+                continue
+            plan_w = interval.battery(index).ac_power_w
             delta_w = actual_w - plan_w
             controller.interval_deviation_kwh += delta_w * elapsed_h / 1000.0
             controller.daily_deviation_kwh += abs(delta_w) * elapsed_h / 1000.0
@@ -710,7 +734,8 @@ class FastControlPolicy:
         # expected to do, which is their decision once taken and their plan
         # setpoint until then.
         residual = house_w + sum(
-            interval.battery(i).ac_power_w for i in range(len(plan.specs))
+            profile_power_at(interval.battery(i), now) if plan.format_version == 2
+            else interval.battery(i).ac_power_w for i in range(len(plan.specs))
         )
         total_benefit = 0.0
         any_override = False
@@ -718,7 +743,7 @@ class FastControlPolicy:
         for index, spec in enumerate(plan.specs):
             controller = state.battery(index)
             step = interval.battery(index)
-            plan_w = step.ac_power_w
+            plan_w = profile_power_at(step, now) if plan.format_version == 2 else step.ac_power_w
             measured = battery_measurements[index]
             soc = measured.soc
             others_w = residual - plan_w
@@ -732,7 +757,8 @@ class FastControlPolicy:
                 skip = "soc_unknown"
             if skip is not None:
                 decision.batteries.append(
-                    self._plan_decision(index, spec, step, controller, soc, skip, now)
+                    self._plan_decision(index, spec, step, controller, soc, skip, now,
+                                        profiled=plan.format_version == 2)
                 )
                 residual = others_w + plan_w
                 continue
@@ -802,6 +828,7 @@ class FastControlPolicy:
                 benefit=benefit,
                 storage_value=storage_value,
                 reasons=reasons,
+                profiled=plan.format_version == 2,
             )
             decision.batteries.append(battery_decision)
 
@@ -862,6 +889,8 @@ class FastControlPolicy:
         benefit: float,
         storage_value: float,
         reasons: list[str],
+        *,
+        profiled: bool = False,
     ) -> BatteryDecision:
         """Apply hysteresis, deadband and minimum command interval.
 
@@ -902,11 +931,12 @@ class FastControlPolicy:
         change = abs(target_w - controller.last_command_w)
         write = True
 
-        # The optimizer duty-cycles the inverter through the stop moment when it
+        # The legacy optimizer duty-cycles the inverter through the stop moment when it
         # needs less than the minimum power. While overriding, that stop moment
         # must be cleared, so the deadband may not suppress the first write.
         pending_stop = (
-            override
+            not profiled
+            and override
             and not controller.stop_inverter_cleared
             and bool(step.stop_inverter)
             and step.stop_inverter != NO_STOP_SENTINEL
@@ -946,7 +976,7 @@ class FastControlPolicy:
                 mode = step.mode if step.mode else (
                     spec.mode_off if abs(target_w) < POWER_EPS else spec.mode_on
                 )
-                stop_inverter = step.stop_inverter
+                stop_inverter = None if profiled else step.stop_inverter
                 controller.stop_inverter_cleared = False
 
         if not reasons:
@@ -978,9 +1008,11 @@ class FastControlPolicy:
         soc: Optional[float],
         reason: str,
         now: float,
+        *,
+        profiled: bool = False,
     ) -> BatteryDecision:
         """Fall back to exactly what the optimizer published."""
-        plan_w = round(step.ac_power_w)
+        plan_w = round(profile_power_at(step, now) if profiled else step.ac_power_w)
         releasing = controller.override_active or controller.stop_inverter_cleared
         write = (
             releasing or abs(plan_w - controller.last_command_w) >= self.limits.deadband
@@ -993,7 +1025,7 @@ class FastControlPolicy:
                 if step.mode
                 else (spec.mode_off if abs(plan_w) < POWER_EPS else spec.mode_on)
             )
-            stop_inverter = step.stop_inverter
+            stop_inverter = None if profiled else step.stop_inverter
             controller.stop_inverter_cleared = False
         if write:
             controller.last_command_w = plan_w
@@ -1060,6 +1092,7 @@ class FastControlPolicy:
                     measurement.battery(index).soc,
                     reason,
                     measurement.timestamp,
+                    profiled=plan.format_version == 2,
                 )
             )
         return decision

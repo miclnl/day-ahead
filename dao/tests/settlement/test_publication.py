@@ -303,7 +303,8 @@ def test_relevant_changes_are_durably_blocked_before_registration(system, local,
                                                                horizon_end_ts=START_TS + 7200))
         from dao.prog.fastctrl.plan import BatteryPlanStep, PlanInterval
         plan = replace(plan, financial_context=context, intervals=[*plan.intervals, *[
-            PlanInterval(at, at + 900, 0.1, 0.1, batteries=[BatteryPlanStep(0, 50, 50)])
+            PlanInterval(at, at + 900, 0.1, 0.1, batteries=[BatteryPlanStep(0, 50, 50,
+                mean_ac_power_w=0, on_power_w=0, active_from_ts=at, stop_ts=None)])
             for at in range(START_TS + 3600, START_TS + 7200, 900)]])
         publish_fixture(system.adapter, plan, (system.snapshot,))
         inputs = [item(START_TS + 3600)]
@@ -678,7 +679,8 @@ def test_next_contract_boundary_caps_publication_lease(system, local):
                            START_TS, created, created + 1800, created, NOW)
     context = replace(system.plan.financial_context, basis=basis, not_after_ts=created + 600)
     plan = replace(system.plan, created_ts=created, financial_context=context, intervals=[
-        PlanInterval(at, at + 900, 0.1, 0.1, batteries=[BatteryPlanStep(0, 50, 50)])
+        PlanInterval(at, at + 900, 0.1, 0.1, batteries=[BatteryPlanStep(0, 50, 50,
+            mean_ac_power_w=0, on_power_w=0, active_from_ts=at, stop_ts=None)])
         for at in (created, created + 900)
     ])
     adapter.check_basis(basis, now_ts=created)  # Horizon is wel gedekt door beide confirmed-contracten.
@@ -974,7 +976,8 @@ def test_equal_registered_hour_price_new_measurement_does_not_invalidate_prognos
                         horizon_end_ts=START_TS + 7200)
         plan = replace(plan, financial_context=replace(plan.financial_context, basis=basis), intervals=[
             *plan.intervals, *[PlanInterval(start, start + 900, 0.1, 0.1,
-                                           batteries=[BatteryPlanStep(0, 50, 50)])
+                                           batteries=[BatteryPlanStep(0, 50, 50,
+                                               mean_ac_power_w=0, on_power_w=0, active_from_ts=start, stop_ts=None)])
                               for start in range(at, START_TS + 7200, 900)],
         ])
         plan = publish_fixture(system.adapter, plan, (snapshot,))

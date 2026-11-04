@@ -235,7 +235,8 @@ def test_simulate_terminal_uses_archived_ac_reference_once_not_new_tariff_or_inv
     replay_api()
     plan, replay = synthetic_replay()
     plan = bind_replay(plan, replay)
-    plan.intervals[0].batteries[0].ac_power_w = 1000
+    step = plan.intervals[0].batteries[0]
+    step.ac_power_w = step.mean_ac_power_w = step.on_power_w = 1000
     result = simulate(plan, [Sample(NOW, 0), Sample(NOW + 900, 0)], PolicyLimits(), 50,
                       "sandbox", False, inverter_efficiency=1, replay_basis=replay)
     # 0.25 cell kWh added, then valued with exactly archived EUR/kWh * archived eta 0.94.

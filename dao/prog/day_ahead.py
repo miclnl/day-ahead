@@ -6163,12 +6163,10 @@ class DaCalc(DaBase):
             published=published_battery,
             strategy=str(self.strategy),
             price_average=float(p_avg),
+            financial_context=financial_context,
+            battery_charge_kw=[[ac_to_dc[b][u].x for u in range(U)] for b in range(B)] if financial_context else None,
+            battery_discharge_kw=[[ac_from_dc[b][u].x for u in range(U)] for b in range(B)] if financial_context else None,
         )
-        if financial_context is not None:
-            # De v2-basis begint bij het werkelijk berekende restant van het
-            # eerste interval, niet bij de legacy-roostergrens ervoor.
-            plan.intervals[0] = replace(plan.intervals[0],
-                                        start_ts=financial_context.basis.planning_start_ts)
         if financial_context is None:
             # write_plan neemt hetzelfde slot en kan blocked/v2 niet herstellen.
             self._check_financial_output(basis=None, now_ts=int(time.time()))
@@ -6177,8 +6175,6 @@ class DaCalc(DaBase):
             self._financial_settings()
             if canonical_plan_path(path) != self._financial_plan_path:
                 self._refuse_financial_output(now_ts=int(time.time()), reason="financial_publication_path_mismatch")
-            plan.format_version = 2
-            plan.financial_context = financial_context
             self._financial_publication().publish(plan, now_ts=int(time.time()), replay_basis=replay_basis)
         logging.info(
             f"Plan voor de snelle regellaag opgeslagen: {len(plan.intervals)} "

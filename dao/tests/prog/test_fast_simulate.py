@@ -25,6 +25,138 @@ from dao.prog.fastctrl.simulate import (
 T0 = 1_700_000_000
 
 
+@pytest.mark.parametrize("multiple", [False, True])
+@pytest.mark.parametrize("split", [False, True])
+def test_fix1_simulation_preserves_interval_soc_in_real_storage_valuation(monkeypatch, multiple, split):
+    from dataclasses import replace
+    from importlib import import_module
+
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    policy_module = import_module("dao.prog.fastctrl.policy")
+    plan = ready_plan()
+    plan.price_average = 0.2
+    if multiple:
+        plan.specs.append(replace(plan.specs[0], name="second", capacity_kwh=20))
+        context = plan.financial_context
+        plan.financial_context = replace(context, terminal_value=replace(context.terminal_value,
+            reference_efficiency_by_battery=(*context.terminal_value.reference_efficiency_by_battery,
+                                             ("second", context.terminal_value.reference_efficiency_by_battery[0][1]))))
+    for index, (row, price, pair) in enumerate(zip(plan.intervals, [0.1, 0.4, 0.8],
+                                                  [(80, 70), (70, 60), (60, 40)], strict=True)):
+        row.price_import, row.price_export = price, 0.01
+        step = row.battery(0)
+        step.soc_begin, step.soc_end = pair
+        if index == 0:
+            step.ac_power_w = step.mean_ac_power_w = 1000
+            step.on_power_w = 2000 if split else 1000
+            step.stop_ts = row.start_ts + 450 if split else None
+        if multiple:
+            begin, end = [(60, 50), (50, 40), (40, 30)][index]
+            other = BatteryPlanStep(0, begin, end, mean_ac_power_w=0, on_power_w=0,
+                                    active_from_ts=row.start_ts, stop_ts=None)
+            plan.intervals[index] = replace(row, batteries=[step, other])
+    plan = FastPlan.from_dict(plan.to_dict())
+    observed = []
+    original = policy_module.estimate_storage_value
+
+    def observe_value(sim_plan, now, index, limits):
+        value = original(sim_plan, now, index, limits)
+        observed.append((value, [(row.battery(0).soc_begin, row.battery(0).soc_end)
+                                 for row in sim_plan.intervals]))
+        return value
+
+    monkeypatch.setattr(policy_module, "estimate_storage_value", observe_value)
+    result = simulate(plan, [Sample(plan.intervals[0].start_ts, 1000), Sample(plan.horizon_end_ts, 1000)],
+                      PolicyLimits(), 70, "SOC preservation", use_fast_layer=True)
+    # With >10% capacity slack above the floor, the existing valuation is the
+    # surplus 0.2 * 0.9 = 0.18, not the zero-SOC first-window scarcity value 0.09.
+    assert observed[0][0] == pytest.approx(0.18)
+    expected = [(70, 60), (60, 50), (50, 35)] if multiple else [(80, 70), (70, 60), (60, 40)]
+    if split:
+        expected = [expected[0], *expected]
+    assert observed[0][1] == expected
+    assert result.duration_h == pytest.approx(0.75)
+
+
+def test_fix1_nonzero_profiles_with_different_windows_keep_shape_and_energy(monkeypatch):
+    from dataclasses import replace
+
+    from dao.prog.fastctrl.plan import profile_power_at
+    from dao.prog.fastctrl.policy import FastControlPolicy
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    plan = ready_plan()
+    plan.specs.append(replace(plan.specs[0], name="second"))
+    context = plan.financial_context
+    plan.financial_context = replace(context, terminal_value=replace(context.terminal_value,
+        reference_efficiency_by_battery=(*context.terminal_value.reference_efficiency_by_battery,
+                                         ("second", context.terminal_value.reference_efficiency_by_battery[0][1]))))
+    a = plan.intervals[0].start_ts
+    for index, row in enumerate(plan.intervals):
+        first = row.battery(0)
+        second = BatteryPlanStep(0, 50, 50, mean_ac_power_w=0, on_power_w=0,
+                                 active_from_ts=row.start_ts, stop_ts=None)
+        if index == 0:
+            first.ac_power_w = first.mean_ac_power_w = 4000 / 3
+            first.on_power_w, first.stop_ts = 2000, a + 600
+            second.ac_power_w = second.mean_ac_power_w = 2000 / 3
+            second.on_power_w, second.active_from_ts = 1000, a + 300
+        plan.intervals[index] = replace(row, batteries=[first, second])
+    plan = FastPlan.from_dict(plan.to_dict())
+    windows = []
+    original = FastControlPolicy.account
+
+    def observe_account(policy, state, sim_plan, measurement, day_key, *args, **kwargs):
+        row = sim_plan.interval_at(measurement.timestamp)
+        step = row.battery(0)
+        windows.append((row.start_ts, row.end_ts, step.mean_ac_power_w, step.on_power_w,
+                        step.active_from_ts, step.stop_ts, profile_power_at(step, row.start_ts),
+                        profile_power_at(step, row.end_ts)))
+        return original(policy, state, sim_plan, measurement, day_key, *args, **kwargs)
+
+    monkeypatch.setattr(FastControlPolicy, "account", observe_account)
+    result = simulate(plan, [Sample(a, -1500), Sample(a + 900, -1500)],
+                      PolicyLimits(min_benefit=1e9), 50, "two live profiles", use_fast_layer=True,
+                      inverter_efficiency=1)
+    assert windows == [
+        (a, a + 300, 2000, 2000, a, None, 2000, 0),
+        (a + 300, a + 600, 3000, 3000, a + 300, None, 3000, 0),
+        (a + 600, a + 900, 1000, 1000, a + 600, None, 1000, 0),
+    ]
+    assert result.import_kwh == pytest.approx(1 / 6)
+    assert result.export_kwh == pytest.approx(1 / 24)
+    assert result.throughput_kwh == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("multiple", [False, True])
+def test_simulator_integrates_profile_edges_inside_a_sample_without_mean_fallback(multiple):
+    from dataclasses import replace
+
+    from dao.tests.settlement.test_fast_profile import shaped_plan
+
+    plan = shaped_plan()
+    interval = plan.intervals[0]
+    if multiple:
+        plan.specs.append(replace(plan.specs[0], name="second"))
+        context = plan.financial_context
+        plan.financial_context = replace(context, terminal_value=replace(context.terminal_value,
+            reference_efficiency_by_battery=(*context.terminal_value.reference_efficiency_by_battery,
+                                             ("second", context.terminal_value.reference_efficiency_by_battery[0][1]))))
+        for index, row in enumerate(plan.intervals):
+            other = BatteryPlanStep(0, 50, 50, mean_ac_power_w=0, on_power_w=0,
+                                    active_from_ts=row.start_ts, stop_ts=None)
+            plan.intervals[index] = replace(row, batteries=[*row.batteries, other])
+    plan = FastPlan.from_dict(plan.to_dict())
+    samples = [Sample(interval.start_ts, -500), Sample(interval.end_ts, -500)]
+    result = simulate(plan, samples, PolicyLimits(), 50, "profile", use_fast_layer=False,
+                      inverter_efficiency=1)
+    # 1500 W import for 450s, then 500 W export for 450s (not net 500 W constant).
+    assert result.import_kwh == pytest.approx(0.1875)
+    assert result.export_kwh == pytest.approx(0.0625)
+    assert result.throughput_kwh == pytest.approx(0.25)
+
+
 def make_spec(**overrides) -> BatterySpec:
     defaults = dict(
         name="accu",

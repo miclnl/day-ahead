@@ -634,6 +634,28 @@ def test_f1b_battery_profile_is_final_solution_not_claimed_sent_commands(capture
 
 
 @pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True,
+    "supported": True, "with_batteries": True, "vary_prices": True,
+    "start": ts() + 450, "baseload": 0.4}], indirect=True)
+def test_f2a_profile_integral_matches_real_final_solver_partial_and_full_intervals(capture):
+    from dao.prog.fastctrl import plan as plans
+
+    assert str(capture.get("error")) == "actuation_gates_unproven"
+    assert capture["ha_writes"] == []
+    read = read_publication(capture["plan_path"])
+    assert read.status == "ready", read.reason
+    data = capture["export"]
+    assert read.plan.intervals[0].start_ts == ts() + 450
+    assert read.plan.intervals[0].duration_s == 450
+    assert all(hasattr(step, "mean_ac_power_w") for row in read.plan.intervals for step in row.batteries)
+    for u, row in enumerate(read.plan.intervals):
+        for b, step in enumerate(row.batteries):
+            solver_kw = data["ac_to_dc"][b][u].x - data["ac_from_dc"][b][u].x
+            assert plans.profile_energy_kwh(step, row.start_ts, row.end_ts) == pytest.approx(
+                solver_kw * data["hour_fraction"][u], abs=1e-9)
+            assert abs(step.on_power_w) <= 1000 * max(data["ac_to_dc"][b][u].x, data["ac_from_dc"][b][u].x) + 1e-9
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True,
     "supported": True, "with_batteries": True}], indirect=True)
 def test_f1c_real_names_keep_exact_optimizer_terminal_decimals(capture):
     assert str(capture.get("error")) == "actuation_gates_unproven"

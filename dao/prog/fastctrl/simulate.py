@@ -32,7 +32,10 @@ from typing import Callable, Optional, Sequence
 from dao.prog.settlement.replay import ReplayBasis
 from dao.prog.settlement.types import SettlementState, TerminalValue
 
-from .plan import BatterySpec, BatteryPlanStep, FastPlan, PlanInterval
+from .plan import (
+    BatterySpec, BatteryPlanStep, FastPlan, PlanInterval,
+    profile_energy_kwh, profile_power_at,
+)
 from .policy import (
     BatteryMeasurement,
     ControllerState,
@@ -366,13 +369,45 @@ def simulate(
         raise ValueError("te weinig meetpunten om te simuleren")
 
     spec = plan.specs[0] if len(plan.specs) == 1 else aggregate_spec(plan.specs)
+    if plan.format_version == 2:
+        # Keep every profile edge when using the existing aggregate battery
+        # simulator. Differently timed windows cannot be collapsed to one mean.
+        sim_intervals = []
+        for row in plan.intervals:
+            # SOC belongs to the solver interval, not to an invented trajectory
+            # inside it. Reuse the legacy aggregation convention for every slice.
+            planned_soc = _collapse(row).battery(0)
+            edges = sorted({row.start_ts, row.end_ts, *(
+                edge for step in row.batteries for edge in (step.active_from_ts, step.stop_ts)
+                if edge is not None)})
+            for a, b in zip(edges, edges[1:], strict=False):
+                power = sum(profile_power_at(step, a) for step in row.batteries)
+                mean = sum(profile_energy_kwh(step, a, b) for step in row.batteries) * 3600000 / (b - a)
+                sim_intervals.append(replace(row, start_ts=a, end_ts=b, batteries=[BatteryPlanStep(
+                    ac_power_w=mean, mean_ac_power_w=mean, on_power_w=power,
+                    active_from_ts=a, stop_ts=None,
+                    soc_begin=planned_soc.soc_begin, soc_end=planned_soc.soc_end,
+                )]))
+        # House measurements remain left-held, just as on the legacy path;
+        # split the time integration at profile and interval discontinuities.
+        boundaries = sorted({edge for row in sim_intervals for edge in (row.start_ts, row.end_ts)})
+        split_samples = []
+        for sample, following in zip(samples, samples[1:], strict=False):
+            split_samples.append(sample)
+            split_samples.extend(replace(sample, timestamp=edge) for edge in boundaries
+                                 if sample.timestamp < edge < following.timestamp)
+        samples = [*split_samples, samples[-1]]
+    else:
+        sim_intervals = [_collapse(i) for i in plan.intervals]
     sim_plan = FastPlan(
         created_ts=plan.created_ts,
         interval_s=plan.interval_s,
         specs=[spec],
-        intervals=[_collapse(i) for i in plan.intervals],
+        intervals=sim_intervals,
         strategy=plan.strategy,
         price_average=plan.price_average,
+        format_version=plan.format_version,
+        financial_context=plan.financial_context,
     )
 
     battery = BatteryModel(spec, soc_start, inverter_efficiency)
@@ -397,7 +432,8 @@ def simulate(
         if interval is None:
             continue
 
-        plan_w = interval.battery(0).ac_power_w
+        plan_w = (profile_power_at(interval.battery(0), sample.timestamp)
+                  if plan.format_version == 2 else interval.battery(0).ac_power_w)
         if use_fast_layer:
             measurement = Measurement(
                 timestamp=sample.timestamp,
@@ -416,7 +452,9 @@ def simulate(
             wrote = decision.batteries[0].write
             overriding = decision.batteries[0].override
         else:
-            command = plan_w
+            command = (profile_energy_kwh(interval.battery(0), sample.timestamp,
+                                         samples[index + 1].timestamp) * 1000 / dt_h
+                       if plan.format_version == 2 else plan_w)
             wrote = abs(command - previous_command) > 1.0
             overriding = False
 

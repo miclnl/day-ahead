@@ -27,6 +27,71 @@ from dao.prog.fastctrl.policy import (
 T0 = 1_700_000_000
 
 
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("limiter", ["deadband", "rate_limited"])
+def test_fix1_local_stop_affects_only_legacy_decisions(version, limiter):
+    from copy import deepcopy
+
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    plan = ready_plan()
+    plan.price_average = 0.3
+    plan.specs[0].minimum_power_w = 1000
+    for row in plan.intervals:
+        row.price_import, row.price_export = 0.3, 0.0
+        step = row.battery(0)
+        step.ac_power_w = step.mean_ac_power_w = step.on_power_w = -400
+    plan = FastPlan.from_dict(plan.to_dict())
+    if version == 1:
+        plan.format_version, plan.financial_context = 1, None
+    limits = PolicyLimits(min_benefit=0, deadband=5000 if limiter == "deadband" else 50,
+                          min_command_interval=60, urgent_deviation=10000)
+    now = plan.intervals[0].start_ts + 60
+    decisions = []
+    for stop_text in (None, "2026-01-15 18:07"):
+        candidate = deepcopy(plan)
+        candidate.intervals[0].battery(0).stop_inverter = stop_text
+        state = ControllerState()
+        state.battery(0).last_command_w = -400
+        state.battery(0).last_change_ts = now - 10
+        decision = FastControlPolicy(limits).decide(
+            candidate, measure(grid_w=3400, battery_w=-400, timestamp=now), state).batteries[0]
+        decisions.append((decision.setpoint_w, decision.write, decision.reason))
+    assert decisions[0][0:2] == (-400, False)
+    assert limiter in decisions[0][2]
+    if version == 2:
+        assert decisions[1] == decisions[0]
+    else:
+        assert decisions[1][0] == -3800
+        assert decisions[1][1] is True
+        assert limiter not in decisions[1][2]
+
+
+def test_policy_fallback_and_accounting_use_window_not_mean_or_stop_text():
+    from dataclasses import replace
+
+    from dao.tests.settlement.test_fast_profile import shaped_plan
+
+    plan = shaped_plan()
+    interval = plan.intervals[0]
+    interval.battery(0).stop_inverter = "not a profile source"
+    a = interval.start_ts
+    policy, state = FastControlPolicy(PolicyLimits()), ControllerState()
+    before = Measurement(a + 400, 0.0, [BatteryMeasurement(soc=50, power_w=0, valid=True)])
+    after = replace(before, timestamp=a + 700)
+    policy.account(state, plan, before, "synthetic")
+    policy.account(state, plan, after, "synthetic")
+    assert state.battery(0).interval_deviation_kwh == pytest.approx(-1 / 36)
+    assert state.battery(0).daily_deviation_kwh == pytest.approx(1 / 36)
+    decision = policy.decide(plan, replace(after, grid_valid=False), state)
+    assert decision.batteries[0].plan_w == 0
+    # Also exercise the normal residual/disabled path and release before the stop.
+    state.battery(0).override_active = True
+    decision = policy.decide(plan, before, state, enabled=[False])
+    assert decision.batteries[0].plan_w == 2000
+    assert decision.batteries[0].stop_inverter is None
+
+
 def test_limited_v2_still_hits_the_separate_actuation_gate():
     from dataclasses import replace
 

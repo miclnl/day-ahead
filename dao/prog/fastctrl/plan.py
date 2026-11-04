@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
@@ -313,6 +313,11 @@ class BatteryPlanStep:
     #: Inverter stop moment the optimizer published, ``"%Y-%m-%d %H:%M"`` or the
     #: sentinel the optimizer uses to mean "no stop".
     stop_inverter: Optional[str] = None
+    #: Financial-v2 average and rectangular AC profile; absent only for legacy v1.
+    mean_ac_power_w: float | None = None
+    on_power_w: float | None = None
+    active_from_ts: int | None = None
+    stop_ts: int | None = None
 
     def to_dict(self) -> dict:
         data: dict[str, Any] = {
@@ -337,6 +342,36 @@ class BatteryPlanStep:
         )
 
 
+def _profile_span(step: BatteryPlanStep) -> tuple[int, int]:
+    """Resolve None against the owning interval, never against a clock or local text."""
+    if (step.mean_ac_power_w is None or step.on_power_w is None
+            or step.active_from_ts is None):
+        raise ValueError("profile_required")
+    bounds = getattr(step, "_profile_interval", None)
+    if bounds is None:
+        raise ValueError("profile_interval_required")
+    start, end = bounds
+    return max(start, step.active_from_ts), min(end, end if step.stop_ts is None else step.stop_ts)
+
+
+def profile_power_at(step: BatteryPlanStep, at_ts: float) -> float:
+    """Pure signed AC watts on the half-open active window, zero elsewhere.
+
+    PlanInterval binds its span on construction (not a wire field). This makes
+    stop_ts=None unambiguously mean its end, including point queries after end.
+    Legacy callers must keep their explicit v1 interpretation.
+    """
+    start, end = _profile_span(step)
+    return float(step.on_power_w) if start <= at_ts < end else 0.0
+
+
+def profile_energy_kwh(step: BatteryPlanStep, start_ts: float, end_ts: float) -> float:
+    """Pure signed AC kWh in the intersection of the query and active window."""
+    start, end = _profile_span(step)
+    duration = max(0.0, min(end, end_ts) - max(start, start_ts))
+    return float(step.on_power_w) * duration / 3600000.0
+
+
 @dataclass
 class PlanInterval:
     """One row of the day-ahead plan."""
@@ -353,6 +388,18 @@ class PlanInterval:
     pv_w: float = 0.0
     batteries: list[BatteryPlanStep] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        span = (self.start_ts, self.end_ts)
+        # A bound profile owns its time span. Same-span views may share steps,
+        # but another span gets independent dataclass copies and a new list;
+        # never rebind a caller's steps (including deepcopy/replace lifecycles).
+        # Legacy steps without a profile retain their existing reuse behavior.
+        if any(step.mean_ac_power_w is not None and getattr(step, "_profile_interval", span) != span
+               for step in self.batteries):
+            self.batteries = [replace(step) for step in self.batteries]
+        for step in self.batteries:
+            step._profile_interval = span
+
     @property
     def duration_s(self) -> int:
         return max(1, self.end_ts - self.start_ts)
@@ -368,7 +415,8 @@ class PlanInterval:
     @property
     def plan_battery_w(self) -> float:
         """Total planned battery AC power over all batteries."""
-        return sum(b.ac_power_w for b in self.batteries)
+        return sum(b.ac_power_w if b.mean_ac_power_w is None else b.mean_ac_power_w
+                   for b in self.batteries)
 
     def to_dict(self) -> dict:
         return {
@@ -545,9 +593,21 @@ def _read_ready_v2(data):
             _number(interval[name], name)
         steps = []
         for step in _array(interval["batteries"]):
-            _object(step, ("ac_power_w", "soc_begin", "soc_end"), ("mode", "stop_inverter"))
+            profile_fields = ("mean_ac_power_w", "on_power_w", "active_from_ts", "stop_ts")
+            if type(step) is not dict or any(name not in step or (name != "stop_ts" and step[name] is None)
+                                             for name in profile_fields):
+                raise ValueError("profile_required: ready-v2 requires all four profile fields")
+            _object(step, ("ac_power_w", "soc_begin", "soc_end", *profile_fields), ("mode", "stop_inverter"))
             for name in ("ac_power_w", "soc_begin", "soc_end"):
                 _number(step[name], name)
+            _number(step["mean_ac_power_w"], "mean_ac_power_w")
+            _number(step["on_power_w"], "on_power_w")
+            active = _integer(step["active_from_ts"], "active_from_ts")
+            stop = end if step["stop_ts"] is None else _integer(step["stop_ts"], "stop_ts")
+            if not start <= active < end or not active <= stop <= end:
+                raise ValueError("profile_outside_interval")
+            if step["mean_ac_power_w"] != step["ac_power_w"]:
+                raise ValueError("profile_mean_mismatch")
             if not 0 <= step["soc_begin"] <= 100 or not 0 <= step["soc_end"] <= 100:
                 raise ValueError("Invalid planned SOC")
             for name in ("mode", "stop_inverter"):
@@ -556,7 +616,13 @@ def _read_ready_v2(data):
             steps.append(BatteryPlanStep(**step))
         if len(steps) != len(specs):
             raise ValueError("Every interval must specify exactly the declared batteries")
-        intervals.append(PlanInterval(**{**interval, "batteries": steps}))
+        row = PlanInterval(**{**interval, "batteries": steps})
+        for step in steps:
+            # v2 is unrounded: absolute tolerance 1e-9 kWh, no relative slack.
+            expected = step.mean_ac_power_w * (end - start) / 3600000.0
+            if not math.isclose(profile_energy_kwh(step, start, end), expected, rel_tol=0, abs_tol=1e-9):
+                raise ValueError("profile_energy_mismatch")
+        intervals.append(row)
         cursor = end
     if not intervals or cursor != context.basis.horizon_end_ts:
         raise ValueError("Incomplete planning horizon")
@@ -642,6 +708,10 @@ def build_plan(
     published: Optional[list[dict]] = None,
     strategy: str = "",
     price_average: float = 0.0,
+    *,
+    financial_context: FinancialContext | None = None,
+    battery_charge_kw: list[list[float]] | None = None,
+    battery_discharge_kw: list[list[float]] | None = None,
 ) -> FastPlan:
     """Turn the optimizer's solution into a plan artefact.
 
@@ -656,7 +726,14 @@ def build_plan(
     the fast layer lets it restore the inverter exactly when it releases an
     override, instead of approximating it from the raw solver value.
 
-    Note the asymmetry between ``start_ts`` and ``hour_fraction``. The
+    For v2, the deterministic convention is the final solver's net AC power
+    held over the actual energy span. No duty-cycle or sub-interval order can
+    be inferred from an interval solution. Both final AC direction columns
+    are required; simultaneous directions are explicitly unrepresentable.
+    The profile never exceeds the optimizer's used power. The shared integral
+    is checked against final solver kW times hour_fraction, not a local command.
+
+    Legacy v1 retains the asymmetry between ``start_ts`` and ``hour_fraction``. The
     optimizer starts partway through the current interval, so its first row
     carries the interval boundary as its timestamp but only the *remaining*
     fraction of an hour as its duration. Intervals are therefore laid out on
@@ -670,9 +747,34 @@ def build_plan(
 
     for index, stamp in enumerate(start_ts):
         fraction = hour_fraction[index] or 1.0
+        energy_start = int(stamp)
+        if financial_context is not None and index == 0:
+            energy_start = financial_context.basis.planning_start_ts
+        end = int(stamp + interval_s)
+        if financial_context:
+            if not 0 < end - energy_start <= interval_s or not math.isclose(
+                    hour_fraction[index] * 3600, end - energy_start, rel_tol=0, abs_tol=1e-6):
+                raise ValueError("profile_solver_duration_mismatch")
+            if battery_charge_kw is None or battery_discharge_kw is None:
+                raise ValueError("profile_solver_directions_required")
         steps: list[BatteryPlanStep] = []
         for b in range(battery_count):
-            if index == 0 and b < len(published):
+            if financial_context:
+                charge = _number(battery_charge_kw[b][index], "solver_charge_kw")
+                discharge = _number(battery_discharge_kw[b][index], "solver_discharge_kw")
+                power = _number(battery_kw[b][index], "solver_battery_kw")
+                if charge < 0 or discharge < 0:
+                    raise ValueError("profile_negative_solver_direction")
+                if charge > 0 and discharge > 0:
+                    raise ValueError("profile_simultaneous_charge_discharge")
+                if power != charge - discharge:
+                    raise ValueError("profile_solver_direction_mismatch")
+                steps.append(BatteryPlanStep(
+                    ac_power_w=1000 * power, soc_begin=_f(soc[b][index]),
+                    soc_end=_f(soc[b][index + 1]), mean_ac_power_w=1000 * power,
+                    on_power_w=1000 * power, active_from_ts=energy_start, stop_ts=None,
+                ))
+            elif index == 0 and b < len(published):
                 steps.append(
                     BatteryPlanStep(
                         ac_power_w=_f(published[b].get("power_w")),
@@ -693,11 +795,11 @@ def build_plan(
         # grid = house + battery, so the planned house load follows from the
         # planned grid exchange without having to re-add every single device.
         grid_w = 1000.0 * grid_kwh[index] / fraction
-        battery_w = sum(step.ac_power_w for step in steps)
+        battery_w = sum(step.mean_ac_power_w if financial_context else step.ac_power_w for step in steps)
         intervals.append(
             PlanInterval(
-                start_ts=int(stamp),
-                end_ts=int(stamp + interval_s),
+                start_ts=energy_start,
+                end_ts=end,
                 price_import=_f(price_import[index]),
                 price_export=_f(price_export[index]),
                 grid_w=grid_w,
@@ -706,6 +808,11 @@ def build_plan(
                 batteries=steps,
             )
         )
+        if financial_context:
+            for b, step in enumerate(steps):
+                if not math.isclose(profile_energy_kwh(step, energy_start, end),
+                                    battery_kw[b][index] * hour_fraction[index], rel_tol=0, abs_tol=1e-9):
+                    raise ValueError("profile_solver_energy_mismatch")
 
     return FastPlan(
         created_ts=created_ts,
@@ -714,4 +821,6 @@ def build_plan(
         intervals=intervals,
         strategy=strategy,
         price_average=price_average,
+        format_version=2 if financial_context else 1,
+        financial_context=financial_context,
     )

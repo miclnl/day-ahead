@@ -313,6 +313,40 @@ def test_explicit_v2_context_is_published_through_real_adapter(financial_exporte
     assert plan.financial_context == context
 
 
+def test_f2a_export_uses_final_solver_power_not_local_command(financial_exporter, system):
+    from dao.prog.fastctrl import plan as plans
+
+    exporter, context = financial_exporter
+    context = replace(context, basis=replace(context.basis, planning_start_ts=NOW + 300))
+    from dao.prog.settlement.replay import write_replay_basis
+
+    evidence = replace(system.plan, financial_context=context,
+                       intervals=[replace(system.plan.intervals[0], start_ts=NOW + 300), *system.plan.intervals[1:]])
+    replay = replay_for_plan(evidence, (system.snapshot,))
+    context = replace(context, replay_basis_hash=write_replay_basis(replay, plan_path=system.path))
+    plan = call(exporter, str(system.path), steps=3,
+                interval_ts=[NOW, NOW + 900, NOW + 1800],
+                hour_fraction=[1 / 6, 0.25, 0.25],
+                c_l=[Var(0.2), Var(0), Var(0.4)],
+                financial_context=context,
+                published_battery=[{"power_w": -6000, "stop_inverter": "invalid-local-text"}])
+    first = plan.intervals[0]
+    assert first.start_ts == NOW + 300 and first.end_ts == NOW + 900
+    assert first.battery(0).ac_power_w == -1200.0
+    assert first.battery(0).mean_ac_power_w == -1200.0
+    assert first.battery(0).on_power_w == -1200.0
+    assert plans.profile_energy_kwh(first.battery(0), first.start_ts, first.end_ts) == pytest.approx(-0.2)
+    assert first.grid_w == pytest.approx(1200) and first.house_w == pytest.approx(2400)
+
+
+def test_f2a_simultaneous_solver_directions_have_own_refusal(financial_exporter, system):
+    exporter, context = financial_exporter
+    with pytest.raises((ValueError, FinancialPlanBlocked), match="profile_simultaneous_charge_discharge"):
+        call(exporter, str(system.path), steps=3,
+             interval_ts=[NOW, NOW + 900, NOW + 1800], hour_fraction=[0.25] * 3,
+             financial_context=context, ac_to_dc=[[Var(1), Var(0), Var(0)]])
+
+
 def test_limited_v2_export_keeps_unknown_economics_and_base_tick_prices(financial_exporter, system):
     exporter, context = financial_exporter
     context = replace(context, economics_supported=False, issues=("bonus_prefix_unknown",))
