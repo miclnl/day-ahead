@@ -125,6 +125,16 @@ def validate_current_locked(*, lease: PublicationLease, expected_digest: str,
     return plan
 
 
+def _is_reserved(observation: ActuationReceipt) -> bool:
+    """The receiver still holds a live reservation of this very command.
+
+    The receiver reports a reserved command as ``unconfirmed`` with the reason
+    ``pending_effect``: the command is durably reserved and its helpers may
+    still write. Such a reservation is not a terminal outcome.
+    """
+    return observation.status == "unconfirmed" and observation.reason == "pending_effect"
+
+
 def _conservative(observations: list[ActuationReceipt]) -> ActuationReceipt:
     """The most conservative observation; the result always comes from the receiver.
 
@@ -132,11 +142,17 @@ def _conservative(observations: list[ActuationReceipt]) -> ActuationReceipt:
     no effect by this very command: one single observation with an effect is
     enough to make the outcome uncertain. A mixed set is reported with the
     most conservative non-rejection, never with a rejection.
+
+    A live reservation is never terminal either. A refusal of a duplicate says
+    nothing about the reservation that the first delivery made, so a rejection
+    may not end the command while the receiver still holds that reservation.
+    The uncertainty stays until a terminal proof or an exact safe barrier.
     """
     for observation in observations:
         if observation.status == "accepted":
             return observation
-    if all(observation.effect == "none" for observation in observations):
+    if (all(observation.effect == "none" for observation in observations)
+            and not any(_is_reserved(observation) for observation in observations)):
         for observation in observations:
             if observation.status == "rejected":
                 return observation
@@ -185,21 +201,28 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
     now = owner.now_ns
     if deadline.remaining_ns(now()) == 0:
         raise ExecutionRefused("budget_exhausted")
-    receipt = receiver.send(command, deadline=deadline)
-    observations = [receipt]
-    if receipt.status != "accepted" and deadline.remaining_ns(now()) > 0:
-        # At most one retry, with exactly the same bytes, id, sequence and deadline.
-        retried = receiver.send(command, deadline=deadline)
-        observations.append(retried)
-        if retried.status != "accepted" and deadline.remaining_ns(now()) > 0:
-            queried = receiver.query(installation_id=command.installation_id,
-                                     owner_epoch=command.owner_epoch,
-                                     sequence=command.sequence,
-                                     command_id=command.command_id,
-                                     payload_digest=payload_digest(command),
-                                     deadline=deadline)
-            if queried is not None:
-                observations.append(queried)
+    try:
+        receipt = receiver.send(command, deadline=deadline)
+        observations = [receipt]
+        if receipt.status != "accepted" and deadline.remaining_ns(now()) > 0:
+            # At most one retry, with exactly the same bytes, id, sequence and deadline.
+            retried = receiver.send(command, deadline=deadline)
+            observations.append(retried)
+            if retried.status != "accepted" and deadline.remaining_ns(now()) > 0:
+                queried = receiver.query(installation_id=command.installation_id,
+                                         owner_epoch=command.owner_epoch,
+                                         sequence=command.sequence,
+                                         command_id=command.command_id,
+                                         payload_digest=payload_digest(command),
+                                         deadline=deadline)
+                if queried is not None:
+                    observations.append(queried)
+    except Exception as exc:
+        # A transport failure is a machine-readable refusal: fail closed, never
+        # an uncaught exception and never an invented proof. The pattern is
+        # the one of `ownership.stop()`, which already handles the receiver
+        # call fail closed.
+        raise ExecutionRefused("receiver_unavailable") from exc
     outcome = _conservative(observations)
     if outcome.status == "accepted" and deadline.remaining_ns(now()) == 0:
         # A late acknowledgement is history only: it grants no right, clears no

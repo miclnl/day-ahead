@@ -37,12 +37,36 @@ class FencedReceiver(FinancialActuationAdapter):
     remains a test double; it is not a qualified production adapter.
     """
 
-    def __init__(self, path, *, initial_state, utc_ms, clock_uncertainty_ms=0):
+    def __init__(self, path, *, initial_state=None, utc_ms, clock_uncertainty_ms=0,
+                 attach=False, effect_log_path=None):
+        """Provision a receiver, or take over the durable files of one.
+
+        With ``attach=True`` this instance takes over the durable files of an
+        already provisioned receiver: it reads the state and the independent
+        anchor back and never provisions again. That is the documented
+        test-only facility for the second process of a caller crash: the
+        caller that died owned the durable files, so the recovery needs the
+        same receiver. It never clears the queue and never judges the state.
+
+        With ``effect_log_path`` the fake keeps a durable effect log next to
+        its state: every real write of the last writer is appended at the
+        moment that write happens. That is opt-in test-only fault evidence:
+        it lets the effect evidence of the fake survive the death of the
+        process that owned the fake. It never invents an entry: only a real
+        write of the dummy appends one, and an attached instance reads the
+        real entries back.
+        """
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         self.state_path = path / "receiver-state.json"
         self.anchor_path = path / "independent-anchor.json"
-        if self.state_path.exists() or self.anchor_path.exists():
+        self.effect_log_path = Path(effect_log_path) if effect_log_path is not None else None
+        if attach:
+            if initial_state is not None:
+                raise ValueError("fake_attach_takes_no_initial_state")
+        elif initial_state is None:
+            raise ValueError("fake_initial_state_missing")
+        elif self.state_path.exists() or self.anchor_path.exists():
             raise ValueError("fake_already_provisioned")
         self.state = initial_state
         self.utc_ms = utc_ms
@@ -59,7 +83,62 @@ class FencedReceiver(FinancialActuationAdapter):
         self.running = True
         self._lose_ack = False
         self._checkpoint_counter = 0
-        self._persist()
+        if attach:
+            self._attach_durable()
+        else:
+            self._persist()
+
+    def _attach_durable(self):
+        """Take over the durable files of an already provisioned receiver.
+
+        The state and the independent anchor have to be one consistent pair.
+        The existing pure validation of the receiver decides that: a state
+        that is behind its anchor is a rollback, and an unusable state is an
+        unknown state. Neither becomes an active receiver here: the attach
+        refuses before any write, so both files stay exactly as they were. A
+        refused attach never overwrites the independent anchor either.
+        """
+        try:
+            anchor = json.loads(self.anchor_path.read_text())
+            loaded = receiver.ReceiverState.from_dict(
+                json.loads(self.state_path.read_text()))
+            _state, reason = receiver.receiver_recovery_state(
+                loaded, anchor_epoch_high_water=anchor["epoch_high_water"],
+                anchor_sequence_high_water=anchor["sequence_high_water"],
+                anchor_checkpoint=anchor["anchor_checkpoint"])
+        except (OSError, KeyError, TypeError, ValueError):
+            raise ValueError("fake_attach_inconsistent") from None
+        if reason != "recovered":
+            # A rollback or an unknown state never becomes an active receiver.
+            raise ValueError("fake_attach_inconsistent")
+        self.state = loaded
+        checkpoint = self.state.anchor_checkpoint
+        if checkpoint.startswith("fake-checkpoint-"):
+            # The checkpoint counter continues where the other process left it.
+            self._checkpoint_counter = max(self._checkpoint_counter,
+                                           int(checkpoint.rsplit("-", 1)[1]))
+        self.effect_log = self._load_effect_log()
+        return anchor
+
+    def _load_effect_log(self):
+        """The real effect writes of the durable effect log, in their order."""
+        if self.effect_log_path is None or not self.effect_log_path.exists():
+            return []
+        entries = []
+        for line in self.effect_log_path.read_text().splitlines():
+            if line.strip():
+                entries.append(tuple(json.loads(line)))
+        return entries
+
+    def _append_effect(self, entry):
+        """Append one real effect write to the durable effect log."""
+        if self.effect_log_path is None:
+            return
+        with self.effect_log_path.open("a") as stream:
+            json.dump(list(entry), stream, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
 
     @property
     def receiver_now_upper_ms(self):
@@ -132,7 +211,11 @@ class FencedReceiver(FinancialActuationAdapter):
                                                 clock_uncertainty_ms=self.clock_uncertainty_ms,
                                                 result=result, acknowledged=not self._lose_ack)
             if ok:
-                self.effect_log.append((command.command_id, part, command.battery_name, command.setpoint_w))
+                entry = (command.command_id, part, command.battery_name, command.setpoint_w)
+                self.effect_log.append(entry)
+                # The durable effect log keeps the real write of the last
+                # writer: it survives the death of the process that owns it.
+                self._append_effect(entry)
         self._apply(decision)
         if decision.record.phase != "reserved":
             self.work = [item for item in self.work if item.command_id != command.command_id]
