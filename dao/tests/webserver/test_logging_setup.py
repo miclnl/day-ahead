@@ -16,7 +16,12 @@ The setup also lived in the v1 module, so v2 and the API silently depended
 on v1 being imported; it is in app/__init__.py now.
 """
 
+import importlib
+import io
 import logging
+import runpy
+import sys
+from contextlib import contextmanager
 from logging.handlers import TimedRotatingFileHandler
 
 import pytest
@@ -105,3 +110,82 @@ def test_a_report_in_a_request_does_not_change_the_dashboard_level(client):
     assert owns is False, "DaBase took over the dashboard's root logger"
     assert root.level == level_before
     assert root.handlers == handlers_before
+
+
+@contextmanager
+def _logging_sandbox():
+    """Exercise real handlers without changing pytest's root logger/capture."""
+    root = logging.RootLogger(logging.WARNING)
+    stdout = io.StringIO()
+    foreign_output = io.StringIO()
+    foreign_handler = logging.StreamHandler(foreign_output)
+    foreign_handler.setLevel(logging.ERROR)
+    root.addHandler(foreign_handler)
+    get_logger = logging.getLogger
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            logging, "getLogger", lambda name=None: get_logger(name) if name else root
+        )
+        monkeypatch.setattr(sys, "stdout", stdout)
+        try:
+            yield root, stdout, foreign_output
+        finally:
+            for handler in root.handlers[:]:
+                root.removeHandler(handler)
+                handler.close()
+
+
+@pytest.mark.parametrize("dashboard_first", [False, True], ids=["preload-first", "dashboard-first"])
+def test_collection_preload_restores_logging(monkeypatch, dashboard_first):
+    """The synthetic collection import must not own a later test's stdout."""
+    import dao.webserver
+
+    from . import conftest
+
+    dashboard = importlib.import_module("dao.webserver.app")
+    # Re-run the real package initializer, restoring its module and parent
+    # binding afterwards. The cached route modules need no reload here.
+    monkeypatch.setattr(dao.webserver, "app", dashboard)
+    monkeypatch.delitem(sys.modules, "dao.webserver.app")
+    with _logging_sandbox() as (root, stdout, foreign_output):
+        if dashboard_first:
+            dashboard._configure_logging()
+            root.setLevel(logging.ERROR)
+        before, level = root.handlers[:], root.level
+        streams = [handler.stream for handler in before]
+
+        runpy.run_path(conftest.__file__)
+
+        assert root.handlers == before
+        assert root.level == level
+        assert [handler.stream for handler in root.handlers] == streams
+        assert all(not stream.closed for stream in streams)
+        root.error("after collection preload")
+        assert foreign_output.getvalue() == "after collection preload\n"
+        if dashboard_first:
+            assert stdout.getvalue().count("after collection preload") == 1
+        else:
+            assert stdout.getvalue() == ""
+
+
+def test_reconfiguration_emits_once_and_preserves_host_logging():
+    dashboard = importlib.import_module("dao.webserver.app")
+    with _logging_sandbox() as (root, stdout, foreign_output):
+        foreign_handler = root.handlers[0]
+        dashboard._configure_logging()
+        root.setLevel(logging.ERROR)
+        before = root.handlers[:]
+
+        dashboard._configure_logging()
+        dashboard._configure_logging()
+        root.error("dashboard stdout regression")
+
+        marked = [handler for handler in root.handlers if getattr(handler, "_dao_dashboard", False)]
+        assert len(marked) == 1
+        assert marked[0].stream is sys.stdout
+        assert stdout.getvalue().count("dashboard stdout regression") == 1
+        assert foreign_output.getvalue() == "dashboard stdout regression\n"
+        assert root.handlers == before
+        assert foreign_handler.stream is foreign_output
+        assert foreign_handler.level == root.level == logging.ERROR
+        assert not foreign_output.closed

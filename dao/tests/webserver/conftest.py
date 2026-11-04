@@ -6,9 +6,11 @@ package linked) and imports the app from there.
 """
 
 import importlib
+import logging
 import os
 import shutil
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -25,9 +27,26 @@ SUPERVISOR = {"REMOTE_ADDR": "172.30.32.2"}
 INGRESS = {"X-Ingress-Path": "/api/hassio_ingress/token"}
 
 
+@contextmanager
+def _preserve_dashboard_logging():
+    """Keep an app import's logging changes within its test lifetime."""
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        yield
+    finally:
+        for handler in root.handlers[:]:
+            if handler not in handlers and getattr(handler, "_dao_dashboard", False):
+                root.removeHandler(handler)
+                handler.close()
+        root.setLevel(level)
+
+
 # Some tests import dao.webserver.app during collection, before site/client run.
 # Preload that package with a synthetic ../data, never the worktreeparent's key.
-with TemporaryDirectory(prefix="dao-web-import-") as _import_root:
+# Collection may run outside pytest capture; its handler must not leak into
+# the client import, which needs to bind stdout while test capture is active.
+with _preserve_dashboard_logging(), TemporaryDirectory(prefix="dao-web-import-") as _import_root:
     _import_cwd = Path(_import_root) / "webserver"
     _import_cwd.mkdir()
     _previous_cwd = os.getcwd()
@@ -64,10 +83,11 @@ def client(site, tmp_path_factory):
     for name in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
         del sys.modules[name]
     try:
-        from app import app  # noqa: WPS433 - imported here so cwd is the site
+        with _preserve_dashboard_logging():
+            from app import app  # noqa: WPS433 - imported here so cwd is the site
 
-        app.config["TESTING"] = True
-        yield app.test_client()
+            app.config["TESTING"] = True
+            yield app.test_client()
     finally:
         os.chdir(previous)
         sys.path.remove(str(site / "webserver"))
