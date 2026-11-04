@@ -18,12 +18,14 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from inspect import getattr_static
 from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from dao.prog import task_execution
 from dao.prog.config.models.fastcontrol import (
     FastBatteryLink,
     FastControlConfig,
@@ -32,6 +34,8 @@ from dao.prog.config.models.fastcontrol import (
 from dao.prog.config.models.pricing import PricingConfig
 
 from .actuator import CommandReceipt, execute_battery_command
+from .command import Deadline
+from .ownership import MirrorWriteFailed, OwnerCoordinator, RecoveryRequired
 from .plan import FAST_PLAN_FILE, FastPlan, load_plan
 from .policy import (
     BatteryMeasurement,
@@ -289,6 +293,7 @@ class FastControlRunner:
         *,
         gate_policy: GatePolicy | None = None,
         fallback: FallbackSink | None = None,
+        owner: OwnerCoordinator | None = None,
     ):
         self.hass = hass
         if gate_policy is None:
@@ -304,6 +309,8 @@ class FastControlRunner:
             raise TypeError("Expected explicit GatePolicy")
         self.gate_policy = gate_policy
         self.fallback = fallback
+        self.owner = owner
+        self._owner_writer = None
         self.last_gate: GateVerdict | None = None
         self.last_fallback: FallbackReceipt | None = None
         self.last_receipts: list[CommandReceipt] = []
@@ -1006,12 +1013,52 @@ class FastControlRunner:
 
     # -- the loop --------------------------------------------------------
 
+    def start_owner_session(self) -> None:
+        """Optional fenced-owner lifecycle; never changes the legacy route."""
+        if self.owner is None or self._owner_writer is not None:
+            return
+        try:
+            store = self.owner.store
+            self._owner_writer = task_execution.acquire_resource(store.resource, lease_dir=store.lease_dir)
+            now_ms = time.time_ns() // 1_000_000
+            deadline = Deadline(time.clock_gettime_ns(time.CLOCK_BOOTTIME) + 750_000_000, now_ms + 750)
+            result = self.owner.start(writer=self._owner_writer, receiver=self.owner.receiver,
+                                      installation_id=store.installation_id, owner_session_id=uuid.uuid4().hex,
+                                      requested_not_after_ms=now_ms + 1000, deadline=deadline, now_ms=now_ms)
+            if isinstance(result, RecoveryRequired):
+                logging.warning("Fast control: owner inhibited: %s", result.reason)
+        except task_execution.LeaseBusy as exception:
+            self.owner.report_failure("owner_lease_busy")
+            logging.warning("Fast control: owner lease bezet: %s", exception)
+        except Exception as exception:  # noqa: BLE001 - optional lifecycle never aborts legacy
+            self.owner.report_failure(exception.reason if isinstance(exception, (MirrorWriteFailed, RecoveryRequired))
+                                      else "owner_start_failed")
+            logging.warning("Fast control: owner start mislukt: %s", exception)
+
+    def stop_owner_session(self, reason: str) -> None:
+        if self.owner is None or self._owner_writer is None:
+            return
+        try:
+            self.owner.stop(reason=reason)
+        except Exception as exception:  # noqa: BLE001
+            self.owner.report_failure(exception.reason if isinstance(exception, (MirrorWriteFailed, RecoveryRequired))
+                                      else "owner_stop_failed")
+            logging.warning("Fast control: owner stop mislukt: %s", exception)
+        finally:
+            writer, self._owner_writer = self._owner_writer, None
+            try:
+                writer.close()
+            except Exception as exception:  # noqa: BLE001
+                self.owner.report_failure("owner_stop_failed")
+                logging.warning("Fast control: owner lease sluiten mislukt: %s", exception)
+
     def run(self, stop_event: Optional[threading.Event] = None) -> None:
         """Run until *stop_event* is set. Never raises."""
         stop_event = stop_event or threading.Event()
         period = max(5, int(self.config.interval))
         logging.info(f"Fast control gestart, interval {period} s")
         failures = 0
+        self.start_owner_session()
         while not stop_event.is_set():
             started = time.time()
             try:
@@ -1041,10 +1088,13 @@ class FastControlRunner:
             plan = self.plan()
         except Exception:  # noqa: BLE001
             plan = None
-        if plan is not None and self._measure_seconds > 0:
-            self._flush_measurement(plan)
-        # Flush whatever the throttled writer was still holding back.
-        self._persist_state(time.time(), force=True)
+        try:
+            if plan is not None and self._measure_seconds > 0:
+                self._flush_measurement(plan)
+            # Flush whatever the throttled writer was still holding back.
+            self._persist_state(time.time(), force=True)
+        finally:
+            self.stop_owner_session("shutdown")
         logging.info("Fast control gestopt")
 
 

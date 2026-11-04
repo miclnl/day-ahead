@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import stat
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -85,6 +86,24 @@ def acquire(task_key: str) -> Lease:
         os.close(fd)
         raise
     return Lease(tasks.resource_key(task_key), fd)
+
+
+def acquire_resource(resource: str, *, lease_dir: Path) -> Lease:
+    """Acquire a stable generic sidecar; the caller owns its lifetime."""
+    if type(resource) is not str or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", resource) is None:
+        raise LeaseError("Ongeldige resource")
+    path = Path(lease_dir).absolute() / f"{resource}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise LeaseBusy(f"Resource {resource} is bezet") from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    return Lease(resource, fd)
 
 
 def _inherited(task_key: str) -> Lease | None:
