@@ -2,6 +2,11 @@
 
 Confirmation means only that the required helpers accepted their values. This
 module neither grants execution rights nor touches controller state.
+
+The financial route adds exactly two things here: the **nominal** adapter
+classification (who may carry financial command rights at all) and the explicit
+machine-readable verdict of an actuation attempt. Neither is inferred from
+duck typing, a boolean or a configuration field.
 """
 
 from __future__ import annotations
@@ -12,9 +17,50 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from .command import ActuationReceipt, HelperResult
+from .command import ActuationReceipt, HelperResult, _boolean, _reason
 from .plan import NO_STOP_SENTINEL, FastPlan
 from .policy import BatteryDecision
+
+#: The generic Home Assistant gateway: it may never carry financial command
+#: rights, not even through a canonical actuator call.
+LEGACY_ONLY_ADAPTER = "legacy_only"
+
+#: A nominally qualified adapter: the fenced receiver contract.
+FENCED_ADAPTER = "fenced"
+
+
+class FinancialActuationAdapter:
+    """Nominal opt-in for adapters that may carry financial command rights.
+
+    Qualification happens by inheriting this class only. It is never
+    inferred from the presence of methods, never a boolean and never a
+    configuration field.
+    """
+
+
+def classify_actuation_adapter(gateway) -> str:
+    """Classify a battery-command adapter; the generic gateway is legacy_only.
+
+    Only a real base class counts, never a structural check: an object that
+    merely has the right methods is still ``legacy_only``. A foreign object
+    never raises here; it is simply not qualified.
+    """
+    if isinstance(gateway, FinancialActuationAdapter):
+        return FENCED_ADAPTER
+    return LEGACY_ONLY_ADAPTER
+
+
+@dataclass(frozen=True)
+class ActuationVerdict:
+    """The explicit outcome of an actuation attempt: allowed or refused."""
+
+    allowed: bool
+    #: Machine-readable, ``^[a-z][a-z0-9_]*$``.
+    reason: str
+
+    def __post_init__(self) -> None:
+        _boolean(self.allowed, "actuation_verdict_allowed_invalid")
+        _reason(self.reason, "actuation_verdict_reason_invalid")
 
 
 @dataclass(frozen=True)

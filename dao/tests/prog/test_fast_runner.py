@@ -948,6 +948,7 @@ def test_f2b_r24_shadow_restart_uses_projection_without_accepting_it(workspace):
 
 
 def test_f2b_r22_invalid_identity_fails_before_helpers_and_escalates(workspace):
+    """A v2 plan never reaches the legacy helper route; a v1 plan does."""
     from dataclasses import replace
 
     from dao.prog.fastctrl.policy import BatteryDecision, Decision
@@ -959,10 +960,28 @@ def test_f2b_r22_invalid_identity_fails_before_helpers_and_escalates(workspace):
     runner = FastControlRunner(hass, make_config(), fallback=sink, **workspace)
     decision = Decision(T0, [BatteryDecision(0, "accu", -1000, 0, True, True, "override")])
     runner._actuate(decision, plan, "active")
+    # (1) The financial route refuses a v2 plan without a financial context: no
+    # helper call, no receipt and no legacy fallback.
     assert hass.attempts == []
     assert runner.last_receipts == []
-    assert decision.as_attributes()["batteries"][0]["actuation_status"] == "unconfirmed"
-    assert sink.requests[0].reason == "actuation_identity_invalid"
+    assert runner.last_actuation.allowed is False
+    assert runner.last_actuation.reason == "missing_financial_context"
+    assert sink.requests == []
+    assert decision.as_attributes()["batteries"][0]["actuation_status"] is None
+    # (2) A valid v1 plan reaches the legacy helper route: the helpers are
+    # called, a legacy receipt is produced and the financial route never ran.
+    legacy = make_plan(workspace["plan_path"])
+    legacy_hass = F2bHass()
+    legacy_runner = FastControlRunner(legacy_hass, make_config(), fallback=sink,
+                                      **workspace)
+    legacy_runner._actuate(decision, legacy, "active")
+    assert legacy_hass.attempts == ["setpoint"]
+    assert len(legacy_runner.last_receipts) == 1
+    assert legacy_runner.last_receipts[0].plan_identity == "v1:1700000000"
+    assert legacy_runner.last_receipts[0].status == "confirmed"
+    # The financial route never ran for the v1 plan: there is no verdict.
+    assert legacy_runner.last_actuation is None
+    assert sink.requests == []
 
 
 def test_f2b_missing_helper_entities_do_not_accept_proposed_state(workspace):
@@ -1432,3 +1451,111 @@ class TestMeasurement:
         )
         for offset in range(0, 950, 30):
             runner.tick(T0 + offset)  # must not raise
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "active"])
+def test_f2c5_the_public_entrypoint_still_refuses_a_ready_v2_plan(workspace, mode):
+    """The financial consumer is not reachable from the public route."""
+    path = Path(workspace["plan_path"])
+    plan = ready_plan()
+    path.write_text(json.dumps(plan.to_dict()))
+    hass = FakeHass({"sensor.p1_power": "500", "sensor.soc": "60"})
+    sink = RecordingFallback(path=path)
+    runner = FastControlRunner(hass, make_config(mode=mode), fallback=sink, **workspace)
+    assert runner.tick(plan.created_ts) is None
+    assert runner.last_gate.allowed is False
+    assert runner.last_gate.reason == "actuation_gates_unproven"
+    # The consumer was never reached: no verdict, no receipt, no helper call.
+    assert runner.last_actuation is None
+    assert runner.last_receipts == []
+    assert hass.values == hass.options == hass.switches == hass.published == {}
+    assert hass.services == []
+    assert hass.template_calls == hass.state_calls == 0
+    # A restart does not recover the right either.
+    restarted = FastControlRunner(hass, make_config(mode=mode), fallback=sink, **workspace)
+    assert restarted.tick(plan.created_ts + 1) is None
+    assert restarted.last_gate.reason == "actuation_gates_unproven"
+    assert restarted.last_actuation is None
+    assert restarted.last_receipts == []
+    assert hass.values == hass.options == hass.switches == hass.published == {}
+
+
+def test_f2c5_the_v2_route_refuses_without_an_owner_and_writes_nothing(workspace, monkeypatch):
+    from dao.prog.fastctrl.actuator import LegacyActuationReceipt
+    from dao.prog.fastctrl.policy import BatteryDecision, Decision
+
+    calls = []
+    monkeypatch.setattr("dao.prog.fastctrl.runner.execute_battery_command",
+                        lambda *args, **kwargs: calls.append(args))
+    plan = ready_plan()
+    hass = FakeHass()
+    runner = FastControlRunner(hass, make_config(), **workspace)
+    decision = Decision(T0, [BatteryDecision(0, "accu", -1000, -2000, True, True, "override")])
+    receipts = runner._actuate(decision, plan, "active")
+    assert receipts == ()
+    assert runner.last_receipts == []
+    assert runner.last_actuation.allowed is False
+    assert runner.last_actuation.reason == "owner_unavailable"
+    # The legacy helper route is never used in the financial regime.
+    assert calls == []
+    assert not any(isinstance(receipt, LegacyActuationReceipt) for receipt in receipts)
+    assert hass.values == hass.options == hass.switches == hass.published == {}
+    assert hass.services == []
+
+
+def test_f2c5_the_generic_gateway_is_explicitly_legacy_only():
+    from dao.prog.fastctrl import actuator as actuator_module
+
+    # Deliberate assertion RED, never a collection/import error.
+    assert hasattr(actuator_module, "FinancialActuationAdapter"), (
+        "F2c5 nominal adapter base class missing")
+    assert hasattr(actuator_module, "classify_actuation_adapter"), (
+        "F2c5 adapter classification missing")
+    assert HomeAssistantGateway.actuation_adapter_class == (
+        actuator_module.LEGACY_ONLY_ADAPTER)
+    assert actuator_module.classify_actuation_adapter(
+        HomeAssistantGateway(FakeHass())) == actuator_module.LEGACY_ONLY_ADAPTER
+    # The label is not a release: the generic gateway never inherits the
+    # financial adapter contract.
+    assert not isinstance(HomeAssistantGateway(FakeHass()),
+                          actuator_module.FinancialActuationAdapter)
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "active"])
+def test_f2c5_the_production_route_never_reaches_the_execution_boundary(workspace, monkeypatch, mode):
+    """The public route never calls the mechanical boundary itself."""
+    from dao.prog.fastctrl import execution as execution_boundary
+
+    path = Path(workspace["plan_path"])
+    plan = ready_plan()
+    path.write_text(json.dumps(plan.to_dict()))
+    reached = []
+    monkeypatch.setattr(execution_boundary, "owner_section",
+                        lambda *args, **kwargs: reached.append("owner_section"))
+    monkeypatch.setattr(execution_boundary, "send_locked",
+                        lambda *args, **kwargs: reached.append("send_locked"))
+    hass = FakeHass({"sensor.p1_power": "500", "sensor.soc": "60"})
+    runner = FastControlRunner(hass, make_config(mode=mode), **workspace)
+    assert runner.tick(plan.created_ts) is None
+    assert runner.last_gate.reason == "actuation_gates_unproven"
+    assert reached == []
+    # A restart does not reach the boundary either.
+    restarted = FastControlRunner(hass, make_config(mode=mode), **workspace)
+    assert restarted.tick(plan.created_ts + 1) is None
+    assert restarted.last_gate.reason == "actuation_gates_unproven"
+    assert reached == []
+
+
+def test_f2c5_the_v1_diagnostics_keep_writing_an_aliased_entity(workspace):
+    """The alias rule is a financial-route rule; the v1 route is unchanged."""
+    make_plan(workspace["plan_path"], battery_w=-400)
+    hass = FakeHass({"sensor.soc": "60", "sensor.p1_power": "-100",
+                     "sensor.battery_power": "-390"})
+    config = make_config(diagnostics={"entity setpoint": "input_select.mode"})
+    runner = FastControlRunner(hass, config, **workspace)
+    runner.tick(T0 + 60)
+    # The v1 diagnostics write the aliased entity, exactly as before: the
+    # overlap check belongs to the financial route only.
+    assert "input_select.mode" in hass.values
+    assert hass.values["input_select.mode"] == pytest.approx(
+        runner.state.last_decision["batteries"][0]["setpoint_w"], abs=1.0)

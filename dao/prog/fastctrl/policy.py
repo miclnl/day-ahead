@@ -61,6 +61,7 @@ from .plan import (
     profile_energy_kwh,
     profile_power_at,
 )
+from .receiver import payload_digest
 
 #: Fraction of the energy budget over which the allowed power is tapered to
 #: zero, instead of dropping to zero in one step.
@@ -76,6 +77,9 @@ SCARCITY_BAND_FRACTION = 0.10
 
 #: Setpoints closer to each other than this are treated as identical.
 POWER_EPS = 1.0
+
+#: The execution outcomes the financial route can report.
+EXECUTION_OUTCOMES = ("unknown", "accepted", "unconfirmed", "stopped")
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -184,6 +188,12 @@ class BatteryControllerState:
     restore_pending: bool = False
     #: Last issued canonical command, cached for exact receipt matching only.
     pending_command: Optional[BatteryCommand] = None
+    #: The last known execution outcome of the financial route.
+    execution_status: str = "unknown"
+    #: There is an unfinished recovery duty: an uncertain or unproven execution.
+    recovery_required: bool = False
+    #: The identity of the last **confirmed** command.
+    last_accepted_command: Optional[BatteryCommand] = None
 
     def to_dict(self) -> dict:
         return {
@@ -199,6 +209,12 @@ class BatteryControllerState:
             "held_stop_inverter_cleared": self.held_stop_inverter_cleared,
             "restore_pending": self.restore_pending,
             "pending_command": self.pending_command.to_dict() if self.pending_command is not None else None,
+            "execution_status": self.execution_status,
+            "recovery_required": self.recovery_required,
+            "last_accepted_command": (
+                self.last_accepted_command.to_dict()
+                if self.last_accepted_command is not None else None
+            ),
         }
 
     @classmethod
@@ -206,6 +222,8 @@ class BatteryControllerState:
         state = cls()
         for key, value in (data or {}).items():
             if key == "pending_command" and value is not None:
+                value = BatteryCommand.from_dict(value)
+            if key == "last_accepted_command" and value is not None:
                 value = BatteryCommand.from_dict(value)
             if hasattr(state, key):
                 setattr(state, key, value)
@@ -363,6 +381,74 @@ def apply_actuation_receipt(state: BatteryControllerState, receipt: ActuationRec
     state.held_setpoint_w = float(pending.setpoint_w)
     state.held_stop_inverter_cleared = state.stop_inverter_cleared
     state.pending_command = None
+
+
+def apply_execution_outcome(state: BatteryControllerState, *,
+                             outcome: str,
+                             receipt: ActuationReceipt | None = None,
+                             pending: BatteryCommand | None = None) -> bool:
+    """Fold one financial execution outcome into the controller state.
+
+    Pure: no I/O, no clock and no plan. The decision table is binding:
+
+    ============  =================  ==================  =================  ====================
+    outcome       execution_status   recovery_required  pending_command    last_accepted_command
+    ============  =================  ==================  =================  ====================
+    unknown       unknown            unchanged          unchanged          unchanged
+    accepted      accepted           unchanged          cleared            the stored command
+    unconfirmed   unconfirmed        True               stays standing     unchanged
+    stopped       stopped            False              cleared            unchanged
+    ============  =================  ==================  =================  ====================
+
+    The in-force facts (``held_setpoint_w``, ``held_stop_inverter_cleared`` and
+    ``last_change_ts``) are never touched here: they belong to the in-force
+    reality, not to a receipt. Only an exactly matching receipt proves an
+    acceptance; a receipt that does not match the stored pending command
+    field by field mutates nothing at all.
+
+    The return value says whether the outcome was applied. Only an applied
+    ``accepted`` may unlock the in-force facts in the runner.
+    """
+    if outcome not in EXECUTION_OUTCOMES:
+        raise ValueError("execution_outcome_invalid")
+    if receipt is not None and type(receipt) is not ActuationReceipt:
+        raise TypeError("canonical_receipt_required")
+    if outcome == "unknown":
+        # No execution: no owner, an unsuitable adapter, a gate or a proven
+        # absence of effect. The recovery duty and the pending command stay.
+        state.execution_status = "unknown"
+        return True
+    if outcome == "stopped":
+        # An exact safe barrier ends the recovery duty; nothing else does.
+        state.execution_status = "stopped"
+        state.recovery_required = False
+        state.pending_command = None
+        return True
+    if outcome == "unconfirmed":
+        # Ambiguous: the pending command, the recovery duty and the uncertainty
+        # all stay standing until an exact safe barrier.
+        state.execution_status = "unconfirmed"
+        state.recovery_required = True
+        if state.pending_command is None and pending is not None:
+            state.pending_command = pending
+        return True
+    # accepted: only an exactly matching receipt proves it.
+    stored = pending if pending is not None else state.pending_command
+    if stored is None or receipt is None or receipt.status != "accepted":
+        return False
+    for name in ("installation_id", "battery_name", "owner_session_id", "owner_epoch",
+                 "sequence", "command_id", "plan_digest"):
+        if getattr(receipt, name) != getattr(stored, name):
+            return False
+    if receipt.payload_digest != payload_digest(stored):
+        return False
+    state.execution_status = "accepted"
+    state.pending_command = None
+    state.last_accepted_command = stored
+    state.last_command_w = float(stored.setpoint_w)
+    state.last_command_ts = receipt.accepted_ts / 1000.0
+    state.stop_inverter_cleared = stored.stop_at_ms is None
+    return True
 
 
 def apply_accepted_command(controller: BatteryControllerState, decision: BatteryDecision) -> None:
@@ -628,11 +714,15 @@ class FastControlPolicy:
         for index in range(len(plan.specs)):
             controller = state.battery(index)
             measured = measurement.battery(index)
-            actual_w = (
-                measured.power_w
-                if use_measured and measured.valid and measured.power_w is not None
-                else controller.held_setpoint_w
-            )
+            if use_measured and measured.valid and measured.power_w is not None:
+                actual_w = measured.power_w
+            elif plan.format_version == 2 and controller.execution_status != "accepted":
+                # The in-force setpoint is not a sensor reading. Without an
+                # accepted command this segment is unknown, not a measured
+                # zero, and no deviation is booked for it.
+                continue
+            else:
+                actual_w = controller.held_setpoint_w
             if plan.format_version == 2:
                 # Split only at actual profile/interval edges; do not charge the
                 # current mean for the entire elapsed tick (or an earlier row).
@@ -779,6 +869,11 @@ class FastControlPolicy:
             else:
                 house_w -= state.battery(index).held_setpoint_w
 
+        economics_supported = True
+        if plan.format_version == 2:
+            context = plan.financial_context
+            economics_supported = bool(context is not None and context.economics_supported)
+
         decision = Decision(
             timestamp=now,
             house_w=house_w,
@@ -861,10 +956,18 @@ class FastControlPolicy:
 
             benefit = cost(plan_w) - cost(best_power)
 
+            if not economics_supported:
+                # Unsupported economics forbid a deviation, never the plan
+                # itself: the plan is still followed, without a benefit claim.
+                best_power = plan_w
+                benefit = 0.0
+                reasons.append("economics_unsupported")
+
             # Peak shaving overrules the economics, but never the hardware or
-            # the state of charge working range.
+            # the state of charge working range. Without economics there is no
+            # deviation at all, so the peak shave may not create one either.
             peak_shaved = False
-            if self.limits.max_grid_import is not None:
+            if economics_supported and self.limits.max_grid_import is not None:
                 needed = self.limits.max_grid_import - others_w
                 if needed < best_power:
                     hard_low, hard_high = self._hard_bounds(spec, soc, plan_w)
@@ -892,10 +995,16 @@ class FastControlPolicy:
                 storage_value=storage_value,
                 reasons=reasons,
                 profiled=plan.format_version == 2,
+                economics_supported=economics_supported,
             )
             decision.batteries.append(battery_decision)
 
-            total_benefit += max(0.0, benefit) if battery_decision.override else 0.0
+            # A segment whose execution is not accepted books no euro claim:
+            # an unproven or ambiguous execution is not a saving.
+            countable = battery_decision.override
+            if plan.format_version == 2 and controller.execution_status != "accepted":
+                countable = False
+            total_benefit += max(0.0, benefit) if countable else 0.0
             any_override = any_override or battery_decision.override
             residual = others_w + battery_decision.setpoint_w
 
@@ -939,6 +1048,18 @@ class FastControlPolicy:
             )
         return min(low, plan_w), max(high, plan_w)
 
+    @staticmethod
+    def _confirmed_baseline(controller: BatteryControllerState) -> float:
+        """The in-force setpoint of a financial segment, but only when proven.
+
+        Only an accepted command proves an in-force setpoint. Without one
+        nothing is in force: the plan power is a proposal, never an already
+        in-force fact.
+        """
+        if controller.execution_status == "accepted":
+            return controller.held_setpoint_w
+        return 0.0
+
     def _stabilise(
         self,
         index: int,
@@ -954,6 +1075,7 @@ class FastControlPolicy:
         reasons: list[str],
         *,
         profiled: bool = False,
+        economics_supported: bool = True,
     ) -> BatteryDecision:
         """Apply hysteresis, deadband and minimum command interval.
 
@@ -967,7 +1089,16 @@ class FastControlPolicy:
         deviating = abs(target_w - plan_w) > limits.release_deviation
         baseline_w = controller.held_setpoint_w
 
-        if deviating:
+        if profiled and not economics_supported:
+            # Without economics no deviation is allowed at all, not even an
+            # existing one: it ends in this very tick, without the release
+            # hysteresis. The target is the plan power.
+            controller.quiet_since = None
+            override = False
+            target_w = plan_w
+            if not controller.override_active:
+                baseline_w = self._confirmed_baseline(controller)
+        elif deviating:
             controller.quiet_since = None
             override = True
         elif controller.override_active:
@@ -981,11 +1112,18 @@ class FastControlPolicy:
         else:
             controller.quiet_since = None
             override = False
-            # Reconcile the in-force plan fact across ticks, without claiming
-            # helper acceptance or forcing a redundant write.
-            controller.held_setpoint_w = plan_w
-            baseline_w = plan_w
-            target_w = plan_w
+            if profiled:
+                # v2: the optimizer wrote nothing, so the plan power is not an
+                # already in-force fact but a proposal. Only a confirmed
+                # command proves an in-force setpoint.
+                baseline_w = self._confirmed_baseline(controller)
+                target_w = plan_w
+            else:
+                # Reconcile the in-force plan fact across ticks, without claiming
+                # helper acceptance or forcing a redundant write.
+                controller.held_setpoint_w = plan_w
+                baseline_w = plan_w
+                target_w = plan_w
 
         releasing = controller.override_active and not override
         restoring = controller.restore_pending and not override
@@ -1004,12 +1142,18 @@ class FastControlPolicy:
         )
 
         if (not releasing and not pending_stop) or restoring:
-            if not restoring and change < limits.deadband:
+            # In the financial regime the thresholds guard an override only: a
+            # plan-following command is a real proposal whenever the plan power
+            # differs from the in-force setpoint. The legacy regime keeps its
+            # behaviour exactly.
+            guarded = not profiled or override
+            if not restoring and change < limits.deadband and (guarded or change == 0):
                 target_w = baseline_w
                 write = False
                 reasons.append("deadband")
             elif (
-                now - controller.last_change_ts < limits.min_command_interval
+                guarded
+                and now - controller.last_change_ts < limits.min_command_interval
                 and (restoring or limits.urgent_deviation <= 0 or change < limits.urgent_deviation)
             ):
                 target_w = baseline_w
@@ -1017,7 +1161,9 @@ class FastControlPolicy:
                 reasons.append("rate_limited")
 
         target_w = round(target_w)
-        if write:
+        if write and not profiled:
+            # In the financial regime a proposal is not an in-force change: the
+            # runner stamps the moment of an applied acceptance instead.
             controller.last_change_ts = now
         controller.override_active = override
 
@@ -1079,14 +1225,27 @@ class FastControlPolicy:
         plan_w = round(profile_power_at(step, now) if profiled else step.ac_power_w)
         releasing = (controller.override_active or controller.held_stop_inverter_cleared
                      or controller.restore_pending)
-        write = (
-            releasing or abs(plan_w - controller.held_setpoint_w) >= self.limits.deadband
-        )
-        if (controller.restore_pending
+        if profiled:
+            # v2: the threshold never suppresses a plan-following. Only a
+            # confirmed command proves an in-force setpoint, so without one
+            # the plan power is always a proposal. The legacy regime keeps
+            # its behaviour exactly.
+            baseline_w = self._confirmed_baseline(controller)
+            write = releasing or plan_w != baseline_w
+        else:
+            write = (
+                releasing or abs(plan_w - controller.held_setpoint_w) >= self.limits.deadband
+            )
+        if (not profiled
+                and controller.restore_pending
                 and now - controller.last_change_ts < self.limits.min_command_interval):
+            # The legacy restore/rate-limit path belongs to v1: in the
+            # financial regime a plan-following is a proposal that the
+            # threshold and the rate limit may never hide.
             write = False
             reason += "+rate_limited"
-        if write:
+        if write and not profiled:
+            # In the financial regime a proposal is not an in-force change.
             controller.last_change_ts = now
         mode: Optional[str] = None
         stop_inverter: Optional[str] = None

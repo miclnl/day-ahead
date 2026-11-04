@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from dao.prog.fastctrl import receiver
+from dao.prog.fastctrl.actuator import FinancialActuationAdapter
 from dao.prog.fastctrl.command import HelperResult
 
 
@@ -28,8 +29,13 @@ def _durable_write(path, data):
         os.close(directory)
 
 
-class FencedReceiver:
-    """The only executable fenced gateway in F2c2; not a qualified adapter."""
+class FencedReceiver(FinancialActuationAdapter):
+    """The only executable fenced gateway in F2c2; a test double, not an adapter.
+
+    The nominal qualification is the whole point of this inheritance: it is
+    the only way to carry financial command rights in this repository. The fake
+    remains a test double; it is not a qualified production adapter.
+    """
 
     def __init__(self, path, *, initial_state, utc_ms, clock_uncertainty_ms=0):
         path = Path(path)

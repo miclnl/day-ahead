@@ -1596,3 +1596,33 @@ def test_final_cell_direction_audit_precedes_every_consumer(capture, snapshot, b
     else:
         assert instance._debug_finalized_solution is previous_solution
         assert instance._debug_financial_terms is previous_terms
+
+
+def test_f2c5_the_device_intents_are_published_and_never_consumed():
+    """No intent consumer exists: an intent never becomes a device write."""
+    from pathlib import Path
+
+    from dao.prog import fastctrl
+
+    root = Path(fastctrl.__file__).parent
+    sources = {path.name: path.read_text(encoding="utf-8") for path in root.glob("*.py")}
+    # The fast layer never reads the published intents and never knows their type.
+    offenders = sorted(
+        name for name, text in sources.items()
+        if "device_intents" in text or "DeviceWriteIntent" in text
+    )
+    assert offenders == []
+
+
+@pytest.mark.parametrize("capture", [{"active": True, "solve": True, "f1b": True,
+    "supported": True, "with_batteries": True, "heating": True,
+    "early_temperature": True}], indirect=True)
+def test_f2c5_the_published_intents_never_reach_the_device_channel(capture):
+    """The write spy proves it: the intents are published and never written."""
+    instance = capture["instance"]
+    intents = getattr(instance, "device_intents", [])
+    # The intents exist: the producer collected them instead of writing them.
+    assert intents, "the producer published no device intents at all"
+    assert any(i.operation == "set_value" for i in intents)
+    # The write spy on the device channel stayed empty: no intent became a write.
+    assert capture["ha_writes"] == []

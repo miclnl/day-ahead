@@ -33,11 +33,21 @@ from dao.prog.config.models.fastcontrol import (
 )
 from dao.prog.config.models.pricing import PricingConfig
 
-from .actuator import CommandReceipt, execute_battery_command
-from .command import Deadline
+from . import execution as execution_boundary
+from .actuator import (
+    FENCED_ADAPTER,
+    LEGACY_ONLY_ADAPTER,
+    ActuationVerdict,
+    CommandReceipt,
+    classify_actuation_adapter,
+    execute_battery_command,
+)
+from .command import ActuationReceipt, BarrierReceipt, BatteryCommand, ClockSample, Deadline
 from .ownership import MirrorWriteFailed, OwnerCoordinator, RecoveryRequired
-from .plan import FAST_PLAN_FILE, FastPlan, load_plan
+from .plan import FAST_PLAN_FILE, NO_STOP_SENTINEL, FastPlan, load_plan
 from .policy import (
+    POWER_EPS,
+    BatteryDecision,
     BatteryMeasurement,
     ControllerState,
     Decision,
@@ -45,6 +55,7 @@ from .policy import (
     Measurement,
     PolicyLimits,
     apply_accepted_command,
+    apply_execution_outcome,
 )
 from .publication import (
     FallbackReceipt,
@@ -52,6 +63,7 @@ from .publication import (
     FallbackSink,
     GatePolicy,
     GateVerdict,
+    PublicationLockBusy,
     canonical_plan_path,
     following_verdict,
     publication_lock,
@@ -117,6 +129,16 @@ def _parse_float(raw: Any) -> Optional[float]:
     return value if value == value else None
 
 
+def _boot_id() -> str:
+    """The boot identity of this machine; never empty, never a random value."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as handle:
+            value = handle.read().strip()
+    except OSError:
+        value = ""
+    return value or "unknown-boot"
+
+
 class HomeAssistantGateway:
     """Batched reads and guarded writes against the Home Assistant REST API.
 
@@ -125,6 +147,11 @@ class HomeAssistantGateway:
     configured. When the template endpoint is unavailable the gateway falls back
     to individual state reads and remembers that for the rest of the run.
     """
+
+    #: The generic gateway is explicitly legacy-only. This is a label, never a
+    #: release: it can never become ``FENCED_ADAPTER`` and the class does not
+    #: inherit :class:`FinancialActuationAdapter`.
+    actuation_adapter_class = LEGACY_ONLY_ADAPTER
 
     def __init__(self, hass, use_template: bool = True):
         self.hass = hass
@@ -314,6 +341,12 @@ class FastControlRunner:
         self.last_gate: GateVerdict | None = None
         self.last_fallback: FallbackReceipt | None = None
         self.last_receipts: list[CommandReceipt] = []
+        #: The explicit outcome of the last actuation attempt: allowed only for
+        #: a canonical accepted receipt.
+        self.last_actuation: ActuationVerdict | None = None
+        #: True when this tick's diagnostics publication is suppressed because
+        #: the financial route refused a diagnostics overlap.
+        self._publish_suppressed = False
         self.fallback_pending = False
         self._last_fallback_at: float | None = None
         self.config: FastControlConfig = config or getattr(
@@ -529,6 +562,9 @@ class FastControlRunner:
             battery.override_active = False
             battery.stop_inverter_cleared = False
             battery.held_stop_inverter_cleared = False
+            # A blocked period is not an execution. The recovery duty and the
+            # pending command stay exactly as they are.
+            apply_execution_outcome(battery, outcome="unknown")
         return self._request_fallback(verdict.reason, now_ts=now_ts)
 
     def _request_fallback(self, reason: str, *, now_ts: int) -> FallbackReceipt:
@@ -559,6 +595,9 @@ class FastControlRunner:
         """Run one control cycle. Returns the decision, or None when idle."""
         now = time.time() if now is None else now
         self.last_receipts = []
+        # Every tick starts without a suppression: the flag belongs to the tick
+        # that refuses a diagnostics overlap.
+        self._publish_suppressed = False
 
         # Geen mtime-/inodescache als autorisatie. Geen sensor-/sink-I/O onder dit slot.
         try:
@@ -672,7 +711,7 @@ class FastControlRunner:
             if previous_tick_ts
             else 0.0
         )
-        self.state.saved_today_eur += decision.benefit_eur_h * elapsed_h
+        self._book_saving(decision, elapsed_h=elapsed_h)
         if mode != MODE_ACTIVE:
             # Nothing was actually written this tick, so this contribution
             # (and therefore today's total) is a projection, not a measured
@@ -685,6 +724,15 @@ class FastControlRunner:
         self.state.refresh_budget_aggregates()
         self._persist_state(now)
         return decision
+
+    def _book_saving(self, decision: Decision, *, elapsed_h: float) -> None:
+        """Book the proven saving of this tick into today's total.
+
+        The euro claim of a decision is only nonzero when the segment was
+        really executed: an unproven or ambiguous segment books nothing at
+        all, so this addition stays zero for a refused tick.
+        """
+        self.state.saved_today_eur += decision.benefit_eur_h * elapsed_h
 
     def _warn_if_plan_expired(self, decision, plan: FastPlan, now: float) -> None:
         """Keep saying so while the plan does not cover the current moment.
@@ -866,6 +914,21 @@ class FastControlRunner:
         self._state_signature = signature
 
     def _actuate(self, decision: Decision, plan: FastPlan, mode: str) -> tuple[CommandReceipt, ...]:
+        """Route the tick to the legacy (v1) or the financial (v2) actuator.
+
+        The legacy route stays exactly as it was: the helper path, the legacy
+        receipt and the legacy state update. The financial route has its own
+        consumer, its own adapter qualification and its own receipts.
+
+        A plan is financial when it is a v2 plan. A v2 plan without a financial
+        context is refused by the financial route itself; it never falls
+        through to the legacy helpers.
+        """
+        if plan.format_version == 2:
+            return self._actuate_financial(decision, plan, mode)
+        return self._actuate_legacy(decision, plan, mode)
+
+    def _actuate_legacy(self, decision: Decision, plan: FastPlan, mode: str) -> tuple[CommandReceipt, ...]:
         self.last_receipts = []
         for battery in decision.batteries:
             battery.actuation_status = None
@@ -913,7 +976,352 @@ class FastControlRunner:
                 self._request_fallback(f"actuation_{receipt.status}", now_ts=int(decision.timestamp))
         return tuple(self.last_receipts)
 
+    def _actuate_financial(self, decision: Decision, plan: FastPlan, mode: str) -> tuple[CommandReceipt, ...]:
+        """The financial route: one owner, one writer, never the legacy helpers."""
+        self.last_receipts = []
+        # The overlap is determined first: the publication of a financial tick
+        # with an overlap is suppressed, whatever the refusal reason will be.
+        overlap = self._suppress_overlap(plan)
+        if plan.financial_context is None:
+            # A v2 plan without a financial context is not a financial plan:
+            # there is no identity to bind a command to. The reason keeps its
+            # precedence over the overlap.
+            return self._deny_financial("missing_financial_context", decision)
+        if overlap:
+            return self._deny_financial("diagnostics_overlap", decision)
+        if mode == MODE_SHADOW:
+            # Shadow stays a projection: no receipt and no command state change.
+            return self._deny_financial("shadow", decision)
+        if mode != MODE_ACTIVE:
+            return self._deny_financial("mode_inactive", decision)
+        return self._consume_financial_actuation(
+            decision, plan, owner=self.owner, now_ms=int(round(decision.timestamp * 1000))
+        )
+
+    def _suppress_overlap(self, plan: FastPlan) -> bool:
+        """Whether the diagnostics of this plan overlap an actuator entity.
+
+        The overlap is determined without side effects apart from the
+        suppression of the publication: the diagnostics may never write an
+        actuator entity, not even in a tick that is refused for another reason.
+        """
+        if not self._diagnostics_overlap(plan):
+            return False
+        self._publish_suppressed = True
+        return True
+
+    def _deny_financial(self, reason: str, decision: Decision) -> tuple[ActuationReceipt, ...]:
+        """An explicit refusal: no receipt, no command, a readable reason.
+
+        A refusal that means "this tick executed nothing" applies the row
+        `unknown`: an old accepted status may not stay behind while nothing
+        was executed. A shadow tick and a deadband tick are no-ops: they say
+        nothing about an execution at all.
+        """
+        self.last_receipts = []
+        self.last_actuation = ActuationVerdict(False, reason)
+        for battery in decision.batteries:
+            battery.actuation_status = None
+        if reason not in ("shadow", "no_proposal"):
+            for battery in decision.batteries:
+                apply_execution_outcome(self.state.battery(battery.index), outcome="unknown")
+        return ()
+
+    def _diagnostics_overlap(self, plan: FastPlan) -> bool:
+        """The diagnostics write Home Assistant entities of their own.
+
+        They may not alias the actuator, mode or stop entity of a battery: the
+        diagnostic write would then become a second, unmarked command writer.
+        The comparison is on the exact entity name.
+        """
+        diagnostics = self.config.diagnostics
+        published = {
+            diagnostics.entity_status,
+            diagnostics.entity_active,
+            diagnostics.entity_setpoint,
+            diagnostics.entity_benefit,
+            diagnostics.entity_saved_today,
+        }
+        published = {entity for entity in published if entity}
+        if not published:
+            return False
+        for spec in plan.specs:
+            for entity in (spec.setpoint_entity, spec.mode_entity, spec.stop_inverter_entity):
+                if entity and entity in published:
+                    return True
+        return False
+
+    def _command_request(self, plan: FastPlan, decision: Decision,
+                         battery: BatteryDecision) -> execution_boundary.CommandRequest:
+        """One canonical command request: no identity, no epoch, no digest."""
+        spec = plan.spec(battery.index)
+        setpoint_w = int(round(battery.setpoint_w))
+        mode = battery.mode
+        if mode is None:
+            mode = spec.mode_on if abs(setpoint_w) >= POWER_EPS else spec.mode_off
+        return execution_boundary.CommandRequest(
+            battery_name=battery.name,
+            setpoint_w=setpoint_w,
+            mode=mode,
+            stop_at_ms=self._command_stop_at_ms(plan, decision, battery),
+        )
+
+    def _command_stop_at_ms(self, plan: FastPlan, decision: Decision,
+                            battery: BatteryDecision) -> Optional[int]:
+        """The stop moment this command carries; None means "no stop"."""
+        if battery.stop_inverter is not None:
+            if battery.stop_inverter == NO_STOP_SENTINEL:
+                return None
+            try:
+                moment = datetime.datetime.fromisoformat(battery.stop_inverter)
+            except ValueError:
+                return None
+            return int(round(moment.timestamp() * 1000))
+        interval = plan.interval_at(decision.timestamp)
+        if interval is None:
+            return None
+        step = interval.battery(battery.index)
+        if step.stop_ts is None:
+            return None
+        return int(step.stop_ts) * 1000
+
+    def _consume_financial_actuation(self, decision: Decision, plan: FastPlan, *,
+                                     owner: OwnerCoordinator | None,
+                                     now_ms: int) -> tuple[ActuationReceipt, ...]:
+        """The one financial consumer: the owner writes, the receiver confirms.
+
+        Every refusal is explicit and machine-readable. No epoch, installation
+        id or command identity is ever invented: without a bound owner or a
+        nominally qualified adapter there simply is no command to give.
+        """
+        self.last_receipts = []
+        # The overlap is determined first: the publication of a financial tick
+        # with an overlap is suppressed, whatever the refusal reason will be.
+        overlap = self._suppress_overlap(plan)
+        if plan.financial_context is None:
+            # The reason keeps its precedence over the overlap.
+            return self._deny_financial("missing_financial_context", decision)
+        if overlap:
+            return self._deny_financial("diagnostics_overlap", decision)
+        if owner is None or owner.binding is None or owner.phase != "owned":
+            return self._deny_financial("owner_unavailable", decision)
+        receiver = owner.receiver
+        if receiver is None or classify_actuation_adapter(receiver) != FENCED_ADAPTER:
+            return self._deny_financial("adapter_unqualified", decision)
+        if any(b.recovery_required for b in self.state.batteries):
+            # An ambiguous outcome stops the whole installation: no further
+            # command, not even a stop, until an exact safe barrier.
+            return self._deny_financial("recovery_required", decision)
+        proposals = [b for b in decision.batteries if b.write]
+        if not proposals:
+            return self._deny_financial("no_proposal", decision)
+
+        binding = owner.binding
+        context = plan.financial_context
+        clock = ClockSample(utc_ms=int(now_ms), boottime_ns=owner.now_ns(),
+                             boot_id=_boot_id(), uncertainty_ms=0, healthy=True)
+        # One absolute transport window for the whole installation; a retry or a
+        # second battery never gets a new window.
+        execute_before = min(context.not_after_ts * 1000, binding.owner_not_after_ms)
+        deadline = Deadline(clock.boottime_ns + execution_boundary.TRANSPORT_BUDGET_NS,
+                            execute_before)
+        receipts: list[ActuationReceipt] = []
+        refusal = ""
+        try:
+            # The publication lease is taken here and released only after the
+            # result has been recorded. There is no nested acquisition.
+            with publication_lock(self.plan_path) as lease:
+                # The proposal is bound to the fresh publication under the lock:
+                # only the published plan may carry this command.
+                try:
+                    execution_boundary.validate_current_locked(
+                        lease=lease, expected_digest=execution_boundary.plan_digest(plan),
+                        clock=clock, policy=self.gate_policy)
+                except execution_boundary.ExecutionRefused as exception:
+                    return self._deny_financial(exception.reason, decision)
+                captured, restore = self._observe_pending_command(owner)
+                try:
+                    for battery in proposals:
+                        try:
+                            receipt = execution_boundary.owner_section(
+                                lease=lease, owner=owner, receiver=receiver,
+                                request=self._command_request(plan, decision, battery),
+                                policy=self.gate_policy, clock=clock, deadline=deadline,
+                            )
+                        except execution_boundary.ExecutionRefused as exception:
+                            # A refusal is an execution outcome, never a silent end.
+                            refusal = exception.reason
+                            self._record_refusal(battery, owner)
+                            break
+                        if receipt is None:
+                            refusal = "no_receipt"
+                            self._record_refusal(battery, owner)
+                            break
+                        receipts.append(receipt)
+                        self._record_financial_outcome(battery, receipt,
+                                                       captured.get(battery.name))
+                        if receipt.status != "accepted":
+                            # An ambiguous or refused outcome stops the installation.
+                            break
+                finally:
+                    restore()
+        except PublicationLockBusy:
+            return self._deny_financial("publication_busy", decision)
+
+        allowed = bool(proposals) and len(receipts) == len(proposals) and all(
+            receipt.status == "accepted" for receipt in receipts)
+        if refusal:
+            reason = refusal
+        elif not receipts:
+            reason = "no_receipt"
+        elif allowed:
+            reason = "accepted"
+        else:
+            reason = receipts[-1].status
+        self.last_receipts = list(receipts)
+        self.last_actuation = ActuationVerdict(allowed, reason)
+        return tuple(receipts)
+
+    def _observe_pending_command(self, owner: OwnerCoordinator):
+        """Observe the exact stored command; restore the attribute exactly.
+
+        The observation exists only while the publication lease is held, so a
+        command can never be watched without the lock. The durable storage is
+        always the class method: an earlier instance attribute never replaces
+        it, so the pending command always lands in the owner's own mirror. An
+        earlier instance attribute is put back, not removed.
+        """
+        had_attribute = "record_pending_command" in owner.__dict__
+        original = owner.__dict__.get("record_pending_command")
+        captured: dict[str, BatteryCommand] = {}
+
+        def capture(command: BatteryCommand) -> None:
+            captured[command.battery_name] = command
+            # The durable storage is the class method, never an instance
+            # attribute that shadows it.
+            OwnerCoordinator.record_pending_command(owner, command)
+
+        def restore() -> None:
+            if had_attribute:
+                owner.record_pending_command = original
+            else:
+                del owner.record_pending_command
+
+        owner.record_pending_command = capture
+        return captured, restore
+
+    def _pending_in_mirror(self, owner: OwnerCoordinator | None,
+                           battery_name: str) -> BatteryCommand | None:
+        """The pending command of this battery in the owner's own mirror."""
+        state = owner.state if owner is not None else None
+        pending = state.pending_command if state is not None else None
+        if pending is None or pending.battery_name != battery_name:
+            return None
+        if state.owner_epoch != pending.owner_epoch:
+            return None
+        return pending
+
+    def _record_refusal(self, battery: BatteryDecision,
+                        owner: OwnerCoordinator | None) -> None:
+        """A refusal is an execution outcome: the evidence is the own mirror.
+
+        A pending command for this battery in the current owner epoch means the
+        effect is uncertain; without one there is no effect proven.
+        """
+        controller = self.state.battery(battery.index)
+        pending = self._pending_in_mirror(owner, battery.name)
+        if pending is None:
+            apply_execution_outcome(controller, outcome="unknown")
+            return
+        apply_execution_outcome(controller, outcome="unconfirmed", pending=pending)
+
+    def _record_financial_outcome(self, battery: BatteryDecision, receipt: ActuationReceipt,
+                                  pending: BatteryCommand | None) -> None:
+        """Fold one canonical receipt into the controller state; no I/O."""
+        controller = self.state.battery(battery.index)
+        battery.actuation_status = receipt.status
+        if receipt.status == "accepted":
+            applied = apply_execution_outcome(controller, outcome="accepted",
+                                              receipt=receipt, pending=pending)
+            if applied:
+                # The in-force facts belong to the runner, not to the receipt:
+                # the policy never invents an in-force reality. They follow an
+                # applied acceptance and nothing else.
+                stored = controller.last_accepted_command
+                controller.held_setpoint_w = float(stored.setpoint_w)
+                controller.held_stop_inverter_cleared = controller.stop_inverter_cleared
+                controller.last_change_ts = receipt.accepted_ts / 1000.0
+        elif receipt.status == "unconfirmed":
+            apply_execution_outcome(controller, outcome="unconfirmed", receipt=receipt,
+                                    pending=pending)
+        else:
+            # A proven absence of effect is not an execution.
+            apply_execution_outcome(controller, outcome="unknown", receipt=receipt,
+                                    pending=pending)
+
+    def _apply_stop_barrier(self, barrier: BarrierReceipt | None, *, now_ms: int) -> None:
+        """Only the owner's own exact safe barrier ends the financial recovery duty.
+
+        The barrier is compared field by field with the owner's own stored
+        barrier receipt: a receipt that differs in any field is not the
+        owner's barrier. The timeliness of that receipt is judged on its own:
+        a future acceptance is not a fact and never lifts the duty, not even
+        without a pending command. The epoch coverage is only required when
+        there is a pending command that the barrier has to withdraw.
+        """
+        if type(barrier) is not BarrierReceipt:
+            return
+        owner = self.owner
+        state = owner.state if owner is not None else None
+        if state is None or state.phase != "released":
+            return
+        own = state.last_barrier
+        if own is None or type(own) is not BarrierReceipt:
+            return
+        # The barrier must be the owner's own last barrier, field by field.
+        if (barrier.barrier_id != own.barrier_id
+                or barrier.installation_id != own.installation_id
+                or barrier.receiver_generation != own.receiver_generation
+                or barrier.revoked_through_epoch != own.revoked_through_epoch
+                or barrier.current_epoch != own.current_epoch
+                or barrier.status != own.status
+                or barrier.queues_fenced != own.queues_fenced
+                or barrier.safe_state != own.safe_state
+                or barrier.accepted_ts != own.accepted_ts):
+            return
+        if barrier.installation_id != state.installation_id:
+            return
+        if barrier.receiver_generation != state.receiver_generation:
+            return
+        if (barrier.status != "accepted" or not barrier.queues_fenced
+                or barrier.safe_state != "confirmed"):
+            return
+        if barrier.accepted_ts is None:
+            # Without an acceptance moment the barrier proves nothing.
+            return
+        if barrier.accepted_ts > now_ms:
+            # A future timestamp is not a fact: the duty stays.
+            return
+        for battery in self.state.batteries:
+            pending = battery.pending_command
+            if pending is None and not battery.recovery_required:
+                # No open recovery duty: this battery stays untouched.
+                continue
+            if pending is not None:
+                if barrier.accepted_ts < pending.issued_at_ms:
+                    # A barrier from before the command does not withdraw it.
+                    continue
+                if barrier.revoked_through_epoch < pending.owner_epoch:
+                    # The barrier does not cover the epoch of the command.
+                    continue
+            apply_execution_outcome(battery, outcome="stopped")
+
     def _publish(self, decision: Decision, mode: str, measurement: Measurement) -> None:
+        if self._publish_suppressed:
+            # A diagnostics overlap refused the financial route: this tick
+            # writes nothing at all, not even a diagnostic entity that does
+            # not overlap.
+            return
         diagnostics = self.config.diagnostics
         attributes = decision.as_attributes()
         attributes["mode"] = mode
@@ -1039,7 +1447,9 @@ class FastControlRunner:
         if self.owner is None or self._owner_writer is None:
             return
         try:
-            self.owner.stop(reason=reason)
+            barrier = self.owner.stop(reason=reason)
+            # An exact accepted safe barrier ends the financial recovery duty.
+            self._apply_stop_barrier(barrier, now_ms=self.owner.now_ms())
         except Exception as exception:  # noqa: BLE001
             self.owner.report_failure(exception.reason if isinstance(exception, (MirrorWriteFailed, RecoveryRequired))
                                       else "owner_stop_failed")

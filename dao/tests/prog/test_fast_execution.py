@@ -1180,8 +1180,16 @@ def test_10_the_production_route_never_reaches_the_send(artifact, monkeypatch):
     assert runner.last_gate.reason == "actuation_gates_unproven"
     assert hass.values == hass.options == hass.switches == hass.published == {}
     assert reached == []
-    # The runner does not even import the mechanical boundary.
-    assert "fastctrl.execution" not in inspect.getsource(runner_module)
+    # The production route never reaches the mechanical boundary: the spy sits
+    # on the boundary itself, so a call through any name would show up.
+    monkeypatch.setattr(module, "owner_section", lambda *args, **kwargs: reached.append(kwargs))
+    assert runner.tick(NOW_TS + 1) is None
+    assert runner.last_gate.reason == "actuation_gates_unproven"
+    assert reached == []
+    # The runner binds the boundary under exactly one alias, so the spy above
+    # covers every path into it.
+    assert [name for name, member in inspect.getmembers(runner_module)
+            if member is module] == ["execution_boundary"]
 
 
 def test_12_the_regressions_use_no_sleep_as_causal_synchronisation():

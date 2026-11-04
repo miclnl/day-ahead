@@ -1022,3 +1022,448 @@ class TestScarcity:
         value = estimate_storage_value(plan, T0 + 10, 0, PolicyLimits())
         expected = plan.price_average * PolicyLimits().round_trip_efficiency
         assert value == pytest.approx(expected, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# F2c5: the financial regime of the policy
+# ---------------------------------------------------------------------------
+
+
+def financial_plan(*, powers=(-2000.0,), economics_supported=True, prices=None):
+    """A ready-v2 plan with a rectangular profile and a real import price."""
+    from dataclasses import replace
+
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    plan = ready_plan()
+    intervals = []
+    for index, row in enumerate(plan.intervals):
+        power = powers[index] if index < len(powers) else powers[-1]
+        if prices:
+            price = prices[index] if index < len(prices) else prices[-1]
+        else:
+            price = 0.30
+        step = replace(row.battery(0), ac_power_w=power, mean_ac_power_w=power,
+                       on_power_w=power, active_from_ts=row.start_ts, stop_ts=None)
+        intervals.append(replace(row, price_import=price, price_export=0.0,
+                                 batteries=[step]))
+    plan = replace(plan, intervals=intervals, price_average=0.30)
+    if not economics_supported:
+        plan = replace(plan, financial_context=replace(plan.financial_context,
+                                                       economics_supported=False))
+    return plan
+
+
+def test_f2c5_a_v2_plan_proposes_the_plan_power_instead_of_assuming_it():
+    """The optimizer wrote nothing, so the plan power is a command."""
+    plan = financial_plan()
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    decision = FastControlPolicy(PolicyLimits()).decide(
+        plan, measure(grid_w=2000.0, timestamp=now), state)
+    battery = decision.batteries[0]
+    assert battery.setpoint_w == -2000
+    assert battery.write is True
+    assert battery.override is False
+    # The in-force setpoint is not reconciled without an acceptance.
+    assert state.battery(0).held_setpoint_w == 0.0
+
+
+def test_f2c5_the_legacy_route_still_assumes_the_plan_power():
+    from dataclasses import replace
+
+    plan = replace(financial_plan(), format_version=1, financial_context=None)
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    decision = FastControlPolicy(PolicyLimits()).decide(
+        plan, measure(grid_w=2000.0, timestamp=now), state)
+    battery = decision.batteries[0]
+    assert battery.write is False
+    assert state.battery(0).held_setpoint_w == -2000.0
+
+
+def test_f2c5_a_missing_acceptance_is_not_hidden_by_the_deadband():
+    plan = financial_plan()
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    policy = FastControlPolicy(PolicyLimits())
+    first = policy.decide(plan, measure(grid_w=2000.0, timestamp=now), state)
+    assert first.batteries[0].write is True
+    # Nothing was accepted, so the second tick proposes again.
+    second = policy.decide(plan, measure(grid_w=2000.0, timestamp=now + 60), state)
+    assert second.batteries[0].write is True
+    assert second.batteries[0].setpoint_w == -2000
+
+
+def test_f2c5_unsupported_economics_forbid_a_deviation_but_not_the_plan():
+    plan = financial_plan(economics_supported=False)
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    policy = FastControlPolicy(PolicyLimits(min_benefit=0.0))
+    decision = policy.decide(plan, measure(grid_w=5000.0, timestamp=now), state)
+    battery = decision.batteries[0]
+    assert battery.override is False
+    assert battery.setpoint_w == -2000
+    assert "economics_unsupported" in battery.reason
+    # The plan is still followed: it is proposed as a real command.
+    assert battery.write is True
+
+
+def test_f2c5_only_an_accepted_v2_segment_books_a_benefit():
+    plan = financial_plan()
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    policy = FastControlPolicy(PolicyLimits(min_benefit=0.0))
+    decision = policy.decide(plan, measure(grid_w=5000.0, timestamp=now), state)
+    assert decision.batteries[0].override is True
+    # Nothing is proven yet, so the deviation books no euro claim.
+    assert decision.benefit_eur_h == 0.0
+    state.battery(0).execution_status = "accepted"
+    proven = policy.decide(plan, measure(grid_w=5000.0, timestamp=now + 60), state)
+    assert proven.batteries[0].override is True
+    assert proven.benefit_eur_h > 0.0
+
+
+def test_f2c5_a_v2_segment_without_an_accepted_command_books_no_deviation():
+    from dataclasses import replace
+
+    plan = financial_plan()
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    policy = FastControlPolicy(PolicyLimits())
+    # No usable battery sensor: the policy would fall back on the held setpoint.
+    sample = Measurement(timestamp=now + 100, grid_w=0.0,
+                          batteries=[BatteryMeasurement(soc=50.0, power_w=None, valid=True)])
+    policy.account(state, plan, sample, "synthetic")
+    policy.account(state, plan, replace(sample, timestamp=now + 200), "synthetic")
+    # The held setpoint is not a sensor value: the segment stays unknown.
+    assert state.battery(0).interval_deviation_kwh == 0.0
+    state.battery(0).execution_status = "accepted"
+    state.battery(0).held_setpoint_w = -1000.0
+    policy.account(state, plan, replace(sample, timestamp=now + 300), "synthetic")
+    assert state.battery(0).interval_deviation_kwh != 0.0
+
+
+def test_f2c5_the_legacy_route_still_falls_back_on_the_held_setpoint():
+    from dataclasses import replace
+
+    plan = replace(financial_plan(), format_version=1, financial_context=None)
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    policy = FastControlPolicy(PolicyLimits())
+    sample = Measurement(timestamp=now + 100, grid_w=0.0,
+                          batteries=[BatteryMeasurement(soc=50.0, power_w=None, valid=True)])
+    policy.account(state, plan, sample, "synthetic")
+    policy.account(state, plan, replace(sample, timestamp=now + 200), "synthetic")
+    assert state.battery(0).interval_deviation_kwh != 0.0
+
+
+def test_f2c5_apply_execution_outcome_follows_the_decision_table():
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import policy as policy_module
+    from dao.prog.fastctrl.command import ActuationReceipt, BatteryCommand
+    from dao.prog.fastctrl.receiver import payload_digest
+
+    # Deliberate assertion RED, never a collection/import error.
+    assert hasattr(policy_module, "apply_execution_outcome"), (
+        "F2c5 execution outcome application missing")
+    apply_execution_outcome = policy_module.apply_execution_outcome
+
+    command = BatteryCommand(installation_id="sandbox", battery_name="accu",
+                             owner_session_id="session", owner_epoch=3, sequence=7,
+                             command_id="command-a", plan_digest="a" * 64,
+                             issued_at_ms=1000, execute_before_ms=2000,
+                             hold_until_ms=2000, setpoint_w=-2000, mode="Aan",
+                             stop_at_ms=None)
+    receipt = ActuationReceipt(installation_id="sandbox", battery_name="accu",
+                               owner_epoch=3, sequence=7, command_id="command-a",
+                               plan_digest="a" * 64, accepted_ts=1500, status="accepted",
+                               helper_results=(), owner_session_id="session",
+                               payload_digest=payload_digest(command), reason="accepted",
+                               observed_at_ms=1500, effect="complete")
+    state = ControllerState().battery(0)
+    state.pending_command = command
+
+    # Unknown: nothing changes but the status.
+    assert apply_execution_outcome(state, outcome="unknown") is True
+    assert state.execution_status == "unknown"
+    assert state.pending_command is command
+    assert state.recovery_required is False
+
+    # Unconfirmed: the uncertainty, the duty and the pending command remain.
+    assert apply_execution_outcome(state, outcome="unconfirmed", receipt=receipt,
+                                    pending=command) is True
+    assert state.execution_status == "unconfirmed"
+    assert state.recovery_required is True
+    assert state.pending_command is command
+    assert state.last_accepted_command is None
+
+    # A receipt that does not match the stored command mutates nothing.
+    wrong = replace(receipt, command_id="command-b")
+    assert apply_execution_outcome(state, outcome="accepted", receipt=wrong,
+                                    pending=command) is False
+    assert state.execution_status == "unconfirmed"
+    assert state.recovery_required is True
+    assert state.pending_command is command
+    assert state.last_command_w == 0.0
+
+    # Another session is not this command either.
+    other_session = replace(receipt, owner_session_id="other-session")
+    assert apply_execution_outcome(state, outcome="accepted", receipt=other_session,
+                                    pending=command) is False
+    assert state.execution_status == "unconfirmed"
+    assert state.last_accepted_command is None
+
+    # Another payload is not this command either.
+    other_payload = replace(receipt, payload_digest="b" * 64)
+    assert apply_execution_outcome(state, outcome="accepted", receipt=other_payload,
+                                    pending=command) is False
+    assert state.execution_status == "unconfirmed"
+    assert state.last_accepted_command is None
+
+    # The in-force facts are never touched by an outcome.
+    assert apply_execution_outcome(state, outcome="accepted", receipt=receipt,
+                                    pending=command) is True
+    assert state.execution_status == "accepted"
+    assert state.recovery_required is True
+    assert state.pending_command is None
+    assert state.last_accepted_command is command
+    assert state.last_command_w == -2000
+    assert state.last_command_ts == 1.5
+    assert state.stop_inverter_cleared is True
+    assert state.held_setpoint_w == 0.0
+
+    # Only an exact safe barrier ends the recovery duty.
+    assert apply_execution_outcome(state, outcome="stopped") is True
+    assert state.execution_status == "stopped"
+    assert state.recovery_required is False
+    assert state.last_accepted_command is command
+
+
+def test_f2c5_the_controller_state_survives_a_roundtrip():
+    from dao.prog.fastctrl.command import BatteryCommand
+
+    command = BatteryCommand(installation_id="sandbox", battery_name="accu",
+                             owner_session_id="session", owner_epoch=3, sequence=7,
+                             command_id="command-a", plan_digest="a" * 64,
+                             issued_at_ms=1000, execute_before_ms=2000,
+                             hold_until_ms=2000, setpoint_w=-2000, mode="Aan",
+                             stop_at_ms=None)
+    state = ControllerState().battery(0)
+    state.execution_status = "accepted"
+    state.recovery_required = True
+    state.last_accepted_command = command
+    restored = ControllerState.from_dict({"batteries": [state.to_dict()]}).battery(0)
+    assert restored.execution_status == "accepted"
+    assert restored.recovery_required is True
+    assert restored.last_accepted_command == command
+
+
+def test_f2c5_unsupported_economics_forbid_the_peak_shaving_override():
+    """Without economics there is no deviation at all, not even a peak shave."""
+    prices = [0.10, 0.10, 0.60]
+    limits = PolicyLimits(min_benefit=0.0, deadband=0.0, max_grid_import=2000.0)
+
+    supported = financial_plan(powers=(0.0,), prices=prices)
+    now = supported.intervals[0].start_ts
+    decision = FastControlPolicy(limits).decide(
+        supported, measure(grid_w=6000.0, timestamp=now), ControllerState())
+    battery = decision.batteries[0]
+    # The positive control: with economics the peak shave is a real deviation.
+    assert battery.setpoint_w == pytest.approx(-4000.0, abs=1.0)
+    assert "peak_shave" in battery.reason
+    assert battery.override is True
+
+    unsupported = financial_plan(powers=(0.0,), prices=prices, economics_supported=False)
+    decision = FastControlPolicy(limits).decide(
+        unsupported, measure(grid_w=6000.0, timestamp=now), ControllerState())
+    battery = decision.batteries[0]
+    # Unsupported economics forbid every deviation: the plan is followed.
+    assert battery.override is False
+    assert battery.setpoint_w == 0
+    assert "peak_shave" not in battery.reason
+    assert "economics_unsupported" in battery.reason
+
+
+def test_f2c5_the_deadband_never_hides_a_v2_profile_transition():
+    """The deadband guards an override; a plan transition is a real command."""
+    plan = financial_plan(powers=(-2000.0, -1950.0))
+    now = plan.intervals[1].start_ts
+    state = ControllerState()
+    controller = state.battery(0)
+    # A confirmed state: the in-force setpoint is the accepted one.
+    controller.held_setpoint_w = -2000.0
+    controller.execution_status = "accepted"
+    controller.last_change_ts = now - 10
+    limits = PolicyLimits(min_benefit=0.0, deadband=150.0, min_command_interval=60.0)
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=1950.0, timestamp=now), state)
+    battery = decision.batteries[0]
+    # The change is far below the deadband, but it is a new plan power.
+    assert battery.setpoint_w == -1950
+    assert battery.write is True
+    assert battery.override is False
+
+
+def test_f2c5_a_v2_proposal_is_not_an_in_force_change():
+    """`last_change_ts` belongs to an accepted command, not to a proposal."""
+    from dataclasses import replace
+
+    plan = financial_plan()
+    now = plan.intervals[0].start_ts
+    limits = PolicyLimits(min_benefit=0.0, deadband=0.0, min_command_interval=0.0)
+    state = ControllerState()
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=2000.0, timestamp=now), state)
+    # The proposal is a real command, but it is not an in-force change.
+    assert decision.batteries[0].write is True
+    assert state.battery(0).last_change_ts == 0.0
+
+    legacy = replace(plan, format_version=1, financial_context=None)
+    legacy_state = ControllerState()
+    legacy_decision = FastControlPolicy(limits).decide(
+        legacy, measure(grid_w=2000.0, timestamp=now), legacy_state)
+    # The v1 route keeps its behaviour exactly.
+    assert legacy_decision.batteries[0].write is True
+    assert legacy_state.battery(0).last_change_ts == now
+
+
+def test_f2c5_unsupported_economics_end_an_existing_override_at_once():
+    """Without economics no deviation may persist: it ends in the same tick."""
+    plan = financial_plan(economics_supported=False)
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    controller = state.battery(0)
+    # An existing, young override: the layer is deviating right now.
+    controller.override_active = True
+    controller.quiet_since = now
+    controller.held_setpoint_w = -4000.0
+    limits = PolicyLimits(min_benefit=0.0, deadband=0.0, min_command_interval=0.0,
+                          release_time=120.0)
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=5000.0, timestamp=now), state)
+    battery = decision.batteries[0]
+    # The deviation ends now: the plan power is the target, without hysteresis.
+    assert battery.override is False
+    assert battery.setpoint_w == -2000
+    assert battery.write is True
+    assert controller.override_active is False
+
+
+def test_f2c5_the_v1_route_keeps_its_release_hysteresis():
+    """The v1 route is unchanged: a young override survives one more tick."""
+    from dataclasses import replace
+
+    plan = replace(financial_plan(), format_version=1, financial_context=None)
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    controller = state.battery(0)
+    controller.override_active = True
+    controller.quiet_since = now
+    controller.held_setpoint_w = -4000.0
+    limits = PolicyLimits(min_benefit=0.0, deadband=0.0, min_command_interval=0.0,
+                          release_time=120.0)
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=5000.0, timestamp=now), state)
+    battery = decision.batteries[0]
+    # The v1 release hysteresis is untouched: the override stays.
+    assert battery.override is True
+
+
+def test_f2c5_a_v2_plan_without_a_confirmed_state_always_proposes():
+    """Without a confirmed state a non-zero plan power is always a proposal."""
+    plan = financial_plan(powers=(-100.0,))
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    controller = state.battery(0)
+    # The last command was withdrawn: there is no confirmed in-force state.
+    controller.held_setpoint_w = -100.0
+    controller.execution_status = "stopped"
+    limits = PolicyLimits(min_benefit=0.0, deadband=150.0, min_command_interval=0.0)
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=100.0, timestamp=now), state)
+    battery = decision.batteries[0]
+    # The plan power is a real command again, not an already in-force fact.
+    assert battery.setpoint_w == -100
+    assert battery.write is True
+
+
+def test_f2c5_the_fallback_also_proposes_a_v2_plan_without_a_confirmed_state():
+    """The fallback path follows the same rule: the threshold hides nothing."""
+    plan = financial_plan(powers=(-100.0,))
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    controller = state.battery(0)
+    controller.held_setpoint_w = -100.0
+    controller.execution_status = "stopped"
+    limits = PolicyLimits(min_benefit=0.0, deadband=150.0, min_command_interval=0.0)
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=100.0, timestamp=now, soc=None), state)
+    battery = decision.batteries[0]
+    assert battery.setpoint_w == -100
+    assert battery.write is True
+
+
+def test_f2c5_the_v1_route_keeps_its_deadband_in_the_fallback():
+    """The v1 fallback is unchanged: the threshold still applies there."""
+    from dataclasses import replace
+
+    plan = replace(financial_plan(powers=(-100.0,)), format_version=1,
+                   financial_context=None)
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    controller = state.battery(0)
+    controller.held_setpoint_w = -100.0
+    limits = PolicyLimits(min_benefit=0.0, deadband=150.0, min_command_interval=0.0)
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=100.0, timestamp=now, soc=None), state)
+    battery = decision.batteries[0]
+    # The v1 route keeps its behaviour exactly: no command, the threshold wins.
+    assert battery.write is False
+
+
+def test_f2c5_the_v2_fallback_delivers_the_plan_command_despite_the_rate_limit():
+    """In v2 the legacy restore/rate-limit path may not hide a plan-following."""
+    plan = financial_plan(powers=(-100.0,))
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    controller = state.battery(0)
+    # An existing deviation with a pending legacy restore and a recent change:
+    # the v1 rate-limit path would swallow the plan command.
+    controller.override_active = True
+    controller.restore_pending = True
+    controller.last_change_ts = now - 1
+    controller.held_setpoint_w = -100.0
+    limits = PolicyLimits(min_benefit=0.0, deadband=150.0, min_command_interval=60.0)
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=100.0, timestamp=now, soc=None), state)
+    battery = decision.batteries[0]
+    # The plan command is delivered: in v2 the threshold and the rate limit
+    # guard an override only, never a plan-following.
+    assert battery.setpoint_w == -100
+    assert battery.write is True
+    assert battery.override is False
+    assert "+rate_limited" not in battery.reason
+
+
+def test_f2c5_the_v1_route_keeps_its_legacy_rate_limit_in_the_fallback():
+    """The v1 fallback keeps the legacy restore/rate-limit path."""
+    from dataclasses import replace
+
+    plan = replace(financial_plan(powers=(-100.0,)), format_version=1,
+                   financial_context=None)
+    now = plan.intervals[0].start_ts
+    state = ControllerState()
+    controller = state.battery(0)
+    controller.override_active = True
+    controller.restore_pending = True
+    controller.last_change_ts = now - 1
+    controller.held_setpoint_w = -100.0
+    limits = PolicyLimits(min_benefit=0.0, deadband=150.0, min_command_interval=60.0)
+    decision = FastControlPolicy(limits).decide(
+        plan, measure(grid_w=100.0, timestamp=now, soc=None), state)
+    battery = decision.batteries[0]
+    # The v1 route keeps its behaviour exactly: the rate limit wins.
+    assert battery.write is False
+    assert "+rate_limited" in battery.reason
