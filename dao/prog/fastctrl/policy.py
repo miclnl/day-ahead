@@ -735,7 +735,7 @@ class FastControlPolicy:
         if elapsed_h <= 0.0 or interval is None:
             return
 
-        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context else ""
+        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context and owner_binding is not None else ""
         for index in range(len(plan.specs)):
             controller = state.battery(index)
             measured = measurement.battery(index)
@@ -894,7 +894,7 @@ class FastControlPolicy:
         price_export = min(interval.price_export, price_import)
 
         battery_measurements = [measurement.battery(i) for i in range(len(plan.specs))]
-        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context else ""
+        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context and owner_binding is not None else ""
         baselines = [self._confirmed_baseline(
             state.battery(i), binding=owner_binding, now_ms=int(round(now * 1000)),
             expected_digest=digest) if plan.format_version == 2 else state.battery(i).held_setpoint_w
@@ -1342,7 +1342,7 @@ class FastControlPolicy:
             price_export=interval.price_export if interval else 0.0,
             plan_grid_w=interval.grid_w if interval else 0.0,
         )
-        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context else ""
+        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context and owner_binding is not None else ""
         for index, spec in enumerate(plan.specs):
             step = interval.battery(index) if interval else None
             controller = state.battery(index)

@@ -1081,6 +1081,142 @@ def accept_policy_command(plan, state, power, timestamp):
     return binding
 
 
+def g2_aggregate_plan():
+    """Aligned profiles as one internal model, retaining the source identities."""
+    from dataclasses import replace
+
+    from dao.prog.fastctrl.simulate import aggregate_spec
+    from dao.tests.prog.test_fast_consumer import financial_plan as multi_battery_plan
+
+    source = multi_battery_plan(batteries=2, powers=(-1000.0,))
+    source.to_dict()  # The source is a valid ready-v2 plan before aggregation.
+    rows = [replace(row, batteries=[replace(
+        row.battery(0), ac_power_w=sum(b.ac_power_w for b in row.batteries),
+        mean_ac_power_w=sum(b.mean_ac_power_w for b in row.batteries),
+        on_power_w=sum(b.on_power_w for b in row.batteries))]) for row in source.intervals]
+    return replace(source, specs=[aggregate_spec(source.specs)], intervals=rows)
+
+
+G2_POLICY_ROUTES = ("account_measured", "account_unknown", "decide_measured", "decide_unknown",
+                    "release", "all_plan", "expired")
+
+
+def g2_policy_call(policy, route, plan, state, sample, binding=None):
+    from dataclasses import replace
+
+    if route.endswith("unknown"):
+        sample = replace(sample, batteries=[BatteryMeasurement(soc=50, power_w=None)])
+    if route.startswith("account_"):
+        return policy.account(state, plan, sample, "synthetic", owner_binding=binding)
+    if route == "release":
+        return policy.release(plan, sample, state, "g2_release", owner_binding=binding)
+    if route == "all_plan":
+        return policy._all_plan(plan, sample, state, "g2_fallback", plan.interval_at(sample.timestamp),
+                                owner_binding=binding)
+    if route == "expired":
+        sample = replace(sample, timestamp=plan.horizon_end_ts)
+    return policy.decide(plan, sample, state, owner_binding=binding)
+
+
+@pytest.mark.parametrize("route", G2_POLICY_ROUTES)
+def test_g2_unbound_aggregate_needs_no_execution_digest(route):
+    from dataclasses import replace
+
+    plan = g2_aggregate_plan()
+    start = plan.intervals[0].start_ts
+    state = ControllerState(last_tick_ts=start, day_key="synthetic")
+    controller = state.battery(0)
+    controller.held_setpoint_w = -4000.0  # Virtual/history only, never a measured baseline.
+    sample = measure(grid_w=4000, battery_w=-1000, timestamp=start + 60)
+    policy = FastControlPolicy(PolicyLimits())
+    failure = None
+    try:
+        decision = g2_policy_call(policy, route, plan, state, sample)
+    except ValueError as exc:
+        failure = str(exc)
+    assert failure is None, f"unbound {route} requested an execution digest: {failure}"
+    assert controller.held_setpoint_w == -4000.0
+    assert controller._current_accepted_command is None
+    assert controller.last_accepted_command is None
+    assert controller.execution_status == "unknown"
+    if route.startswith("account_"):
+        # -1000 W measured versus a -2000 W plan for one minute: +1/60 kWh.
+        expected = 1 / 60 if route == "account_measured" else 0
+        assert controller.interval_deviation_kwh == pytest.approx(expected)
+        assert controller.daily_deviation_kwh == pytest.approx(expected)
+        return
+    assert decision.benefit_eur_h == 0.0
+    battery = decision.batteries[0]
+    assert battery.write is (route != "expired")
+    if route == "decide_measured":
+        assert decision.house_w == 5000.0
+        assert battery.override is True and battery.benefit_eur_h > 0
+        # The simulator's existing virtual acceptance still grants no live right.
+        apply_accepted_command(controller, battery)
+        again = policy.decide(plan, replace(sample, timestamp=start + 61), state)
+        assert again.batteries[0].write is True
+        assert again.benefit_eur_h == 0.0
+        assert controller._current_accepted_command is None
+        assert controller.last_accepted_command is None
+        assert controller.execution_status == "unknown"
+    elif route != "expired":
+        assert battery.setpoint_w == -2000.0
+        assert battery.override is False
+        if route == "decide_unknown":
+            assert decision.reason == "execution_unknown"
+    else:
+        assert decision.reason == "plan_expired"
+
+
+@pytest.mark.parametrize("route", G2_POLICY_ROUTES)
+def test_g2_binding_keeps_aggregate_validation_strict_without_runtime_command(route):
+    from dao.prog.fastctrl.command import OwnerBinding
+
+    plan = g2_aggregate_plan()
+    start = plan.intervals[0].start_ts
+    binding = OwnerBinding(plan.financial_context.basis.meter_id, "receiver", "generation",
+                           "session", 3, "barrier", (plan.horizon_end_ts + 60) * 1000)
+    state = ControllerState(last_tick_ts=start, day_key="synthetic")
+    sample = measure(grid_w=4000, battery_w=-1000, timestamp=start + 60)
+    assert state.battery(0)._current_accepted_command is None
+    with pytest.raises(ValueError, match="^Terminal references must identify exactly the plan batteries$"):
+        g2_policy_call(FastControlPolicy(PolicyLimits()), route, plan, state, sample, binding)
+    assert state.battery(0)._current_accepted_command is None
+    assert state.battery(0).last_accepted_command is None
+
+
+def test_g2_aggregate_remains_unserializable_without_binding():
+    with pytest.raises(ValueError, match="^Terminal references must identify exactly the plan batteries$"):
+        g2_aggregate_plan().to_dict()
+
+
+def test_g2_bound_canonical_noop_still_requires_the_exact_digest():
+    from dataclasses import replace
+
+    from dao.prog.fastctrl.command import plan_digest
+    from dao.prog.fastctrl.policy import current_execution_command
+
+    plan = financial_plan()
+    start = plan.intervals[0].start_ts
+    state = ControllerState()
+    binding = accept_policy_command(plan, state, -2000, start)
+    command = state.battery(0).last_accepted_command
+    sample = measure(grid_w=0, battery_w=-2000, timestamp=start + 60)
+    policy = FastControlPolicy(PolicyLimits())
+    assert policy.decide(plan, sample, state, owner_binding=binding).batteries[0].write is False
+    assert current_execution_command(state.battery(0), binding=binding,
+                                     now_ms=(start + 60) * 1000,
+                                     expected_digest=plan_digest(plan)) == command
+    changed = replace(plan, price_average=0.31)
+    assert current_execution_command(state.battery(0), binding=binding,
+                                     now_ms=(start + 60) * 1000,
+                                     expected_digest=plan_digest(changed)) is None
+    follow = policy.decide(changed, sample, state, owner_binding=binding)
+    assert follow.batteries[0].write is True
+    assert follow.batteries[0].setpoint_w == -2000.0
+    assert state.battery(0).last_accepted_command == command
+
+
 @pytest.mark.parametrize("power", [-100.25, 100.25])
 @pytest.mark.parametrize("partial", [False, True])
 @pytest.mark.parametrize("path", ["normal", "grid_stale", "disabled", "soc_unknown", "release"])
