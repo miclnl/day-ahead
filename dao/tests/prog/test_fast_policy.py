@@ -55,8 +55,10 @@ def test_fix1_local_stop_affects_only_legacy_decisions(version, limiter):
         state = ControllerState()
         state.battery(0).held_setpoint_w = -400
         state.battery(0).last_change_ts = now - 10
+        binding = accept_policy_command(candidate, state, -400, now - 10) if version == 2 else None
         decision = FastControlPolicy(limits).decide(
-            candidate, measure(grid_w=3400, battery_w=-400, timestamp=now), state).batteries[0]
+            candidate, measure(grid_w=3400, battery_w=-400, timestamp=now), state,
+            owner_binding=binding).batteries[0]
         decisions.append((decision.setpoint_w, decision.write, decision.reason))
     assert decisions[0][0:2] == (-400, False)
     assert limiter in decisions[0][2]
@@ -1054,6 +1056,58 @@ def financial_plan(*, powers=(-2000.0,), economics_supported=True, prices=None):
     return plan
 
 
+def accept_policy_command(plan, state, power, timestamp):
+    """Apply canonical synthetic acceptance; a status flag alone proves nothing."""
+    from dao.prog.fastctrl.command import (
+        ActuationReceipt,
+        BatteryCommand,
+        OwnerBinding,
+        plan_digest,
+    )
+    from dao.prog.fastctrl.policy import apply_execution_outcome
+    from dao.prog.fastctrl.receiver import payload_digest
+
+    now_ms = int(timestamp * 1000)
+    binding = OwnerBinding(plan.financial_context.basis.meter_id, "receiver", "generation",
+                           "session", 3, "barrier", now_ms + 3_600_000)
+    command = BatteryCommand(binding.installation_id, plan.specs[0].name, "session", 3, 7,
+                             "command-a", plan_digest(plan), now_ms, now_ms + 1000,
+                             now_ms + 3_600_000, power, "Aan", None)
+    receipt = ActuationReceipt(command.installation_id, command.battery_name, 3, 7, "command-a",
+                               command.plan_digest, now_ms, "accepted", (), "session",
+                               payload_digest(command), "accepted", now_ms, "complete")
+    assert apply_execution_outcome(state.battery(0), outcome="accepted", pending=command,
+                                   receipt=receipt)
+    return binding
+
+
+@pytest.mark.parametrize("power", [-100.25, 100.25])
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("path", ["normal", "grid_stale", "disabled", "soc_unknown", "release"])
+def test_i4_fractional_profile_is_not_rounded_by_policy(power, partial, path):
+    from dataclasses import replace
+
+    plan = financial_plan(powers=(power,), economics_supported=False)
+    now = plan.intervals[0].start_ts
+    if partial:
+        for row in plan.intervals:
+            step = row.battery(0)
+            step.stop_ts = row.start_ts + 600
+            step.ac_power_w = step.mean_ac_power_w = power * 2 / 3
+    policy = FastControlPolicy(PolicyLimits())
+    sample = measure(grid_w=-power, timestamp=now, soc=None if path == "soc_unknown" else 50)
+    if path == "release":
+        decision = policy.release(plan, sample, ControllerState(), "mode_off")
+    else:
+        decision = policy.decide(plan, replace(sample, grid_valid=path != "grid_stale"),
+                                 ControllerState(), enabled=[path != "disabled"])
+    battery = decision.batteries[0]
+    assert battery.setpoint_w == power
+    assert battery.plan_w == power
+    assert battery.write is True
+    assert battery.override is False
+
+
 def test_f2c5_a_v2_plan_proposes_the_plan_power_instead_of_assuming_it():
     """The optimizer wrote nothing, so the plan power is a command."""
     plan = financial_plan()
@@ -1118,8 +1172,9 @@ def test_f2c5_only_an_accepted_v2_segment_books_a_benefit():
     assert decision.batteries[0].override is True
     # Nothing is proven yet, so the deviation books no euro claim.
     assert decision.benefit_eur_h == 0.0
-    state.battery(0).execution_status = "accepted"
-    proven = policy.decide(plan, measure(grid_w=5000.0, timestamp=now + 60), state)
+    binding = accept_policy_command(plan, state, -5000, now)
+    proven = policy.decide(plan, measure(grid_w=5000.0, timestamp=now + 60), state,
+                           owner_binding=binding)
     assert proven.batteries[0].override is True
     assert proven.benefit_eur_h > 0.0
 
@@ -1138,9 +1193,9 @@ def test_f2c5_a_v2_segment_without_an_accepted_command_books_no_deviation():
     policy.account(state, plan, replace(sample, timestamp=now + 200), "synthetic")
     # The held setpoint is not a sensor value: the segment stays unknown.
     assert state.battery(0).interval_deviation_kwh == 0.0
-    state.battery(0).execution_status = "accepted"
-    state.battery(0).held_setpoint_w = -1000.0
-    policy.account(state, plan, replace(sample, timestamp=now + 300), "synthetic")
+    binding = accept_policy_command(plan, state, -1000, now + 200)
+    policy.account(state, plan, replace(sample, timestamp=now + 300), "synthetic",
+                   owner_binding=binding)
     assert state.battery(0).interval_deviation_kwh != 0.0
 
 

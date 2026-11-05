@@ -20,6 +20,7 @@ from dao.prog.fastctrl.command import ActuationReceipt, Deadline, RevokeRequest
 from dao.prog.fastctrl.plan import profile_power_at
 from dao.prog.fastctrl.policy import (
     BatteryMeasurement,
+    ControllerState,
     FastControlPolicy,
     Measurement,
     PolicyLimits,
@@ -140,7 +141,7 @@ def build(tmp_path, *, plan=None, config=None, start_owner=True, lease_ms=LEASE_
                            store=store, plan=plan, path=path, root=tmp_path, hass=hass)
 
 
-def propose(plan, state, *, timestamp=NOW_TS, grid_w=None, limits=None):
+def propose(plan, state, *, timestamp=NOW_TS, grid_w=None, limits=None, owner_binding=None):
     """The policy's verdict for one tick."""
     policy = FastControlPolicy(limits or PolicyLimits())
     interval = plan.interval_at(timestamp)
@@ -158,12 +159,430 @@ def propose(plan, state, *, timestamp=NOW_TS, grid_w=None, limits=None):
                    for _ in plan.specs],
         grid_valid=True,
     )
-    return policy.decide(plan, measurement, state)
+    return policy.decide(plan, measurement, state, owner_binding=owner_binding)
 
 
 def consume(harness, decision, *, now_ms=NOW):
     return harness.runner._consume_financial_actuation(
         decision, harness.plan, owner=harness.owner, now_ms=now_ms)
+
+
+def restart_i4_owner(harness, session="i4-fresh-session"):
+    owner = harness.owner
+    return owner.start(
+        writer=harness.lease, receiver=harness.gateway, installation_id=INSTALLATION,
+        owner_session_id=session, requested_not_after_ms=owner.now_ms() + LEASE_MS,
+        deadline=Deadline(owner.now_ns() + 750_000_000, owner.now_ms() + 750),
+        now_ms=owner.now_ms())
+
+
+@pytest.mark.parametrize("batteries", [1, 2])
+@pytest.mark.parametrize("reload_state", [False, True])
+def test_i4_stop_restart_same_power_requires_fresh_command(tmp_path, batteries, reload_state):
+    harness = build(tmp_path, plan=financial_plan(batteries=batteries))
+    try:
+        first = consume(harness, propose(harness.plan, harness.runner.state))
+        assert [receipt.status for receipt in first] == ["accepted"] * batteries
+        history = harness.runner.state.to_dict()
+        assert all(b.pending_command is None for b in harness.runner.state.batteries)
+        barrier = harness.owner.stop(reason="operator_stop")
+        assert (barrier.status, barrier.safe_state, barrier.queues_fenced) == (
+            "accepted", "confirmed", True)
+        harness.runner._apply_stop_barrier(barrier, now_ms=NOW)
+        # C2.3: clean batteries retain every historical fact after a safe stop.
+        assert harness.runner.state.to_dict() == history
+        if reload_state:
+            from dao.prog.fastctrl.runner import load_state, save_state
+
+            save_state(harness.runner.state, harness.runner.state_path)
+            harness.runner.state = load_state(harness.runner.state_path)
+        harness.gateway.advance_clock(1000)
+        binding = restart_i4_owner(harness)
+        assert binding.owner_epoch > first[0].owner_epoch
+        follow = propose(harness.plan, harness.runner.state, timestamp=NOW_TS + 1,
+                         owner_binding=binding)
+        assert [b.write for b in follow.batteries] == [True] * batteries
+        assert [b.setpoint_w for b in follow.batteries] == [PLAN_W] * batteries
+        fresh = consume(harness, follow, now_ms=NOW + 1000)
+        assert [receipt.status for receipt in fresh] == ["accepted"] * batteries
+        assert {r.command_id for r in first}.isdisjoint(r.command_id for r in fresh)
+        assert len(harness.gateway.effect_log) == 6 * batteries
+    finally:
+        harness.lease.close()
+
+
+def test_i4_live_acceptance_keeps_noop(tmp_path):
+    harness = build(tmp_path)
+    try:
+        consume(harness, propose(harness.plan, harness.runner.state))
+        harness.gateway.advance_clock(60_000)
+        follow = propose(harness.plan, harness.runner.state, timestamp=NOW_TS + 60,
+                         owner_binding=harness.owner.binding)
+        assert follow.batteries[0].write is False
+        assert consume(harness, follow, now_ms=NOW + 60_000) == ()
+        assert harness.runner.last_actuation.reason == "no_proposal"
+        assert len(harness.gateway.effect_log) == 3
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("case", ["loaded", "missing", "installation", "session", "epoch",
+                                  "owner_expired", "hold_before", "hold_at", "hold_after",
+                                  "pending", "recovery", "future"])
+def test_i4_historical_acceptance_needs_live_context(tmp_path, case):
+    harness = build(tmp_path)
+    try:
+        consume(harness, propose(harness.plan, harness.runner.state))
+        controller = harness.runner.state.battery(0)
+        command = controller.last_accepted_command
+        binding = harness.owner.binding
+        timestamp = NOW_TS + 1
+        if case == "loaded":
+            harness.runner.state = ControllerState.from_dict(harness.runner.state.to_dict())
+        elif case == "missing":
+            binding = None
+        elif case in ("installation", "session", "epoch"):
+            field, value = {"installation": ("installation_id", "other"),
+                            "session": ("owner_session_id", "other"),
+                            "epoch": ("owner_epoch", binding.owner_epoch + 1)}[case]
+            binding = replace(binding, **{field: value})
+        elif case == "owner_expired":
+            binding = replace(binding, owner_not_after_ms=NOW + 1000)
+        elif case.startswith("hold_") or case == "future":
+            # A short hold inside the same profile isolates expiry from a plan edge.
+            from dao.prog.fastctrl.policy import apply_execution_outcome
+            from dao.prog.fastctrl.receiver import payload_digest
+
+            command = (replace(command, issued_at_ms=NOW + 1000) if case == "future" else
+                       replace(command, execute_before_ms=NOW + 500, hold_until_ms=NOW + 1000))
+            receipt = replace(harness.owner.state.last_receipt, accepted_ts=command.issued_at_ms,
+                              payload_digest=payload_digest(command))
+            assert apply_execution_outcome(controller, outcome="accepted", pending=command,
+                                           receipt=receipt)
+            delta = {"hold_before": 999, "hold_at": 1000, "hold_after": 1001, "future": 999}[case]
+            timestamp = (NOW + delta) / 1000
+        elif case == "pending":
+            controller.pending_command = command
+        elif case == "recovery":
+            controller.recovery_required = True
+        follow = propose(harness.plan, harness.runner.state, timestamp=timestamp,
+                         owner_binding=binding)
+        assert follow.batteries[0].write is (case != "hold_before")
+        assert harness.runner.state.battery(0).last_accepted_command == command
+        if case == "recovery":
+            assert controller.recovery_required is True
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("path", ["normal", "fallback", "release"])
+def test_i4_unknown_zero_is_a_proposal(tmp_path, path):
+    harness = build(tmp_path, plan=financial_plan(powers=(0.0,)))
+    try:
+        policy = FastControlPolicy(PolicyLimits(deadband=5000, min_command_interval=600))
+        controller = harness.runner.state.battery(0)
+        controller.last_change_ts = NOW_TS
+        sample = Measurement(NOW_TS, 0, [BatteryMeasurement(soc=50, power_w=0)])
+        if path == "release":
+            decision = policy.release(harness.plan, sample, harness.runner.state, "mode_off")
+        else:
+            decision = policy.decide(harness.plan, replace(sample, grid_valid=path == "normal"),
+                                     harness.runner.state)
+        assert decision.batteries[0].setpoint_w == 0.0
+        assert decision.batteries[0].write is True
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("check", ["account", "demand", "benefit"])
+@pytest.mark.parametrize("context", ["live", "stopped", "loaded", "missing", "session", "digest", "expired"])
+def test_i4_stale_history_books_no_benefit_or_held_fallback(tmp_path, context, check):
+    harness = build(tmp_path)
+    try:
+        policy = FastControlPolicy(PolicyLimits())
+        initial = Measurement(NOW_TS, 5000, [BatteryMeasurement(soc=50, power_w=None)])
+        policy.account(harness.runner.state, harness.plan, initial, "synthetic",
+                       owner_binding=harness.owner.binding)
+        receipts = consume(harness, propose(harness.plan, harness.runner.state, grid_w=5000))
+        assert receipts[0].status == "accepted"
+        binding = harness.owner.binding
+        live = context == "live"
+        if context == "stopped":
+            barrier = harness.owner.stop(reason="operator_stop")
+            harness.runner._apply_stop_barrier(barrier, now_ms=NOW)
+            binding = harness.owner.binding
+        elif context == "loaded":
+            harness.runner.state = ControllerState.from_dict(harness.runner.state.to_dict())
+        elif context == "missing":
+            binding = None
+        elif context == "session":
+            binding = replace(binding, owner_session_id="other-session")
+        elif context == "digest":
+            harness.plan = replace(harness.plan, price_average=0.31)
+        elif context == "expired":
+            binding = replace(binding, owner_not_after_ms=NOW + 60_000)
+        sample = replace(initial, timestamp=NOW_TS + 60)
+        policy.account(harness.runner.state, harness.plan, sample, "synthetic",
+                       owner_binding=binding)
+        decision = policy.decide(harness.plan, sample, harness.runner.state,
+                                 owner_binding=binding)
+        harness.runner._book_saving(decision, elapsed_h=1 / 60, plan=harness.plan,
+                                    owner_binding=binding)
+        controller = harness.runner.state.battery(0)
+        if check == "account":
+            assert (controller.daily_deviation_kwh > 0) is live
+        elif check == "demand":
+            if live:
+                assert decision.house_w == sample.grid_w - controller.last_accepted_command.setpoint_w
+                assert decision.reason != "execution_unknown"
+            else:
+                assert decision.reason == "execution_unknown"
+                assert decision.batteries[0].setpoint_w == PLAN_W
+                assert decision.override is False
+        else:
+            assert (harness.runner.state.saved_today_eur > 0) is live
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("measured_valid", [False, True])
+def test_i4_measurements_remain_evidence_after_acceptance_expires(tmp_path, measured_valid):
+    harness = build(tmp_path)
+    try:
+        policy = FastControlPolicy(PolicyLimits())
+        sample = Measurement(NOW_TS, 5000, [BatteryMeasurement(soc=50, power_w=-3000,
+                                                             valid=measured_valid)])
+        policy.account(harness.runner.state, harness.plan, sample, "synthetic")
+        consume(harness, propose(harness.plan, harness.runner.state, grid_w=5000))
+        barrier = harness.owner.stop(reason="operator_stop")
+        harness.runner._apply_stop_barrier(barrier, now_ms=NOW)
+        sample = replace(sample, timestamp=NOW_TS + 60)
+        policy.account(harness.runner.state, harness.plan, sample, "synthetic")
+        controller = harness.runner.state.battery(0)
+        assert controller.daily_deviation_kwh == pytest.approx(1 / 60 if measured_valid else 0)
+        decision = policy.decide(harness.plan, sample, harness.runner.state)
+        if measured_valid:
+            assert decision.house_w == 8000
+            assert decision.reason != "execution_unknown"
+        else:
+            assert decision.reason == "execution_unknown"
+        assert decision.benefit_eur_h == 0
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "unconfirmed", "stopped"])
+def test_i4_execution_outcomes_invalidate_runtime_only(tmp_path, outcome):
+    from dao.prog.fastctrl.policy import apply_execution_outcome, current_execution_command
+
+    harness = build(tmp_path)
+    try:
+        consume(harness, propose(harness.plan, harness.runner.state))
+        controller = harness.runner.state.battery(0)
+        command = controller.last_accepted_command
+        assert apply_execution_outcome(controller, outcome=outcome)
+        assert current_execution_command(controller, binding=harness.owner.binding, now_ms=NOW,
+                                          expected_digest=command.plan_digest) is None
+        assert controller._current_accepted_command is None
+        assert controller.last_accepted_command == command
+        assert controller.last_command_w == controller.held_setpoint_w == PLAN_W
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("boundary", ["full", "issued_late", "accepted_late", "hold_expired"])
+def test_i4_accounting_requires_the_whole_acceptance_segment(tmp_path, boundary):
+    from dao.prog.fastctrl.policy import apply_execution_outcome
+    from dao.prog.fastctrl.receiver import payload_digest
+
+    harness = build(tmp_path)
+    try:
+        state = harness.runner.state
+        sample = Measurement(NOW_TS, 5000, [BatteryMeasurement(soc=50, power_w=None)])
+        policy = FastControlPolicy(PolicyLimits())
+        policy.account(state, harness.plan, sample, "synthetic", owner_binding=harness.owner.binding)
+        receipt = consume(harness, propose(harness.plan, state, grid_w=5000))[0]
+        controller = state.battery(0)
+        command = controller.last_accepted_command
+        if boundary == "issued_late":
+            command = replace(command, issued_at_ms=NOW + 1000)
+        elif boundary == "hold_expired":
+            command = replace(command, execute_before_ms=NOW + 1000, hold_until_ms=NOW + 30_000)
+        receipt = replace(receipt, payload_digest=payload_digest(command),
+                          accepted_ts=NOW + 1000 if boundary.endswith("late") else NOW)
+        assert apply_execution_outcome(controller, outcome="accepted", pending=command, receipt=receipt)
+        sample = replace(sample, timestamp=NOW_TS + 60)
+        policy.account(state, harness.plan, sample, "synthetic", owner_binding=harness.owner.binding)
+        decision = policy.decide(harness.plan, sample, state, owner_binding=harness.owner.binding)
+        harness.runner._book_saving(decision, elapsed_h=1 / 60, plan=harness.plan,
+                                    owner_binding=harness.owner.binding)
+        assert (controller.daily_deviation_kwh > 0) is (boundary == "full")
+        assert (state.saved_today_eur > 0) is (boundary == "full")
+    finally:
+        harness.lease.close()
+
+
+def test_i4_booking_keeps_the_other_batterys_proven_segment(tmp_path):
+    from dao.prog.fastctrl.policy import apply_execution_outcome
+
+    harness = build(tmp_path, plan=financial_plan(batteries=2))
+    try:
+        receipts = consume(harness, propose(harness.plan, harness.runner.state, grid_w=20_000))
+        assert [receipt.status for receipt in receipts] == ["accepted", "accepted"]
+        apply_execution_outcome(harness.runner.state.battery(1), outcome="unknown")
+        sample = Measurement(NOW_TS + 60, 20_000,
+                             [BatteryMeasurement(soc=50, power_w=-5000) for _ in range(2)])
+        decision = FastControlPolicy(PolicyLimits()).decide(
+            harness.plan, sample, harness.runner.state, owner_binding=harness.owner.binding)
+        assert [battery.override for battery in decision.batteries] == [True, True]
+        assert decision.benefit_eur_h == decision.batteries[0].benefit_eur_h > 0
+        harness.runner._book_saving(decision, elapsed_h=1 / 60, plan=harness.plan,
+                                    owner_binding=harness.owner.binding)
+        assert harness.runner.state.saved_today_eur == pytest.approx(decision.benefit_eur_h / 60)
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("evidence", ["controller", "receipt", "pending"])
+def test_i4_new_digest_requires_rebind_before_reserving(tmp_path, evidence):
+    harness = build(tmp_path)
+    try:
+        first = consume(harness, propose(harness.plan, harness.runner.state))[0]
+        command = harness.runner.state.battery(0).last_accepted_command
+        if evidence == "controller":
+            harness.owner.state = replace(harness.owner.state, last_receipt=None)
+        else:
+            harness.runner.state = ControllerState()
+            if evidence == "pending":
+                harness.owner.record_pending_command(command)
+                harness.owner.state = replace(harness.owner.state, last_receipt=None)
+        other = financial_plan(powers=(-1200.0,))
+        harness.path.write_text(json.dumps(other.to_dict()))
+        before = harness.store.path.read_bytes()
+        high_water = harness.owner._sequence_high_water
+        decision = propose(other, harness.runner.state, owner_binding=harness.owner.binding)
+        receipts = harness.runner._consume_financial_actuation(
+            decision, other, owner=harness.owner, now_ms=NOW)
+        assert harness.runner.last_actuation.reason == "plan_rebind_required"
+        assert receipts == ()
+        assert harness.store.path.read_bytes() == before
+        assert harness.owner._sequence_high_water == high_water
+        assert harness.owner.binding is None
+        assert harness.owner.recovery_required is True
+        assert harness.owner.phase == "inhibited"
+        assert len(harness.gateway.effect_log) == 3
+        assert harness.gateway.effect_log[0][0] == first.command_id
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("action", ["start_failed", "stop_unconfirmed", "stop_no_writer", "blocked"])
+def test_i4_lifecycle_withdraws_runtime_without_erasing_history(tmp_path, action):
+    from dao.prog.fastctrl.policy import current_execution_command
+    from dao.prog.fastctrl.publication import GateVerdict
+
+    harness = build(tmp_path)
+    try:
+        consume(harness, propose(harness.plan, harness.runner.state))
+        controller = harness.runner.state.battery(0)
+        command = controller.last_accepted_command
+        binding = harness.owner.binding
+        if action == "start_failed":
+            # The held writer makes a new runner start fail before receiver I/O.
+            harness.runner.start_owner_session()
+        elif action.startswith("stop_"):
+            harness.gateway.safe_state_confirmed = False
+            if action == "stop_unconfirmed":
+                harness.runner._owner_writer = harness.lease
+            harness.runner.stop_owner_session("operator_stop")
+        else:
+            harness.runner._consume_block(GateVerdict(False, "publication_blocked"), now_ts=NOW_TS)
+        # Even the captured old binding cannot revive locally withdrawn runtime evidence.
+        assert current_execution_command(controller, binding=binding, now_ms=NOW,
+                                          expected_digest=command.plan_digest) is None
+        assert controller.last_accepted_command == command
+        assert controller.held_setpoint_w == PLAN_W
+        assert controller.last_command_w == PLAN_W
+        if action != "blocked":
+            assert controller.execution_status == "accepted"
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("deadband", [0, 150])
+@pytest.mark.parametrize("power", [-100.25, 100.25, 0.0])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_i4_wire_baseline_keeps_fractional_proposal_without_resending(
+        tmp_path, deadband, power, fallback):
+    harness = build(tmp_path, plan=financial_plan(powers=(power,), economics_supported=False))
+    try:
+        limits = PolicyLimits(deadband=deadband)
+        initial = propose(harness.plan, harness.runner.state, limits=limits)
+        assert initial.batteries[0].setpoint_w == power
+        receipt = consume(harness, initial)[0]
+        controller = harness.runner.state.battery(0)
+        assert controller.last_command_w == {-100.25: -100, 100.25: 100, 0.0: 0}[power]
+        harness.gateway.advance_clock(1000)
+        if fallback:
+            sample = Measurement(NOW_TS + 1, 0, [BatteryMeasurement(soc=50)], grid_valid=False)
+            follow = FastControlPolicy(limits).release(
+                harness.plan, sample, harness.runner.state, "sensor_stale",
+                owner_binding=harness.owner.binding)
+        else:
+            follow = propose(harness.plan, harness.runner.state, limits=limits, timestamp=NOW_TS + 1,
+                             owner_binding=harness.owner.binding)
+        assert follow.batteries[0].setpoint_w == power
+        assert follow.batteries[0].write is False
+        assert consume(harness, follow, now_ms=NOW + 1000) == ()
+        assert controller.last_accepted_command.command_id == receipt.command_id
+        assert len(harness.gateway.effect_log) == 3
+    finally:
+        harness.lease.close()
+
+
+def test_i4_contextless_plan_still_reaches_explicit_refusal(tmp_path):
+    harness = build(tmp_path)
+    try:
+        contextless = replace(harness.plan, financial_context=None)
+        failure = None
+        try:
+            decision = propose(contextless, harness.runner.state)
+        except ValueError as exc:
+            failure = str(exc)
+        assert failure is None, f"policy prevented the consumer's explicit refusal: {failure}"
+        assert harness.runner._actuate(decision, contextless, "active") == ()
+        assert harness.runner.last_actuation.reason == "missing_financial_context"
+        assert harness.gateway.effect_log == []
+    finally:
+        harness.lease.close()
+
+
+def test_i4_runtime_acceptance_cannot_be_restored_from_json(tmp_path):
+    from dao.prog.fastctrl.policy import current_execution_command
+    from dao.prog.fastctrl.runner import load_state
+
+    harness = build(tmp_path)
+    try:
+        consume(harness, propose(harness.plan, harness.runner.state))
+        controller = harness.runner.state.battery(0)
+        command = controller.last_accepted_command
+        payload = harness.runner.state.to_dict()
+        assert "_current_accepted_command" not in payload["batteries"][0]
+        payload["batteries"][0]["_current_accepted_command"] = command.to_dict()
+        (harness.root / "fast_state.json").write_text(json.dumps(payload))
+        loaded = load_state(harness.runner.state_path).battery(0)
+        assert loaded.execution_status == "accepted"
+        assert loaded.last_accepted_command == command
+        assert current_execution_command(loaded, binding=harness.owner.binding, now_ms=NOW,
+                                          expected_digest=command.plan_digest) is None
+        # The predicate is pure and also rejects disagreement with history.
+        controller.last_accepted_command = replace(command, command_id="different-history")
+        before = controller.to_dict()
+        assert current_execution_command(controller, binding=harness.owner.binding, now_ms=NOW,
+                                          expected_digest=command.plan_digest) is None
+        assert controller.to_dict() == before
+    finally:
+        harness.lease.close()
 
 
 @pytest.mark.parametrize("meter", ["sandbox", "other-installation", "Sandbox", " sandbox",
@@ -321,7 +740,8 @@ def test_02_following_the_plan_gives_no_second_command(tmp_path):
     controller = harness.runner.state.battery(0)
     accepted = (controller.last_command_w, controller.last_command_ts)
     harness.gateway.advance_clock(60_000)
-    second_decision = propose(harness.plan, harness.runner.state, timestamp=NOW_TS + 60)
+    second_decision = propose(harness.plan, harness.runner.state, timestamp=NOW_TS + 60,
+                              owner_binding=harness.owner.binding)
     assert second_decision.batteries[0].write is False
     second = consume(harness, second_decision, now_ms=NOW + 60_000)
     assert second == ()
@@ -338,18 +758,33 @@ def test_03_a_profile_change_and_a_new_plan_get_new_commands(tmp_path):
     assert controller.last_accepted_command.command_id == first.command_id
     # A profile transition inside the horizon is a new command, never a reuse.
     harness.gateway.advance_clock(900_000)
-    transition = propose(harness.plan, harness.runner.state, timestamp=NOW_TS + 900)
+    transition = propose(harness.plan, harness.runner.state, timestamp=NOW_TS + 900,
+                         owner_binding=harness.owner.binding)
     second = consume(harness, transition, now_ms=NOW + 900_000)[0]
     assert second.command_id != first.command_id
     assert second.sequence > first.sequence
     assert second.plan_digest == first.plan_digest
     assert controller.last_accepted_command.command_id == second.command_id
     assert controller.last_command_w == -1500.0
-    # A new plan identity gets a new digest and a new command.
+    # A new digest requires a real lifecycle barrier and a new binding first.
     other = financial_plan(powers=(-1200.0,))
     harness.path.write_text(json.dumps(other.to_dict()))
     harness.gateway.advance_clock(60_000)
-    follow = propose(other, harness.runner.state, timestamp=NOW_TS + 960)
+    follow = propose(other, harness.runner.state, timestamp=NOW_TS + 960,
+                     owner_binding=harness.owner.binding)
+    before = harness.store.path.read_bytes()
+    effects = list(harness.gateway.effect_log)
+    assert harness.runner._consume_financial_actuation(
+        follow, other, owner=harness.owner, now_ms=NOW + 960_000) == ()
+    assert harness.runner.last_actuation.reason == "plan_rebind_required"
+    assert harness.store.path.read_bytes() == before
+    assert harness.gateway.effect_log == effects
+    barrier = harness.owner.stop(reason="plan_rebind_required")
+    assert barrier.status == "accepted" and barrier.safe_state == "confirmed"
+    harness.runner._apply_stop_barrier(barrier, now_ms=NOW + 960_000)
+    binding = restart_i4_owner(harness)
+    assert binding.owner_epoch > second.owner_epoch
+    follow = propose(other, harness.runner.state, timestamp=NOW_TS + 960, owner_binding=binding)
     third = harness.runner._consume_financial_actuation(
         follow, other, owner=harness.owner, now_ms=NOW + 960_000)[0]
     assert third.plan_digest != first.plan_digest
@@ -448,7 +883,7 @@ def test_08_only_an_accepted_segment_books_a_benefit(tmp_path):
     assert receipts[0].status == "accepted"
     harness.gateway.advance_clock(60_000)
     proven = propose(harness.plan, harness.runner.state, grid_w=5000.0,
-                     timestamp=NOW_TS + 60)
+                     timestamp=NOW_TS + 60, owner_binding=harness.owner.binding)
     assert proven.batteries[0].override is True
     assert proven.benefit_eur_h > 0.0
 
@@ -924,10 +1359,11 @@ def test_24_the_real_euro_bookkeeping_follows_the_acceptance(tmp_path):
     assert receipts[0].status == "accepted"
     harness.gateway.advance_clock(60_000)
     proven = propose(harness.plan, harness.runner.state, grid_w=5000.0,
-                     timestamp=NOW_TS + 60)
+                     timestamp=NOW_TS + 60, owner_binding=harness.owner.binding)
     assert proven.benefit_eur_h > 0.0
-    harness.runner._book_saving(proven, elapsed_h=1.0)
-    assert harness.runner.state.saved_today_eur == pytest.approx(proven.benefit_eur_h)
+    harness.runner._book_saving(proven, elapsed_h=1 / 60, plan=harness.plan,
+                                owner_binding=harness.owner.binding)
+    assert harness.runner.state.saved_today_eur == pytest.approx(proven.benefit_eur_h / 60)
 
 
 def test_25_the_barrier_is_compared_field_by_field(tmp_path):

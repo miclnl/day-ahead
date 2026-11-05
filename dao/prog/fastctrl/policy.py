@@ -52,7 +52,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .command import ActuationReceipt, BatteryCommand
+from .command import ActuationReceipt, BatteryCommand, OwnerBinding, plan_digest
 from .plan import (
     NO_STOP_SENTINEL,
     BatterySpec,
@@ -194,6 +194,8 @@ class BatteryControllerState:
     recovery_required: bool = False
     #: The identity of the last **confirmed** command.
     last_accepted_command: Optional[BatteryCommand] = None
+    #: Runtime evidence only; persisted history can never restore live execution.
+    _current_accepted_command: BatteryCommand | None = field(default=None, init=False, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -221,6 +223,8 @@ class BatteryControllerState:
     def from_dict(cls, data: dict) -> "BatteryControllerState":
         state = cls()
         for key, value in (data or {}).items():
+            if key == "_current_accepted_command":
+                continue
             if key == "pending_command" and value is not None:
                 value = BatteryCommand.from_dict(value)
             if key == "last_accepted_command" and value is not None:
@@ -228,6 +232,24 @@ class BatteryControllerState:
             if hasattr(state, key):
                 setattr(state, key, value)
         return state
+
+
+def current_execution_command(state: BatteryControllerState, *, binding: OwnerBinding | None,
+                              now_ms: int, expected_digest: str) -> BatteryCommand | None:
+    """Return live acceptance in this exact context, never acceptance history."""
+    command = state._current_accepted_command
+    if (command is None or command != state.last_accepted_command
+            or state.execution_status != "accepted" or state.pending_command is not None
+            or state.recovery_required or binding is None):
+        return None
+    if (command.installation_id != binding.installation_id
+            or command.owner_session_id != binding.owner_session_id
+            or command.owner_epoch != binding.owner_epoch
+            or command.plan_digest != expected_digest):
+        return None
+    if not command.issued_at_ms <= now_ms < min(command.hold_until_ms, binding.owner_not_after_ms):
+        return None
+    return command
 
 
 @dataclass
@@ -417,10 +439,12 @@ def apply_execution_outcome(state: BatteryControllerState, *,
         # No execution: no owner, an unsuitable adapter, a gate or a proven
         # absence of effect. The recovery duty and the pending command stay.
         state.execution_status = "unknown"
+        state._current_accepted_command = None
         return True
     if outcome == "stopped":
         # An exact safe barrier ends the recovery duty; nothing else does.
         state.execution_status = "stopped"
+        state._current_accepted_command = None
         state.recovery_required = False
         state.pending_command = None
         return True
@@ -428,6 +452,7 @@ def apply_execution_outcome(state: BatteryControllerState, *,
         # Ambiguous: the pending command, the recovery duty and the uncertainty
         # all stay standing until an exact safe barrier.
         state.execution_status = "unconfirmed"
+        state._current_accepted_command = None
         state.recovery_required = True
         if state.pending_command is None and pending is not None:
             state.pending_command = pending
@@ -441,6 +466,7 @@ def apply_execution_outcome(state: BatteryControllerState, *,
     state.execution_status = "accepted"
     state.pending_command = None
     state.last_accepted_command = stored
+    state._current_accepted_command = stored
     state.last_command_w = float(stored.setpoint_w)
     state.last_command_ts = receipt.accepted_ts / 1000.0
     state.stop_inverter_cleared = stored.stop_at_ms is None
@@ -654,6 +680,8 @@ class FastControlPolicy:
         measurement: Measurement,
         day_key: str,
         use_measured: bool = True,
+        *,
+        owner_binding: OwnerBinding | None = None,
     ) -> None:
         """Integrate the deviation energy and roll over budgets.
 
@@ -707,16 +735,22 @@ class FastControlPolicy:
         if elapsed_h <= 0.0 or interval is None:
             return
 
+        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context else ""
         for index in range(len(plan.specs)):
             controller = state.battery(index)
             measured = measurement.battery(index)
             if use_measured and measured.valid and measured.power_w is not None:
                 actual_w = measured.power_w
-            elif plan.format_version == 2 and controller.execution_status != "accepted":
-                # The in-force setpoint is not a sensor reading. Without an
-                # accepted command this segment is unknown, not a measured
-                # zero, and no deviation is booked for it.
-                continue
+            elif plan.format_version == 2:
+                command = current_execution_command(
+                    controller, binding=owner_binding, now_ms=int(round(now * 1000)),
+                    expected_digest=digest)
+                if (command is None or command.issued_at_ms > int(round(previous * 1000))
+                        or controller.last_command_ts > previous):
+                    # A held command is evidence only for its complete live
+                    # segment. A later acceptance cannot fill an earlier gap.
+                    continue
+                actual_w = float(command.setpoint_w)
             else:
                 actual_w = controller.held_setpoint_w
             if plan.format_version == 2:
@@ -836,6 +870,8 @@ class FastControlPolicy:
         measurement: Measurement,
         state: ControllerState,
         enabled: Optional[list[bool]] = None,
+        *,
+        owner_binding: OwnerBinding | None = None,
     ) -> Decision:
         """Compute the setpoints for this tick.
 
@@ -848,7 +884,7 @@ class FastControlPolicy:
         interval = plan.interval_at(now)
         if interval is None:
             return self._all_plan(
-                plan, measurement, state, "plan_expired", interval=None
+                plan, measurement, state, "plan_expired", interval=None, owner_binding=owner_binding
             )
 
         price_import = interval.price_import
@@ -858,12 +894,20 @@ class FastControlPolicy:
         price_export = min(interval.price_export, price_import)
 
         battery_measurements = [measurement.battery(i) for i in range(len(plan.specs))]
+        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context else ""
+        baselines = [self._confirmed_baseline(
+            state.battery(i), binding=owner_binding, now_ms=int(round(now * 1000)),
+            expected_digest=digest) if plan.format_version == 2 else state.battery(i).held_setpoint_w
+            for i in range(len(plan.specs))]
         house_w = measurement.grid_w
         for index, measured in enumerate(battery_measurements):
             if measured.valid and measured.power_w is not None:
                 house_w -= measured.power_w
+            elif baselines[index] is not None:
+                house_w -= baselines[index]
             else:
-                house_w -= state.battery(index).held_setpoint_w
+                return self._all_plan(plan, measurement, state, "execution_unknown", interval,
+                                      owner_binding=owner_binding)
 
         economics_supported = True
         if plan.format_version == 2:
@@ -881,7 +925,8 @@ class FastControlPolicy:
         )
 
         if not measurement.grid_valid:
-            return self._all_plan(plan, measurement, state, measurement.invalid_reason, interval)
+            return self._all_plan(plan, measurement, state, measurement.invalid_reason, interval,
+                                  owner_binding=owner_binding)
 
         # Batteries are decided one at a time. Each one sees the rest of the
         # site as its load: the house plus whatever the other batteries are
@@ -896,6 +941,7 @@ class FastControlPolicy:
 
         for index, spec in enumerate(plan.specs):
             controller = state.battery(index)
+            baseline_w = baselines[index]
             step = interval.battery(index)
             plan_w = profile_power_at(step, now) if plan.format_version == 2 else step.ac_power_w
             measured = battery_measurements[index]
@@ -912,7 +958,7 @@ class FastControlPolicy:
             if skip is not None:
                 decision.batteries.append(
                     self._plan_decision(index, spec, step, controller, soc, skip, now,
-                                        profiled=plan.format_version == 2)
+                                        profiled=plan.format_version == 2, baseline_w=baseline_w)
                 )
                 residual = others_w + plan_w
                 continue
@@ -992,13 +1038,14 @@ class FastControlPolicy:
                 reasons=reasons,
                 profiled=plan.format_version == 2,
                 economics_supported=economics_supported,
+                baseline_w=baseline_w,
             )
             decision.batteries.append(battery_decision)
 
             # A segment whose execution is not accepted books no euro claim:
             # an unproven or ambiguous execution is not a saving.
             countable = battery_decision.override
-            if plan.format_version == 2 and controller.execution_status != "accepted":
+            if plan.format_version == 2 and baseline_w is None:
                 countable = False
             total_benefit += max(0.0, benefit) if countable else 0.0
             any_override = any_override or battery_decision.override
@@ -1014,6 +1061,8 @@ class FastControlPolicy:
         measurement: Measurement,
         state: ControllerState,
         reason: str,
+        *,
+        owner_binding: OwnerBinding | None = None,
     ) -> Decision:
         """Hand every battery back to the optimizer's published command.
 
@@ -1022,7 +1071,8 @@ class FastControlPolicy:
         moment cleared until the next optimisation happens to run.
         """
         return self._all_plan(
-            plan, measurement, state, reason, plan.interval_at(measurement.timestamp)
+            plan, measurement, state, reason, plan.interval_at(measurement.timestamp),
+            owner_binding=owner_binding,
         )
 
     def _hard_bounds(
@@ -1045,16 +1095,12 @@ class FastControlPolicy:
         return min(low, plan_w), max(high, plan_w)
 
     @staticmethod
-    def _confirmed_baseline(controller: BatteryControllerState) -> float:
-        """The in-force setpoint of a financial segment, but only when proven.
-
-        Only an accepted command proves an in-force setpoint. Without one
-        nothing is in force: the plan power is a proposal, never an already
-        in-force fact.
-        """
-        if controller.execution_status == "accepted":
-            return controller.held_setpoint_w
-        return 0.0
+    def _confirmed_baseline(controller: BatteryControllerState, *, binding: OwnerBinding | None,
+                            now_ms: int, expected_digest: str) -> float | None:
+        """Unknown is not measured zero; a live baseline is the sent wire power."""
+        command = current_execution_command(controller, binding=binding, now_ms=now_ms,
+                                            expected_digest=expected_digest)
+        return float(command.setpoint_w) if command is not None else None
 
     def _stabilise(
         self,
@@ -1072,6 +1118,7 @@ class FastControlPolicy:
         *,
         profiled: bool = False,
         economics_supported: bool = True,
+        baseline_w: float | None = None,
     ) -> BatteryDecision:
         """Apply hysteresis, deadband and minimum command interval.
 
@@ -1083,7 +1130,8 @@ class FastControlPolicy:
         """
         limits = self.limits
         deviating = abs(target_w - plan_w) > limits.release_deviation
-        baseline_w = controller.held_setpoint_w
+        if not profiled:
+            baseline_w = controller.held_setpoint_w
 
         if profiled and not economics_supported:
             # Without economics no deviation is allowed at all, not even an
@@ -1092,8 +1140,6 @@ class FastControlPolicy:
             controller.quiet_since = None
             override = False
             target_w = plan_w
-            if not controller.override_active:
-                baseline_w = self._confirmed_baseline(controller)
         elif deviating:
             controller.quiet_since = None
             override = True
@@ -1112,7 +1158,6 @@ class FastControlPolicy:
                 # v2: the optimizer wrote nothing, so the plan power is not an
                 # already in-force fact but a proposal. Only a confirmed
                 # command proves an in-force setpoint.
-                baseline_w = self._confirmed_baseline(controller)
                 target_w = plan_w
             else:
                 # Reconcile the in-force plan fact across ticks, without claiming
@@ -1123,7 +1168,9 @@ class FastControlPolicy:
 
         releasing = controller.override_active and not override
         restoring = controller.restore_pending and not override
-        change = abs(target_w - baseline_w)
+        # Compare with the wire value without rounding the v2 proposal itself.
+        change = (abs((round(target_w) if profiled else target_w) - baseline_w)
+                  if baseline_w is not None else math.inf)
         write = True
 
         # The legacy optimizer duty-cycles the inverter through the stop moment when it
@@ -1137,14 +1184,16 @@ class FastControlPolicy:
             and step.stop_inverter != NO_STOP_SENTINEL
         )
 
-        if (not releasing and not pending_stop) or restoring:
+        if baseline_w is not None and ((not releasing and not pending_stop) or restoring):
             # In the financial regime the thresholds guard an override only: a
             # plan-following command is a real proposal whenever the plan power
             # differs from the in-force setpoint. The legacy regime keeps its
             # behaviour exactly.
             guarded = not profiled or override
-            if not restoring and change < limits.deadband and (guarded or change == 0):
-                target_w = baseline_w
+            if not restoring and ((profiled and change == 0)
+                                  or (change < limits.deadband and (guarded or change == 0))):
+                if not profiled or change != 0:
+                    target_w = baseline_w
                 write = False
                 reasons.append("deadband")
             elif (
@@ -1156,7 +1205,8 @@ class FastControlPolicy:
                 write = False
                 reasons.append("rate_limited")
 
-        target_w = round(target_w)
+        if not profiled:
+            target_w = round(target_w)
         if write and not profiled:
             # In the financial regime a proposal is not an in-force change: the
             # runner stamps the moment of an applied acceptance instead.
@@ -1216,9 +1266,10 @@ class FastControlPolicy:
         now: float,
         *,
         profiled: bool = False,
+        baseline_w: float | None = None,
     ) -> BatteryDecision:
         """Fall back to exactly what the optimizer published."""
-        plan_w = round(profile_power_at(step, now) if profiled else step.ac_power_w)
+        plan_w = profile_power_at(step, now) if profiled else round(step.ac_power_w)
         releasing = (controller.override_active or controller.held_stop_inverter_cleared
                      or controller.restore_pending)
         if profiled:
@@ -1226,8 +1277,7 @@ class FastControlPolicy:
             # confirmed command proves an in-force setpoint, so without one
             # the plan power is always a proposal. The legacy regime keeps
             # its behaviour exactly.
-            baseline_w = self._confirmed_baseline(controller)
-            write = releasing or plan_w != baseline_w
+            write = releasing or baseline_w is None or round(plan_w) != baseline_w
         else:
             write = (
                 releasing or abs(plan_w - controller.held_setpoint_w) >= self.limits.deadband
@@ -1281,6 +1331,8 @@ class FastControlPolicy:
         state: ControllerState,
         reason: str,
         interval: Optional[PlanInterval],
+        *,
+        owner_binding: OwnerBinding | None = None,
     ) -> Decision:
         decision = Decision(
             timestamp=measurement.timestamp,
@@ -1290,6 +1342,7 @@ class FastControlPolicy:
             price_export=interval.price_export if interval else 0.0,
             plan_grid_w=interval.grid_w if interval else 0.0,
         )
+        digest = plan_digest(plan) if plan.format_version == 2 and plan.financial_context else ""
         for index, spec in enumerate(plan.specs):
             step = interval.battery(index) if interval else None
             controller = state.battery(index)
@@ -1319,6 +1372,10 @@ class FastControlPolicy:
                     reason,
                     measurement.timestamp,
                     profiled=plan.format_version == 2,
+                    baseline_w=self._confirmed_baseline(
+                        controller, binding=owner_binding,
+                        now_ms=int(round(measurement.timestamp * 1000)), expected_digest=digest)
+                    if plan.format_version == 2 else controller.held_setpoint_w,
                 )
             )
         return decision

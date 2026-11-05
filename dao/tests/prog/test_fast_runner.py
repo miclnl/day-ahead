@@ -36,6 +36,80 @@ from dao.tests.settlement.test_publication import pricing_config
 T0 = 1_700_000_000
 
 
+@pytest.mark.parametrize("owner_state", ["owned", "missing", "inhibited", "expired"])
+def test_i4_tick_passes_only_live_owner_context_before_policy(tmp_path, monkeypatch, owner_state):
+    from dataclasses import replace
+
+    from dao.prog.fastctrl.publication import GatePolicy
+    from dao.tests.prog.test_fast_consumer import NOW, NOW_TS, build, consume, propose
+
+    harness = build(tmp_path)
+    try:
+        consume(harness, propose(harness.plan, harness.runner.state))
+        binding = harness.owner.binding
+        # A legacy publication exercises normal tick wiring without opening a v2 gate.
+        legacy = replace(harness.plan, format_version=1, financial_context=None)
+        harness.path.write_text(json.dumps(legacy.to_dict()))
+        harness.runner.gate_policy = GatePolicy(None)
+        if owner_state == "missing":
+            harness.owner.binding = None
+        elif owner_state == "inhibited":
+            harness.owner.phase = "inhibited"
+        elif owner_state == "expired":
+            harness.owner.binding = replace(binding, owner_not_after_ms=NOW)
+        observed = []
+        account, decide = FastControlPolicy.account, FastControlPolicy.decide
+
+        def account_with_context(self, *args, **kwargs):
+            observed.append(("account", kwargs.get("owner_binding")))
+            return account(self, *args, **kwargs)
+
+        def decide_with_context(self, *args, **kwargs):
+            observed.append(("decide", kwargs.get("owner_binding")))
+            return decide(self, *args, **kwargs)
+
+        monkeypatch.setattr(FastControlPolicy, "account", account_with_context)
+        monkeypatch.setattr(FastControlPolicy, "decide", decide_with_context)
+        harness.runner.tick(NOW_TS)
+        expected = binding if owner_state == "owned" else None
+        assert observed == [("account", expected), ("decide", expected)]
+        if expected is None:
+            assert harness.runner.state.battery(0)._current_accepted_command is None
+    finally:
+        harness.lease.close()
+
+
+def test_i4_tick_does_not_book_a_gap_hidden_by_the_legacy_saving_cap(tmp_path, monkeypatch):
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.prog.fastctrl.publication import GateVerdict
+    from dao.tests.prog.test_fast_consumer import NOW, NOW_TS, build, consume, propose
+
+    harness = build(tmp_path)
+    try:
+        runner = harness.runner
+        runner.state.last_tick_ts = NOW_TS
+        runner.state.day_key = runner._day_key(NOW_TS)
+        # A command accepted between the two ticks does not cover the whole gap.
+        harness.gateway.advance_clock(100_000)
+        receipt = consume(harness, propose(harness.plan, runner.state, timestamp=NOW_TS + 100,
+                                            grid_w=5000), now_ms=NOW + 100_000)[0]
+        assert receipt.status == "accepted"
+        harness.gateway.advance_clock(900_000)
+        now = NOW_TS + 1000
+        # Synthetic composition of the internal v2 loop only; the public refusal
+        # is tested separately and no production gate is changed.
+        monkeypatch.setattr(runner_module, "following_verdict",
+                            lambda *args, **kwargs: GateVerdict(True, "synthetic"))
+        monkeypatch.setattr(runner.gateway, "read", lambda ids: {
+            "sensor.p1_power": ("5000", now), "sensor.soc": ("50", now),
+            "sensor.battery_power": ("-5000", now)})
+        decision = runner.tick(now)
+        assert decision.benefit_eur_h > 0
+        assert runner.state.saved_today_eur == 0.0
+    finally:
+        harness.lease.close()
+
+
 class FakeHass:
     """Minimal stand-in for the HA client surface DaBase exposes."""
 

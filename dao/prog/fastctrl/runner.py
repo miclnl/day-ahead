@@ -42,7 +42,14 @@ from .actuator import (
     classify_actuation_adapter,
     execute_battery_command,
 )
-from .command import ActuationReceipt, BarrierReceipt, BatteryCommand, ClockSample, Deadline
+from .command import (
+    ActuationReceipt,
+    BarrierReceipt,
+    BatteryCommand,
+    ClockSample,
+    Deadline,
+    OwnerBinding,
+)
 from .ownership import MirrorWriteFailed, OwnerCoordinator, RecoveryRequired
 from .plan import FAST_PLAN_FILE, NO_STOP_SENTINEL, FastPlan, load_plan
 from .policy import (
@@ -56,6 +63,7 @@ from .policy import (
     PolicyLimits,
     apply_accepted_command,
     apply_execution_outcome,
+    current_execution_command,
 )
 from .publication import (
     FallbackReceipt,
@@ -550,6 +558,19 @@ class FastControlRunner:
 
     # -- one iteration ---------------------------------------------------
 
+    def _invalidate_current_execution(self) -> None:
+        """Withdraw runtime evidence without rewriting historical controller facts."""
+        for battery in self.state.batteries:
+            battery._current_accepted_command = None
+
+    def _owner_binding(self, owner: OwnerCoordinator | None, *, now_ms: int) -> OwnerBinding | None:
+        binding = owner.binding if owner is not None else None
+        if (binding is None or owner.phase != "owned" or owner.recovery_required
+                or now_ms >= binding.owner_not_after_ms or not owner.store.holds(owner.writer)):
+            self._invalidate_current_execution()
+            return None
+        return binding
+
     def _consume_block(self, verdict: GateVerdict, *, now_ts: int) -> FallbackReceipt:
         """Trek lokale bevoegdheid in; vraag stop aan zonder zelf HA te bedienen."""
         self.last_gate = verdict
@@ -690,28 +711,32 @@ class FastControlRunner:
         )
 
         policy = FastControlPolicy(self.limits())
+        owner_binding = self._owner_binding(self.owner, now_ms=int(round(now * 1000)))
         policy.account(
             self.state,
             plan,
             measurement,
             self._day_key(now),
             use_measured=mode == MODE_ACTIVE,
+            owner_binding=owner_binding,
         )
-        decision = policy.decide(plan, measurement, self.state, enabled)
+        decision = policy.decide(plan, measurement, self.state, enabled, owner_binding=owner_binding)
         self._warn_if_plan_expired(decision, plan, now)
 
         # decision.house_w is the reconstructed site demand excluding the
         # battery, which is exactly the quantity the optimizer forecasts as
         # "hload". Recording it turns the control loop into the measurement
         # the forecast side has been missing.
-        self._measure(now, plan, decision.house_w, pv_w, measurement.grid_valid)
+        self._measure(now, plan, decision.house_w, pv_w,
+                      measurement.grid_valid and decision.reason != "execution_unknown")
 
         elapsed_h = (
             min(now - previous_tick_ts, 600.0) / 3600.0
             if previous_tick_ts
             else 0.0
         )
-        self._book_saving(decision, elapsed_h=elapsed_h)
+        self._book_saving(decision, elapsed_h=elapsed_h, plan=plan, owner_binding=owner_binding,
+                          previous_tick_ts=previous_tick_ts)
         if mode != MODE_ACTIVE:
             # Nothing was actually written this tick, so this contribution
             # (and therefore today's total) is a projection, not a measured
@@ -725,14 +750,37 @@ class FastControlRunner:
         self._persist_state(now)
         return decision
 
-    def _book_saving(self, decision: Decision, *, elapsed_h: float) -> None:
+    def _book_saving(self, decision: Decision, *, elapsed_h: float,
+                     plan: FastPlan | None = None, owner_binding: OwnerBinding | None = None,
+                     previous_tick_ts: float | None = None) -> None:
         """Book the proven saving of this tick into today's total.
 
         The euro claim of a decision is only nonzero when the segment was
         really executed: an unproven or ambiguous segment books nothing at
         all, so this addition stays zero for a refused tick.
         """
-        self.state.saved_today_eur += decision.benefit_eur_h * elapsed_h
+        benefit = decision.benefit_eur_h
+        if plan is not None and plan.format_version == 2:
+            digest = execution_boundary.plan_digest(plan)
+            # Keep the legacy euro cap, but prove the entire previous-tick gap.
+            previous = (decision.timestamp - elapsed_h * 3600
+                        if previous_tick_ts is None else previous_tick_ts)
+            covered_benefit = 0.0
+            for battery in decision.batteries:
+                if not battery.override:
+                    continue
+                controller = self.state.battery(battery.index)
+                command = current_execution_command(
+                    controller, binding=owner_binding, now_ms=int(round(decision.timestamp * 1000)),
+                    expected_digest=digest)
+                if (command is None or command.issued_at_ms > int(round(previous * 1000))
+                        or controller.last_command_ts > previous):
+                    continue
+                # Filter existing per-battery claims; do not recalculate value
+                # or discard another battery's independently proven segment.
+                covered_benefit += max(0.0, battery.benefit_eur_h)
+            benefit = min(benefit, covered_benefit)
+        self.state.saved_today_eur += benefit * elapsed_h
 
     def _warn_if_plan_expired(self, decision, plan: FastPlan, now: float) -> None:
         """Keep saying so while the plan does not cover the current moment.
@@ -797,7 +845,8 @@ class FastControlRunner:
             grid_valid=False,
         )
         decision = FastControlPolicy(self.limits()).release(
-            plan, measurement, self.state, "mode_off"
+            plan, measurement, self.state, "mode_off",
+            owner_binding=self._owner_binding(self.owner, now_ms=int(round(now * 1000))),
         )
         if self._last_mode == MODE_ACTIVE or any(
             b.stop_inverter_cleared or b.restore_pending for b in self.state.batteries
@@ -1103,7 +1152,8 @@ class FastControlRunner:
             return self._deny_financial("missing_financial_context", decision)
         if overlap:
             return self._deny_financial("diagnostics_overlap", decision)
-        if owner is None or owner.binding is None or owner.phase != "owned":
+        binding = self._owner_binding(owner, now_ms=now_ms)
+        if binding is None:
             return self._deny_financial("owner_unavailable", decision)
         receiver = owner.receiver
         if receiver is None or classify_actuation_adapter(receiver) != FENCED_ADAPTER:
@@ -1113,10 +1163,6 @@ class FastControlRunner:
             # command, not even a stop, until an exact safe barrier.
             return self._deny_financial("recovery_required", decision)
         proposals = [b for b in decision.batteries if b.write]
-        if not proposals:
-            return self._deny_financial("no_proposal", decision)
-
-        binding = owner.binding
         context = plan.financial_context
         clock = ClockSample(utc_ms=int(now_ms), boottime_ns=owner.now_ns(),
                              boot_id=_boot_id(), uncertainty_ms=0, healthy=True)
@@ -1140,6 +1186,20 @@ class FastControlRunner:
                         clock=clock, policy=self.gate_policy)
                 except execution_boundary.ExecutionRefused as exception:
                     return self._deny_financial(exception.reason, decision)
+                evidence = [owner.state.pending_command, owner.state.last_receipt]
+                for controller in self.state.batteries:
+                    evidence.extend((controller.pending_command, controller.last_accepted_command))
+                digest = execution_boundary.plan_digest(plan)
+                if any(item is not None and item.installation_id == binding.installation_id
+                       and item.owner_epoch == binding.owner_epoch and item.plan_digest != digest
+                       for item in evidence):
+                    # The existing lifecycle must withdraw and rebind before a
+                    # new digest may use this installation. No reserve/send here.
+                    owner.report_failure("plan_rebind_required")
+                    self._invalidate_current_execution()
+                    return self._deny_financial("plan_rebind_required", decision)
+                if not proposals:
+                    return self._deny_financial("no_proposal", decision)
                 captured, restore = self._observe_pending_command(owner)
                 try:
                     for battery in proposals:
@@ -1315,6 +1375,7 @@ class FastControlRunner:
         if barrier.accepted_ts > now_ms:
             # A future timestamp is not a fact: the duty stays.
             return
+        self._invalidate_current_execution()
         for battery in self.state.batteries:
             pending = battery.pending_command
             if pending is None and not battery.recovery_required:
@@ -1436,6 +1497,7 @@ class FastControlRunner:
 
     def start_owner_session(self) -> None:
         """Optional fenced-owner lifecycle; never changes the legacy route."""
+        self._invalidate_current_execution()
         if self.owner is None or self._owner_writer is not None:
             return
         try:
@@ -1457,6 +1519,7 @@ class FastControlRunner:
             logging.warning("Fast control: owner start mislukt: %s", exception)
 
     def stop_owner_session(self, reason: str) -> None:
+        self._invalidate_current_execution()
         if self.owner is None or self._owner_writer is None:
             return
         try:
