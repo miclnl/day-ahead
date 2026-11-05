@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from dao.prog import task_execution
-from dao.prog.fastctrl.command import ActuationReceipt, Deadline
+from dao.prog.fastctrl.command import ActuationReceipt, Deadline, RevokeRequest
 from dao.prog.fastctrl.plan import profile_power_at
 from dao.prog.fastctrl.policy import (
     BatteryMeasurement,
@@ -201,6 +201,85 @@ def test_i2_plan_meter_must_equal_owner_installation(tmp_path, monkeypatch, mete
             assert controller.pending_command is None
             assert controller.last_accepted_command is None
             assert controller.execution_status == "unknown"
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("session", ["session-new", "second-session"])
+@pytest.mark.parametrize("lease_delta_ms", [-1000, 0, 60_000])
+@pytest.mark.parametrize("crash_persist", [None, False, True])
+def test_i3_consumed_barrier_cannot_rebind(
+        tmp_path, monkeypatch, session, lease_delta_ms, crash_persist):
+    """A refused rebind keeps A valid; only a real new barrier fences A out."""
+    harness = build(tmp_path)
+    gateway = harness.gateway
+    real_send = gateway.send
+    commands = []
+
+    def reserve(command, *, deadline):
+        commands.append(command)
+        gateway.enqueue(command)
+        return gateway.deliver()
+
+    monkeypatch.setattr(gateway, "send", reserve)
+    try:
+        receipts = consume(harness, propose(harness.plan, harness.runner.state))
+        old = commands[0]
+        assert [receipt.status for receipt in receipts] == ["unconfirmed"]
+        assert harness.owner.state.pending_command == old
+        assert gateway.state.commands[0].phase == "reserved"
+        assert gateway.effect_log == []
+        binding = harness.owner.binding
+        gateway.advance_clock(1)
+        if crash_persist is not None:
+            gateway.crash(persist=crash_persist)
+            assert gateway.restart() == "recovered"
+        before = gateway.state
+        files = (gateway.state_path.read_bytes(), gateway.anchor_path.read_bytes())
+        refused = None
+        try:
+            gateway.bind_owner(
+                installation_id=binding.installation_id, barrier_id=binding.barrier_id,
+                expected_epoch=binding.owner_epoch, owner_session_id=session,
+                requested_not_after_ms=binding.owner_not_after_ms + lease_delta_ms,
+                deadline=DEADLINE)
+        except ValueError as exc:
+            refused = str(exc)
+        assert refused == "barrier_already_bound", "a consumed barrier granted a second binding"
+        assert gateway.state == before
+        assert gateway.state.owner_not_after_ms == binding.owner_not_after_ms
+        assert (gateway.state_path.read_bytes(), gateway.anchor_path.read_bytes()) == files
+        assert gateway.effect_log == []
+
+        # Refusal did not revoke A: its still-valid reservation may write.
+        partial = gateway.step_helper("setpoint", command=old)
+        assert (partial.status, partial.effect) == ("unconfirmed", "partial")
+        effects = [(old.command_id, "setpoint", "accu", PLAN_W)]
+        assert gateway.effect_log == effects
+
+        request = RevokeRequest(INSTALLATION, 8, "i3-barrier-b", "owner_start", gateway.utc_ms)
+        barrier = gateway.revoke_and_stop(request, deadline=DEADLINE)
+        assert (barrier.status, barrier.barrier_id, barrier.revoked_through_epoch,
+                barrier.current_epoch, barrier.queues_fenced, barrier.safe_state) == (
+            "accepted", "i3-barrier-b", 8, 9, True, "confirmed")
+        fresh_binding = gateway.bind_owner(
+            installation_id=INSTALLATION, barrier_id="i3-barrier-b", expected_epoch=9,
+            owner_session_id="second-session", requested_not_after_ms=NOW + LEASE_MS,
+            deadline=DEADLINE)
+        assert fresh_binding.owner_epoch == 9
+        late = gateway.step_helper("mode", command=old)
+        assert (late.status, late.reason, late.effect) == ("unconfirmed", "epoch_withdrawn", "partial")
+        assert late.helper_results == partial.helper_results
+        assert gateway.effect_log == effects
+
+        fresh = replace(old, owner_session_id="second-session", owner_epoch=9,
+                        sequence=old.sequence + 1, command_id="i3-command-b")
+        assert real_send(fresh, deadline=DEADLINE).status == "accepted"
+        assert gateway.effect_log == effects + [
+            ("i3-command-b", "setpoint", "accu", PLAN_W),
+            ("i3-command-b", "mode", "accu", PLAN_W),
+            ("i3-command-b", "stop_inverter", "accu", PLAN_W),
+        ]
     finally:
         harness.lease.close()
 

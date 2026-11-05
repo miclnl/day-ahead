@@ -408,6 +408,41 @@ def test_effect_fence_precedence_at_final_writer():
                                clock_healthy=True, clock_uncertainty_ms=0)[0]
 
 
+@pytest.mark.parametrize("completed_helpers", [0, 1, 2])
+@pytest.mark.parametrize("changes,reason", [
+    ({"installation_id": "elsewhere"}, "wrong_installation"),
+    ({"bound_owner_session_id": "owner-b"}, "wrong_owner_session"),
+    ({"bound_owner_session_id": None}, "wrong_owner_session"),
+    ({"bound_owner_epoch": 8}, "epoch_withdrawn"),
+    ({"bound_owner_epoch": 0}, "epoch_withdrawn"),
+])
+def test_i3_effect_rechecks_current_session(tmp_path, changes, reason, completed_helpers):
+    gateway = fake(tmp_path)
+    cmd = command()
+    gateway.enqueue(cmd)
+    assert gateway.deliver().reason == "pending_effect"
+    parts = ("setpoint", "mode", "stop_inverter")
+    for part in parts[:completed_helpers]:
+        gateway.step_helper(part, command=cmd)
+    stored = gateway.state.commands[0]
+    before = list(gateway.effect_log)
+    assert receiver().fence_effect(gateway.state, cmd, receiver_now_upper_ms=1001,
+                                   clock_healthy=True, clock_uncertainty_ms=0) == (True, "reserved")
+
+    # Inject the current identity change after reservation, before the last writer.
+    gateway.state = replace(gateway.state, **changes)
+    fenced = receiver().fence_effect(gateway.state, cmd, receiver_now_upper_ms=1001,
+                                     clock_healthy=True, clock_uncertainty_ms=0)
+    result = gateway.step_helper(parts[completed_helpers], command=cmd)
+    assert gateway.effect_log == before, "a helper wrote under a changed current receiver identity"
+    assert fenced == (False, reason)
+    status, effect = ("unconfirmed", "partial") if completed_helpers else ("rejected", "none")
+    assert (result.status, result.reason, result.effect) == (status, reason, effect)
+    assert result.helper_results == stored.helper_results
+    assert result.accepted_ts is None
+    assert query(gateway, cmd) == result
+
+
 @pytest.mark.parametrize("outcome,status,phase,effect,accepted", [
     ("complete", "accepted", "accepted", "complete", 1002),
     ("partial", "unconfirmed", "unknown", "partial", None),
@@ -460,6 +495,63 @@ def test_bind_refusal_precedence(tmp_path, changes, reason):
     with pytest.raises(ValueError, match=f"^{reason}$"):
         bind(gateway, **changes)
     assert gateway.state == before
+
+
+@pytest.mark.parametrize("state_changes,changes,reason", [
+    ({}, {"installation_id": "wrong", "barrier_id": "wrong"}, "wrong_installation"),
+    ({"last_barrier": None}, {"barrier_id": "wrong"}, "no_confirmed_barrier"),
+    ({}, {"barrier_id": "wrong", "expected_epoch": 9}, "barrier_mismatch"),
+    ({}, {"expected_epoch": 9, "owner_session_id": ""}, "epoch_mismatch"),
+    ({"epoch_high_water": 9, "bound_owner_epoch": 9},
+     {"expected_epoch": 9, "owner_session_id": ""}, "barrier_epoch_mismatch"),
+    ({}, {"owner_session_id": ""}, "invalid_owner_session"),
+    ({"bound_owner_session_id": None, "inhibited": True}, {}, "barrier_already_bound"),
+    ({}, {"receiver_now_upper_ms": 7000}, "barrier_already_bound"),
+])
+def test_i3_consumed_bind_keeps_refusal_precedence(tmp_path, state_changes, changes, reason):
+    gateway = fake(tmp_path)
+    assert revoke(gateway).status == "accepted"
+    assert bind(gateway).owner_epoch == 8
+    current = replace(gateway.state, **state_changes)
+    result = receiver().classify_bind(current, **(dict(
+        installation_id="sandbox", barrier_id="barrier-a", expected_epoch=8,
+        owner_session_id="owner-b", requested_not_after_ms=12000,
+        receiver_max_lease_ms=5000, receiver_now_upper_ms=1001,
+    ) | changes))
+    assert (result.status, result.reason, result.binding) == ("rejected", reason, None)
+    assert result.state is current
+    assert result.state.owner_not_after_ms == current.owner_not_after_ms
+    assert gateway.effect_log == []
+
+
+@pytest.mark.parametrize("queues_drained,safe_state_confirmed", [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_i3_new_epoch_requires_exact_safe_barrier(tmp_path, queues_drained, safe_state_confirmed):
+    gateway = fake(tmp_path)
+    assert revoke(gateway).status == "accepted"
+    assert bind(gateway).owner_epoch == 8
+    gateway.queues_drained = queues_drained
+    gateway.safe_state_confirmed = safe_state_confirmed
+    barrier = revoke(gateway, expected_epoch=8, barrier_id="barrier-b")
+    confirmed = queues_drained and safe_state_confirmed
+    assert barrier.status == ("accepted" if confirmed else "unconfirmed")
+    assert (barrier.revoked_through_epoch, barrier.current_epoch) == (8, 9)
+    assert gateway.state.epoch_high_water == 9 and gateway.state.inhibited
+    before = gateway.state
+    reason = "barrier_mismatch" if confirmed else "no_confirmed_barrier"
+    with pytest.raises(ValueError, match=f"^{reason}$"):
+        bind(gateway, expected_epoch=9)
+    assert gateway.state == before
+    if confirmed:
+        binding = bind(gateway, expected_epoch=9, barrier_id="barrier-b", owner_session_id="owner-c")
+        assert (binding.owner_epoch, binding.barrier_id, binding.owner_session_id) == (9, "barrier-b", "owner-c")
+        assert not gateway.state.inhibited
+    else:
+        with pytest.raises(ValueError, match="^no_confirmed_barrier$"):
+            bind(gateway, expected_epoch=9, barrier_id="barrier-b", owner_session_id="owner-c")
+        assert gateway.state == before
+    assert gateway.effect_log == []
 
 
 def test_recovery_checks_checkpoint_then_high_waters_and_keeps_unknown_queue():

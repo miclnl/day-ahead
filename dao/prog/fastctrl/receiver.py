@@ -400,6 +400,12 @@ def fence_effect(state: ReceiverState, command: BatteryCommand, *, receiver_now_
         return False, "receiver_inhibited"
     if not state.queue_known:
         return False, "queue_unknown"
+    if command.installation_id != state.installation_id:
+        return False, "wrong_installation"
+    if command.owner_session_id != state.bound_owner_session_id:
+        return False, "wrong_owner_session"
+    if command.owner_epoch != state.bound_owner_epoch:
+        return False, "epoch_withdrawn"
     if not clock_healthy:
         return False, "clock_unhealthy"
     if type(clock_uncertainty_ms) is not int or clock_uncertainty_ms < 0:
@@ -553,6 +559,7 @@ def classify_bind(state: ReceiverState, *, installation_id: str, barrier_id: str
         (expected_epoch != state.epoch_high_water, "epoch_mismatch"),
         (state.last_barrier is not None and expected_epoch != state.last_barrier.current_epoch, "barrier_epoch_mismatch"),
         (type(owner_session_id) is not str or not owner_session_id.strip(), "invalid_owner_session"),
+        (state.bound_owner_epoch == expected_epoch, "barrier_already_bound"),
     )
     reason = next((reason for refused, reason in checks if refused), None)
     if reason is not None:
