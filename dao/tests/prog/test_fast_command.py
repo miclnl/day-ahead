@@ -11,6 +11,7 @@ from dataclasses import FrozenInstanceError, asdict, fields, replace
 from importlib import import_module, util
 from pathlib import Path
 from typing import get_args, get_type_hints
+from unittest.mock import Mock
 
 import pytest
 
@@ -438,7 +439,11 @@ def test_runner_returns_tuple_and_preserves_last_receipts(tmp_path, kind):
 
 
 @pytest.mark.parametrize("mode", ["active", "shadow", "off"])
-def test_public_runner_ready_v2_is_still_hard_denied_without_helpercalls(tmp_path, mode):
+def test_public_runner_ready_v2_is_still_hard_denied_without_helpercalls(tmp_path, monkeypatch, mode):
+    from dao.prog.fastctrl import runner as runner_module
+
+    clock = [15_000_000_000]
+    monkeypatch.setattr(runner_module.time, "clock_gettime_ns", lambda _: clock[0])
     plan = ready_plan()
     path = tmp_path / "plan.json"
     path.write_text(json.dumps(plan.to_dict()))
@@ -446,6 +451,24 @@ def test_public_runner_ready_v2_is_still_hard_denied_without_helpercalls(tmp_pat
     runner = FastControlRunner(hass, make_config(mode=mode), fallback=sink,
                                plan_path=str(path), state_path=str(tmp_path / "state.json"))
     assert runner.tick(plan.created_ts) is None
+    assert [r.reason for r in sink.requests] == ["actuation_gates_unproven"]
+    assert runner.last_receipts == []
+    assert hass.values == hass.options == hass.published == hass.switches == {}
+    assert hass.services == []
+    assert hass.template_calls == hass.state_calls == 0
+
+    # The real admitted read established financial cadence. Phase three must
+    # defer before another publication lock/read or any fallback/sensor I/O.
+    read = Mock(wraps=runner_module.read_publication)
+    acquire = Mock(wraps=runner_module.publication_lock)
+    monkeypatch.setattr(runner_module, "read_publication", read)
+    monkeypatch.setattr(runner_module, "publication_lock", acquire)
+    clock[0] = 18_000_000_000
+    assert runner.tick(plan.created_ts) is None
+    assert runner.last_gate.allowed is False
+    assert runner.last_gate.reason == "admission_deferred"
+    read.assert_not_called()
+    acquire.assert_not_called()
     assert [r.reason for r in sink.requests] == ["actuation_gates_unproven"]
     assert runner.last_receipts == []
     assert hass.values == hass.options == hass.published == hass.switches == {}
