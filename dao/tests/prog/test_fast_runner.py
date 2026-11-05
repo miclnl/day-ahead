@@ -80,13 +80,36 @@ def test_i4_tick_passes_only_live_owner_context_before_policy(tmp_path, monkeypa
 
 
 def test_i4_tick_does_not_book_a_gap_hidden_by_the_legacy_saving_cap(tmp_path, monkeypatch):
-    from dao.prog.fastctrl import runner as runner_module
-    from dao.prog.fastctrl.publication import GateVerdict
-    from dao.tests.prog.test_fast_consumer import NOW, NOW_TS, build, consume, propose
+    import copy
+    from dataclasses import replace
 
-    harness = build(tmp_path)
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.prog.fastctrl.command import plan_digest
+    from dao.prog.fastctrl.policy import current_execution_command
+    from dao.prog.fastctrl.publication import GateVerdict
+    from dao.tests.prog.test_fast_consumer import (
+        NOW,
+        NOW_TS,
+        build,
+        consume,
+        financial_plan,
+        propose,
+    )
+
+    plan = financial_plan(powers=(-4000.0,))
+    first = plan.intervals[0]
+    # Keep acceptance live past the final tick without exhausting the default
+    # energy budget: a continuous profile in one final, partial hourly interval.
+    step = replace(first.battery(0), ac_power_w=-4000.0, mean_ac_power_w=-4000.0,
+                   stop_ts=None)
+    plan = replace(plan, interval_s=3600, intervals=[replace(
+        first, end_ts=NOW_TS + 2700, batteries=[step])])
+    harness = build(tmp_path, plan=plan)
     try:
         runner = harness.runner
+        assert plan.financial_context.not_after_ts == NOW_TS + 1800
+        assert harness.owner.binding.owner_not_after_ms == NOW + 3_600_000
+        assert runner.limits().energy_budget == 0.5
         runner.state.last_tick_ts = NOW_TS
         runner.state.day_key = runner._day_key(NOW_TS)
         # A command accepted between the two ticks does not cover the whole gap.
@@ -94,8 +117,15 @@ def test_i4_tick_does_not_book_a_gap_hidden_by_the_legacy_saving_cap(tmp_path, m
         receipt = consume(harness, propose(harness.plan, runner.state, timestamp=NOW_TS + 100,
                                             grid_w=5000), now_ms=NOW + 100_000)[0]
         assert receipt.status == "accepted"
+        controller = runner.state.battery(0)
+        command = controller.last_accepted_command
+        assert command.issued_at_ms == receipt.accepted_ts == NOW + 100_000
+        assert command.hold_until_ms == NOW + 1_800_000
         harness.gateway.advance_clock(900_000)
         now = NOW_TS + 1000
+        assert current_execution_command(
+            controller, binding=harness.owner.binding, now_ms=NOW + 1_000_000,
+            expected_digest=plan_digest(plan)) is command
         # Synthetic composition of the internal v2 loop only; the public refusal
         # is tested separately and no production gate is changed.
         monkeypatch.setattr(runner_module, "following_verdict",
@@ -105,6 +135,16 @@ def test_i4_tick_does_not_book_a_gap_hidden_by_the_legacy_saving_cap(tmp_path, m
             "sensor.battery_power": ("-5000", now)})
         decision = runner.tick(now)
         assert decision.benefit_eur_h > 0
+        assert runner.state.saved_today_eur == 0.0
+        assert controller.last_accepted_command is command
+        assert abs(controller.interval_deviation_kwh) < runner.limits().energy_budget
+        # The clipped +400..+1000s gap would book a positive amount; the real
+        # +0..+1000s gap must still reject its unaccepted first 100 seconds.
+        clipped = copy.copy(runner)
+        clipped.state = copy.deepcopy(runner.state)
+        clipped._book_saving(decision, elapsed_h=600 / 3600, plan=plan,
+                             owner_binding=harness.owner.binding)
+        assert clipped.state.saved_today_eur > 0
         assert runner.state.saved_today_eur == 0.0
     finally:
         harness.lease.close()

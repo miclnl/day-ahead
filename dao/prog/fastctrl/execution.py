@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
+from .actuator import FENCED_ADAPTER, classify_actuation_adapter
 from .command import (
     ActuationReceipt,
     BatteryCommand,
@@ -125,6 +126,14 @@ def validate_current_locked(*, lease: PublicationLease, expected_digest: str,
     return plan
 
 
+def _validate_receiver(*, owner: OwnerCoordinator, receiver: FencedDeviceGateway) -> None:
+    """Require the owner's nominal adapter object before any mechanical side effect."""
+    if classify_actuation_adapter(receiver) != FENCED_ADAPTER:
+        raise ExecutionRefused("adapter_unqualified")
+    if receiver is not owner.receiver:
+        raise ExecutionRefused("receiver_binding_mismatch")
+
+
 def _validate_installation(plan: FastPlan, *, owner: OwnerCoordinator,
                            command: BatteryCommand | None = None) -> None:
     """Bind the freshly validated meter to the startup-proven owner identity."""
@@ -219,6 +228,7 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
         raise ExecutionRefused("command_invalid")
     if type(deadline) is not Deadline:
         raise ExecutionRefused("deadline_invalid")
+    _validate_receiver(owner=owner, receiver=receiver)
     # An earlier caller check never suffices; the final check runs here.
     plan = validate_current_locked(lease=lease, expected_digest=command.plan_digest,
                                    clock=clock, policy=policy)
@@ -354,6 +364,7 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
         raise ExecutionRefused("owner_invalid")
     if type(deadline) is not Deadline:
         raise ExecutionRefused("deadline_invalid")
+    _validate_receiver(owner=owner, receiver=receiver)
     now = owner.now_ns
     # One absolute deadline for the whole installation.
     end = min(deadline.monotonic_end_ns, clock.boottime_ns + SECTION_BUDGET_NS)

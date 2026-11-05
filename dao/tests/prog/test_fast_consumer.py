@@ -1259,6 +1259,38 @@ def test_11_an_overlap_suppresses_the_diagnostics_publication(tmp_path, entity):
     assert harness.hass.switches == harness.hass.published == {}
 
 
+@pytest.mark.parametrize("mode", ["off", "shadow", "active"])
+def test_i6_public_v2_denies_even_own_nominal_receiver(tmp_path, monkeypatch, mode):
+    harness = build(tmp_path, config=make_config(mode=mode))
+    try:
+        decision = propose(harness.plan, harness.runner.state)
+        assert decision.batteries[0].write is True
+        assert harness.owner.receiver is harness.gateway
+        before = harness.store.path.read_bytes()
+        calls = observe_receiver_calls(monkeypatch, harness.gateway)
+        boundary = import_module("dao.prog.fastctrl.execution")
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("the public v2 gate reached a mechanical boundary")
+
+        monkeypatch.setattr(boundary, "owner_section", forbidden)
+        monkeypatch.setattr(boundary, "send_locked", forbidden)
+        assert harness.runner.tick(NOW_TS) is None
+        assert harness.runner.last_gate.allowed is False
+        assert harness.runner.last_gate.reason == "actuation_gates_unproven"
+        assert harness.runner.last_actuation is None
+        assert harness.runner.last_receipts == []
+        assert calls == [] and harness.gateway.effect_log == []
+        assert harness.store.path.read_bytes() == before
+        assert harness.owner.state.pending_command is None
+        assert harness.runner.state.battery(0).pending_command is None
+        assert harness.hass.values == harness.hass.options == harness.hass.published == {}
+        assert harness.hass.switches == {} and harness.hass.services == []
+        assert harness.hass.template_calls == harness.hass.state_calls == 0
+    finally:
+        harness.lease.close()
+
+
 def test_12_the_adapter_classification_is_nominal(tmp_path):
     module = actuator()
     from dao.prog.fastctrl.runner import HomeAssistantGateway

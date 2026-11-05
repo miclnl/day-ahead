@@ -723,6 +723,127 @@ def test_06_a_changed_plan_is_refused_even_when_it_is_still_valid(artifact):
 
 # -- the bounded send --------------------------------------------------------
 
+@pytest.mark.parametrize("boundary,publication", [
+    ("owner_section", "ready"), ("owner_section", "blocked"), ("send_locked", "ready"),
+])
+@pytest.mark.parametrize("adapter,on_owner", [
+    ("duck", False), ("duck", True),
+    ("labelled_duck", False), ("labelled_duck", True),
+    ("generic_ha", False), ("generic_ha", True),
+    ("foreign", False), ("foreign", True), ("other_fenced", False),
+])
+def test_i6_direct_boundary_refuses_duck_receiver(
+        artifact, monkeypatch, boundary, publication, adapter, on_owner):
+    """Neither duck methods nor equal receiver IDs grant mechanical command rights."""
+    from dao.prog.fastctrl.runner import HomeAssistantGateway
+    from dao.tests.prog.test_fast_runner import FakeHass
+
+    module = execution()
+    layout = owner_layout(artifact.root)
+    try:
+        command = None
+        if boundary == "send_locked":
+            command = build_command(module, layout, artifact)
+            layout.owner.record_pending_command(command)
+        receiver_files = [layout.gateway.state_path, layout.gateway.anchor_path]
+        if adapter in ("duck", "labelled_duck"):
+            offered = SimpleNamespace(**{name: getattr(layout.gateway, name)
+                                         for name in RECEIVER_ENTRYPOINTS})
+            if adapter == "labelled_duck":
+                offered.actuation_adapter_class = "fenced"
+        elif adapter == "generic_ha":
+            offered = HomeAssistantGateway(FakeHass())
+        elif adapter == "foreign":
+            offered = object()
+        else:
+            offered = FencedReceiver(artifact.root / "other-receiver",
+                                      initial_state=layout.gateway.state, utc_ms=NOW)
+            assert offered is not layout.owner.receiver
+            assert offered.state.receiver_id == layout.binding.receiver_id
+            assert offered.state.receiver_generation == layout.binding.receiver_generation
+            receiver_files.extend((offered.state_path, offered.anchor_path))
+        if on_owner:
+            layout.owner.receiver = offered
+        if publication == "blocked":
+            artifact.path.write_text(json.dumps({"format_version": 2, "status": "blocked",
+                                                 "created_ts": NOW_TS, "reason": "correction"}))
+        before = {path: path.read_bytes()
+                  for path in (artifact.path, layout.store.path, *receiver_files)}
+        state_before = layout.owner.state
+        calls = []
+
+        def tripwire(name):
+            def forbidden(*args, **kwargs):
+                calls.append(name)
+                raise AssertionError(f"receiver refusal came after a side effect: {name}")
+            return forbidden
+
+        for label, target in (("bound", layout.gateway), ("offered", offered)):
+            for name in (*RECEIVER_ENTRYPOINTS, "read", "write_number", "select_option",
+                         "set_datetime", "publish_state", "switch"):
+                if hasattr(target, name):
+                    monkeypatch.setattr(target, name, tripwire(f"{label}.{name}"))
+        for name in ("reserve_sequence", "record_pending_command", "record_receipt",
+                     "stop", "report_failure", "_write"):
+            monkeypatch.setattr(layout.owner, name, tripwire(f"owner.{name}"))
+        monkeypatch.setattr(layout.store, "write", tripwire("store.write"))
+        failure = None
+        with publication_lock(artifact.path) as lease:
+            try:
+                if boundary == "send_locked":
+                    module.send_locked(command, lease=lease, owner=layout.owner,
+                                       receiver=offered, deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+                else:
+                    module.owner_section(lease=lease, owner=layout.owner, receiver=offered,
+                                         request=request(), deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+            except Exception as exc:
+                failure = exc
+        assert isinstance(failure, module.ExecutionRefused), (failure, calls)
+        expected = "receiver_binding_mismatch" if adapter == "other_fenced" else "adapter_unqualified"
+        assert failure.reason == expected, calls
+        assert calls == []
+        assert {path: path.read_bytes() for path in before} == before
+        assert layout.owner.state is state_before
+        assert layout.owner.binding is layout.binding
+        assert layout.owner.phase == "owned" and layout.owner.recovery_required is False
+        assert layout.owner._sequence_high_water == (41 if command is not None else 40)
+        assert layout.owner.state.pending_command == command
+        assert layout.store.load_strict().pending_command == command
+        assert layout.gateway.effect_log == []
+        if adapter == "other_fenced":
+            assert offered.effect_log == []
+    finally:
+        layout.lease.close()
+
+
+@pytest.mark.parametrize("boundary", ["owner_section", "send_locked"])
+def test_i6_direct_boundary_accepts_own_nominal_receiver(artifact, monkeypatch, boundary):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    try:
+        command = None
+        if boundary == "send_locked":
+            command = build_command(module, layout, artifact)
+            layout.owner.record_pending_command(command)
+        calls = observe_receiver_calls(monkeypatch, layout.gateway)
+        with publication_lock(artifact.path) as lease:
+            if boundary == "send_locked":
+                receipt = module.send_locked(command, lease=lease, owner=layout.owner,
+                    receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+            else:
+                receipt = module.owner_section(lease=lease, owner=layout.owner,
+                    receiver=layout.gateway, request=request(), deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+        assert receipt.status == "accepted" and receipt.sequence == 41
+        assert calls.count("send") == 1 and "inspect" not in calls
+        assert layout.gateway.effect_log == [(receipt.command_id, part, "accu", -1200)
+                                            for part in ("setpoint", "mode", "stop_inverter")]
+        mirror = layout.store.load_strict()
+        assert mirror.pending_command is None and mirror.last_receipt == receipt
+        assert mirror.last_reserved_sequence == 41
+    finally:
+        layout.lease.close()
+
+
 @pytest.mark.parametrize("fault", ["none", "plan", "binding", "state", "store", "command",
                                     "missing_binding", "missing_state"])
 def test_i2_direct_send_rechecks_installation(artifact, monkeypatch, fault):
