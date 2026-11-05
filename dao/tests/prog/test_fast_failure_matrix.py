@@ -78,6 +78,8 @@ from dao.tests.prog.test_fast_execution import (
     RESOURCE,
     build_command,
     execution,
+    final_section,
+    next_owner_cycle,
     observed_receipt,
     owner_layout,
     ownership,
@@ -240,6 +242,7 @@ def layout_at(root, *, requested_not_after_ms=None):
     bound = owner_layout(root, requested_not_after_ms=requested_not_after_ms)
     bound.owner.now_ns = lambda: MONO + bound.gateway.monotonic_ns
     bound.owner.now_ms = lambda: bound.gateway.utc_ms
+    bound.gateway.owner_now_ns = lambda: bound.owner.now_ns()
     return bound
 
 
@@ -374,7 +377,7 @@ def faulted_section(artifact, layout, moment, *, window_ms, answer=True, crash=F
     gateway = layout.gateway
     attempts = delayed_transport(gateway, moment, window_ms=window_ms, answer=answer,
                                  crash=crash, persist=persist)
-    with publication_lock(artifact.path) as lease:
+    with final_section(layout.owner) as lease:
         try:
             receipt = module.owner_section(lease=lease, owner=layout.owner, receiver=gateway,
                                            request=request(), policy=POLICY, clock=CLOCK,
@@ -386,6 +389,7 @@ def faulted_section(artifact, layout, moment, *, window_ms, answer=True, crash=F
 
 def withdraw_epoch(layout, *, reason="operator_stop"):
     """The new epoch barrier: the epoch is withdrawn and confirmed."""
+    next_owner_cycle(layout.owner)
     barrier = layout.owner.stop(reason=reason)
     assert barrier is not None, "the epoch was not withdrawn"
     assert barrier.status == "accepted", barrier
@@ -401,6 +405,8 @@ def new_session(layout, *, session_id):
     """
     layout.lease.close()
     lease = task_execution.acquire_resource(RESOURCE, lease_dir=layout.store.lease_dir)
+    layout.owner._bind_lifetime(lease)
+    next_owner_cycle(layout.owner)
     deadline = Deadline(layout.owner.now_ns() + 1_000_000_000, layout.gateway.utc_ms + 60_000)
     binding = layout.owner.start(writer=lease, receiver=layout.gateway,
                                  installation_id=INSTALLATION, owner_session_id=session_id,
@@ -411,6 +417,7 @@ def new_session(layout, *, session_id):
     # The layout follows the owner: a command that is built here belongs to
     # the binding that is really in force.
     layout.binding = binding
+    next_owner_cycle(layout.owner)
     return binding
 
 
@@ -611,6 +618,7 @@ def assert_new_command_needs_binding_and_basis(artifact, layout):
     binding = layout.owner.binding
     assert binding is not None, "the negative control needs a current binding"
     # A fresh and correct clock and deadline: the manual clock of the fake.
+    next_owner_cycle(layout.owner)
     clock = clock_at(layout.gateway, layout.gateway.utc_ms)
     # The valid starting point: a new pending command in the current binding
     # and the current basis.
@@ -621,10 +629,10 @@ def assert_new_command_needs_binding_and_basis(artifact, layout):
     # valid, so the refusal can only come from the binding.
     layout.owner.binding = replace(binding, owner_epoch=binding.owner_epoch + 1)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.send_locked(fresh, lease=lease, owner=layout.owner,
-                                   receiver=layout.gateway, deadline=SECTION_DEADLINE,
+                                   receiver=layout.gateway, deadline=layout.owner.section_deadline,
                                    clock=clock, policy=POLICY)
         assert error.value.reason == "owner_binding_mismatch", error.value
     finally:
@@ -633,11 +641,13 @@ def assert_new_command_needs_binding_and_basis(artifact, layout):
     # command stay valid, so the refusal can only come from the basis.
     other = replace(artifact.plan, price_average=artifact.plan.price_average + 0.5)
     artifact.path.write_text(json.dumps(other.to_dict()))
+    next_owner_cycle(layout.owner)
+    clock = clock_at(layout.gateway, layout.gateway.utc_ms)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.send_locked(fresh, lease=lease, owner=layout.owner,
-                                   receiver=layout.gateway, deadline=SECTION_DEADLINE,
+                                   receiver=layout.gateway, deadline=layout.owner.section_deadline,
                                    clock=clock, policy=POLICY)
         assert error.value.reason == "plan_digest_mismatch", error.value
     finally:
@@ -683,7 +693,7 @@ def test_01_the_bounded_retry_reaches_the_receiver_and_is_deduplicated(artifact,
 
     layout.gateway.query = query
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
                                            request=request(), policy=POLICY, clock=CLOCK,
                                            deadline=SECTION_DEADLINE)
@@ -775,7 +785,7 @@ def test_01b_the_retransmission_after_a_lost_transport_delivers_the_command_exac
 
     layout.gateway.send = send
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.send_locked(command, lease=lease, owner=layout.owner,
                                    receiver=layout.gateway, deadline=SECTION_DEADLINE,
@@ -790,10 +800,11 @@ def test_01b_the_retransmission_after_a_lost_transport_delivers_the_command_exac
         assert not layout.gateway.effect_log, layout.gateway.effect_log
         # The retry: exactly the same bytes and the same pending command.
         layout.gateway.__dict__.pop("send", None)
-        with publication_lock(artifact.path) as lease:
+        next_owner_cycle(layout.owner)
+        with final_section(layout.owner) as lease:
             receipt = module.send_locked(command, lease=lease, owner=layout.owner,
                                          receiver=layout.gateway, deadline=SECTION_DEADLINE,
-                                         clock=CLOCK, policy=POLICY)
+                                         clock=clock_at(layout.gateway, layout.gateway.utc_ms), policy=POLICY)
         assert receipt.status == "accepted", receipt
         assert receipt.command_id == command.command_id, receipt
         assert len(layout.gateway.effect_log) == 3, layout.gateway.effect_log
@@ -844,13 +855,17 @@ def caller_layout(root):
     gateway = FencedReceiver(Path(root) / "receiver", initial_state=receiver_state(),
                              utc_ms=NOW, effect_log_path=effect_log_path(root))
     owner = module.OwnerCoordinator(store, receiver=gateway)
-    owner.now_ns = lambda: MONO
+    owner.now_ns = lambda: 0
     owner.now_ms = lambda: NOW
     lease = task_execution.acquire_resource(RESOURCE, lease_dir=Path(root) / "leases")
+    gateway.receiver_max_lease_ms = 60_000
+    owner._bind_lifetime(lease)
+    next_owner_cycle(owner)
     binding = owner.start(writer=lease, receiver=gateway, installation_id=INSTALLATION,
                           owner_session_id="session-new", requested_not_after_ms=NOW + 60_000,
                           deadline=DEADLINE, now_ms=NOW)
     assert binding.owner_epoch == 8, binding
+    owner.now_ns = lambda: MONO
     return SimpleNamespace(module=module, store=store, gateway=gateway, owner=owner,
                            lease=lease, binding=binding)
 
@@ -887,11 +902,15 @@ def caller_worker(root, cutpoint, moment):
                              effect_log_path=effect_log_path(root))
     owner = OwnerCoordinator(store, receiver=gateway, now_ns=lambda: MONO, now_ms=lambda: NOW)
     lease = task_execution.acquire_resource(RESOURCE, lease_dir=root / "leases")
+    gateway.receiver_max_lease_ms = 60_000
+    owner._bind_lifetime(lease)
+    next_owner_cycle(owner)
     binding = owner.start(writer=lease, receiver=gateway, installation_id=INSTALLATION,
                           owner_session_id="session-caller",
                           requested_not_after_ms=NOW + 60_000,
-                          deadline=Deadline(MONO + 1_000_000_000, NOW + 60_000), now_ms=NOW)
+                          deadline=Deadline(owner.now_ns() + 1_000_000_000, NOW + 60_000), now_ms=NOW)
     assert binding is not None, binding
+    next_owner_cycle(owner)
     if cutpoint == "before_send":
         real_record = owner.record_pending_command
 
@@ -918,10 +937,10 @@ def caller_worker(root, cutpoint, moment):
             os._exit(CALLER_DEATH)
 
         gateway.send = send
-    with publication_lock(root / "fast_plan.json") as publication:
+    with final_section(owner) as publication:
         module.owner_section(lease=publication, owner=owner, receiver=gateway,
-                             request=request(), policy=POLICY, clock=CLOCK,
-                             deadline=Deadline(MONO + 1_000_000_000, NOW + 60_000))
+                             request=request(), policy=POLICY, clock=replace(CLOCK, boottime_ns=owner.now_ns()),
+                             deadline=owner.section_deadline)
     raise AssertionError("the caller did not die at its cutpoint")
 
 
@@ -1040,12 +1059,15 @@ def test_02_the_caller_process_dies_and_the_durable_state_survives(artifact, mom
             assert_identity(original, old, what="original query receipt")
         store = OwnerStore(artifact.root / "fast_plan.json", INSTALLATION,
                            lease_dir=artifact.root / "leases")
-        owner = OwnerCoordinator(store, receiver=gateway, now_ns=lambda: MONO,
+        owner = OwnerCoordinator(store, receiver=gateway, now_ns=lambda: 30_000_000_000,
                                  now_ms=lambda: NOW)
+        gateway.receiver_max_lease_ms = 60_000
+        owner._bind_lifetime(lease)
+        next_owner_cycle(owner)
         binding = owner.start(writer=lease, receiver=gateway, installation_id=INSTALLATION,
                               owner_session_id="session-after-crash",
                               requested_not_after_ms=NOW + 60_000,
-                              deadline=Deadline(MONO + 1_000_000_000, NOW + 60_000), now_ms=NOW)
+                              deadline=Deadline(owner.now_ns() + 1_000_000_000, NOW + 60_000), now_ms=NOW)
         assert binding.owner_epoch == 10, binding
         # The barrier of the new session is exact and durable.
         mirror = read_mirror(artifact.root)
@@ -1115,10 +1137,12 @@ def test_02_the_caller_process_dies_and_the_durable_state_survives(artifact, mom
             recorded["command"] = pending_command(stored)
 
         owner.record_pending_command = record
-        with publication_lock(artifact.path) as publication:
+        next_owner_cycle(owner)
+        with final_section(owner) as publication:
             receipt = module.owner_section(lease=publication, owner=owner, receiver=gateway,
-                                           request=request(), policy=POLICY, clock=CLOCK,
-                                           deadline=SECTION_DEADLINE)
+                                           request=request(), policy=POLICY,
+                                           clock=replace(CLOCK, boottime_ns=owner.now_ns()),
+                                           deadline=owner.section_deadline)
         owner.record_pending_command = real_record
         new = recorded.get("command")
         assert new is not None, "the new command was not stored durably before the send"
@@ -1395,11 +1419,12 @@ def test_06_the_correction_after_the_send_withdraws_the_owner_epoch(artifact, la
                                           "reason": "registered_financial_inputs_changed"}))
     module = execution()
     # This is the next section, after the timed-out send and the correction.
+    next_owner_cycle(layout.owner)
     clock = clock_at(layout.gateway, layout.gateway.utc_ms)
-    with publication_lock(artifact.path) as lease:
+    with final_section(layout.owner) as lease:
         assert module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
                                     request=request(), policy=POLICY, clock=clock,
-                                    deadline=SECTION_DEADLINE) is None
+                                    deadline=layout.owner.section_deadline) is None
     mirror = read_mirror(artifact.root)
     # The invalidation is the new epoch barrier.
     assert mirror["phase"] == "released", mirror
@@ -1435,7 +1460,7 @@ def test_07_the_correction_before_the_send_gives_no_send_at_all(artifact, layout
                                           "created_ts": NOW_TS,
                                           "reason": "registered_financial_inputs_changed"}))
     module = execution()
-    with publication_lock(artifact.path) as lease:
+    with final_section(layout.owner) as lease:
         assert module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
                                     request=request(), policy=POLICY, clock=CLOCK,
                                     deadline=SECTION_DEADLINE) is None
@@ -1564,9 +1589,9 @@ def test_09_the_lifetime_lease_before_on_and_after_the_new_epoch_barrier(artifac
 
 # -- the time boundaries of the lease and of the command (fix round 1) --------
 
-#: The owner lease of the boundary cells: the fake caps its own lease at five
-#: seconds, so this request is exactly the cap.
-LEASE_END_MS = 5000
+#: Put the exact wire edge inside a new admission phase, with a sufficient
+#: startup lease. Before/on/after still differ by exactly one millisecond.
+LEASE_END_MS = 5500
 
 
 def clock_at(gateway, utc_ms):
@@ -1575,7 +1600,7 @@ def clock_at(gateway, utc_ms):
     The owner's own clock follows the fake as well, so the two never disagree
     about the remaining lease.
     """
-    return replace(CLOCK, utc_ms=utc_ms, boottime_ns=MONO + gateway.monotonic_ns)
+    return replace(CLOCK, utc_ms=utc_ms, boottime_ns=gateway.owner_now_ns())
 
 
 @pytest.mark.parametrize("offset", [-1, 0, 1])
@@ -1596,7 +1621,7 @@ def test_09b_the_owner_lease_time_boundary_is_exact(artifact, offset):
         moment = NOW + LEASE_END_MS + offset
         bound.gateway.advance_clock(LEASE_END_MS + offset)
         clock = clock_at(bound.gateway, moment)
-        with publication_lock(artifact.path) as lease:
+        with final_section(bound.owner) as lease:
             if offset < 0:
                 receipt = module.owner_section(lease=lease, owner=bound.owner,
                                                receiver=bound.gateway, request=request(),
@@ -1649,7 +1674,7 @@ def test_09c_the_command_deadline_boundary_is_exact(artifact, offset):
 
         bound.gateway.send = send
         failure = None
-        with publication_lock(artifact.path) as lease:
+        with final_section(bound.owner) as lease:
             try:
                 returned = module.send_locked(command, lease=lease, owner=bound.owner,
                                               receiver=bound.gateway, deadline=SECTION_DEADLINE,
@@ -1711,7 +1736,7 @@ def test_09d_the_helper_effects_before_the_expiry_stay_visible(artifact):
             return receipt
 
         bound.gateway.send = send
-        with publication_lock(artifact.path) as lease:
+        with final_section(bound.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.send_locked(command, lease=lease, owner=bound.owner,
                                    receiver=bound.gateway, deadline=SECTION_DEADLINE,
@@ -1937,10 +1962,10 @@ def test_09e_a_new_section_after_an_exact_stop_is_allowed(artifact, layout):
     # The normal section is allowed again: the transport works again.
     restore_transport(layout.gateway)
     clock = clock_at(layout.gateway, layout.gateway.utc_ms)
-    with publication_lock(artifact.path) as lease:
+    with final_section(layout.owner) as lease:
         receipt = module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
                                        request=request(), policy=POLICY, clock=clock,
-                                       deadline=SECTION_DEADLINE)
+                                       deadline=layout.owner.section_deadline)
     assert receipt.status == "accepted", receipt
     assert receipt.owner_epoch == 10, receipt
     assert receipt.sequence > old.sequence, (receipt, old)
@@ -1981,7 +2006,7 @@ def test_09f_a_delayed_delivery_inside_the_window_goes_through_the_owner(artifac
 
     layout.gateway.send = send
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
                                            request=request(), policy=POLICY, clock=CLOCK,
                                            deadline=SECTION_DEADLINE)
@@ -2299,6 +2324,7 @@ def test_14_a_delivered_duplicate_keeps_the_live_reservation_uncertain(tmp_path)
         assert len(gateway.effect_log) == 1, gateway.effect_log
         effect_before_barrier = list(gateway.effect_log)
         # The new epoch barrier ends the reservation: no old effect after it.
+        next_owner_cycle(harness.owner)
         barrier = harness.owner.stop(reason="operator_stop")
         assert barrier.status == "accepted", barrier
         gateway.step_helper("mode", command=commands[0])
@@ -2395,7 +2421,7 @@ def test_17_a_new_command_needs_an_exact_binding_and_a_current_basis(artifact, l
     # The positive route: the valid new pending command really goes through.
     first = build_command(module, layout, artifact)
     layout.owner.record_pending_command(first)
-    with publication_lock(artifact.path) as lease:
+    with final_section(layout.owner) as lease:
         receipt = module.send_locked(first, lease=lease, owner=layout.owner,
                                     receiver=layout.gateway, deadline=SECTION_DEADLINE,
                                     clock=CLOCK, policy=POLICY)

@@ -28,7 +28,7 @@ from dao.prog.fastctrl.policy import (
 from dao.prog.fastctrl.publication import GatePolicy
 from dao.prog.fastctrl.runner import FastControlRunner
 from dao.tests.prog.fakes.fenced_receiver import FencedReceiver
-from dao.tests.prog.test_fast_execution import observe_receiver_calls
+from dao.tests.prog.test_fast_execution import next_owner_cycle, observe_receiver_calls
 from dao.tests.prog.test_fast_ownership import RECEIPT_IDENTITY_MISMATCHES
 from dao.tests.prog.test_fast_receiver import state as receiver_state
 from dao.tests.prog.test_fast_runner import FakeHass, make_config
@@ -37,7 +37,7 @@ from dao.tests.settlement.test_fast_contract import ready_plan
 
 INSTALLATION = "sandbox"
 RESOURCE = "actuator-" + hashlib.sha256(b"sandbox").hexdigest()[:32]
-MONO = 1_000_000_000
+MONO = 15_000_000_000
 #: The plant timeline is seconds; the clock and the receiver are milliseconds.
 NOW_TS = START_TS + 900
 NOW = NOW_TS * 1000
@@ -117,21 +117,25 @@ def build(tmp_path, *, plan=None, config=None, start_owner=True, lease_ms=LEASE_
     path.write_text(json.dumps(plan.to_dict()))
     store = provision_mirror(tmp_path)
     gateway = FencedReceiver(tmp_path / "receiver", initial_state=receiver_state(),
-                              utc_ms=NOW)
-    gateway.receiver_max_lease_ms = LEASE_MS
+                              utc_ms=NOW - 10_000 if start_owner else NOW)
+    gateway.receiver_max_lease_ms = LEASE_MS + 10_000
     owner = ownership.OwnerCoordinator(
         store, receiver=gateway,
-        now_ns=lambda: MONO + gateway.monotonic_ns,
+        now_ns=lambda: 0,
         now_ms=lambda: gateway.utc_ms,
     )
     lease = None
     if start_owner:
         lease = task_execution.acquire_resource(RESOURCE, lease_dir=tmp_path / "leases")
+        owner._bind_lifetime(lease)
+        owner.now_ns = lambda: 5_000_000_000
         binding = owner.start(writer=lease, receiver=gateway, installation_id=INSTALLATION,
                               owner_session_id="session-new",
                               requested_not_after_ms=NOW + lease_ms,
-                              deadline=DEADLINE, now_ms=NOW)
+                              deadline=Deadline(6_000_000_000, NOW + lease_ms), now_ms=gateway.utc_ms)
         assert binding.owner_epoch == 8, binding
+    gateway.utc_ms = NOW
+    owner.now_ns = lambda: MONO + gateway.monotonic_ns
     hass = FakeHass({"sensor.p1_power": "0", "sensor.soc": "50",
                      "sensor.battery_power": "0"})
     runner = FastControlRunner(hass, config or make_config(), plan_path=str(path),
@@ -165,6 +169,11 @@ def propose(plan, state, *, timestamp=NOW_TS, grid_w=None, limits=None, owner_bi
 def consume(harness, decision, *, now_ms=NOW):
     return harness.runner._consume_financial_actuation(
         decision, harness.plan, owner=harness.owner, now_ms=now_ms)
+
+
+def stop(harness, **kwargs):
+    next_owner_cycle(harness.owner)
+    return harness.owner.stop(**kwargs)
 
 
 def i5_short_plan():
@@ -460,6 +469,8 @@ def test_i5_profile_hold_expiry_requires_new_same_power_proposal(tmp_path, edge,
         assert follow.batteries[0].setpoint_w == power
         assert follow.batteries[0].write is (offset >= 0)
         assert old.execute_before_ms == old.hold_until_ms == boundary_ms
+        if offset >= 0 and edge in ("active", "stop"):
+            next_owner_cycle(harness.owner)
         receipts = consume(harness, follow, now_ms=gateway.utc_ms)
         if offset < 0:
             assert receipts == ()
@@ -492,11 +503,14 @@ def test_i5_profile_hold_is_specific_to_each_battery(tmp_path):
 
 def restart_i4_owner(harness, session="i4-fresh-session"):
     owner = harness.owner
-    return owner.start(
+    next_owner_cycle(owner)
+    result = owner.start(
         writer=harness.lease, receiver=harness.gateway, installation_id=INSTALLATION,
         owner_session_id=session, requested_not_after_ms=owner.now_ms() + LEASE_MS,
         deadline=Deadline(owner.now_ns() + 750_000_000, owner.now_ms() + 750),
         now_ms=owner.now_ms())
+    next_owner_cycle(owner)
+    return result
 
 
 @pytest.mark.parametrize("batteries", [1, 2])
@@ -508,7 +522,7 @@ def test_i4_stop_restart_same_power_requires_fresh_command(tmp_path, batteries, 
         assert [receipt.status for receipt in first] == ["accepted"] * batteries
         history = harness.runner.state.to_dict()
         assert all(b.pending_command is None for b in harness.runner.state.batteries)
-        barrier = harness.owner.stop(reason="operator_stop")
+        barrier = stop(harness, reason="operator_stop")
         assert (barrier.status, barrier.safe_state, barrier.queues_fenced) == (
             "accepted", "confirmed", True)
         harness.runner._apply_stop_barrier(barrier, now_ms=NOW)
@@ -631,7 +645,7 @@ def test_i4_stale_history_books_no_benefit_or_held_fallback(tmp_path, context, c
         binding = harness.owner.binding
         live = context == "live"
         if context == "stopped":
-            barrier = harness.owner.stop(reason="operator_stop")
+            barrier = stop(harness, reason="operator_stop")
             harness.runner._apply_stop_barrier(barrier, now_ms=NOW)
             binding = harness.owner.binding
         elif context == "loaded":
@@ -677,7 +691,7 @@ def test_i4_measurements_remain_evidence_after_acceptance_expires(tmp_path, meas
                                                              valid=measured_valid)])
         policy.account(harness.runner.state, harness.plan, sample, "synthetic")
         consume(harness, propose(harness.plan, harness.runner.state, grid_w=5000))
-        barrier = harness.owner.stop(reason="operator_stop")
+        barrier = stop(harness, reason="operator_stop")
         harness.runner._apply_stop_barrier(barrier, now_ms=NOW)
         sample = replace(sample, timestamp=NOW_TS + 60)
         policy.account(harness.runner.state, harness.plan, sample, "synthetic")
@@ -783,6 +797,7 @@ def test_i4_new_digest_requires_rebind_before_reserving(tmp_path, evidence):
         harness.path.write_text(json.dumps(other.to_dict()))
         before = harness.store.path.read_bytes()
         high_water = harness.owner._sequence_high_water
+        next_owner_cycle(harness.owner)
         decision = propose(other, harness.runner.state, owner_binding=harness.owner.binding)
         receipts = harness.runner._consume_financial_actuation(
             decision, other, owner=harness.owner, now_ms=NOW)
@@ -1102,7 +1117,7 @@ def test_03_a_profile_change_and_a_new_plan_get_new_commands(tmp_path):
     assert harness.runner.last_actuation.reason == "plan_rebind_required"
     assert harness.store.path.read_bytes() == before
     assert harness.gateway.effect_log == effects
-    barrier = harness.owner.stop(reason="plan_rebind_required")
+    barrier = stop(harness, reason="plan_rebind_required")
     assert barrier.status == "accepted" and barrier.safe_state == "confirmed"
     harness.runner._apply_stop_barrier(barrier, now_ms=NOW + 960_000)
     binding = restart_i4_owner(harness)
@@ -1280,8 +1295,9 @@ def test_i6_public_v2_denies_even_own_nominal_receiver(tmp_path, monkeypatch, mo
         assert harness.runner.last_gate.reason == "actuation_gates_unproven"
         assert harness.runner.last_actuation is None
         assert harness.runner.last_receipts == []
-        assert calls == [] and harness.gateway.effect_log == []
-        assert harness.store.path.read_bytes() == before
+        assert calls == ["revoke_and_stop"] and harness.gateway.effect_log == []
+        assert harness.store.path.read_bytes() != before
+        assert harness.store.load_strict().phase == "released"
         assert harness.owner.state.pending_command is None
         assert harness.runner.state.battery(0).pending_command is None
         assert harness.hass.values == harness.hass.options == harness.hass.published == {}
@@ -1329,7 +1345,7 @@ def test_13_only_an_exact_barrier_ends_the_recovery_duty(tmp_path):
     assert controller.recovery_required is True
     assert controller.execution_status == "unconfirmed"
     # Only an exact accepted safe barrier ends the duty.
-    barrier = harness.owner.stop(reason="operator_stop")
+    barrier = stop(harness, reason="operator_stop")
     assert barrier.status == "accepted"
     harness.runner._apply_stop_barrier(barrier, now_ms=harness.owner.now_ms())
     assert controller.execution_status == "stopped"
@@ -1432,7 +1448,7 @@ def test_18_a_foreign_or_late_barrier_never_ends_the_recovery_duty(tmp_path):
     harness.gateway.lose_ack()
     consume(harness, decision)
     controller = harness.runner.state.battery(0)
-    barrier = harness.owner.stop(reason="operator_stop")
+    barrier = stop(harness, reason="operator_stop")
     pending = controller.pending_command
     assert pending is not None
     for wrong in (replace(barrier, barrier_id="other-barrier"),
@@ -1456,7 +1472,7 @@ def test_19_the_exact_barrier_ends_the_duty_whatever_the_status(tmp_path):
     controller.execution_status = "unknown"
     other = harness.runner.state.battery(1)
     other.execution_status = "accepted"
-    barrier = harness.owner.stop(reason="operator_stop")
+    barrier = stop(harness, reason="operator_stop")
     harness.runner._apply_stop_barrier(barrier, now_ms=harness.owner.now_ms())
     assert controller.execution_status == "stopped"
     assert controller.recovery_required is False
@@ -1487,7 +1503,7 @@ def test_21_the_pending_command_observation_is_installed_under_the_lock(tmp_path
     """The observation exists only while the lease is held, and is restored."""
     harness = build(tmp_path)
     owner = harness.owner
-    runner_module = import_module("dao.prog.fastctrl.runner")
+    runner_module = import_module("dao.prog.fastctrl.ownership")
     real_lock = runner_module.publication_lock
     seen = []
 
@@ -1509,6 +1525,7 @@ def test_21_the_pending_command_observation_is_installed_under_the_lock(tmp_path
         return None
 
     owner.record_pending_command = sentinel
+    next_owner_cycle(owner)
     consume(harness, decision)
     assert owner.record_pending_command is sentinel
     del owner.record_pending_command
@@ -1732,7 +1749,7 @@ def test_25_the_barrier_is_compared_field_by_field(tmp_path):
     # An open duty without a controller pending command.
     controller.pending_command = None
     controller.recovery_required = True
-    barrier = harness.owner.stop(reason="operator_stop")
+    barrier = stop(harness, reason="operator_stop")
     # The own barrier, but seen with an earlier clock: its accepted_ts is in the
     # future, so it proves nothing yet.
     harness.runner._apply_stop_barrier(barrier, now_ms=NOW - 1)
@@ -1847,3 +1864,137 @@ def test_29_the_legacy_route_has_no_identity_refusal(tmp_path):
     assert runner.last_receipts[0].status == "confirmed"
     # The financial route never ran: there is no financial verdict.
     assert runner.last_actuation is None
+
+
+@pytest.mark.parametrize("phase,allowed", [(0, True), (999_999_999, True),
+                                           (1_000_000_000, False),
+                                           (2_000_000_000, False), (5_000_000_000, True)])
+def test_i7_admission_phase_boundaries(tmp_path, phase, allowed):
+    """A valid proposal cannot acquire/send during the publisher's phases."""
+    harness = build(tmp_path)
+    harness.owner.now_ns = lambda: 20_000_000_000 + phase
+    try:
+        before = harness.store.path.read_bytes()
+        receipts = consume(harness, propose(harness.plan, harness.runner.state))
+        assert bool(receipts) is allowed
+        if allowed:
+            assert receipts[0].status == "accepted"
+        else:
+            assert harness.runner.last_actuation.reason == "admission_deferred"
+            assert harness.store.path.read_bytes() == before
+            assert harness.gateway.effect_log == []
+    finally:
+        harness.lease.close()
+
+
+def test_i7_one_final_send_or_stop_per_cycle(tmp_path):
+    """Two batteries share one claim; another send or lifecycle stop cannot reuse it."""
+    harness = build(tmp_path, plan=financial_plan(batteries=2))
+    harness.owner.now_ns = lambda: 20_000_000_000
+    try:
+        decision = propose(harness.plan, harness.runner.state)
+        assert [r.status for r in consume(harness, decision)] == ["accepted", "accepted"]
+        before = harness.store.path.read_bytes()
+        assert consume(harness, decision) == ()
+        assert harness.runner.last_actuation.reason == "admission_cycle_used"
+        assert harness.store.path.read_bytes() == before
+        assert harness.owner.stop(reason="shutdown") is None
+        assert harness.owner.binding is None and harness.owner.recovery_required
+        assert harness.owner.pending_stop_reason == "shutdown"
+        assert harness.store.path.read_bytes() == before
+        assert len(harness.gateway.effect_log) == 6
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("fault", ["rollback", "boot"])
+def test_i7_fix1_consumer_clock_failure_after_receipt_write_keeps_recovery(tmp_path, monkeypatch, fault):
+    from dao.tests.prog.test_fast_execution import i7_receipt_write_clock_fault
+
+    harness = build(tmp_path, plan=financial_plan(batteries=2))
+    runner, owner = harness.runner, harness.owner
+    committed = i7_receipt_write_clock_fault(monkeypatch, owner, fault=fault)
+    try:
+        decision = propose(harness.plan, runner.state)
+        assert consume(harness, decision) == ()
+        assert not runner.last_actuation.allowed and runner.last_actuation.reason == "clock_unhealthy"
+        assert len(committed) == 1
+        command, written = committed[0]
+        assert written.pending_command is None and written.last_receipt.status == "accepted"
+        first = runner.state.battery(0)
+        assert first.execution_status == "unconfirmed"
+        assert first.pending_command == command and first.recovery_required
+        assert first.last_accepted_command is None and first.held_setpoint_w == 0
+        second = runner.state.battery(1)
+        assert second.pending_command is second.last_accepted_command is None
+        assert harness.gateway.effect_log == [(command.command_id, part, "accu", PLAN_W)
+                                             for part in ("setpoint", "mode", "stop_inverter")]
+        mirror = harness.store.load_strict()
+        assert mirror.pending_command == owner.state.pending_command == command
+        assert mirror.last_receipt == written.last_receipt
+        assert mirror.phase == owner.phase == "inhibited"
+        assert owner.binding is None and owner.recovery_required
+        assert consume(harness, decision) == ()
+        assert len(harness.gateway.effect_log) == 3 and len(committed) == 1
+    finally:
+        harness.lease.close()
+
+
+def test_i7_start_lease_covers_next_send_cycle(tmp_path, monkeypatch):
+    """Runner startup asks for the validated plan lease, not a one-second binding."""
+    harness = build(tmp_path, start_owner=False)
+    clock = [20_000_000_000]
+    harness.owner.now_ns = lambda: clock[0]
+    seen = []
+    real_bind = harness.gateway.bind_owner
+
+    def bind(**kwargs):
+        seen.append(kwargs["requested_not_after_ms"])
+        return real_bind(**kwargs)
+
+    monkeypatch.setattr(harness.gateway, "bind_owner", bind)
+    monkeypatch.setattr("time.time_ns", lambda: NOW * 1_000_000)
+    try:
+        harness.runner.start_owner_session()
+        clock[0] = 25_000_000_000
+        harness.runner.start_owner_session()
+        assert seen == [harness.plan.financial_context.not_after_ts * 1000]
+        assert harness.owner.binding.owner_not_after_ms > NOW + 6000
+        clock[0] = 30_000_000_000
+        assert consume(harness, propose(harness.plan, harness.runner.state))[0].status == "accepted"
+    finally:
+        if harness.runner._owner_writer is not None:
+            harness.runner._owner_writer.close()
+
+
+def test_i7_expiry_schedules_stop_and_fresh_start_before_send(tmp_path, monkeypatch):
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.prog.fastctrl.publication import GateVerdict
+
+    harness = build(tmp_path, lease_ms=20_000)
+    runner, owner = harness.runner, harness.owner
+    runner._owner_writer = harness.lease
+    runner._owner_session_id = "replacement"
+    harness.gateway.advance_clock(20_000)
+    try:
+        decision = propose(harness.plan, runner.state, timestamp=harness.gateway.utc_ms / 1000)
+        assert consume(harness, decision, now_ms=harness.gateway.utc_ms) == ()
+        assert owner.pending_stop_reason == "owner_lease_expired"
+        assert owner.binding is None
+        monkeypatch.setattr(runner_module, "following_verdict", lambda *a, **k: GateVerdict(True, "synthetic"))
+        monkeypatch.setattr(runner.gateway, "read", lambda ids: {
+            "sensor.p1_power": ("2000", harness.gateway.utc_ms / 1000),
+            "sensor.soc": ("50", harness.gateway.utc_ms / 1000)})
+        runner.tick(harness.gateway.utc_ms / 1000)
+        assert harness.gateway.state.epoch_high_water == 9
+        assert harness.gateway.effect_log == []
+        next_owner_cycle(owner)
+        runner.tick(harness.gateway.utc_ms / 1000)
+        assert owner.binding.owner_epoch == 10
+        assert harness.gateway.effect_log == []  # startup owns this cycle
+        next_owner_cycle(owner)
+        runner.tick(harness.gateway.utc_ms / 1000)
+        assert runner.last_actuation.reason == "accepted"
+        assert len(harness.gateway.effect_log) == 3
+    finally:
+        harness.lease.close()

@@ -23,7 +23,7 @@ from .command import (
     _string,
     plan_digest,
 )
-from .ownership import OwnerCoordinator
+from .ownership import OwnerCoordinator, RecoveryRequired
 from .plan import FastPlan
 from .publication import GatePolicy, PublicationError, PublicationLease, read_publication
 from .receiver import FencedDeviceGateway, payload_digest, receipt_matches_command
@@ -134,6 +134,30 @@ def _validate_receiver(*, owner: OwnerCoordinator, receiver: FencedDeviceGateway
         raise ExecutionRefused("receiver_binding_mismatch")
 
 
+def _require_section(owner: OwnerCoordinator, lease: PublicationLease) -> None:
+    try:
+        owner.require_final_section(lease, operation="send")
+    except RecoveryRequired as exc:
+        raise ExecutionRefused(exc.reason) from exc
+
+
+def _now(owner: OwnerCoordinator) -> int:
+    try:
+        return owner._clock()
+    except RecoveryRequired as exc:
+        raise ExecutionRefused(exc.reason) from exc
+
+
+def _section_budget(owner: OwnerCoordinator, deadline: Deadline) -> Deadline:
+    return Deadline(min(deadline.monotonic_end_ns, owner.section_deadline.monotonic_end_ns),
+                    min(deadline.execute_before_ms, owner.section_deadline.execute_before_ms))
+
+
+def _transport_budget(owner: OwnerCoordinator, section: Deadline) -> Deadline:
+    return Deadline(min(section.monotonic_end_ns, owner.transport_deadline.monotonic_end_ns),
+                    min(section.execute_before_ms, owner.transport_deadline.execute_before_ms))
+
+
 def _validate_installation(plan: FastPlan, *, owner: OwnerCoordinator,
                            command: BatteryCommand | None = None) -> None:
     """Bind the freshly validated meter to the startup-proven owner identity."""
@@ -214,6 +238,19 @@ def _command_end_ms(plan: FastPlan, *, battery_name: str, at_ms: int,
     return min(ends)
 
 
+def _check_result_deadline(*, owner: OwnerCoordinator, command: BatteryCommand,
+                           deadline: Deadline) -> None:
+    """A result write may clear pending, but an unproven post-write clock may not."""
+    try:
+        if deadline.remaining_ns(_now(owner)) == 0:
+            raise ExecutionRefused("deadline_exceeded")
+    except ExecutionRefused:
+        # Keep the receipt as history and the command as recovery evidence.
+        # A failed restoration remains a hard persistence error, not a refusal.
+        owner.record_pending_command(command)
+        raise
+
+
 def send_locked(command: BatteryCommand, *, lease: PublicationLease,
                 owner: OwnerCoordinator, receiver: FencedDeviceGateway,
                 deadline: Deadline, clock: ClockSample,
@@ -229,6 +266,8 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
     if type(deadline) is not Deadline:
         raise ExecutionRefused("deadline_invalid")
     _validate_receiver(owner=owner, receiver=receiver)
+    _require_section(owner, lease)
+    deadline = _section_budget(owner, deadline)
     # An earlier caller check never suffices; the final check runs here.
     plan = validate_current_locked(lease=lease, expected_digest=command.plan_digest,
                                    clock=clock, policy=policy)
@@ -266,11 +305,12 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
         Deadline(min(deadline.monotonic_end_ns, clock.boottime_ns + SECTION_BUDGET_NS),
                  deadline.execute_before_ms),
         clock=clock, wire_end_ms=min(command.execute_before_ms, command_end))
-    transport = Deadline(min(deadline.monotonic_end_ns, clock.boottime_ns + TRANSPORT_BUDGET_NS),
-                         deadline.execute_before_ms)
-    now = owner.now_ns
+    transport = _transport_budget(owner, deadline)
+    def now():
+        return _now(owner)
     if transport.remaining_ns(now()) == 0:
         raise ExecutionRefused("budget_exhausted")
+    owner._section_used = True
     try:
         receipt = receiver.send(command, deadline=transport)
     except Exception as exc:
@@ -310,11 +350,7 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
         owner.record_receipt(outcome, terminal=False)
         raise ExecutionRefused("deadline_exceeded")
     owner.record_receipt(outcome)
-    if deadline.remaining_ns(now()) == 0:
-        # Direct callers need the durable-write check too. Keep the original
-        # section budget, including its lease cap, and restore pending evidence.
-        owner.record_pending_command(command)
-        raise ExecutionRefused("deadline_exceeded")
+    _check_result_deadline(owner=owner, command=command, deadline=deadline)
     return outcome
 
 
@@ -365,7 +401,10 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
     if type(deadline) is not Deadline:
         raise ExecutionRefused("deadline_invalid")
     _validate_receiver(owner=owner, receiver=receiver)
-    now = owner.now_ns
+    _require_section(owner, lease)
+    deadline = _section_budget(owner, deadline)
+    def now():
+        return _now(owner)
     # One absolute deadline for the whole installation.
     end = min(deadline.monotonic_end_ns, clock.boottime_ns + SECTION_BUDGET_NS)
     binding = owner.binding
@@ -387,15 +426,17 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
                 raise
             owner.report_failure("publication_invalidation_budget_exhausted", durable=True)
             return None
-        revoke = Deadline(min(section.monotonic_end_ns, clock.boottime_ns + TRANSPORT_BUDGET_NS),
-                          section.execute_before_ms)
+        revoke = _transport_budget(owner, section)
         if revoke.remaining_ns(now()) == 0:
             # Not enough budget for a safe withdrawal: the epoch is not
             # withdrawn, the recovery duty stays and stays visible. The duty
             # is written durably through the existing mirror route.
             owner.report_failure("publication_invalidation_budget_exhausted", durable=True)
             return None
-        owner.stop(reason="publication_invalidated", deadline=revoke)
+        try:
+            owner._stop_in_send_section(lease, reason="publication_invalidated", deadline=revoke)
+        except RecoveryRequired as exc:
+            raise ExecutionRefused(exc.reason) from exc
         return None
     plan = read.plan
     if section.remaining_ns(now()) == 0:
@@ -406,8 +447,7 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
     section = _bounded_deadline(section, clock=clock, wire_end_ms=_command_end_ms(
         plan, battery_name=request.battery_name, at_ms=clock.utc_ms,
         owner_end_ms=owner.binding.owner_not_after_ms))
-    transport = Deadline(min(section.monotonic_end_ns, clock.boottime_ns + TRANSPORT_BUDGET_NS),
-                         section.execute_before_ms)
+    transport = _transport_budget(owner, section)
     if section.remaining_ns(now()) == 0:
         raise ExecutionRefused("budget_exhausted")
     # The sequence is reserved durably before the send; gaps are allowed.
@@ -424,7 +464,5 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
     # The section checks the deadline after the last durable result write. An
     # overrun is never reported as an accepted command update: the pending
     # command is restored durably and the history stays visible.
-    if section.remaining_ns(now()) == 0:
-        owner.record_pending_command(command)
-        raise ExecutionRefused("deadline_exceeded")
+    _check_result_deadline(owner=owner, command=command, deadline=section)
     return receipt

@@ -36,6 +36,188 @@ from dao.tests.settlement.test_publication import pricing_config
 T0 = 1_700_000_000
 
 
+@pytest.fixture(autouse=True)
+def boottime_at_start_phase(monkeypatch):
+    # Existing v2/public-gate probes run at an admitted phase. I7 probes inject
+    # their own advancing clock and exercise the real admission predicate.
+    monkeypatch.setattr("dao.prog.fastctrl.runner.time.clock_gettime_ns", lambda _: 15_000_000_000)
+
+
+@pytest.mark.parametrize("owner_present", [False, True])
+def test_i7_early_financial_read_and_sensor_overrun(tmp_path, monkeypatch, owner_present):
+    """Financial early reads respect cadence, even without an owner."""
+    from contextlib import contextmanager
+
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import NOW_TS, build
+
+    harness = build(tmp_path)
+    clock = [23_000_000_000]
+    harness.owner.now_ns = lambda: clock[0]
+    if not owner_present:
+        harness.runner.owner = None
+    monkeypatch.setattr(runner_module.time, "clock_gettime_ns", lambda _: clock[0])
+    acquired = []
+    real_lock = runner_module.publication_lock
+
+    @contextmanager
+    def observe(path):
+        with real_lock(path) as lease:
+            acquired.append(clock[0])
+            yield lease
+
+    monkeypatch.setattr(runner_module, "publication_lock", observe)
+    try:
+        assert harness.runner.tick(NOW_TS) is None
+        assert acquired == []
+        assert harness.runner.last_gate.reason == "admission_deferred"
+        clock[0] = 25_000_000_000
+        assert harness.runner.tick(NOW_TS) is None
+        assert acquired == [25_000_000_000]
+        assert harness.runner.last_gate.reason == "actuation_gates_unproven"
+    finally:
+        harness.lease.close()
+
+
+def test_i7_early_financial_read_and_sensor_overrun_discards_proposal(tmp_path, monkeypatch):
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import NOW_TS, build
+
+    harness = build(tmp_path)
+    clock = [20_000_000_000]
+    harness.owner.now_ns = lambda: clock[0]
+    # Existing internal-v2 composition seam; admission itself is always real.
+    monkeypatch.setattr(runner_module, "following_verdict",
+                        lambda *a, **kw: publication.GateVerdict(True, "synthetic"))
+
+    def slow_sensor(ids):
+        clock[0] = 21_000_000_000
+        return {"sensor.p1_power": ("2000", NOW_TS), "sensor.soc": ("50", NOW_TS)}
+
+    monkeypatch.setattr(harness.runner.gateway, "read", slow_sensor)
+    try:
+        harness.runner.tick(NOW_TS)
+        assert harness.runner.last_actuation.reason == "admission_window_missed"
+        assert harness.gateway.effect_log == []
+        assert harness.store.load_strict().last_reserved_sequence == 40
+    finally:
+        harness.lease.close()
+
+
+def test_i7_unexpected_v2_releases_legacy_read_before_financial_processing(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import NOW_TS, financial_plan
+
+    plan = financial_plan()
+    path = tmp_path / "fast_plan.json"
+    path.write_text(json.dumps(replace(plan, format_version=1, financial_context=None).to_dict()))
+    runner = FastControlRunner(FakeHass(), make_config(), plan_path=path,
+        state_path=str(tmp_path / "state.json"), gate_policy=publication.GatePolicy(None))
+    clock, acquisitions, verdicts = [23_000_000_000], [], []
+    real_lock, real_verdict = runner_module.publication_lock, runner_module.following_verdict
+
+    @contextmanager
+    def publish_race(target):
+        with real_lock(target) as lease:
+            if not acquisitions:
+                path.write_text(json.dumps(plan.to_dict()))
+            acquisitions.append(clock[0])
+            yield lease
+
+    def verdict(*args, **kwargs):
+        verdicts.append(clock[0])
+        return real_verdict(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "publication_lock", publish_race)
+    monkeypatch.setattr(runner_module, "following_verdict", verdict)
+    monkeypatch.setattr(runner_module.time, "clock_gettime_ns", lambda _: clock[0])
+    assert runner.tick(NOW_TS) is None
+    assert acquisitions == [23_000_000_000] and verdicts == []
+    assert runner.last_gate.reason == "admission_deferred"
+    clock[0] = 25_000_000_000
+    assert runner.tick(NOW_TS) is None
+    assert acquisitions == [23_000_000_000, 25_000_000_000]
+    assert verdicts == [25_000_000_000]
+    assert runner.last_gate.reason == "actuation_gates_unproven"
+
+
+def test_i7_shutdown_requested_during_sensors_prevents_new_send(tmp_path, monkeypatch):
+    import threading
+
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import NOW_TS, build
+
+    harness = build(tmp_path)
+    runner = harness.runner
+    runner._owner_writer = harness.lease
+    stopped = threading.Event()
+    monkeypatch.setattr(runner_module, "following_verdict",
+                        lambda *a, **k: publication.GateVerdict(True, "synthetic"))
+    monkeypatch.setattr(runner_module.time, "time", lambda: NOW_TS)
+
+    def sensor(ids):
+        stopped.set()
+        return {"sensor.p1_power": ("2000", NOW_TS), "sensor.soc": ("50", NOW_TS)}
+
+    class Wait:
+        def wait(self, seconds):
+            harness.gateway.advance_clock(round(seconds * 1000))
+
+    monkeypatch.setattr(runner.gateway, "read", sensor)
+    monkeypatch.setattr(runner_module.threading, "Event", Wait)
+    try:
+        runner.run(stopped)
+        assert harness.gateway.effect_log == []
+        assert runner.last_actuation.reason == "shutdown"
+        assert harness.lease.fd == -1
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("interval", [5, 10, 15])
+def test_i7_loop_started_outside_window_makes_progress(tmp_path, monkeypatch, interval):
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import NOW, NOW_TS, build
+
+    harness = build(tmp_path, config=make_config(interval=interval))
+    harness.runner.owner = None
+    clock = [23_000_000_000]
+    monkeypatch.setattr(runner_module.time, "clock_gettime_ns", lambda _: clock[0])
+    monkeypatch.setattr(runner_module.time, "time", lambda: NOW_TS + (clock[0] - 23_000_000_000) / 1e9)
+    monkeypatch.setattr(runner_module.time, "time_ns", lambda: NOW * 1_000_000 + clock[0])
+    seen = []
+    real_tick = harness.runner.tick
+
+    def tick(now):
+        result = real_tick(now)
+        seen.append((clock[0], harness.runner.last_gate.reason))
+        return result
+
+    class Wait:
+        calls = 0
+
+        def is_set(self):
+            return self.calls >= 3
+
+        def wait(self, seconds):
+            clock[0] += round(seconds * 1e9)
+            self.calls += 1
+            return self.is_set()
+
+    monkeypatch.setattr(harness.runner, "tick", tick)
+    try:
+        harness.runner.run(Wait())
+        assert any(at == 25_000_000_000 and reason == "actuation_gates_unproven"
+                   for at, reason in seen), seen
+        assert all(at % 5_000_000_000 < 1_000_000_000 for at, reason in seen
+                   if reason == "actuation_gates_unproven"), seen
+    finally:
+        harness.lease.close()
+
+
 @pytest.mark.parametrize("owner_state", ["owned", "missing", "inhibited", "expired"])
 def test_i4_tick_passes_only_live_owner_context_before_policy(tmp_path, monkeypatch, owner_state):
     from dataclasses import replace

@@ -99,6 +99,18 @@ ACQUISITION_DEADLINE_NS = 6_000_000_000
 #: Cadence between two acquisition attempts (fifty milliseconds).
 ACQUISITION_INTERVAL_NS = 50_000_000
 
+OWNER_CYCLE_NS = 5_000_000_000
+OWNER_START_NS = 1_000_000_000
+PUBLICATION_PHASE_NS = 2_000_000_000
+
+
+def owner_admission_at(now_ns: int) -> tuple[int, bool, int]:
+    """Pure absolute BOOTTIME cadence; phase one never opens another start."""
+    _integer(now_ns, "now_ns")
+    cycle, phase = divmod(now_ns, OWNER_CYCLE_NS)
+    allowed = phase < OWNER_START_NS
+    return cycle, allowed, now_ns if allowed else (cycle + 1) * OWNER_CYCLE_NS
+
 
 def publication_deadline_ns(*, window_ns: int = ACQUISITION_DEADLINE_NS) -> int:
     """The absolute monotone deadline of one bounded acquisition attempt.
@@ -189,6 +201,10 @@ def publication_lock(path: str | Path) -> Iterator[PublicationLease]:
         lease._check()
         yield lease
     except OSError as exc:
+        if lease is not None:
+            # The acquired caller body owns its error classification (for
+            # example a durable owner-mirror failure), not the lock primitive.
+            raise
         raise PublicationError(f"Publication lock/file I/O failed: {exc}") from exc
     finally:
         if lease is not None:

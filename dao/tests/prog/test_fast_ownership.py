@@ -20,6 +20,29 @@ from dao.prog import task_execution
 from dao.prog.fastctrl.command import Deadline, RevokeRequest
 from dao.tests.prog.test_fast_receiver import command, fake
 
+
+def stop(owner, **kwargs):
+    from dao.tests.prog.test_fast_execution import next_owner_cycle
+
+    next_owner_cycle(owner)
+    return owner.stop(**kwargs)
+
+
+def start_runner(obj):
+    from dao.tests.prog.test_fast_execution import next_owner_cycle
+
+    obj.start_owner_session()
+    if obj._owner_start_pending:
+        next_owner_cycle(obj.owner)
+        obj.start_owner_session()
+
+
+def shutdown_runner(obj):
+    from dao.tests.prog.test_fast_execution import next_owner_cycle
+
+    next_owner_cycle(obj.owner)
+    obj._shutdown_owner()
+
 ROOT = Path(__file__).resolve().parents[3]
 RESOURCE = "actuator-" + hashlib.sha256(b"sandbox").hexdigest()[:32]
 DEADLINE = Deadline(100_000_000_000, 10000)
@@ -69,6 +92,7 @@ def layout(root, *, provision=True):
         store.path.write_text(json.dumps(initial().to_dict()))
         store.path.chmod(0o600)
     gateway = fake(root / "receiver")
+    gateway.receiver_max_lease_ms = 60_000
     owner = module.OwnerCoordinator(store, receiver=gateway)
     owner.now_ns = lambda: 0
     owner.now_ms = lambda: 1001
@@ -76,9 +100,487 @@ def layout(root, *, provision=True):
 
 
 def start(owner, lease, gateway, **changes):
+    from dao.tests.prog.test_fast_execution import next_owner_cycle
+
+    if owner.store.holds(lease):
+        owner._bind_lifetime(lease)
+        next_owner_cycle(owner)
     return owner.start(**(dict(writer=lease, receiver=gateway, installation_id="sandbox",
-                              owner_session_id="session-new", requested_not_after_ms=6000,
+                              owner_session_id="session-new", requested_not_after_ms=15_000,
                               deadline=DEADLINE, now_ms=1001) | changes))
+
+
+def test_i7_direct_start_stop_and_send_have_no_admission_bypass(tmp_path):
+    """A new lifetime must wait a cycle; direct startup may not inspect or persist."""
+    module, store, gateway, owner = layout(tmp_path)
+    lease = acquire(tmp_path)
+    before = store.path.read_bytes()
+    try:
+        result = owner.start(writer=lease, receiver=gateway, installation_id="sandbox",
+                             owner_session_id="new", requested_not_after_ms=15_000,
+                             deadline=DEADLINE, now_ms=1001)
+        assert isinstance(result, module.RecoveryRequired)
+        assert result.reason == "admission_deferred"
+        assert store.path.read_bytes() == before
+        assert gateway.state.epoch_high_water == 7
+    finally:
+        lease.close()
+
+
+def test_i7_shutdown_defers_stop_without_false_release(tmp_path):
+    """A deferred shutdown withdraws local rights, never fabricates a barrier."""
+    from dao.tests.prog.test_fast_consumer import build
+
+    harness = build(tmp_path)
+    harness.owner.now_ns = lambda: 23_000_000_000
+    before = harness.store.path.read_bytes()
+    try:
+        receipt = harness.owner.stop(reason="shutdown")
+        assert receipt is None
+        assert harness.owner.binding is None
+        assert harness.owner.recovery_required
+        assert harness.owner.pending_stop_reason == "shutdown"
+        assert harness.store.path.read_bytes() == before
+        assert harness.gateway.state.epoch_high_water == 8
+        assert harness.store.holds(harness.lease)
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_i7_fix1_deferred_handoff_releases_lifetime_only_after_exact_barrier(tmp_path, confirmed):
+    from dao.tests.prog.test_fast_consumer import NOW_TS, build
+
+    harness = build(tmp_path)
+    runner, owner = harness.runner, harness.owner
+    runner._owner_writer = harness.lease
+    clock = [23_000_000_000]
+    owner.now_ns = lambda: clock[0]
+    harness.gateway.safe_state_confirmed = confirmed
+    try:
+        assert runner.stop_owner_session("handoff") is None
+        assert owner.pending_stop_reason == "handoff"
+        assert owner.binding is None and owner.recovery_required
+        assert harness.store.holds(harness.lease)
+        with pytest.raises(task_execution.LeaseBusy):
+            acquire(tmp_path)
+
+        clock[0] = 25_000_000_000
+        runner.tick(NOW_TS)
+        state = harness.store.load_strict()
+        if confirmed:
+            assert state.phase == owner.phase == "released"
+            barrier = state.last_barrier
+            assert (barrier.status, barrier.revoked_through_epoch, barrier.current_epoch,
+                    barrier.queues_fenced, barrier.safe_state) == ("accepted", 8, 9, True, "confirmed")
+            assert not owner.recovery_required
+            assert runner.last_fallback.status == "acknowledged"
+            assert harness.lease.fd == -1
+            assert runner._owner_writer is None
+            replacement = acquire(tmp_path)
+            replacement.close()
+        else:
+            assert owner.recovery_required and owner.pending_stop_reason == "handoff"
+            assert state.phase != "released"
+            assert runner.last_fallback.status != "acknowledged"
+            assert harness.store.holds(harness.lease)
+            with pytest.raises(task_execution.LeaseBusy):
+                acquire(tmp_path)
+    finally:
+        harness.lease.close()
+
+
+def test_i7_fix1_restart_stop_retains_lifetime(tmp_path):
+    from dao.tests.prog.test_fast_consumer import NOW_TS, build, consume, propose
+
+    harness = build(tmp_path)
+    runner, owner = harness.runner, harness.owner
+    runner._owner_writer = harness.lease
+    runner._owner_session_id = "restart"
+    clock = [23_000_000_000]
+    owner.now_ns = lambda: clock[0]
+    try:
+        assert runner._request_fallback("owner_lease_expired", now_ts=NOW_TS).status == "requested"
+        clock[0] = 25_000_000_000
+        runner.tick(NOW_TS)
+        assert owner.state.last_barrier.current_epoch == 9
+        assert runner._owner_start_pending
+        assert runner._owner_writer is harness.lease and harness.store.holds(harness.lease)
+        with pytest.raises(task_execution.LeaseBusy):
+            acquire(tmp_path)
+        clock[0] = 30_000_000_000
+        runner.start_owner_session()
+        assert owner.binding.owner_epoch == 10
+        assert runner._owner_writer is harness.lease
+        assert harness.gateway.effect_log == []
+        clock[0] = 35_000_000_000
+        assert consume(harness, propose(harness.plan, runner.state))[0].status == "accepted"
+    finally:
+        harness.lease.close()
+
+
+def test_i7_fix1_shutdown_during_startup_read_prevents_receiver_work(tmp_path, monkeypatch):
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.prog.fastctrl.publication import publication_lock
+    from dao.tests.prog.test_fast_consumer import NOW_TS, build
+    from dao.tests.prog.test_fast_execution import observe_receiver_calls
+
+    harness = build(tmp_path, start_owner=False)
+    runner, owner = harness.runner, harness.owner
+    clock = [20_000_000_000]
+    owner.now_ns = lambda: clock[0]
+    runner.start_owner_session()
+    writer = runner._owner_writer
+    assert owner.binding is None and runner._owner_start_pending
+    before = harness.store.path.read_bytes()
+    clock[0] = 25_000_000_000
+    stopped = threading.Event()
+    calls = observe_receiver_calls(monkeypatch, harness.gateway)
+    real_read = runner_module.read_publication
+    reads, waits = [], []
+
+    def read(path):
+        result = real_read(path)
+        reads.append(result.status)
+        stopped.set()
+        return result
+
+    class Wait:
+        def wait(self, seconds):
+            with publication_lock(harness.path):
+                waits.append(seconds)
+            clock[0] += round(seconds * 1e9)
+
+    monkeypatch.setattr(runner_module, "read_publication", read)
+    monkeypatch.setattr(runner_module.time, "time", lambda: NOW_TS)
+    monkeypatch.setattr(runner_module.threading, "Event", Wait)
+    try:
+        runner.run(stopped)
+        assert reads and stopped.is_set()
+        assert calls == []
+        assert harness.store.path.read_bytes() == before
+        assert owner.binding is None and owner.recovery_required
+        assert runner.last_fallback.status == "unconfirmed"
+        assert writer.fd == -1 and runner._owner_writer is None
+        assert len(waits) <= 1 and all(0 < seconds <= 5 for seconds in waits)
+        replacement = acquire(tmp_path)
+        replacement.close()
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize("publication", ["blocked", "shorter", "too_short"])
+def test_i7_fix1_startup_uses_fresh_plan_in_its_final_lease(tmp_path, monkeypatch, publication):
+    from contextlib import contextmanager
+
+    from dao.prog.fastctrl import publication as pub
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import NOW, NOW_TS, build
+    from dao.tests.prog.test_fast_execution import observe_receiver_calls
+
+    harness = build(tmp_path, start_owner=False)
+    runner, owner = harness.runner, harness.owner
+    clock = [20_000_000_000]
+    owner.now_ns = lambda: clock[0]
+    runner.start_owner_session()
+    writer = runner._owner_writer
+    clock[0] = 25_000_000_000
+    fresh_end = NOW_TS + (6 if publication == "too_short" else 20)
+    fresh = replace(harness.plan, financial_context=replace(
+        harness.plan.financial_context, not_after_ts=fresh_end))
+    real_lock, real_read = pub.publication_lock, runner_module.read_publication
+    acquisitions, read_leases, requested = [], [], []
+    calls = observe_receiver_calls(monkeypatch, harness.gateway)
+    real_bind = harness.gateway.bind_owner
+    before = harness.store.path.read_bytes()
+
+    @contextmanager
+    def preliminary(path):
+        with real_lock(path) as lease:
+            acquisitions.append(("preliminary", lease))
+            yield lease
+
+    @contextmanager
+    def final(path):
+        # A real publisher wins before the owner's final acquisition.
+        with real_lock(path) as lease:
+            if publication == "blocked":
+                pub.invalidate_plan(lease=lease, now_ts=NOW_TS, reason="correction")
+            else:
+                pub._write_verified_ready(fresh, lease=lease)
+        with real_lock(path) as lease:
+            acquisitions.append(("start", lease))
+            yield lease
+
+    def read(path):
+        read_leases.append(owner._section_lease)
+        return real_read(path)
+
+    def bind(**kwargs):
+        requested.append(kwargs["requested_not_after_ms"])
+        return real_bind(**kwargs)
+
+    monkeypatch.setattr(runner_module, "publication_lock", preliminary)
+    monkeypatch.setattr(ownership(), "publication_lock", final)
+    monkeypatch.setattr(runner_module, "read_publication", read)
+    monkeypatch.setattr(harness.gateway, "bind_owner", bind)
+    try:
+        runner.start_owner_session()
+        if publication == "blocked":
+            assert requested == [] and calls == []
+            assert owner.binding is None and owner.recovery_required
+            assert harness.store.path.read_bytes() == before
+        else:
+            assert requested == [fresh_end * 1000]
+            if publication == "shorter":
+                assert owner.binding.owner_not_after_ms == NOW + 20_000
+                assert not owner.recovery_required
+            else:
+                assert owner.binding is None and owner.phase == "inhibited" and owner.recovery_required
+        assert [kind for kind, lease in acquisitions] == ["start"]
+        assert read_leases == [acquisitions[0][1]]
+        assert owner.section_deadline is owner.transport_deadline is None
+        assert harness.gateway.effect_log == []
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize("read_ms", [200, 600])
+def test_i7_fix1_startup_final_read_spends_original_budget(tmp_path, monkeypatch, read_ms):
+    from contextlib import contextmanager
+
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import build
+
+    harness = build(tmp_path, start_owner=False)
+    runner, owner = harness.runner, harness.owner
+    clock = [20_000_000_000]
+    owner.now_ns = lambda: clock[0]
+    runner.start_owner_session()
+    writer = runner._owner_writer
+    clock[0] = 25_000_000_000
+    real_lock, real_read = ownership().publication_lock, runner_module.read_publication
+    real_inspect = harness.gateway.inspect
+    deadlines = []
+
+    @contextmanager
+    def acquire(path):
+        with real_lock(path) as lease:
+            clock[0] += 200_000_000
+            yield lease
+
+    def read(path):
+        result = real_read(path)
+        clock[0] += read_ms * 1_000_000
+        return result
+
+    def inspect(*, deadline):
+        deadlines.append(deadline.monotonic_end_ns)
+        return real_inspect(deadline=deadline)
+
+    monkeypatch.setattr(ownership(), "publication_lock", acquire)
+    monkeypatch.setattr(runner_module, "read_publication", read)
+    monkeypatch.setattr(harness.gateway, "inspect", inspect)
+    try:
+        runner.start_owner_session()
+        assert deadlines == ([25_750_000_000] if read_ms == 200 else [])
+        if read_ms == 200:
+            assert owner.binding is not None
+        else:
+            assert owner.binding is None and owner.recovery_required
+            assert harness.gateway.state.epoch_high_water == 7
+        assert harness.gateway.effect_log == []
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize("when", ["start", "stop"])
+def test_i7_lifecycle_keeps_classified_persistence_failure(tmp_path, monkeypatch, when):
+    module, store, gateway, owner = layout(tmp_path)
+    lease = acquire(tmp_path)
+    try:
+        if when == "stop":
+            start(owner, lease, gateway)
+        monkeypatch.setattr(store, "write", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+        with pytest.raises(module.MirrorWriteFailed):
+            if when == "start":
+                start(owner, lease, gateway)
+            else:
+                stop(owner, reason="shutdown")
+    finally:
+        lease.close()
+
+
+def test_i7_blocked_ticks_keep_exact_stop_proof(tmp_path):
+    from dao.prog.fastctrl.publication import GateVerdict
+    from dao.tests.prog.test_fast_consumer import NOW_TS, build
+    from dao.tests.prog.test_fast_execution import next_owner_cycle
+
+    harness = build(tmp_path)
+    try:
+        verdict = GateVerdict(False, "actuation_gates_unproven")
+        assert harness.runner._consume_block(verdict, now_ts=NOW_TS).status == "acknowledged"
+        before = harness.store.path.read_bytes()
+        next_owner_cycle(harness.owner)
+        assert harness.runner._consume_block(verdict, now_ts=NOW_TS).status == "acknowledged"
+        assert harness.store.path.read_bytes() == before
+        assert harness.owner.pending_stop_reason is None
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("advance", [True, False])
+def test_i7_shutdown_waits_outside_lock_then_attempts_once(tmp_path, monkeypatch, advance):
+    from dao.prog.fastctrl.publication import publication_lock
+    from dao.tests.prog.test_fast_consumer import build
+
+    harness = build(tmp_path)
+    runner, owner = harness.runner, harness.owner
+    runner._owner_writer = harness.lease
+    clock = [23_000_000_000]
+    owner.now_ns = lambda: clock[0]
+    seen = []
+    real_stop = harness.gateway.revoke_and_stop
+
+    def revoke(*a, **kw):
+        seen.append(("revoke", harness.store.holds(harness.lease)))
+        return real_stop(*a, **kw)
+
+    class Wait:
+        def wait(self, seconds):
+            with publication_lock(harness.path):
+                seen.append(("wait", seconds, harness.store.holds(harness.lease)))
+            if advance:
+                clock[0] += round(seconds * 1e9)
+
+    monkeypatch.setattr(harness.gateway, "revoke_and_stop", revoke)
+    monkeypatch.setattr("dao.prog.fastctrl.runner.threading.Event", Wait)
+    runner._shutdown_owner()
+    assert seen == [("wait", 2.0, True)] + ([("revoke", True)] if advance else [])
+    assert harness.lease.fd == -1
+    assert runner.last_fallback.status == ("acknowledged" if advance else "unconfirmed")
+    assert owner.recovery_required is not advance
+
+
+@pytest.mark.parametrize("fault", ["rollback", "utc_jump"])
+def test_i7_start_final_write_rechecks_clock_and_next_cycle_coverage(tmp_path, monkeypatch, fault):
+    module, store, gateway, owner = layout(tmp_path)
+    clock, utc = [0], [1001]
+    owner.now_ns, owner.now_ms = lambda: clock[0], lambda: utc[0]
+    lease = acquire(tmp_path)
+    owner._bind_lifetime(lease)
+    clock[0] = 5_000_000_000
+    real_write = store.write
+
+    def write(state, **kwargs):
+        real_write(state, **kwargs)
+        if state.phase == "owned":
+            if fault == "rollback":
+                clock[0] -= 1
+            else:
+                utc[0] += 9000
+
+    monkeypatch.setattr(store, "write", write)
+    try:
+        result = owner.start(writer=lease, receiver=gateway, installation_id="sandbox",
+            owner_session_id="new", requested_not_after_ms=15_000, deadline=DEADLINE, now_ms=1001)
+        assert isinstance(result, module.RecoveryRequired)
+        assert result.reason == ("clock_unhealthy" if fault == "rollback" else "owner_lease_too_short")
+        assert owner.binding is None and owner.recovery_required
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize("cap", [5000, 6000, 6001, 60_000])
+def test_i7_receiver_cap_must_cover_next_send_margin(tmp_path, cap):
+    module, store, gateway, owner = layout(tmp_path)
+    gateway.receiver_max_lease_ms = cap
+    lease = acquire(tmp_path)
+    try:
+        result = start(owner, lease, gateway, requested_not_after_ms=61_001)
+        if cap <= 6000:
+            assert isinstance(result, module.RecoveryRequired)
+            assert result.reason == "owner_lease_too_short"
+            assert owner.binding is None and owner.recovery_required
+        else:
+            assert result is owner.binding
+        assert gateway.effect_log == []
+    finally:
+        lease.close()
+
+
+def test_i7_shutdown_clock_failure_closes_without_claiming_stop(tmp_path):
+    from dao.tests.prog.test_fast_consumer import build
+
+    harness = build(tmp_path)
+    runner, owner = harness.runner, harness.owner
+    runner._owner_writer = harness.lease
+    runner._cadence_now()
+    owner.now_ns = lambda: 1
+    try:
+        failure = None
+        try:
+            runner._shutdown_owner()
+        except Exception as exc:
+            failure = exc
+        assert failure is None
+        assert harness.lease.fd == -1
+        assert runner.last_fallback.status == "unconfirmed"
+        assert owner.recovery_required
+        assert harness.gateway.state.epoch_high_water == 8
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("operation", ["start", "stop"])
+def test_i7_locked_lifecycle_cannot_extend_context_budget(tmp_path, monkeypatch, operation):
+    from dao.tests.prog.test_fast_consumer import NOW, build
+
+    harness = build(tmp_path)
+    owner = harness.owner
+    real_write = harness.store.write
+
+    def write(state, **kwargs):
+        real_write(state, **kwargs)
+        if state.phase == ("owned" if operation == "start" else "released"):
+            harness.gateway.advance_clock(1100)
+
+    monkeypatch.setattr(harness.store, "write", write)
+    wide = Deadline(owner.now_ns() + 60_000_000_000, NOW + 60_000)
+    try:
+        with owner.final_section(operation=operation) as lease:
+            if operation == "start":
+                result = owner._start_locked(lease=lease, writer=harness.lease, receiver=harness.gateway,
+                    installation_id="sandbox", owner_session_id="new", requested_not_after_ms=NOW + 60_000,
+                    deadline=wide, now_ms=NOW)
+                assert isinstance(result, ownership().RecoveryRequired)
+                assert result.reason == "deadline_exceeded"
+            else:
+                assert owner._stop_locked(lease=lease, reason="shutdown", deadline=wide) is None
+        assert owner.binding is None and owner.recovery_required
+    finally:
+        harness.lease.close()
+
+
+def test_i7_lifecycle_honors_short_caller_wire_deadline(tmp_path, monkeypatch):
+    from dao.tests.prog.test_fast_consumer import NOW, build
+
+    harness = build(tmp_path)
+    owner = harness.owner
+    seen = []
+    real_stop = harness.gateway.revoke_and_stop
+
+    def revoke(request, *, deadline):
+        seen.append(deadline)
+        return real_stop(request, deadline=deadline)
+
+    monkeypatch.setattr(harness.gateway, "revoke_and_stop", revoke)
+    try:
+        before = owner.now_ns()
+        assert owner.stop(reason="shutdown", deadline=Deadline(before + 1_000_000_000, NOW + 100)) is not None
+        assert seen == [Deadline(before + 100_000_000, NOW + 100)]
+    finally:
+        harness.lease.close()
 
 
 PROCESS = '''
@@ -205,7 +707,7 @@ def test_04_crash_after_reserve_skips_sequence(tmp_path):
         assert start(owner, lease, gateway).owner_epoch == 8
         assert owner.reserve_sequence(writer=lease) == 41
         restarted = module.OwnerCoordinator(store, receiver=gateway)
-        restarted.now_ns = lambda: 0
+        restarted.now_ns = owner.now_ns
         restarted.now_ms = lambda: 1001
         assert start(restarted, lease, gateway, owner_session_id="restart").owner_epoch == 9
         assert restarted.reserve_sequence(writer=lease) == 42
@@ -313,7 +815,7 @@ def test_09_stop_failure_retains_pending_recovery(tmp_path, raises):
             gateway.revoke_and_stop = fail
         else:
             gateway.safe_state_confirmed = False
-        receipt = owner.stop(reason="shutdown")
+        receipt = stop(owner, reason="shutdown")
         assert receipt is None if raises else receipt.status == "unconfirmed"
         state = store.load_strict()
         assert state.phase == "unconfirmed" and state.pending_barrier_id
@@ -331,7 +833,7 @@ def test_10_old_barrier_ack_cannot_release_new_owner(tmp_path):
         old = store.load_strict().last_barrier
         start(owner, lease, gateway, owner_session_id="newer")
         gateway.revoke_and_stop = lambda *args, **kwargs: old
-        assert owner.stop(reason="shutdown") == old
+        assert stop(owner, reason="shutdown") == old
         assert store.load_strict().phase == "unconfirmed"
         assert owner.recovery_required
     finally:
@@ -481,6 +983,18 @@ def runner(root, owner=None):
     from dao.prog.config.models.fastcontrol import FastControlConfig
     from dao.prog.fastctrl.publication import GatePolicy
     from dao.prog.fastctrl.runner import FastControlRunner
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    if owner is not None:
+        plan = ready_plan()
+        context = plan.financial_context
+        plan = replace(plan, created_ts=1, financial_context=replace(context, not_after_ts=61,
+            basis=replace(context.basis, meter_id="sandbox", prefix_start_ts=0, planning_start_ts=1,
+                          horizon_end_ts=2701, captured_ts=1, source_watermark_ts=1)),
+            intervals=[replace(row, start_ts=1 + index * 900, end_ts=901 + index * 900,
+                batteries=[replace(row.battery(0), active_from_ts=1 + index * 900)])
+                for index, row in enumerate(plan.intervals)])
+        (root / "fast_plan.json").write_text(json.dumps(plan.to_dict()))
     assert "owner" in __import__("inspect").signature(FastControlRunner).parameters, "F2c3 runner owner hook missing"
     return FastControlRunner(SimpleNamespace(), config=FastControlConfig(),
                              plan_path=str(root / "fast_plan.json"), state_path=str(root / "fast_state.json"),
@@ -499,11 +1013,11 @@ def test_16_runner_hooks_acquire_revoke_close_after_flush(tmp_path, monkeypatch)
     monkeypatch.setattr("time.time_ns", lambda: 1001_000_000)
     _, store, gateway, owner = layout(tmp_path)
     obj = runner(tmp_path, owner)
-    obj.start_owner_session()
+    start_runner(obj)
     assert owner.phase == "owned"
     with pytest.raises(task_execution.LeaseBusy):
         acquire(tmp_path)
-    obj.stop_owner_session("shutdown")
+    shutdown_runner(obj)
     assert store.load_strict().phase == "released"
     assert not owner.recovery_required
     lease = acquire(tmp_path)
@@ -517,6 +1031,8 @@ def test_16_runner_hooks_acquire_revoke_close_after_flush(tmp_path, monkeypatch)
     monkeypatch.setattr(obj, "stop_owner_session", stop)
     stopped = threading.Event()
     stopped.set()
+    from dao.tests.prog.test_fast_execution import next_owner_cycle
+    next_owner_cycle(owner)
     obj.run(stopped)
     assert events == ["flush", "shutdown"]
 
@@ -599,7 +1115,7 @@ def test_late_barrier_ack_never_clears_recovery(tmp_path, when):
             assert result.reason == "barrier_unconfirmed"
             assert owner.phase == "inhibited"
         else:
-            owner.stop(reason="shutdown")
+            stop(owner, reason="shutdown")
             assert store.load_strict().phase == "unconfirmed"
         assert owner.recovery_required
         assert not gateway.effect_log
@@ -644,13 +1160,15 @@ def test_runner_lifecycle_errors_do_not_escape_or_leak_lease(tmp_path, monkeypat
         raise OSError("synthetic lifecycle failure")
     try:
         if failure == "start":
-            monkeypatch.setattr(owner, "start", fail)
-        obj.start_owner_session()
+            monkeypatch.setattr(owner, "_start_locked", fail)
+        start_runner(obj)
         if failure in ("busy", "start"):
             assert owner.phase == "inhibited"
         if failure == "stop":
             monkeypatch.setattr(owner, "stop", fail)
         if failure == "flush":
+            from dao.tests.prog.test_fast_execution import next_owner_cycle
+            next_owner_cycle(owner)
             stopped = threading.Event()
             stopped.set()
             monkeypatch.setattr(obj, "_persist_state", fail)
@@ -658,7 +1176,7 @@ def test_runner_lifecycle_errors_do_not_escape_or_leak_lease(tmp_path, monkeypat
             with pytest.raises(OSError):
                 obj.run(stopped)
         else:
-            obj.stop_owner_session("shutdown")
+            shutdown_runner(obj)
     finally:
         if lease is not None:
             lease.close()
@@ -716,7 +1234,7 @@ def test_fix1_a_final_owned_write_consumes_deadline(tmp_path, monkeypatch, end_n
 
 
 @pytest.mark.parametrize("when", ["bind", "owned_write"])
-@pytest.mark.parametrize("current_ms", [6000, 9000])
+@pytest.mark.parametrize("current_ms", [15_000, 18_000])
 def test_fix1_a_binding_expiry_uses_current_time(tmp_path, monkeypatch, when, current_ms):
     module, store, gateway, owner = layout(tmp_path)
     clock = [1001]
@@ -770,7 +1288,7 @@ def test_fix1_b_failed_reservation_survives_stop_and_older_reload(tmp_path, monk
         if operation == "directory_fsync":
             assert store.load_strict().last_reserved_sequence == 41
         assert owner.phase == "inhibited" and owner.recovery_required
-        owner.stop(reason="shutdown")
+        stop(owner, reason="shutdown")
         assert store.load_strict().last_reserved_sequence == 41, "stop rolled back attempted reservation"
         store.path.write_bytes(older)
         assert start(owner, lease, gateway, owner_session_id="restart").owner_epoch > 8
@@ -810,7 +1328,7 @@ def test_fix1_d_mirror_write_is_a_classified_hard_error(tmp_path, monkeypatch, w
             elif when == "reserve":
                 owner.reserve_sequence(writer=lease)
             else:
-                owner.stop(reason="shutdown")
+                stop(owner, reason="shutdown")
         assert getattr(error.value, "reason", None) == "mirror_write_failed", "write failure lost its cause code"
         assert owner.phase == "inhibited" and owner.recovery_required
     finally:
@@ -838,19 +1356,19 @@ def test_fix1_d_runner_uses_public_failure_reporting(tmp_path, monkeypatch, fail
         raise OSError("synthetic hook failure")
     try:
         if failure == "start":
-            monkeypatch.setattr(owner, "start", fail)
+            monkeypatch.setattr(owner, "_start_locked", fail)
         elif failure == "mirror_start":
             monkeypatch.setattr(store, "write", fail)
-        obj.start_owner_session()
+        start_runner(obj)
         if failure in ("stop", "mirror_stop"):
             monkeypatch.setattr(owner if failure == "stop" else store,
                                 "stop" if failure == "stop" else "write", fail)
-            obj.stop_owner_session("shutdown")
+            shutdown_runner(obj)
         assert reported and reported[-1] == expected
         assert owner.phase == "inhibited" and owner.recovery_required
     finally:
         # Remove injection before orderly cleanup, without changing the assertion.
         monkeypatch.undo()
-        obj.stop_owner_session("shutdown")
+        shutdown_runner(obj)
         if blocker is not None:
             blocker.close()

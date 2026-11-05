@@ -44,7 +44,7 @@ CTX = multiprocessing.get_context("fork")
 INSTALLATION = "sandbox"
 RESOURCE = "actuator-" + hashlib.sha256(b"sandbox").hexdigest()[:32]
 MIRROR = hashlib.sha256(b"sandbox").hexdigest() + ".json"
-MONO = 1_000_000_000
+MONO = 15_000_000_000
 #: De boek- en plantijdlijn is seconden.
 NOW_TS = START_TS + 900
 #: De klok en het ontvangende contract zijn milliseconden.
@@ -61,10 +61,232 @@ def execution():
     return import_module("dao.prog.fastctrl.execution")
 
 
+@pytest.mark.parametrize("boundary", ["owner_section", "send_locked"])
+def test_i7_direct_start_stop_and_send_have_no_admission_bypass(artifact, boundary):
+    """An independently acquired publication lease grants no owner section."""
+    module = execution()
+    layout = owner_layout(artifact.root)
+    try:
+        command = build_command(module, layout, artifact)
+        layout.owner.record_pending_command(command)
+        before = layout.store.path.read_bytes()
+        failure = None
+        with publication_lock(artifact.path) as lease:
+            try:
+                if boundary == "send_locked":
+                    module.send_locked(command, lease=lease, owner=layout.owner,
+                        receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+                else:
+                    module.owner_section(lease=lease, owner=layout.owner,
+                        receiver=layout.gateway, request=request(), deadline=DEADLINE,
+                        clock=CLOCK, policy=POLICY)
+            except module.ExecutionRefused as exc:
+                failure = exc.reason
+        assert failure == "owner_section_required"
+        assert layout.store.path.read_bytes() == before
+        assert layout.gateway.effect_log == []
+    finally:
+        layout.lease.close()
+
+
 def attempts():
     module = import_module("dao.prog.fastctrl.publication")
     assert hasattr(module, "publication_attempts"), "F2c4 publication_attempts missing"
     return module
+
+
+def i7_owner_work(root, clock, control, ready, release):
+    """Keep offering real read/send/stop work while the publisher is retrying."""
+    from contextlib import contextmanager
+
+    from dao.prog.fastctrl import ownership as own
+    from dao.prog.fastctrl import runner as run
+    from dao.tests.prog.test_fast_consumer import propose
+    from dao.tests.prog.test_fast_runner import FakeHass, make_config
+
+    root = Path(root)
+    store = provision_mirror(root, installation_id=METER)
+    gateway = FencedReceiver(root / "receiver", initial_state=receiver_state(installation_id=METER), utc_ms=NOW)
+    gateway.receiver_max_lease_ms = 60_000
+    owner = own.OwnerCoordinator(store, receiver=gateway, now_ns=lambda: clock.value, now_ms=lambda: NOW)
+    writer = task_execution.acquire_resource(store.resource, lease_dir=root / "leases")
+    acquisitions = []
+    real_lock = publication_lock
+
+    @contextmanager
+    def observed(path):
+        with real_lock(path) as lease:
+            acquisitions.append(clock.value)
+            yield lease
+
+    run.publication_lock = observed
+    if hasattr(own, "publication_lock"):
+        own.publication_lock = observed
+    run.time.clock_gettime_ns = lambda _: clock.value
+    # A DB call from this owner process is always a contract violation.
+    import sqlalchemy
+    sqlalchemy.create_engine = lambda *a, **k: (_ for _ in ()).throw(AssertionError("owner DB I/O"))
+
+    def start():
+        return owner.start(writer=writer, receiver=gateway, installation_id=METER,
+                           owner_session_id="i7-session", requested_not_after_ms=NOW + 60_000,
+                           deadline=Deadline(clock.value + 1_000_000_000, NOW + 60_000), now_ms=NOW)
+
+    start()  # Lifetime observation at cycle zero: the implementation must defer.
+    clock.value = 5_000_000_000
+    start()
+    runner = run.FastControlRunner(FakeHass(), make_config(), plan_path=str(root / "fast_plan.json"),
+                                  state_path=str(root / "fast_state.json"), gate_policy=POLICY, owner=owner)
+    reader = run.FastControlRunner(FakeHass(), make_config(), plan_path=str(root / "fast_plan.json"),
+                                  state_path=str(root / "read_state.json"), gate_policy=POLICY)
+    plan = read_publication(root / "fast_plan.json").plan
+    real_send = gateway.send
+    first = True
+
+    def send(command, *, deadline):
+        nonlocal first
+        if first:
+            first = False
+            ready.set()
+            assert release.wait(timeout=30)
+        return real_send(command, deadline=deadline)
+
+    gateway.send = send
+    control.send("ready")
+    try:
+        while True:
+            operation, at = control.recv()
+            clock.value = at
+            if operation == "done":
+                control.send((acquisitions, len(gateway.effect_log)))
+                break
+            if operation == "start":
+                result = start()
+                outcome = getattr(result, "reason", "bound")
+            elif operation == "stop":
+                result = owner.stop(reason="handoff")
+                outcome = None if result is None else result.status
+            else:
+                reader.tick(NOW_TS)
+                receipts = runner._consume_financial_actuation(
+                    propose(plan, runner.state), plan, owner=owner, now_ms=NOW)
+                outcome = [receipt.status for receipt in receipts]
+            control.send((operation, at, outcome))
+    finally:
+        writer.close()
+
+
+def i7_publisher_work(url, path, pricing, clock, control, ready, tripwire):
+    """Real bounded acquisition, real final basis check/write; no receiver or commit."""
+    from contextlib import contextmanager
+
+    from dao.prog.fastctrl import publication as pub
+    from dao.prog.settlement import publication as settlement_publication
+
+    install_receiver_tripwire(tripwire)
+    engine, repo, adapter = connect_publication(url, path, pricing)
+    plan = read_publication(path).plan
+    real_lock, real_check = pub.publication_lock, adapter._check_basis_locked
+    events, checks, writes = [], [], []
+    real_write = settlement_publication._write_verified_ready
+
+    @contextmanager
+    def observed(target):
+        try:
+            with real_lock(target) as lease:
+                events.append(("acquired", clock.value))
+                yield lease
+        except PublicationLockBusy:
+            events.append(("busy", clock.value))
+            raise
+
+    def wait(seconds):
+        control.send(("retry", seconds))
+        assert control.recv() == "continue"
+
+    def check(*args, **kwargs):
+        checks.append(clock.value)
+        return real_check(*args, **kwargs)
+
+    def write(*args, **kwargs):
+        writes.append(clock.value)
+        return real_write(*args, **kwargs)
+
+    pub.publication_lock, pub.clock_gettime_ns, pub._sleep = observed, lambda _: clock.value, wait
+    adapter._check_basis_locked = check
+    settlement_publication._write_verified_ready = write
+    repo.commit = lambda *a, **k: (_ for _ in ()).throw(AssertionError("repeated settlement commit"))
+    assert ready.wait(timeout=30)
+    # Candidate is already solved/committed by the system fixture, exactly once.
+    adapter.publish(plan, now_ts=NOW_TS)
+    control.send(("published", events, checks, writes))
+    engine.dispose()
+
+
+def test_i7_continuous_owner_work_leaves_publication_window(system):
+    """Busy admitted send -> continuous owner offers -> publisher wins phase two."""
+    from decimal import Decimal
+
+    plan = system.plan
+    context = plan.financial_context
+    plan = replace(plan, specs=[plan.specs[0], replace(plan.specs[0], name="accu2")],
+                   intervals=[replace(row, batteries=[row.battery(0), row.battery(0)]) for row in plan.intervals],
+                   financial_context=replace(context, terminal_value=replace(context.terminal_value,
+                       reference_efficiency_by_battery=(("accu", Decimal("0.94")), ("accu2", Decimal("0.94"))))))
+    publish_fixture(system.adapter, plan, (system.snapshot,))
+    clock, ready, release = CTX.Value("q", 0), CTX.Event(), CTX.Event()
+    parent, child = CTX.Pipe()
+    publisher_parent, publisher_child = CTX.Pipe()
+    tripwire = str(system.root / "i7-receiver-tripwire")
+    owner = CTX.Process(target=i7_owner_work, args=(str(system.root), clock, child, ready, release))
+    publisher = CTX.Process(target=i7_publisher_work,
+                            args=(system.url, str(system.path), system.pricing, clock,
+                                  publisher_child, ready, tripwire))
+    reports = []
+
+    def receive(pipe):
+        assert pipe.poll(30), "missing causal IPC acknowledgement"
+        return pipe.recv()
+
+    def work(operation, at):
+        parent.send((operation, at))
+        reports.append(receive(parent))
+
+    owner.start()
+    publisher.start()
+    try:
+        assert receive(parent) == "ready"
+        parent.send(("work", 20_000_000_000))
+        assert receive(publisher_parent) == ("retry", 0.05)
+        release.set()
+        reports.append(receive(parent))
+        work("work", 20_050_000_000)
+        work("work", 21_000_000_000)
+        work("work", 22_000_000_000)
+        work("stop", 22_000_000_000)
+        publisher_parent.send("continue")
+        published = receive(publisher_parent)
+        for at in (23_000_000_000, 24_000_000_000):
+            work("work", at)
+        work("start", 25_000_000_000)
+        work("work", 30_000_000_000)
+        parent.send(("done", 30_000_000_000))
+        acquisitions, effects = receive(parent)
+        for process in (owner, publisher):
+            join(process)
+            assert process.exitcode == 0
+        assert published == ("published", [("busy", 20_000_000_000), ("acquired", 22_000_000_000)],
+                             [22_000_000_000], [22_000_000_000])
+        assert all(at % 5_000_000_000 < 1_000_000_000 for at in acquisitions), acquisitions
+        assert reports[0][2] == reports[-1][2] == ["accepted", "accepted"]
+        assert effects == 12
+        assert not Path(tripwire).exists()
+    finally:
+        release.set()
+        for process in (owner, publisher):
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=10)
 
 
 def ownership():
@@ -105,18 +327,274 @@ def owner_layout(root, *, requested_not_after_ms=None):
     """Bind one synthetic owner against the deterministic fake receiver."""
     module = ownership()
     store = provision_mirror(root)
-    gateway = FencedReceiver(Path(root) / "receiver", initial_state=receiver_state(), utc_ms=NOW)
+    gateway = FencedReceiver(Path(root) / "receiver", initial_state=receiver_state(), utc_ms=NOW - 10_000)
+    gateway.receiver_max_lease_ms = 70_000
     owner = module.OwnerCoordinator(store, receiver=gateway)
-    owner.now_ns = lambda: MONO
-    owner.now_ms = lambda: NOW
+    owner.now_ns = lambda: 0
+    owner.now_ms = lambda: gateway.utc_ms
     lease = task_execution.acquire_resource(RESOURCE, lease_dir=Path(root) / "leases")
+    owner._bind_lifetime(lease)
+    owner.now_ns = lambda: 5_000_000_000
     binding = owner.start(writer=lease, receiver=gateway, installation_id=INSTALLATION,
                           owner_session_id="session-new",
                           requested_not_after_ms=requested_not_after_ms or (NOW + 60_000),
-                          deadline=DEADLINE, now_ms=NOW)
+                          deadline=Deadline(6_000_000_000, NOW + 60_000), now_ms=gateway.utc_ms)
     assert binding.owner_epoch == 8, binding
+    gateway.utc_ms = NOW
+    owner.now_ns = lambda: MONO + gateway.monotonic_ns
     return SimpleNamespace(module=module, store=store, gateway=gateway, owner=owner,
                            lease=lease, binding=binding)
+
+
+def next_owner_cycle(owner):
+    """Advance only the injected BOOTTIME to a separate lifecycle/test section.
+
+    UTC boundary probes control their own independent wire clock. No admission
+    predicate or budget is replaced, and the BOOTTIME never goes backwards.
+    """
+    previous = owner.now_ns
+    now = previous()
+    target = (now // 5_000_000_000 + 1) * 5_000_000_000
+    owner.now_ns = lambda: previous() + target - now
+    return target
+
+
+def final_section(owner):
+    """Real admission with the normal one-second cap; wire bounds stay per probe."""
+    return owner.final_section(operation="send", deadline=Deadline(
+        owner.now_ns() + 1_000_000_000, owner.now_ms() + 3_600_000))
+
+
+@pytest.mark.parametrize("fault", ["rollback", "boot"])
+def test_i7_clock_change_during_transport_cannot_reopen_context(artifact, monkeypatch, fault):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    clock = [MONO]
+    layout.owner.now_ns = lambda: clock[0]
+    real_send = layout.gateway.send
+    calls = []
+
+    def send(command, *, deadline):
+        calls.append(command)
+        receipt = real_send(command, deadline=deadline)
+        if fault == "rollback":
+            clock[0] -= 1
+        else:
+            monkeypatch.setattr(layout.module, "_boot_id", lambda: "another-boot")
+        return receipt
+
+    layout.gateway.send = send
+    try:
+        failure = None
+        with final_section(layout.owner) as lease:
+            try:
+                module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
+                                     request=request(), policy=POLICY, clock=CLOCK, deadline=DEADLINE)
+            except module.ExecutionRefused as exc:
+                failure = exc.reason
+        assert failure == "clock_unhealthy"
+        assert len(calls) == 1
+        assert layout.owner.binding is None and layout.owner.recovery_required
+        assert layout.store.load_strict().pending_command == calls[0]
+    finally:
+        layout.lease.close()
+
+
+def i7_receipt_write_clock_fault(monkeypatch, owner, *, fault, fail_restore=False):
+    """Fault only after the real receipt write durably cleared the pending command."""
+    clock = [owner.now_ns()]
+    monkeypatch.setattr(owner, "now_ns", lambda: clock[0])
+    real_write = owner.store.write
+    committed = []
+
+    def write(state, **kwargs):
+        if fail_restore and committed and state.pending_command is not None:
+            raise OSError("pending restoration failed")
+        pending = owner.state.pending_command
+        real_write(state, **kwargs)
+        if state.last_receipt is not None and state.pending_command is None:
+            committed.append((pending, owner.store.load_strict()))
+            if fault == "rollback":
+                clock[0] -= 1
+            else:
+                monkeypatch.setattr(ownership(), "_boot_id", lambda: "changed-after-receipt-write")
+
+    monkeypatch.setattr(owner.store, "write", write)
+    return committed
+
+
+@pytest.mark.parametrize("route", ["direct", "section"])
+@pytest.mark.parametrize("fault", ["rollback", "boot"])
+def test_i7_fix1_clock_failure_after_receipt_write_retains_pending(artifact, monkeypatch, route, fault):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    committed = i7_receipt_write_clock_fault(monkeypatch, layout.owner, fault=fault)
+    try:
+        with pytest.raises(module.ExecutionRefused, match="^clock_unhealthy$"):
+            with final_section(layout.owner) as lease:
+                if route == "direct":
+                    command = build_command(module, layout, artifact)
+                    layout.owner.record_pending_command(command)
+                    module.send_locked(command, lease=lease, owner=layout.owner, receiver=layout.gateway,
+                                       deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+                else:
+                    module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
+                                         request=request(), deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+        assert len(committed) == 1
+        command, written = committed[0]
+        assert written.pending_command is None and written.last_receipt.status == "accepted"
+        assert written.last_receipt.command_id == command.command_id
+        state = layout.store.load_strict()
+        assert state.last_receipt == written.last_receipt
+        assert state.pending_command == layout.owner.state.pending_command == command
+        assert state.phase == layout.owner.phase == "inhibited"
+        assert layout.owner.binding is None and layout.owner.recovery_required
+        assert len(layout.gateway.effect_log) == 3
+        with pytest.raises(layout.module.RecoveryRequired, match="^clock_unhealthy$"):
+            with final_section(layout.owner):
+                pytest.fail("post-write clock failure reopened an owner section")
+    finally:
+        layout.lease.close()
+
+
+def test_i7_fix1_pending_restore_write_failure_is_not_masked(artifact, monkeypatch):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    committed = i7_receipt_write_clock_fault(monkeypatch, layout.owner, fault="rollback", fail_restore=True)
+    try:
+        with pytest.raises(layout.module.MirrorWriteFailed, match="pending restoration failed"):
+            with final_section(layout.owner) as lease:
+                module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
+                                     request=request(), deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+        assert len(committed) == 1
+        assert layout.store.load_strict().last_receipt == committed[0][1].last_receipt
+        assert layout.owner.binding is None and layout.owner.recovery_required
+        assert len(layout.gateway.effect_log) == 3
+    finally:
+        layout.lease.close()
+
+
+def test_i7_claim_survives_exception_and_new_coordinator(artifact):
+    layout = owner_layout(artifact.root)
+    try:
+        with pytest.raises(RuntimeError, match="body"):
+            with final_section(layout.owner):
+                raise RuntimeError("body")
+        assert layout.owner.section_deadline is layout.owner.transport_deadline is None
+        other = layout.module.OwnerCoordinator(layout.store, receiver=layout.gateway,
+                                               now_ns=layout.owner.now_ns, now_ms=layout.owner.now_ms)
+        result = other.start(writer=layout.lease, receiver=layout.gateway, installation_id=INSTALLATION,
+            owner_session_id="other", requested_not_after_ms=NOW + 60_000,
+            deadline=DEADLINE, now_ms=NOW)
+        assert result.reason == "admission_cycle_used"
+        assert layout.gateway.state.epoch_high_water == 8
+        with pytest.raises(layout.module.RecoveryRequired, match="admission_cycle_used"):
+            with final_section(layout.owner):
+                pytest.fail("exception returned its cycle claim")
+    finally:
+        layout.lease.close()
+
+
+def test_i7_acquire_recheck_and_shared_budget(artifact, monkeypatch):
+    from contextlib import contextmanager
+
+    layout = owner_layout(artifact.root)
+    clock = [MONO]
+    layout.owner.now_ns = lambda: clock[0]
+    real_lock = layout.module.publication_lock
+    cost = [200_000_000]
+
+    @contextmanager
+    def slow(path):
+        with real_lock(path) as lease:
+            clock[0] += cost[0]
+            yield lease
+
+    monkeypatch.setattr(layout.module, "publication_lock", slow)
+    try:
+        with final_section(layout.owner) as lease:
+            assert layout.owner.section_deadline.monotonic_end_ns == MONO + 1_000_000_000
+            assert layout.owner.transport_deadline.remaining_ns(clock[0]) == 550_000_000
+            layout.owner.require_final_section(lease, operation="send")
+        with pytest.raises(layout.module.RecoveryRequired, match="owner_section_required"):
+            layout.owner.require_final_section(lease, operation="send")
+        clock[0], cost[0] = 20_000_000_000, 1_000_000_000
+        before = layout.store.path.read_bytes()
+        with pytest.raises(layout.module.RecoveryRequired, match="admission_window_missed"):
+            with final_section(layout.owner):
+                pytest.fail("acquire overrun admitted the body")
+        assert layout.store.path.read_bytes() == before
+        with publication_lock(artifact.path):
+            pass
+    finally:
+        layout.lease.close()
+
+
+def test_i7_lifetime_checks_consume_the_section_budget(artifact, monkeypatch):
+    layout = owner_layout(artifact.root)
+    clock = [MONO]
+    layout.owner.now_ns = lambda: clock[0]
+    real_holds = layout.store.holds
+
+    def holds(writer):
+        result = real_holds(writer)
+        clock[0] += 200_000_000
+        return result
+
+    monkeypatch.setattr(layout.store, "holds", holds)
+    try:
+        with final_section(layout.owner):
+            assert layout.owner.section_deadline.monotonic_end_ns == MONO + 1_000_000_000
+            assert layout.owner.transport_deadline.monotonic_end_ns == MONO + 750_000_000
+            assert layout.owner.transport_deadline.remaining_ns(clock[0]) == 350_000_000
+    finally:
+        layout.lease.close()
+
+
+def test_i7_cycle_claim_belongs_to_lifetime_not_new_store_object(artifact):
+    layout = owner_layout(artifact.root)
+    owner = layout.owner
+    other_store = layout.module.OwnerStore(artifact.root / "other-plan.json", INSTALLATION,
+                                           lease_dir=artifact.root / "leases")
+    other = layout.module.OwnerCoordinator(other_store, receiver=layout.gateway,
+        now_ns=lambda: owner.now_ns(), now_ms=owner.now_ms)
+    try:
+        other._bind_lifetime(layout.lease)
+        next_owner_cycle(owner)
+        with final_section(owner):
+            pass
+        before = layout.store.path.read_bytes()
+        result = other.start(writer=layout.lease, receiver=layout.gateway, installation_id=INSTALLATION,
+            owner_session_id="other", requested_not_after_ms=NOW + 60_000,
+            deadline=Deadline(owner.now_ns() + 1_000_000_000, NOW + 60_000), now_ms=NOW)
+        assert isinstance(result, layout.module.RecoveryRequired), "a new store returned the lifetime's cycle claim"
+        assert result.reason == "admission_cycle_used"
+        assert layout.store.path.read_bytes() == before
+    finally:
+        layout.lease.close()
+
+
+def test_i7_invalidation_after_send_cannot_relabel_the_cycle(artifact):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    try:
+        with final_section(layout.owner) as lease:
+            receipt = module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
+                request=request(), deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+            assert receipt.status == "accepted"
+            artifact.path.write_text(json.dumps({"format_version": 2, "status": "blocked",
+                                                 "created_ts": NOW_TS, "reason": "correction"}))
+            assert module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
+                request=request(), deadline=DEADLINE, clock=CLOCK, policy=POLICY) is None
+            assert layout.gateway.state.epoch_high_water == 8
+            assert layout.owner.pending_stop_reason == "publication_invalidated"
+            assert layout.owner.binding is None
+        next_owner_cycle(layout.owner)
+        assert layout.owner.stop(reason="publication_invalidated").status == "accepted"
+        assert layout.gateway.state.epoch_high_water == 9
+        assert len(layout.gateway.effect_log) == 3
+    finally:
+        layout.lease.close()
 
 
 def request():
@@ -189,12 +667,17 @@ def owner_worker(root, mode, barrier, go, registered, results, send_started=None
     store = provision_mirror(root, installation_id=METER)
     gateway = FencedReceiver(root / "receiver", initial_state=receiver_state(installation_id=METER),
                              utc_ms=NOW)
+    gateway.receiver_max_lease_ms = 60_000
     owner = store_owner(store, gateway)
     lease = task_execution.acquire_resource(store.resource, lease_dir=root / "leases")
+    owner.now_ns = lambda: 0
+    owner._bind_lifetime(lease)
+    owner.now_ns = lambda: 5_000_000_000
     binding = owner.start(writer=lease, receiver=gateway, installation_id=METER,
                           owner_session_id="session-new", requested_not_after_ms=NOW + 60_000,
                           deadline=DEADLINE, now_ms=NOW)
     assert binding.owner_epoch == 8, binding
+    owner.now_ns = lambda: MONO
     command_request = module.CommandRequest(battery_name="accu", setpoint_w=-1200,
                                              mode="Aan", stop_at_ms=None)
     if send_started is not None:
@@ -208,13 +691,12 @@ def owner_worker(root, mode, barrier, go, registered, results, send_started=None
         gateway.send = send
 
     def section():
-        module_attempts = attempts()
-        with module_attempts.publication_attempts(
-                root / "fast_plan.json",
-                deadline_ns=module_attempts.publication_deadline_ns()) as lease:
+        clock = replace(CLOCK, boottime_ns=owner.now_ns())
+        deadline = Deadline(owner.now_ns() + 1_000_000_000, NOW + 60_000)
+        with owner.final_section(operation="send", deadline=deadline) as lease:
             return module.owner_section(lease=lease, owner=owner, receiver=gateway,
-                                        request=command_request, policy=POLICY, clock=CLOCK,
-                                        deadline=DEADLINE)
+                                        request=command_request, policy=POLICY, clock=clock,
+                                        deadline=deadline)
 
     statuses = []
     barrier.wait(timeout=30)
@@ -226,6 +708,7 @@ def owner_worker(root, mode, barrier, go, registered, results, send_started=None
     else:
         go.wait(timeout=30)
         registered.wait(timeout=30)
+    next_owner_cycle(owner)
     receipt = section()
     statuses.append(receipt.status if receipt is not None else None)
     results.put(("sections", statuses, len(gateway.effect_log), owner.phase,
@@ -826,7 +1309,7 @@ def test_i6_direct_boundary_accepts_own_nominal_receiver(artifact, monkeypatch, 
             command = build_command(module, layout, artifact)
             layout.owner.record_pending_command(command)
         calls = observe_receiver_calls(monkeypatch, layout.gateway)
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             if boundary == "send_locked":
                 receipt = module.send_locked(command, lease=lease, owner=layout.owner,
                     receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK, policy=POLICY)
@@ -873,7 +1356,7 @@ def test_i2_direct_send_rechecks_installation(artifact, monkeypatch, fault):
         state_before = layout.owner.state
         calls = observe_receiver_calls(monkeypatch, layout.gateway)
         error = None
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             # Even the changed plan is valid with the offered digest: this is
             # an installation refusal, not a stale-publication refusal.
             module.validate_current_locked(lease=lease, expected_digest=offered.plan_digest,
@@ -913,7 +1396,7 @@ def test_07_send_locked_refuses_a_changed_pending_command(artifact):
     layout.owner.record_pending_command(command)
     changed = replace(command, setpoint_w=command.setpoint_w + 1)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.send_locked(changed, lease=lease, owner=layout.owner,
                                    receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
@@ -931,7 +1414,7 @@ def test_07_send_locked_refuses_a_missing_binding(artifact):
     layout.owner.record_pending_command(command)
     layout.owner.binding = None
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.send_locked(command, lease=lease, owner=layout.owner,
                                    receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
@@ -947,8 +1430,8 @@ def test_07_send_locked_refuses_an_expired_lifetime_lease(artifact):
     layout = owner_layout(artifact.root)
     command = build_command(module, layout, artifact)
     layout.owner.record_pending_command(command)
-    layout.lease.close()
-    with publication_lock(artifact.path) as lease:
+    with final_section(layout.owner) as lease:
+        layout.lease.close()
         with pytest.raises(module.ExecutionRefused) as error:
             module.send_locked(command, lease=lease, owner=layout.owner,
                                receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
@@ -978,7 +1461,7 @@ def test_07_a_lost_ack_is_unconfirmed_with_one_retry_and_one_query(artifact):
     layout.gateway.query = query
     layout.gateway.lose_ack()
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.send_locked(command, lease=lease, owner=layout.owner,
                                         receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
                                         policy=POLICY)
@@ -1006,7 +1489,7 @@ def test_07_an_accepted_send_clears_the_pending_command(artifact):
     command = build_command(module, layout, artifact)
     layout.owner.record_pending_command(command)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.send_locked(command, lease=lease, owner=layout.owner,
                                         receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
                                         policy=POLICY)
@@ -1050,7 +1533,7 @@ def test_i1_exact_query_proves_the_terminal_outcome(artifact, status):
 
     layout.gateway.send, layout.gateway.query = send, query
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.send_locked(command, lease=lease, owner=layout.owner,
                                         receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
                                         policy=POLICY)
@@ -1073,7 +1556,7 @@ def test_i1_exact_rejection_without_effect_clears_pending(artifact):
     layout.owner.record_pending_command(command)
     layout.gateway.helper_ok["setpoint"] = False
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.send_locked(command, lease=lease, owner=layout.owner,
                                         receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
                                         policy=POLICY)
@@ -1124,16 +1607,16 @@ def test_07_a_late_acknowledgement_stays_history_and_refuses(artifact):
     layout = owner_layout(artifact.root)
     command = build_command(module, layout, artifact)
     layout.owner.record_pending_command(command)
-    telling = {"n": 0}
+    real_send = layout.gateway.send
 
-    def nu():
-        telling["n"] += 1
-        # Eén controle binnen het budget; de controle na de send erbuiten.
-        return MONO if telling["n"] <= 1 else MONO + 2_000_000_000
+    def late(payload, *, deadline):
+        receipt = real_send(payload, deadline=deadline)
+        layout.gateway.advance_clock(2000)
+        return receipt
 
-    layout.owner.now_ns = nu
+    layout.gateway.send = late
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.send_locked(command, lease=lease, owner=layout.owner,
                                    receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
@@ -1187,7 +1670,7 @@ def test_i5_short_plan_lease_bounds_ack_deadline(artifact, route, finish, epsilo
     gateway.send, layout.owner.record_receipt = send, record
     try:
         failure, receipt = None, None
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             try:
                 if route == "direct":
                     command = replace(build_command(module, layout, artifact), issued_at_ms=clock.utc_ms)
@@ -1239,7 +1722,7 @@ def test_i5_direct_send_honors_each_short_bound(artifact, bound, offset):
     layout.gateway.send = send
     try:
         failure = None
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             try:
                 receipt = module.send_locked(command, lease=lease, owner=layout.owner,
                     receiver=layout.gateway, deadline=caller, clock=CLOCK, policy=POLICY)
@@ -1285,7 +1768,7 @@ def test_i5_transport_and_result_write_keep_their_original_budgets(artifact, rou
     caller = Deadline(MONO + 10_000_000_000, NOW + 60_000)
     try:
         failure = None
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             try:
                 if route == "direct":
                     command = build_command(module, layout, artifact)
@@ -1317,7 +1800,7 @@ def test_i5_uncertainty_can_exhaust_the_lease_before_io(artifact, epsilon, healt
     clock = replace(CLOCK, uncertainty_ms=epsilon, healthy=healthy)
     try:
         failure = None
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             try:
                 if route == "direct":
                     command = build_command(module, layout, artifact)
@@ -1365,9 +1848,12 @@ def test_i5_direct_send_rejects_overwide_command_without_rewriting(artifact, mon
         layout.lease.close()
         layout.gateway.receiver_max_lease_ms = 3_600_000
         layout.lease = task_execution.acquire_resource(RESOURCE, lease_dir=artifact.root / "leases")
+        layout.owner._bind_lifetime(layout.lease)
+        next_owner_cycle(layout.owner)
         layout.binding = layout.owner.start(writer=layout.lease, receiver=layout.gateway,
             installation_id=INSTALLATION, owner_session_id="i5-long", requested_not_after_ms=NOW + 3_600_000,
-            deadline=DEADLINE, now_ms=NOW)
+            deadline=Deadline(layout.owner.now_ns() + 1_000_000_000, NOW + 60_000), now_ms=NOW)
+        next_owner_cycle(layout.owner)
     try:
         command = replace(build_command(module, layout, artifact),
                           execute_before_ms=bound + (1 if field == "execute" else 0),
@@ -1376,7 +1862,7 @@ def test_i5_direct_send_rejects_overwide_command_without_rewriting(artifact, mon
         before = layout.store.path.read_bytes()
         calls = observe_receiver_calls(monkeypatch, layout.gateway)
         failure = None
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             try:
                 module.send_locked(command, lease=lease, owner=layout.owner,
                     receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK, policy=POLICY)
@@ -1407,6 +1893,8 @@ def test_i5_fix1_direct_send_refuses_future_issue_at_profile_edge(tmp_path, monk
         boundary_ms = NOW + 1000
     harness = build(tmp_path, plan=plan)
     harness.gateway.advance_clock(boundary_ms - 100 - NOW)
+    if edge == "interval":
+        next_owner_cycle(harness.owner)
     clock = replace(CLOCK, utc_ms=boundary_ms - 100, boottime_ns=harness.owner.now_ns())
     try:
         command = module._build_command(owner=harness.owner, request=request(), plan=plan,
@@ -1420,7 +1908,7 @@ def test_i5_fix1_direct_send_refuses_future_issue_at_profile_edge(tmp_path, monk
         payload_before = command.to_dict()
         calls = observe_receiver_calls(monkeypatch, harness.gateway)
         failure, receipt = None, None
-        with publication_lock(harness.path) as lease:
+        with final_section(harness.owner) as lease:
             try:
                 receipt = module.send_locked(command, lease=lease, owner=harness.owner,
                     receiver=harness.gateway, deadline=Deadline(clock.boottime_ns + 1_000_000_000,
@@ -1455,7 +1943,7 @@ def test_09_an_exhausted_budget_refuses_and_never_sends(artifact):
     layout.owner.record_pending_command(command)
     expired = Deadline(MONO - 1, NOW + 60_000)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.send_locked(command, lease=lease, owner=layout.owner,
                                    receiver=layout.gateway, deadline=expired, clock=CLOCK,
@@ -1478,7 +1966,7 @@ def test_09_a_shorter_owner_lease_shortens_the_deadline(artifact):
 
     layout.gateway.send = send
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.owner_section(lease=lease, owner=layout.owner,
                                            receiver=layout.gateway, request=request(),
                                            policy=POLICY, clock=CLOCK, deadline=DEADLINE)
@@ -1493,9 +1981,9 @@ def test_09_a_shorter_owner_lease_shortens_the_deadline(artifact):
 def test_09_an_expired_owner_lease_refuses_the_section(artifact):
     module = execution()
     layout = owner_layout(artifact.root)
-    expired = replace(CLOCK, utc_ms=NOW + 6_000)
+    expired = replace(CLOCK, utc_ms=layout.binding.owner_not_after_ms)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
                                      request=request(), policy=POLICY, clock=expired,
@@ -1526,7 +2014,7 @@ def test_09_a_result_write_after_the_deadline_restores_the_pending_command(artif
 
     layout.owner.record_receipt = record
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             with pytest.raises(module.ExecutionRefused) as error:
                 module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
                                      request=request(), policy=POLICY, clock=CLOCK,
@@ -1559,7 +2047,7 @@ def test_i2_plan_meter_must_equal_owner_installation(artifact, monkeypatch, mete
     calls = observe_receiver_calls(monkeypatch, layout.gateway)
     try:
         error = None
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             validated = module.validate_current_locked(lease=lease,
                 expected_digest=module.plan_digest(plan), clock=CLOCK, policy=POLICY)
             assert validated.financial_context.basis.meter_id == meter
@@ -1604,7 +2092,7 @@ def test_i2_owner_section_checks_every_identity_before_reserving(artifact, monke
         state_before = layout.owner.state
         calls = observe_receiver_calls(monkeypatch, layout.gateway)
         error = None
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             try:
                 module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
                     request=request(), policy=POLICY, clock=CLOCK, deadline=DEADLINE)
@@ -1641,7 +2129,7 @@ def test_08_the_owner_section_sends_once_and_records_the_mirror(artifact):
     module = execution()
     layout = owner_layout(artifact.root)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.owner_section(lease=lease, owner=layout.owner,
                                            receiver=layout.gateway, request=request(),
                                            policy=POLICY, clock=CLOCK, deadline=DEADLINE)
@@ -1663,7 +2151,7 @@ def test_08_a_blocked_plan_revokes_the_epoch_and_gives_no_receipt(artifact):
     artifact.path.write_text(json.dumps({"format_version": 2, "status": "blocked",
                                          "created_ts": NOW_TS, "reason": "correction"}))
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.owner_section(lease=lease, owner=layout.owner,
                                            receiver=layout.gateway, request=request(),
                                            policy=POLICY, clock=CLOCK, deadline=DEADLINE)
@@ -1692,7 +2180,7 @@ def test_08_the_invalidation_uses_the_remaining_section_budget(artifact):
     layout.gateway.revoke_and_stop = revoke
     short = Deadline(MONO + 300_000_000, NOW + 60_000)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.owner_section(lease=lease, owner=layout.owner,
                                            receiver=layout.gateway, request=request(),
                                            policy=POLICY, clock=CLOCK, deadline=short)
@@ -1714,7 +2202,7 @@ def test_08_without_budget_the_epoch_is_not_withdrawn(artifact):
     layout.gateway.revoke_and_stop = lambda request, *, deadline: seen.append(deadline)
     expired = Deadline(MONO - 1, NOW + 60_000)
     try:
-        with publication_lock(artifact.path) as lease:
+        with final_section(layout.owner) as lease:
             receipt = module.owner_section(lease=lease, owner=layout.owner,
                                            receiver=layout.gateway, request=request(),
                                            policy=POLICY, clock=CLOCK, deadline=expired)
@@ -1831,6 +2319,7 @@ def test_10_the_production_route_never_reaches_the_send(artifact, monkeypatch):
     from dao.tests.prog.test_fast_runner import FakeHass
 
     reached = []
+    monkeypatch.setattr(runner_module.time, "clock_gettime_ns", lambda _: MONO)
     module = execution()
     monkeypatch.setattr(module, "send_locked", lambda *args, **kwargs: reached.append(kwargs))
     hass = FakeHass()

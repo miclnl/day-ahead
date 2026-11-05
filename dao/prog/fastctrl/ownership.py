@@ -10,9 +10,11 @@ import hashlib
 import json
 import os
 import stat
+import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Literal
@@ -20,6 +22,7 @@ from typing import Literal
 from dao.prog import task_execution
 from dao.prog.task_execution import Lease
 
+from .actuator import FENCED_ADAPTER, classify_actuation_adapter
 from .command import (
     ActuationReceipt,
     BarrierReceipt,
@@ -31,7 +34,37 @@ from .command import (
     _reason,
     _string,
 )
+from .publication import (
+    OWNER_CYCLE_NS,
+    OWNER_START_NS,
+    PUBLICATION_PHASE_NS,
+    PublicationError,
+    PublicationLease,
+    PublicationLockBusy,
+    canonical_plan_path,
+    owner_admission_at,
+    publication_lock,
+)
 from .receiver import FencedDeviceGateway, _helper, _helpers_from_dict, receipt_matches_command
+
+
+def _boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+@dataclass
+class _Admission:
+    """Runtime bookkeeping attached to the held lifetime, never durable rights."""
+
+    pid: int
+    boot_id: str
+    last_ns: int
+    first_cycle: int
+    claimed_cycle: int = -1
+    unhealthy: bool = False
 
 
 class RecoveryRequired(Exception):
@@ -136,9 +169,10 @@ class OwnerStore:
     def __init__(self, plan_path: str | Path, installation_id: str, *, lease_dir: Path | None = None):
         _string(installation_id, "owner_installation_id_invalid")
         self.installation_id = installation_id
+        self.plan_path = canonical_plan_path(plan_path)
         digest = hashlib.sha256(installation_id.encode("utf-8")).hexdigest()
         self.resource = f"actuator-{digest[:32]}"
-        self.path = Path(plan_path).absolute().parent / "actuation_owner" / f"{digest}.json"
+        self.path = self.plan_path.parent / "actuation_owner" / f"{digest}.json"
         self.lease_dir = Path(task_execution.LEASE_DIR if lease_dir is None else lease_dir).absolute()
 
     def holds(self, writer: Lease) -> bool:
@@ -235,6 +269,141 @@ class OwnerCoordinator:
         self.binding: OwnerBinding | None = None
         self.phase = "inhibited"
         self.recovery_required = True
+        self.pending_stop_reason: str | None = None
+        self.last_admission_reason: str | None = None
+        self._admission: _Admission | None = None
+        self._section_lease: PublicationLease | None = None
+        self._section_operation: str | None = None
+        self._section_thread: int | None = None
+        self._section_used = False
+        self.section_deadline: Deadline | None = None
+        self.transport_deadline: Deadline | None = None
+
+    def _bind_lifetime(self, writer: Lease) -> None:
+        if not self.store.holds(writer):
+            raise self._inhibit("owner_lease_missing")
+        now = self.now_ns()
+        try:
+            cycle, _, _ = owner_admission_at(now)
+        except (TypeError, ValueError):
+            raise self._inhibit("clock_unhealthy") from None
+        # A new coordinator using the same lifetime cannot return its claim.
+        admission = getattr(writer, "_fastctrl_admission", None)
+        if admission is None or admission.pid != os.getpid():
+            admission = _Admission(os.getpid(), _boot_id(), now, cycle + 1)
+            writer._fastctrl_admission = admission
+        self.writer, self._admission = writer, admission
+        self._clock()
+
+    def _clock(self) -> int:
+        now = self.now_ns()
+        admission = self._admission
+        if (admission is None or admission.pid != os.getpid()
+                or admission.unhealthy or not admission.boot_id or _boot_id() != admission.boot_id
+                or type(now) is not int or now < admission.last_ns):
+            if admission is not None:
+                admission.unhealthy = True
+            raise self._inhibit("clock_unhealthy")
+        admission.last_ns = now
+        return now
+
+    @contextmanager
+    def final_section(self, *, operation: Literal["start", "send", "stop"],
+                      deadline: Deadline | None = None) -> Iterator[PublicationLease]:
+        """One admitted installation section, one lock, one non-refundable claim."""
+        if operation not in ("start", "send", "stop"):
+            raise ValueError("owner_operation_invalid")
+        if deadline is not None and type(deadline) is not Deadline:
+            raise ValueError("owner_deadline_invalid")
+        if self._admission is None:
+            self._bind_lifetime(self.writer)
+        started = self._clock()
+        if not self.store.holds(self.writer):
+            raise self._inhibit("owner_lease_missing")
+        cycle, allowed, _ = owner_admission_at(started)
+        admission = self._admission
+        reason = None
+        if not allowed or cycle < admission.first_cycle:
+            reason = "admission_deferred"
+        elif cycle <= admission.claimed_cycle:
+            reason = "admission_cycle_used"
+        if reason:
+            self.last_admission_reason = reason
+            raise RecoveryRequired(reason)
+        now_ms = self.now_ms()
+        end = min(started + OWNER_START_NS, cycle * OWNER_CYCLE_NS + PUBLICATION_PHASE_NS)
+        wire_end = now_ms + 1000 if deadline is None else deadline.execute_before_ms
+        if deadline is not None:
+            end = min(end, deadline.monotonic_end_ns)
+        end = min(end, started + max(0, wire_end - now_ms) * 1_000_000)
+        section = Deadline(end, wire_end)
+        transport = Deadline(min(end, started + 750_000_000), wire_end)
+        with publication_lock(self.store.plan_path) as lease:
+            acquired = self._clock()
+            current_cycle, allowed, _ = owner_admission_at(acquired)
+            if current_cycle != cycle or not allowed:
+                self.last_admission_reason = "admission_window_missed"
+                raise RecoveryRequired("admission_window_missed")
+            if cycle <= admission.claimed_cycle:
+                raise RecoveryRequired("admission_cycle_used")
+            if not self.store.holds(self.writer):
+                raise self._inhibit("owner_lease_missing")
+            admission.claimed_cycle = cycle
+            self._section_lease, self._section_operation = lease, operation
+            self._section_thread = threading.get_ident()
+            self._section_used = False
+            self.section_deadline, self.transport_deadline = section, transport
+            self.last_admission_reason = None
+            try:
+                yield lease
+            finally:
+                self._section_lease = self._section_operation = self._section_thread = None
+                self.section_deadline = self.transport_deadline = None
+                self._section_used = False
+
+    def require_final_section(self, lease: PublicationLease, *,
+                              operation: Literal["start", "send", "stop"]) -> None:
+        if (type(lease) is not PublicationLease or lease is not self._section_lease
+                or self._section_operation != operation or self._section_thread != threading.get_ident()
+                or lease.path != self.store.plan_path):
+            raise RecoveryRequired("owner_section_required")
+        try:
+            lease._check()
+        except PublicationError:
+            raise RecoveryRequired("owner_section_required") from None
+        if not self.store.holds(self.writer):
+            raise self._inhibit("owner_lease_missing")
+        self._clock()
+
+    def _stop_in_send_section(self, lease: PublicationLease, *, reason: str,
+                              deadline: Deadline) -> BarrierReceipt | None:
+        self.require_final_section(lease, operation="send")
+        if self._section_used:
+            self.pending_stop_reason = reason
+            self._inhibit(reason)
+            return None
+        self._section_operation = "stop"
+        return self._stop_locked(lease=lease, reason=reason, deadline=deadline)
+
+    def _require_receiver(self, receiver: FencedDeviceGateway) -> None:
+        if classify_actuation_adapter(receiver) != FENCED_ADAPTER:
+            raise RecoveryRequired("adapter_unqualified")
+        if receiver is not self.receiver:
+            raise RecoveryRequired("receiver_binding_mismatch")
+
+    def _covers_next_send(self, binding: OwnerBinding) -> bool:
+        now_ns = self._clock()
+        next_send = (now_ns // OWNER_CYCLE_NS + 1) * OWNER_CYCLE_NS
+        required_ms = (next_send + OWNER_START_NS - now_ns + 999_999) // 1_000_000
+        return binding.owner_not_after_ms > self.now_ms() + required_ms
+
+    def _lifecycle_budget(self, deadline: Deadline) -> Deadline:
+        if type(deadline) is not Deadline:
+            raise ValueError("owner_deadline_invalid")
+        wire_end = min(deadline.execute_before_ms, self.section_deadline.execute_before_ms)
+        end = min(deadline.monotonic_end_ns, self.section_deadline.monotonic_end_ns,
+                  self._clock() + max(0, wire_end - self.now_ms()) * 1_000_000)
+        return Deadline(end, wire_end)
 
     def _inhibit(self, reason):
         self.phase = "inhibited"
@@ -298,12 +467,34 @@ class OwnerCoordinator:
               owner_session_id: str, requested_not_after_ms: int,
               deadline: Deadline, now_ms: int) -> OwnerBinding | RecoveryRequired:
         self._inhibit("owner_lease_missing")
-        if not self.store.holds(writer):
-            return RecoveryRequired("owner_lease_missing")
-        self.writer = writer
-        self.receiver = receiver
+        try:
+            self._require_receiver(receiver)
+            self._bind_lifetime(writer)
+            with self.final_section(operation="start", deadline=deadline) as lease:
+                return self._start_locked(lease=lease, writer=writer, receiver=receiver,
+                    installation_id=installation_id, owner_session_id=owner_session_id,
+                    requested_not_after_ms=requested_not_after_ms,
+                    deadline=self.section_deadline, now_ms=now_ms)
+        except PublicationLockBusy:
+            return RecoveryRequired("publication_busy")
+        except RecoveryRequired as exc:
+            return exc
+
+    def _start_locked(self, *, lease: PublicationLease, writer: Lease,
+                      receiver: FencedDeviceGateway, installation_id: str,
+                      owner_session_id: str, requested_not_after_ms: int,
+                      deadline: Deadline, now_ms: int) -> OwnerBinding | RecoveryRequired:
+        self._require_receiver(receiver)
+        self.require_final_section(lease, operation="start")
+        deadline = self._lifecycle_budget(deadline)
+        if writer is not self.writer:
+            return self._inhibit("owner_lease_missing")
         if installation_id != self.store.installation_id:
             return self._inhibit("mirror_missing_or_corrupt")
+        transport = Deadline(min(deadline.monotonic_end_ns, self.transport_deadline.monotonic_end_ns),
+                             min(deadline.execute_before_ms, self.transport_deadline.execute_before_ms))
+        if transport.remaining_ns(self._clock()) == 0:
+            return self._inhibit("deadline_exceeded")
         try:
             loaded = self.store.load_strict()
         except RecoveryRequired as result:
@@ -319,10 +510,14 @@ class OwnerCoordinator:
             return result
         self._write(replace(loaded, phase="inhibited"))
         try:
-            snapshot = receiver.inspect(deadline=deadline)
+            if transport.remaining_ns(self._clock()) == 0:
+                return self._inhibit("deadline_exceeded")
+            snapshot = receiver.inspect(deadline=transport)
             if (snapshot.installation_id != installation_id or not snapshot.queue_known
                     or snapshot.epoch_high_water < 1):
                 return self._inhibit("queue_unknown")
+        except RecoveryRequired:
+            raise
         except Exception:
             return self._inhibit("queue_unknown")
         try:
@@ -338,77 +533,117 @@ class OwnerCoordinator:
                             owner_session_id=owner_session_id, phase="binding",
                             last_reserved_sequence=max(self.state.last_reserved_sequence, snapshot.sequence_high_water),
                             pending_barrier_id=request.barrier_id))
-        if deadline.remaining_ns(self.now_ns()) == 0:
+        if transport.remaining_ns(self._clock()) == 0:
             return self._inhibit("barrier_unconfirmed")
         try:
-            barrier = receiver.revoke_and_stop(request, deadline=deadline)
+            barrier = receiver.revoke_and_stop(request, deadline=transport)
         except Exception:
             return self._inhibit("barrier_unconfirmed")
         if (not self._exact(barrier, request, snapshot.receiver_generation)
-                or deadline.remaining_ns(self.now_ns()) == 0):
+                or transport.remaining_ns(self._clock()) == 0):
             return self._inhibit("barrier_unconfirmed")
         new_epoch = snapshot.epoch_high_water + 1
         try:
             binding = receiver.bind_owner(installation_id=installation_id, barrier_id=request.barrier_id,
                                           expected_epoch=new_epoch, owner_session_id=owner_session_id,
-                                          requested_not_after_ms=requested_not_after_ms, deadline=deadline)
+                                          requested_not_after_ms=requested_not_after_ms, deadline=transport)
             if (type(binding) is not OwnerBinding or binding.installation_id != installation_id
                     or binding.receiver_id != snapshot.receiver_id
                     or binding.receiver_generation != snapshot.receiver_generation
                     or binding.owner_session_id != owner_session_id or binding.owner_epoch != new_epoch
                     or binding.barrier_id != request.barrier_id
                     or binding.owner_not_after_ms > requested_not_after_ms
-                    or deadline.remaining_ns(self.now_ns()) == 0):
+                    or transport.remaining_ns(self._clock()) == 0):
                 return self._inhibit("bind_refused")
+        except RecoveryRequired:
+            raise
         except Exception:
             return self._inhibit("bind_refused")
         if self.now_ms() >= binding.owner_not_after_ms:
             return self._inhibit("owner_lease_expired")
+        if not self._covers_next_send(binding):
+            return self._inhibit("owner_lease_too_short")
         self._write(replace(self.state, owner_epoch=new_epoch, phase="owned",
                             pending_barrier_id=None, last_barrier=barrier))
-        if deadline.remaining_ns(self.now_ns()) == 0:
+        if deadline.remaining_ns(self._clock()) == 0:
             return self._inhibit("deadline_exceeded")
         if self.now_ms() >= binding.owner_not_after_ms:
             return self._inhibit("owner_lease_expired")
+        if not self._covers_next_send(binding):
+            return self._inhibit("owner_lease_too_short")
         self.binding = binding
+        self.pending_stop_reason = None
         self.recovery_required = False
         return binding
 
     def stop(self, *, reason: str, deadline: Deadline | None = None) -> BarrierReceipt | None:
-        """Withdraw the epoch; the caller may hand in the remaining section budget.
-
-        Without `deadline` the behaviour is exactly as before: the revocation
-        gets its own 750 ms window. With `deadline` the caller keeps the
-        authority over the budget; no second window is ever created.
-        """
+        """Withdraw local rights immediately; defer the barrier until admitted."""
         _reason(reason, "owner_reason_invalid")
         if deadline is not None and type(deadline) is not Deadline:
             raise ValueError("owner_deadline_invalid")
+        if self.phase == "released" and not self.recovery_required:
+            self.pending_stop_reason = None
+            return self.state.last_barrier
         self.binding = None
         self.recovery_required = True
+        self.pending_stop_reason = reason
         if self.state is None or self.state.owner_epoch == 0:
             self.phase = "inhibited"
             return None
         if not self.store.holds(self.writer):
             self._inhibit("owner_lease_missing")
             return None
+        entered = False
+        try:
+            self._require_receiver(self.receiver)
+            with self.final_section(operation="stop", deadline=deadline) as lease:
+                entered = True
+                return self._stop_locked(lease=lease, reason=reason, deadline=self.section_deadline)
+        except PublicationLockBusy:
+            self.last_admission_reason = "publication_busy"
+            return None
+        except RecoveryRequired as exc:
+            if entered:
+                raise
+            self.last_admission_reason = exc.reason
+            return None
+
+    def _stop_locked(self, *, lease: PublicationLease, reason: str,
+                     deadline: Deadline) -> BarrierReceipt | None:
+        self._require_receiver(self.receiver)
+        self.require_final_section(lease, operation="stop")
+        deadline = self._lifecycle_budget(deadline)
+        self.binding = None
+        self.recovery_required = True
+        self.pending_stop_reason = reason
         now_ms = self.now_ms()
-        if deadline is None:
-            deadline = Deadline(self.now_ns() + 750_000_000, now_ms + 750)
+        transport = Deadline(min(deadline.monotonic_end_ns, self.transport_deadline.monotonic_end_ns),
+                             min(deadline.execute_before_ms, self.transport_deadline.execute_before_ms))
+        if transport.remaining_ns(self._clock()) == 0:
+            self._inhibit("budget_exhausted")
+            return None
         request = RevokeRequest(self.state.installation_id, self.state.owner_epoch,
                                 uuid.uuid4().hex, reason, now_ms)
         self._write(replace(self.state, phase="revoking", pending_barrier_id=request.barrier_id))
         try:
-            receipt = self.receiver.revoke_and_stop(request, deadline=deadline)
+            if transport.remaining_ns(self._clock()) == 0:
+                self._write(replace(self.state, phase="unconfirmed"))
+                return None
+            receipt = self.receiver.revoke_and_stop(request, deadline=transport)
         except Exception:
             self._write(replace(self.state, phase="unconfirmed"))
             return None
         exact = (self._exact(receipt, request, self.state.receiver_generation)
-                 and deadline.remaining_ns(self.now_ns()) > 0)
+                 and transport.remaining_ns(self._clock()) > 0)
         self._write(replace(self.state, phase="released" if exact else "unconfirmed",
                             pending_barrier_id=None if exact else request.barrier_id,
                             last_barrier=receipt if type(receipt) is BarrierReceipt else self.state.last_barrier))
         self.recovery_required = not exact
+        if deadline.remaining_ns(self._clock()) == 0:
+            self._inhibit("deadline_exceeded")
+            return None
+        if exact:
+            self.pending_stop_reason = None
         return receipt
 
     def reserve_sequence(self, *, writer: Lease) -> int:
@@ -416,6 +651,8 @@ class OwnerCoordinator:
             raise self._inhibit("owner_lease_missing")
         if self.phase != "owned" or self.binding is None:
             raise self._inhibit("bind_refused")
+        if self._section_lease is not None:
+            self._section_used = True
         sequence = self._sequence_high_water + 1
         self._write(replace(self.state, last_reserved_sequence=sequence))
         return sequence

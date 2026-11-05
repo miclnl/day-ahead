@@ -66,6 +66,7 @@ from .policy import (
     current_execution_command,
 )
 from .publication import (
+    OWNER_CYCLE_NS,
     FallbackReceipt,
     FallbackRequest,
     FallbackSink,
@@ -74,6 +75,7 @@ from .publication import (
     PublicationLockBusy,
     canonical_plan_path,
     following_verdict,
+    owner_admission_at,
     publication_lock,
     read_publication,
 )
@@ -346,6 +348,15 @@ class FastControlRunner:
         self.fallback = fallback
         self.owner = owner
         self._owner_writer = None
+        self._owner_start_pending = False
+        self._owner_release_pending = False
+        self._owner_session_id = None
+        self._financial_cadence = owner is not None
+        self._cadence_last_ns = None
+        self._cadence_boot = _boot_id()
+        self._tick_cycle = None
+        self._shutting_down = False
+        self._stop_event = None
         self.last_gate: GateVerdict | None = None
         self.last_fallback: FallbackReceipt | None = None
         self.last_receipts: list[CommandReceipt] = []
@@ -591,6 +602,24 @@ class FastControlRunner:
     def _request_fallback(self, reason: str, *, now_ts: int) -> FallbackReceipt:
         """Share the existing sink and monotonic throttle for every failure."""
         self.fallback_pending = True
+        if self.owner is not None:
+            self._invalidate_current_execution()
+            try:
+                barrier = self.owner.stop(reason=reason)
+                self._apply_stop_barrier(barrier, now_ms=self.owner.now_ms())
+                self._finish_owner_release()
+                if barrier is not None and not self.owner.recovery_required and self.owner.phase == "released":
+                    receipt = FallbackReceipt("acknowledged", barrier.reason)
+                elif self.owner.last_admission_reason in (
+                        "admission_deferred", "admission_cycle_used", "admission_window_missed"):
+                    receipt = FallbackReceipt("requested", "admission_deferred")
+                else:
+                    receipt = FallbackReceipt("unconfirmed", "barrier_unconfirmed")
+            except Exception as exc:
+                self.owner.report_failure(getattr(exc, "reason", "owner_stop_failed"))
+                receipt = FallbackReceipt("unconfirmed", "barrier_unconfirmed")
+            self.last_fallback = receipt
+            return receipt
         monotonic_now = time.monotonic()
         if (self._last_fallback_at is not None
                 and monotonic_now - self._last_fallback_at < max(1, self.config.interval)):
@@ -612,6 +641,49 @@ class FastControlRunner:
             logging.error(f"Fast control: fallback unconfirmed ({reason}): {receipt.reason}; fysieke stop niet bewezen")
         return receipt
 
+    def _cadence_now(self) -> int:
+        now = self.owner.now_ns() if self.owner is not None else time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        if (type(now) is not int or now < 0 or _boot_id() != self._cadence_boot
+                or (self._cadence_last_ns is not None and now < self._cadence_last_ns)):
+            if self.owner is not None:
+                self.owner.report_failure("clock_unhealthy")
+            raise RecoveryRequired("clock_unhealthy")
+        self._cadence_last_ns = now
+        return now
+
+    def _financial_regime(self, now: float) -> bool:
+        if self.owner is not None or (self.gate_policy.required_from_ts is not None
+                                      and now >= self.gate_policy.required_from_ts):
+            self._financial_cadence = True
+        if not self._financial_cadence:
+            # An unlocked preview selects cadence only. Authorization is always
+            # read again under the lease, including a v1 -> v2 publication race.
+            preview = read_publication(self.plan_path)
+            self._financial_cadence = (preview.status == "blocked" or (
+                preview.plan is not None and preview.plan.format_version == 2))
+        return self._financial_cadence
+
+    def _read_tick(self, now: float):
+        financial = self._financial_regime(now)
+        while True:
+            cycle = None
+            if financial:
+                cycle, allowed, _ = owner_admission_at(self._cadence_now())
+                if not allowed:
+                    raise RecoveryRequired("admission_deferred")
+            with publication_lock(self.plan_path):
+                if financial:
+                    current, allowed, _ = owner_admission_at(self._cadence_now())
+                    if current != cycle or not allowed:
+                        raise RecoveryRequired("admission_window_missed")
+                read = read_publication(self.plan_path)
+                unexpected = not financial and (read.status == "blocked" or (
+                    read.plan is not None and read.plan.format_version == 2))
+                if not unexpected:
+                    self._tick_cycle = cycle
+                    return read, following_verdict(read, policy=self.gate_policy, now_ts=int(now))
+            self._financial_cadence = financial = True
+
     def tick(self, now: Optional[float] = None) -> Optional[Decision]:
         """Run one control cycle. Returns the decision, or None when idle."""
         now = time.time() if now is None else now
@@ -619,12 +691,29 @@ class FastControlRunner:
         # Every tick starts without a suppression: the flag belongs to the tick
         # that refuses a diagnostics overlap.
         self._publish_suppressed = False
+        self._tick_cycle = None
+
+        if self.owner is not None and self.owner.pending_stop_reason is not None:
+            reason = self.owner.pending_stop_reason
+            self._request_fallback(reason, now_ts=int(now))
+            if self.owner.pending_stop_reason is not None:
+                return None
+            if reason in ("plan_rebind_required", "owner_lease_expired") and self._owner_writer is not None:
+                self._owner_start_pending = True
+        if self._owner_start_pending and not self._shutting_down:
+            self.start_owner_session()
+            if self._owner_start_pending or self.owner.binding is None:
+                return None
 
         # Geen mtime-/inodescache als autorisatie. Geen sensor-/sink-I/O onder dit slot.
         try:
-            with publication_lock(self.plan_path):
-                read = read_publication(self.plan_path)
-                verdict = following_verdict(read, policy=self.gate_policy, now_ts=int(now))
+            read, verdict = self._read_tick(now)
+        except RecoveryRequired as exc:
+            self.last_gate = GateVerdict(False, exc.reason)
+            return None
+        except PublicationLockBusy as exc:
+            verdict = GateVerdict(False, "publication_busy" if self._financial_cadence
+                                  else f"publication_unavailable: {exc}")
         except Exception as exc:  # noqa: BLE001 - lock/readfout is geen permissieve herstart
             verdict = GateVerdict(False, f"publication_unavailable: {exc}")
         self.last_gate = verdict
@@ -647,6 +736,9 @@ class FastControlRunner:
         if mode != self._last_mode:
             logging.info(f"Fast control: modus {mode}")
         if mode == MODE_OFF:
+            if plan.format_version == 2 and self.owner is not None:
+                self._request_fallback("mode_off", now_ts=int(now))
+                return None
             self._release_when_switched_off(plan, now, mode)
             return None
 
@@ -1154,6 +1246,9 @@ class FastControlRunner:
             return self._deny_financial("diagnostics_overlap", decision)
         binding = self._owner_binding(owner, now_ms=now_ms)
         if binding is None:
+            if owner is not None and owner.binding is not None and now_ms >= owner.binding.owner_not_after_ms:
+                owner.pending_stop_reason = "owner_lease_expired"
+                owner.report_failure("owner_lease_expired")
             return self._deny_financial("owner_unavailable", decision)
         receiver = owner.receiver
         if receiver is None or classify_actuation_adapter(receiver) != FENCED_ADAPTER:
@@ -1163,6 +1258,17 @@ class FastControlRunner:
             # command, not even a stop, until an exact safe barrier.
             return self._deny_financial("recovery_required", decision)
         proposals = [b for b in decision.batteries if b.write]
+        if not proposals:
+            return self._deny_financial("no_proposal", decision)
+        if self._shutting_down or (self._stop_event is not None and self._stop_event.is_set()):
+            return self._deny_financial("shutdown", decision)
+        if self._tick_cycle is not None:
+            try:
+                cycle, allowed, _ = owner_admission_at(self._cadence_now())
+            except RecoveryRequired as exc:
+                return self._deny_financial(exc.reason, decision)
+            if not allowed or cycle != self._tick_cycle:
+                return self._deny_financial("admission_window_missed", decision)
         context = plan.financial_context
         clock = ClockSample(utc_ms=int(now_ms), boottime_ns=owner.now_ns(),
                              boot_id=_boot_id(), uncertainty_ms=0, healthy=True)
@@ -1177,7 +1283,7 @@ class FastControlRunner:
         try:
             # The publication lease is taken here and released only after the
             # result has been recorded. There is no nested acquisition.
-            with publication_lock(self.plan_path) as lease:
+            with owner.final_section(operation="send", deadline=deadline) as lease:
                 # The proposal is bound to the fresh publication under the lock:
                 # only the published plan may carry this command.
                 try:
@@ -1198,6 +1304,7 @@ class FastControlRunner:
                     # The existing lifecycle must withdraw and rebind before a
                     # new digest may use this installation. No reserve/send here.
                     owner.report_failure("plan_rebind_required")
+                    owner.pending_stop_reason = "plan_rebind_required"
                     self._invalidate_current_execution()
                     return self._deny_financial("plan_rebind_required", decision)
                 if not proposals:
@@ -1205,6 +1312,10 @@ class FastControlRunner:
                 captured, restore = self._observe_pending_command(owner)
                 try:
                     for battery in proposals:
+                        if self._stop_event is not None and self._stop_event.is_set():
+                            refusal = "shutdown"
+                            self._record_refusal(battery, owner)
+                            break
                         try:
                             receipt = execution_boundary.owner_section(
                                 lease=lease, owner=owner, receiver=receiver,
@@ -1241,6 +1352,8 @@ class FastControlRunner:
                     restore()
         except PublicationLockBusy:
             return self._deny_financial("publication_busy", decision)
+        except RecoveryRequired as exc:
+            return self._deny_financial(exc.reason, decision)
 
         allowed = bool(proposals) and not refusal and accepted_count == len(proposals)
         if refusal:
@@ -1500,21 +1613,59 @@ class FastControlRunner:
     def start_owner_session(self) -> None:
         """Optional fenced-owner lifecycle; never changes the legacy route."""
         self._invalidate_current_execution()
-        if self.owner is None or self._owner_writer is not None:
+        if (self.owner is None or self._shutting_down
+                or (self._stop_event is not None and self._stop_event.is_set())):
+            return
+        if self._owner_writer is not None and not self._owner_start_pending:
             return
         try:
             store = self.owner.store
-            self._owner_writer = task_execution.acquire_resource(store.resource, lease_dir=store.lease_dir)
-            now_ms = time.time_ns() // 1_000_000
-            deadline = Deadline(time.clock_gettime_ns(time.CLOCK_BOOTTIME) + 750_000_000, now_ms + 750)
-            result = self.owner.start(writer=self._owner_writer, receiver=self.owner.receiver,
-                                      installation_id=store.installation_id, owner_session_id=uuid.uuid4().hex,
-                                      requested_not_after_ms=now_ms + 1000, deadline=deadline, now_ms=now_ms)
+            if self._owner_writer is None:
+                self._owner_writer = task_execution.acquire_resource(store.resource, lease_dir=store.lease_dir)
+                self._owner_session_id = uuid.uuid4().hex
+                self._owner_start_pending = True
+                self.owner._bind_lifetime(self._owner_writer)
+            self.owner.report_failure("owner_lease_missing")
+            self.owner._require_receiver(self.owner.receiver)
+            with self.owner.final_section(operation="start") as lease:
+                # The plan, its lease and startup share this one final claim.
+                # Plan I/O consumes the budget that began before acquisition.
+                read = read_publication(lease.path)
+                if read.plan is None or read.plan.format_version != 2:
+                    self.owner.report_failure("financial_plan_required")
+                    self._owner_start_pending = False
+                    return
+                now_ms = self.owner.now_ms()
+                clock = ClockSample(now_ms, self.owner._clock(), _boot_id(), 0, True)
+                plan = execution_boundary.validate_current_locked(
+                    lease=lease, expected_digest=execution_boundary.plan_digest(read.plan),
+                    clock=clock, policy=self.gate_policy)
+                if plan.financial_context.basis.meter_id != store.installation_id:
+                    raise RecoveryRequired("installation_mismatch")
+                requested = plan.financial_context.not_after_ts * 1000
+                if self._shutting_down or (self._stop_event is not None and self._stop_event.is_set()):
+                    self._owner_start_pending = False
+                    self.owner.report_failure("shutdown")
+                    return
+                deadline = Deadline(self.owner.section_deadline.monotonic_end_ns, requested)
+                result = self.owner._start_locked(lease=lease, writer=self._owner_writer,
+                    receiver=self.owner.receiver, installation_id=store.installation_id,
+                    owner_session_id=self._owner_session_id, requested_not_after_ms=requested,
+                    deadline=deadline, now_ms=now_ms)
+            self._owner_start_pending = isinstance(result, RecoveryRequired) and result.reason in (
+                "admission_deferred", "admission_cycle_used", "admission_window_missed", "publication_busy")
             if isinstance(result, RecoveryRequired):
                 logging.warning("Fast control: owner inhibited: %s", result.reason)
         except task_execution.LeaseBusy as exception:
             self.owner.report_failure("owner_lease_busy")
             logging.warning("Fast control: owner lease bezet: %s", exception)
+        except PublicationLockBusy:
+            self._owner_start_pending = True
+        except (RecoveryRequired, execution_boundary.ExecutionRefused) as exception:
+            self._owner_start_pending = exception.reason in (
+                "admission_deferred", "admission_cycle_used", "admission_window_missed", "publication_busy")
+            self.owner.report_failure(exception.reason)
+            logging.warning("Fast control: owner inhibited: %s", exception.reason)
         except Exception as exception:  # noqa: BLE001 - optional lifecycle never aborts legacy
             self.owner.report_failure(exception.reason if isinstance(exception, (MirrorWriteFailed, RecoveryRequired))
                                       else "owner_start_failed")
@@ -1522,8 +1673,11 @@ class FastControlRunner:
 
     def stop_owner_session(self, reason: str) -> None:
         self._invalidate_current_execution()
-        if self.owner is None or self._owner_writer is None:
-            return
+        if self.owner is None:
+            return None
+        self._owner_release_pending = True
+        self._owner_start_pending = False
+        barrier = None
         try:
             barrier = self.owner.stop(reason=reason)
             # An exact accepted safe barrier ends the financial recovery duty.
@@ -1533,20 +1687,69 @@ class FastControlRunner:
                                       else "owner_stop_failed")
             logging.warning("Fast control: owner stop mislukt: %s", exception)
         finally:
-            writer, self._owner_writer = self._owner_writer, None
-            try:
-                writer.close()
-            except Exception as exception:  # noqa: BLE001
-                self.owner.report_failure("owner_stop_failed")
-                logging.warning("Fast control: owner lease sluiten mislukt: %s", exception)
+            self._finish_owner_release()
+        return barrier
+
+    def _finish_owner_release(self) -> None:
+        """Complete a session release, including a barrier deferred to a later tick."""
+        if not self._owner_release_pending:
+            return
+        if not self._shutting_down and (self.owner.phase != "released" or self.owner.recovery_required):
+            return
+        writer, self._owner_writer = self._owner_writer, None
+        self._owner_release_pending = False
+        if writer is not None:
+            self._close_owner_writer(writer)
+
+    def _close_owner_writer(self, writer) -> None:
+        try:
+            writer.close()
+        except Exception as exception:  # noqa: BLE001
+            self.owner.report_failure("owner_stop_failed")
+            logging.warning("Fast control: owner lease sluiten mislukt: %s", exception)
+
+    def _shutdown_owner(self) -> None:
+        self._shutting_down = True
+        self._owner_start_pending = False
+        if self.owner is None:
+            return
+        self._invalidate_current_execution()
+        self.owner.binding = None
+        self.owner.recovery_required = True
+        self.owner.pending_stop_reason = "shutdown"
+        try:
+            now = self._cadence_now()
+            cycle, allowed, next_start = owner_admission_at(now)
+            admission = self.owner._admission
+            if admission is not None and (cycle < admission.first_cycle or cycle <= admission.claimed_cycle):
+                next_start = max(cycle + 1, admission.first_cycle) * OWNER_CYCLE_NS
+            elif allowed:
+                next_start = now
+            if next_start > now:
+                # A separate unset event: the already-set stop event would spin.
+                threading.Event().wait((next_start - now) / 1e9)
+            self.stop_owner_session("shutdown")
+            self.last_fallback = FallbackReceipt(
+                "acknowledged" if self.owner.phase == "released" and not self.owner.recovery_required else "unconfirmed",
+                "shutdown")
+        except Exception as exc:
+            reason = getattr(exc, "reason", "owner_stop_failed")
+            self.owner.report_failure(reason)
+            self.last_fallback = FallbackReceipt("unconfirmed", reason)
+        finally:
+            if self._owner_writer is not None:
+                writer, self._owner_writer = self._owner_writer, None
+                self._close_owner_writer(writer)
 
     def run(self, stop_event: Optional[threading.Event] = None) -> None:
         """Run until *stop_event* is set. Never raises."""
         stop_event = stop_event or threading.Event()
+        self._stop_event = stop_event
         period = max(5, int(self.config.interval))
         logging.info(f"Fast control gestart, interval {period} s")
         failures = 0
-        self.start_owner_session()
+        if not stop_event.is_set():
+            self.start_owner_session()
         while not stop_event.is_set():
             started = time.time()
             try:
@@ -1566,6 +1769,25 @@ class FastControlRunner:
             # call during a long backoff still returns promptly (otherwise we
             # could be stuck waiting up to 8x period before noticing).
             remaining = max(0.5, delay - (time.time() - started))
+            if self._financial_regime(time.time()):
+                try:
+                    now_ns = self._cadence_now()
+                    _, allowed, next_start = owner_admission_at(now_ns)
+                    pending = self._owner_start_pending or (self.owner is not None
+                               and self.owner.pending_stop_reason is not None)
+                    deferred = self.last_gate is not None and self.last_gate.reason in (
+                        "admission_deferred", "admission_window_missed")
+                    target = now_ns if pending or deferred else now_ns + round(remaining * 1e9)
+                    _, target_allowed, wake = owner_admission_at(target)
+                    if target_allowed:
+                        wake = target - target % OWNER_CYCLE_NS
+                    if wake <= now_ns:
+                        wake = (now_ns // OWNER_CYCLE_NS + 1) * OWNER_CYCLE_NS
+                    if not allowed and (pending or deferred):
+                        wake = next_start
+                    remaining = (wake - now_ns) / 1e9
+                except RecoveryRequired:
+                    remaining = delay
             if stop_event.wait(remaining):
                 break
         # On shutdown, dump any in-flight measurement integration into the
@@ -1582,7 +1804,7 @@ class FastControlRunner:
             # Flush whatever the throttled writer was still holding back.
             self._persist_state(time.time(), force=True)
         finally:
-            self.stop_owner_session("shutdown")
+            self._shutdown_owner()
         logging.info("Fast control gestopt")
 
 
