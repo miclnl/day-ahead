@@ -31,7 +31,7 @@ from .command import (
     _reason,
     _string,
 )
-from .receiver import FencedDeviceGateway, _helper, _helpers_from_dict
+from .receiver import FencedDeviceGateway, _helper, _helpers_from_dict, receipt_matches_command
 
 
 class RecoveryRequired(Exception):
@@ -435,8 +435,9 @@ class OwnerCoordinator:
     def record_receipt(self, receipt: ActuationReceipt, *, terminal: bool = True) -> None:
         """Record the receiver result durably.
 
-        An accepted or rejected order clears the pending command; an uncertain
-        order stays visible. The phase and the recovery duty are untouched.
+        Only a receipt matching the stored pending command may be recorded.
+        An accepted or rejected order clears that command; an uncertain order
+        stays visible. The phase and the recovery duty are untouched.
         With `terminal=False` the receipt is kept as history only and the
         pending command always stays visible.
         """
@@ -444,9 +445,11 @@ class OwnerCoordinator:
             raise ValueError("owner_receipt_invalid")
         if type(terminal) is not bool:
             raise ValueError("owner_receipt_terminal_invalid")
-        if self.state is None:
-            raise RecoveryRequired("owner_state_missing")
-        pending = self.state.pending_command
+        pending = self.state.pending_command if self.state is not None else None
+        if pending is None:
+            raise RecoveryRequired("pending_command_missing")
+        if not receipt_matches_command(receipt, pending):
+            raise RecoveryRequired("receipt_identity_mismatch")
         if terminal and receipt.status in ("accepted", "rejected"):
             pending = None
         self._write(replace(self.state, pending_command=pending, last_receipt=receipt))

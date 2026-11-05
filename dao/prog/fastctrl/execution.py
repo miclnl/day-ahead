@@ -25,7 +25,7 @@ from .command import (
 from .ownership import OwnerCoordinator
 from .plan import FastPlan
 from .publication import GatePolicy, PublicationError, PublicationLease, read_publication
-from .receiver import FencedDeviceGateway, payload_digest
+from .receiver import FencedDeviceGateway, payload_digest, receipt_matches_command
 
 __all__ = [
     "CommandRequest",
@@ -203,26 +203,35 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
         raise ExecutionRefused("budget_exhausted")
     try:
         receipt = receiver.send(command, deadline=deadline)
-        observations = [receipt]
-        if receipt.status != "accepted" and deadline.remaining_ns(now()) > 0:
-            # At most one retry, with exactly the same bytes, id, sequence and deadline.
+    except Exception as exc:
+        # Only transport failures are masked; identity refusals stay explicit.
+        raise ExecutionRefused("receiver_unavailable") from exc
+    if not receipt_matches_command(receipt, command):
+        raise ExecutionRefused("receipt_identity_mismatch")
+    observations = [receipt]
+    if receipt.status != "accepted" and deadline.remaining_ns(now()) > 0:
+        # At most one retry, with exactly the same bytes, id, sequence and deadline.
+        try:
             retried = receiver.send(command, deadline=deadline)
-            observations.append(retried)
-            if retried.status != "accepted" and deadline.remaining_ns(now()) > 0:
+        except Exception as exc:
+            raise ExecutionRefused("receiver_unavailable") from exc
+        if not receipt_matches_command(retried, command):
+            raise ExecutionRefused("receipt_identity_mismatch")
+        observations.append(retried)
+        if retried.status != "accepted" and deadline.remaining_ns(now()) > 0:
+            try:
                 queried = receiver.query(installation_id=command.installation_id,
                                          owner_epoch=command.owner_epoch,
                                          sequence=command.sequence,
                                          command_id=command.command_id,
                                          payload_digest=payload_digest(command),
                                          deadline=deadline)
-                if queried is not None:
-                    observations.append(queried)
-    except Exception as exc:
-        # A transport failure is a machine-readable refusal: fail closed, never
-        # an uncaught exception and never an invented proof. The pattern is
-        # the one of `ownership.stop()`, which already handles the receiver
-        # call fail closed.
-        raise ExecutionRefused("receiver_unavailable") from exc
+            except Exception as exc:
+                raise ExecutionRefused("receiver_unavailable") from exc
+            if queried is not None:
+                if not receipt_matches_command(queried, command):
+                    raise ExecutionRefused("receipt_identity_mismatch")
+                observations.append(queried)
     outcome = _conservative(observations)
     if outcome.status == "accepted" and deadline.remaining_ns(now()) == 0:
         # A late acknowledgement is history only: it grants no right, clears no

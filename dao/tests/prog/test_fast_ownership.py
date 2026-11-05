@@ -29,6 +29,17 @@ KEYS = {
     "phase", "pending_command", "last_receipt", "pending_barrier_id", "last_barrier",
 }
 
+RECEIPT_IDENTITY_MISMATCHES = [
+    ("installation_id", "other-installation"),
+    ("battery_name", "accu2"),
+    ("owner_session_id", "other-session"),
+    ("owner_epoch", 999),
+    ("sequence", 999),
+    ("command_id", "other-command"),
+    ("plan_digest", "f" * 64),
+    ("payload_digest", "f" * 64),
+]
+
 
 def ownership():
     assert util.find_spec("dao.prog.fastctrl.ownership") is not None, "F2c3 ownership module missing"
@@ -374,6 +385,61 @@ def test_13_schema_is_only_operational_and_roundtrips_pending_dtos(tmp_path):
         assert module.OwnerState.from_dict(state.to_dict()) == state
         with pytest.raises(FrozenInstanceError):
             state.phase = "released"
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize("field,value", RECEIPT_IDENTITY_MISMATCHES)
+@pytest.mark.parametrize("status", ["accepted", "rejected"])
+@pytest.mark.parametrize("terminal", [True, False])
+def test_i1_record_receipt_rejects_foreign_terminal_result(
+        tmp_path, field, value, status, terminal):
+    """A foreign ACK may neither clear pending nor replace this command's history."""
+    module, store, gateway, owner = layout(tmp_path)
+    lease = acquire(tmp_path)
+    try:
+        start(owner, lease, gateway)
+        cmd = command(owner_session_id="session-new", owner_epoch=8,
+                      sequence=owner.reserve_sequence(writer=lease))
+        owner.record_pending_command(cmd)
+        if status == "rejected":
+            gateway.helper_ok["setpoint"] = False
+        receipt = gateway.send(cmd, deadline=DEADLINE)
+        assert receipt.status == status
+        foreign = replace(receipt, **{field: value})
+        before = store.path.read_bytes()
+        before_state = owner.state
+
+        with pytest.raises(module.RecoveryRequired, match="^receipt_identity_mismatch$"):
+            owner.record_receipt(foreign, terminal=terminal)
+
+        assert store.path.read_bytes() == before
+        assert owner.state == before_state
+        assert store.load_strict().pending_command == cmd
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize("terminal", [True, False])
+@pytest.mark.parametrize("recorded", [False, True])
+def test_i1_record_receipt_requires_pending_even_for_a_stored_ack(tmp_path, terminal, recorded):
+    module, store, gateway, owner = layout(tmp_path)
+    lease = acquire(tmp_path)
+    try:
+        start(owner, lease, gateway)
+        cmd = command(owner_session_id="session-new", owner_epoch=8)
+        receipt = gateway.send(cmd, deadline=DEADLINE)
+        assert receipt.status == "accepted"
+        if recorded:
+            owner.record_pending_command(cmd)
+            owner.record_receipt(receipt)
+            # Reading terminal history is allowed; recording it again is not.
+            assert store.load_strict().last_receipt == receipt
+        before = store.path.read_bytes()
+        with pytest.raises(module.RecoveryRequired, match="^pending_command_missing$"):
+            owner.record_receipt(receipt, terminal=terminal)
+        assert store.path.read_bytes() == before
+        assert owner.state.pending_command is None
     finally:
         lease.close()
 

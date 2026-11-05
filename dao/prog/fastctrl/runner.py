@@ -1126,6 +1126,7 @@ class FastControlRunner:
         deadline = Deadline(clock.boottime_ns + execution_boundary.TRANSPORT_BUDGET_NS,
                             execute_before)
         receipts: list[ActuationReceipt] = []
+        accepted_count = 0
         refusal = ""
         try:
             # The publication lease is taken here and released only after the
@@ -1158,18 +1159,28 @@ class FastControlRunner:
                             self._record_refusal(battery, owner)
                             break
                         receipts.append(receipt)
-                        self._record_financial_outcome(battery, receipt,
-                                                       captured.get(battery.name))
+                        pending = captured.get(battery.name)
+                        applied = self._record_financial_outcome(battery, receipt, pending)
                         if receipt.status != "accepted":
                             # An ambiguous or refused outcome stops the installation.
                             break
+                        if not applied:
+                            # A raw ACK is no acceptance. Preserve the own command
+                            # under this same lease and derive uncertainty from it.
+                            refusal = "receipt_not_applied"
+                            if pending is not None and owner.state.pending_command != pending:
+                                owner.record_pending_command(pending)
+                            apply_execution_outcome(self.state.battery(battery.index),
+                                                    outcome="unconfirmed", pending=pending)
+                            battery.actuation_status = "unconfirmed"
+                            break
+                        accepted_count += 1
                 finally:
                     restore()
         except PublicationLockBusy:
             return self._deny_financial("publication_busy", decision)
 
-        allowed = bool(proposals) and len(receipts) == len(proposals) and all(
-            receipt.status == "accepted" for receipt in receipts)
+        allowed = bool(proposals) and not refusal and accepted_count == len(proposals)
         if refusal:
             reason = refusal
         elif not receipts:
@@ -1236,8 +1247,8 @@ class FastControlRunner:
         apply_execution_outcome(controller, outcome="unconfirmed", pending=pending)
 
     def _record_financial_outcome(self, battery: BatteryDecision, receipt: ActuationReceipt,
-                                  pending: BatteryCommand | None) -> None:
-        """Fold one canonical receipt into the controller state; no I/O."""
+                                  pending: BatteryCommand | None) -> bool:
+        """Fold a receipt into controller state; report applied acceptance, no I/O."""
         controller = self.state.battery(battery.index)
         battery.actuation_status = receipt.status
         if receipt.status == "accepted":
@@ -1251,6 +1262,7 @@ class FastControlRunner:
                 controller.held_setpoint_w = float(stored.setpoint_w)
                 controller.held_stop_inverter_cleared = controller.stop_inverter_cleared
                 controller.last_change_ts = receipt.accepted_ts / 1000.0
+            return applied
         elif receipt.status == "unconfirmed":
             apply_execution_outcome(controller, outcome="unconfirmed", receipt=receipt,
                                     pending=pending)
@@ -1258,6 +1270,7 @@ class FastControlRunner:
             # A proven absence of effect is not an execution.
             apply_execution_outcome(controller, outcome="unknown", receipt=receipt,
                                     pending=pending)
+        return False
 
     def _apply_stop_barrier(self, barrier: BarrierReceipt | None, *, now_ms: int) -> None:
         """Only the owner's own exact safe barrier ends the financial recovery duty.

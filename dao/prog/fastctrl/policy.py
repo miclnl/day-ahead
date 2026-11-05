@@ -61,7 +61,7 @@ from .plan import (
     profile_energy_kwh,
     profile_power_at,
 )
-from .receiver import payload_digest
+from .receiver import receipt_matches_command
 
 #: Fraction of the energy budget over which the allowed power is tapered to
 #: zero, instead of dropping to zero in one step.
@@ -436,11 +436,7 @@ def apply_execution_outcome(state: BatteryControllerState, *,
     stored = pending if pending is not None else state.pending_command
     if stored is None or receipt is None or receipt.status != "accepted":
         return False
-    for name in ("installation_id", "battery_name", "owner_session_id", "owner_epoch",
-                 "sequence", "command_id", "plan_digest"):
-        if getattr(receipt, name) != getattr(stored, name):
-            return False
-    if receipt.payload_digest != payload_digest(stored):
+    if not receipt_matches_command(receipt, stored):
         return False
     state.execution_status = "accepted"
     state.pending_command = None

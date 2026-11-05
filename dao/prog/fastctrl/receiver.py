@@ -299,6 +299,15 @@ def payload_digest(command: BatteryCommand) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def receipt_matches_command(receipt: ActuationReceipt, command: BatteryCommand) -> bool:
+    """Bind an observation to the exact command, independently of its status."""
+    return (type(receipt) is ActuationReceipt and type(command) is BatteryCommand
+            and all(getattr(receipt, name) == getattr(command, name) for name in (
+                "installation_id", "battery_name", "owner_session_id", "owner_epoch",
+                "sequence", "command_id", "plan_digest"))
+            and receipt.payload_digest == payload_digest(command))
+
+
 def _find(state, command_id):
     return next((record for record in state.commands if record.command_id == command_id), None)
 

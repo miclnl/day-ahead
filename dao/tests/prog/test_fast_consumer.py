@@ -27,6 +27,7 @@ from dao.prog.fastctrl.policy import (
 from dao.prog.fastctrl.publication import GatePolicy
 from dao.prog.fastctrl.runner import FastControlRunner
 from dao.tests.prog.fakes.fenced_receiver import FencedReceiver
+from dao.tests.prog.test_fast_ownership import RECEIPT_IDENTITY_MISMATCHES
 from dao.tests.prog.test_fast_receiver import state as receiver_state
 from dao.tests.prog.test_fast_runner import FakeHass, make_config
 from dao.tests.settlement.conftest import START_TS
@@ -625,6 +626,150 @@ def test_22_a_receipt_of_another_identity_changes_nothing(tmp_path):
         assert controller.last_accepted_command is None
         assert controller.held_setpoint_w == 0.0
         assert controller.last_command_w == 0.0
+
+
+def changed_two_battery_proposal(harness):
+    """Start with real acceptance, then propose the next profile segment."""
+    first = consume(harness, propose(harness.plan, harness.runner.state))
+    assert [receipt.status for receipt in first] == ["accepted", "accepted"]
+    harness.gateway.advance_clock(900_000)
+    decision = propose(harness.plan, harness.runner.state, timestamp=NOW_TS + 900)
+    assert [battery.write for battery in decision.batteries] == [True, True]
+    assert [battery.setpoint_w for battery in decision.batteries] == [-1500.0, -1500.0]
+    return decision
+
+
+@pytest.mark.parametrize("field,value", RECEIPT_IDENTITY_MISMATCHES)
+@pytest.mark.parametrize("status", ["accepted", "rejected", "unconfirmed"])
+@pytest.mark.parametrize("when", ["send", "retry", "query"])
+def test_i1_foreign_ack_keeps_pending_and_denies_next_battery(
+        tmp_path, monkeypatch, field, value, status, when):
+    """Identity must be checked before any retry, history write or next battery."""
+    harness = build(tmp_path, plan=financial_plan(batteries=2, powers=(PLAN_W, -1500.0)))
+    try:
+        decision = changed_two_battery_proposal(harness)
+        before = [state.to_dict() for state in harness.runner.state.batteries]
+        gateway = harness.gateway
+        real_send, real_query = gateway.send, gateway.query
+        calls, commands, mirrors = [], [], []
+        if status == "rejected":
+            gateway.helper_ok["setpoint"] = False
+        elif status == "unconfirmed":
+            gateway.lose_ack()
+
+        def finish_reserved(command):
+            parts = ("setpoint",) if status == "rejected" else (
+                "setpoint", "mode", "stop_inverter")
+            for part in parts:
+                gateway.step_helper(part, command=command)
+
+        def send(command, *, deadline):
+            calls.append("send")
+            commands.append(command)
+            mirrors.append(harness.store.path.read_bytes())
+            if len(commands) == 1 and when != "send":
+                gateway.enqueue(command)
+                return gateway.deliver()
+            if when == "retry" and len(commands) == 2:
+                finish_reserved(command)
+            receipt = real_send(command, deadline=deadline)
+            if (when == "send" and len(commands) == 1) or (
+                    when == "retry" and len(commands) == 2):
+                assert receipt.status == status
+                return replace(receipt, **{field: value})
+            return receipt
+
+        def query(**kwargs):
+            calls.append("query")
+            if when == "query":
+                finish_reserved(commands[0])
+            receipt = real_query(**kwargs)
+            assert receipt.status == status
+            return replace(receipt, **{field: value})
+
+        monkeypatch.setattr(gateway, "send", send)
+        monkeypatch.setattr(gateway, "query", query)
+        receipts = consume(harness, decision, now_ms=NOW + 900_000)
+
+        assert harness.runner.last_actuation.allowed is False
+        assert harness.runner.last_actuation.reason == "receipt_identity_mismatch"
+        assert receipts == ()
+        assert calls == {"send": ["send"], "retry": ["send", "send"],
+                         "query": ["send", "send", "query"]}[when]
+        assert all(command == commands[0] for command in commands)
+        assert harness.owner.state.pending_command == commands[0]
+        assert harness.store.path.read_bytes() == mirrors[0]
+        controller = harness.runner.state.battery(0)
+        assert controller.to_dict() == before[0] | {
+            "execution_status": "unconfirmed", "recovery_required": True,
+            "pending_command": commands[0].to_dict(),
+        }
+        assert harness.runner.state.battery(1).to_dict() == before[1]
+    finally:
+        harness.lease.close()
+
+
+def test_i1_unapplied_acceptance_restores_pending_inside_the_same_lease(tmp_path, monkeypatch):
+    """An accepted status without policy acceptance cannot allow the installation."""
+    harness = build(tmp_path, plan=financial_plan(batteries=2, powers=(PLAN_W, -1500.0)))
+    boundary = import_module("dao.prog.fastctrl.execution")
+    real_section, real_write = boundary.owner_section, harness.store.write
+    sections, restored = [], []
+
+    def foreign_return(**kwargs):
+        sections.append(kwargs["lease"])
+        receipt = real_section(**kwargs)
+        assert harness.owner.state.pending_command is None
+        return replace(receipt, owner_session_id="other-session")
+
+    def write(state, *, writer):
+        if (state.pending_command is not None and state.last_receipt is not None
+                and state.pending_command.command_id == state.last_receipt.command_id):
+            sections[-1]._check()
+            restored.append(state.pending_command)
+        real_write(state, writer=writer)
+
+    try:
+        decision = changed_two_battery_proposal(harness)
+        before = [state.to_dict() for state in harness.runner.state.batteries]
+        monkeypatch.setattr(boundary, "owner_section", foreign_return)
+        monkeypatch.setattr(harness.store, "write", write)
+        receipts = consume(harness, decision, now_ms=NOW + 900_000)
+
+        assert harness.runner.last_actuation.allowed is False
+        assert harness.runner.last_actuation.reason == "receipt_not_applied"
+        assert [receipt.status for receipt in receipts] == ["accepted"]
+        assert len(sections) == len(restored) == 1
+        pending = restored[0]
+        assert pending.battery_name == "accu"
+        assert harness.store.load_strict().pending_command == pending
+        assert harness.runner.state.battery(0).to_dict() == before[0] | {
+            "execution_status": "unconfirmed", "recovery_required": True,
+            "pending_command": pending.to_dict(),
+        }
+        assert decision.batteries[0].actuation_status == "unconfirmed"
+        assert harness.runner.state.battery(1).to_dict() == before[1]
+        assert [entry[2] for entry in harness.gateway.effect_log[6:]] == ["accu"] * 3
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("field,value", RECEIPT_IDENTITY_MISMATCHES)
+def test_i1_foreign_acceptance_is_a_pure_policy_noop(tmp_path, field, value):
+    from dao.prog.fastctrl.policy import apply_execution_outcome
+
+    harness = build(tmp_path)
+    try:
+        decision = propose(harness.plan, harness.runner.state)
+        receipt = consume(harness, decision)[0]
+        controller = harness.runner.state.battery(0)
+        before = controller.to_dict()
+        assert apply_execution_outcome(
+            controller, outcome="accepted", receipt=replace(receipt, **{field: value}),
+            pending=controller.last_accepted_command) is False
+        assert controller.to_dict() == before
+    finally:
+        harness.lease.close()
 
 
 def test_23_one_writer_wins_and_the_second_one_is_refused(tmp_path):

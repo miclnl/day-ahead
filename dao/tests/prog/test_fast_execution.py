@@ -27,6 +27,7 @@ from dao.prog.fastctrl.publication import (
     publication_lock,
     read_publication,
 )
+from dao.prog.fastctrl.receiver import payload_digest
 from dao.tests.prog.fakes.fenced_receiver import FencedReceiver
 from dao.tests.prog.test_fast_receiver import state as receiver_state
 from dao.tests.settlement.conftest import START_TS
@@ -814,6 +815,70 @@ def test_07_an_accepted_send_clears_the_pending_command(artifact):
         layout.lease.close()
 
 
+@pytest.mark.parametrize("status", ["accepted", "rejected"])
+def test_i1_exact_query_proves_the_terminal_outcome(artifact, status):
+    """A live reservation plus a duplicate needs the exact terminal query proof."""
+    module = execution()
+    layout = owner_layout(artifact.root)
+    command = build_command(module, layout, artifact)
+    layout.owner.record_pending_command(command)
+    calls = []
+    real_send, real_query = layout.gateway.send, layout.gateway.query
+
+    def send(payload, *, deadline):
+        calls.append("send")
+        if len(calls) == 1:
+            layout.gateway.enqueue(payload)
+            return layout.gateway.deliver()
+        return real_send(payload, deadline=deadline)
+
+    def query(**kwargs):
+        calls.append("query")
+        if status == "accepted":
+            for part in ("setpoint", "mode", "stop_inverter"):
+                layout.gateway.step_helper(part, command=command)
+        else:
+            layout.gateway.helper_ok["setpoint"] = False
+            layout.gateway.step_helper("setpoint", command=command)
+        return real_query(**kwargs)
+
+    layout.gateway.send, layout.gateway.query = send, query
+    try:
+        with publication_lock(artifact.path) as lease:
+            receipt = module.send_locked(command, lease=lease, owner=layout.owner,
+                                        receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
+                                        policy=POLICY)
+        assert calls == ["send", "send", "query"]
+        # A no-effect query cannot erase the earlier live-reservation observation.
+        expected = "accepted" if status == "accepted" else "unconfirmed"
+        assert receipt.status == expected
+        state = layout.store.load_strict()
+        assert state.last_receipt == receipt
+        assert state.pending_command == (None if status == "accepted" else command)
+        assert len(layout.gateway.effect_log) == (3 if status == "accepted" else 0)
+    finally:
+        layout.lease.close()
+
+
+def test_i1_exact_rejection_without_effect_clears_pending(artifact):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    command = build_command(module, layout, artifact)
+    layout.owner.record_pending_command(command)
+    layout.gateway.helper_ok["setpoint"] = False
+    try:
+        with publication_lock(artifact.path) as lease:
+            receipt = module.send_locked(command, lease=lease, owner=layout.owner,
+                                        receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK,
+                                        policy=POLICY)
+        assert (receipt.status, receipt.effect) == ("rejected", "none")
+        assert layout.store.load_strict().pending_command is None
+        assert layout.store.load_strict().last_receipt == receipt
+        assert layout.gateway.effect_log == []
+    finally:
+        layout.lease.close()
+
+
 def observed_receipt(status, effect, reason):
     from dao.prog.fastctrl.command import ActuationReceipt
 
@@ -1125,7 +1190,7 @@ def unconfirmed_receipt(command):
                             command_id=command.command_id, plan_digest=command.plan_digest,
                             accepted_ts=None, status="unconfirmed", helper_results=(),
                             owner_session_id=command.owner_session_id,
-                            payload_digest="c" * 64, reason="pending_effect",
+                            payload_digest=payload_digest(command), reason="pending_effect",
                             observed_at_ms=command.issued_at_ms, effect="unknown")
 
 
@@ -1151,7 +1216,8 @@ def test_11_a_non_terminal_receipt_keeps_the_pending_command(artifact):
     layout = owner_layout(artifact.root)
     command = build_command(module, layout, artifact)
     layout.owner.record_pending_command(command)
-    receipt = observed_receipt("accepted", "complete", "accepted")
+    receipt = layout.gateway.send(command, deadline=DEADLINE)
+    assert receipt.status == "accepted"
     layout.owner.record_receipt(receipt, terminal=False)
     state = layout.store.load_strict()
     assert state.pending_command == command
