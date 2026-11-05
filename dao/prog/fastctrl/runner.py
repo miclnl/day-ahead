@@ -1166,10 +1166,10 @@ class FastControlRunner:
         context = plan.financial_context
         clock = ClockSample(utc_ms=int(now_ms), boottime_ns=owner.now_ns(),
                              boot_id=_boot_id(), uncertainty_ms=0, healthy=True)
-        # One absolute transport window for the whole installation; a retry or a
-        # second battery never gets a new window.
+        # One absolute section window for the whole installation; execution caps
+        # transport at 750 ms from this same sample, including retries/next batteries.
         execute_before = min(context.not_after_ts * 1000, binding.owner_not_after_ms)
-        deadline = Deadline(clock.boottime_ns + execution_boundary.TRANSPORT_BUDGET_NS,
+        deadline = Deadline(clock.boottime_ns + execution_boundary.SECTION_BUDGET_NS,
                             execute_before)
         receipts: list[ActuationReceipt] = []
         accepted_count = 0
@@ -1184,6 +1184,8 @@ class FastControlRunner:
                     execution_boundary.validate_current_locked(
                         lease=lease, expected_digest=execution_boundary.plan_digest(plan),
                         clock=clock, policy=self.gate_policy)
+                    deadline = execution_boundary._bounded_deadline(
+                        deadline, clock=clock, wire_end_ms=execute_before)
                 except execution_boundary.ExecutionRefused as exception:
                     return self._deny_financial(exception.reason, decision)
                 evidence = [owner.state.pending_command, owner.state.last_receipt]

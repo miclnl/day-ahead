@@ -167,6 +167,329 @@ def consume(harness, decision, *, now_ms=NOW):
         decision, harness.plan, owner=harness.owner, now_ms=now_ms)
 
 
+def i5_short_plan():
+    plan = financial_plan(batteries=2)
+    return replace(plan, financial_context=replace(plan.financial_context, not_after_ts=NOW_TS + 1))
+
+
+@pytest.mark.parametrize("batteries", [1, 2])
+@pytest.mark.parametrize("elapsed", [800, 999, 1000, 1001])
+def test_i5_fix1_consumer_result_write_uses_section_budget(tmp_path, batteries, elapsed):
+    harness = build(tmp_path, plan=financial_plan(batteries=batteries))
+    gateway = harness.gateway
+    real_send, real_record = gateway.send, harness.owner.record_receipt
+    commands, original, deadlines = [], [], []
+
+    def send(command, *, deadline):
+        commands.append(command)
+        deadlines.append(deadline)
+        receipt = real_send(command, deadline=deadline)
+        original.append(receipt)
+        return receipt
+
+    def record(receipt, **kwargs):
+        real_record(receipt, **kwargs)
+        gateway.advance_clock(elapsed)
+
+    gateway.send, harness.owner.record_receipt = send, record
+    try:
+        decision = propose(harness.plan, harness.runner.state)
+        receipts = consume(harness, decision)
+        late = elapsed >= 1000
+        expected = "deadline_exceeded" if late else ("accepted" if batteries == 1 else "budget_exhausted")
+        assert harness.runner.last_actuation.reason == expected
+        assert harness.runner.last_actuation.allowed is (not late and batteries == 1)
+        assert receipts == (() if late else tuple(original))
+        assert len(commands) == len(original) == 1
+        command = commands[0]
+        assert original[0].status == "accepted"
+        assert original[0].accepted_ts == NOW
+        assert deadlines == [Deadline(MONO + 750_000_000, NOW + 600_000)]
+        assert gateway.effect_log == [(command.command_id, part, "accu", PLAN_W)
+                                     for part in ("setpoint", "mode", "stop_inverter")]
+        mirror = harness.store.load_strict()
+        assert mirror.last_receipt == original[0]
+        assert mirror.pending_command == (command if late else None)
+        controller = harness.runner.state.battery(0)
+        assert controller.execution_status == ("unconfirmed" if late else "accepted")
+        assert controller.last_accepted_command == (None if late else command)
+        assert controller.pending_command == (command if late else None)
+        assert controller.recovery_required is late
+        assert controller.held_setpoint_w == (0.0 if late else PLAN_W)
+        if batteries == 2:
+            second = harness.runner.state.battery(1)
+            assert second.pending_command is None
+            assert second.last_accepted_command is None
+            assert second.recovery_required is False
+        if late:
+            assert consume(harness, decision, now_ms=gateway.utc_ms) == ()
+            assert harness.runner.last_actuation.reason == "recovery_required"
+            assert len(commands) == 1 and len(gateway.effect_log) == 3
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("next_send", ["battery", "retry"])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_i5_fix1_next_send_keeps_original_transport_cutoff(tmp_path, next_send, offset):
+    harness = build(tmp_path, plan=financial_plan(batteries=2 if next_send == "battery" else 1))
+    gateway = harness.gateway
+    real_send = gateway.send
+    commands, deadlines, remaining, original = [], [], [], []
+
+    def send(command, *, deadline):
+        commands.append(command)
+        deadlines.append(deadline)
+        remaining.append(deadline.remaining_ns(harness.owner.now_ns()))
+        if next_send == "retry" and len(commands) == 1:
+            gateway.enqueue(command)
+            receipt = gateway.deliver()
+        else:
+            if next_send == "retry":
+                for part in ("setpoint", "mode", "stop_inverter"):
+                    gateway.step_helper(part, command=command)
+            receipt = real_send(command, deadline=deadline)
+        original.append(receipt)
+        gateway.advance_clock(400 if len(commands) == 1 else 350 + offset)
+        return receipt
+
+    gateway.send = send
+    try:
+        receipts = consume(harness, propose(harness.plan, harness.runner.state))
+        late = offset >= 0
+        assert harness.runner.last_actuation.reason == ("deadline_exceeded" if late else "accepted")
+        assert harness.runner.last_actuation.allowed is not late
+        assert len(commands) == 2
+        assert deadlines == [Deadline(MONO + 750_000_000, NOW + 600_000)] * 2
+        assert remaining == [750_000_000, 350_000_000]
+        assert original[-1].status == "accepted"
+        assert original[-1].accepted_ts == NOW + 400
+        expected = (original[:1] if late else original) if next_send == "battery" else (
+            [] if late else original[-1:])
+        assert receipts == tuple(expected)
+        if next_send == "retry":
+            assert commands[0] == commands[1]
+        assert len(gateway.effect_log) == (6 if next_send == "battery" else 3)
+        assert harness.store.load_strict().last_receipt == original[-1]
+        assert harness.store.load_strict().pending_command == (commands[-1] if late else None)
+        controller = harness.runner.state.battery(1 if next_send == "battery" else 0)
+        assert controller.recovery_required is late
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+@pytest.mark.parametrize("finish", ["ack", "write"])
+def test_i5_short_plan_lease_bounds_ack_deadline(tmp_path, offset, finish):
+    harness = build(tmp_path, plan=i5_short_plan())
+    gateway = harness.gateway
+    gateway.advance_clock(900)
+    real_send, real_record = gateway.send, harness.owner.record_receipt
+    commands, original = [], []
+
+    def send(command, *, deadline):
+        commands.append(command)
+        receipt = real_send(command, deadline=deadline)
+        original.append(receipt)
+        if finish == "ack" and len(commands) == 1:
+            gateway.advance_clock(100 + offset)
+        return receipt
+
+    def record(receipt, **kwargs):
+        real_record(receipt, **kwargs)
+        if finish == "write" and len(commands) == 1:
+            gateway.advance_clock(100 + offset)
+
+    gateway.send, harness.owner.record_receipt = send, record
+    try:
+        decision = propose(harness.plan, harness.runner.state, timestamp=(NOW + 900) / 1000)
+        receipts = consume(harness, decision, now_ms=NOW + 900)
+        late = offset >= 0
+        assert harness.runner.last_actuation.reason == ("deadline_exceeded" if late else "accepted")
+        assert harness.runner.last_actuation.allowed is not late
+        assert receipts == (() if late else tuple(original))
+        assert [command.battery_name for command in commands] == (["accu"] if late else ["accu", "accu2"])
+        assert [receipt.status for receipt in original] == ["accepted"] * len(commands)
+        assert original[0].accepted_ts == NOW + 900
+        assert gateway.effect_log == [(command.command_id, part, command.battery_name, -2000)
+                                     for command in commands
+                                     for part in ("setpoint", "mode", "stop_inverter")]
+        mirror = harness.store.load_strict()
+        assert mirror.last_receipt == original[-1]
+        assert mirror.pending_command == (commands[0] if late else None)
+        first = harness.runner.state.battery(0)
+        assert first.execution_status == ("unconfirmed" if late else "accepted")
+        assert first.recovery_required is late
+        assert first.pending_command == (commands[0] if late else None)
+        assert first.last_accepted_command == (None if late else commands[0])
+        assert first.held_setpoint_w == (0 if late else -2000)
+        second = harness.runner.state.battery(1)
+        assert second.last_accepted_command == (None if late else commands[1])
+        if late:
+            assert second.pending_command is None
+            assert consume(harness, decision, now_ms=gateway.utc_ms) == ()
+            assert harness.runner.last_actuation.reason == "recovery_required"
+            assert len(gateway.effect_log) == 3
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_i5_second_battery_only_has_the_remaining_plan_lease(tmp_path, offset):
+    harness = build(tmp_path, plan=i5_short_plan())
+    gateway = harness.gateway
+    gateway.advance_clock(900)
+    real_send = gateway.send
+    commands, deadlines, remaining = [], [], []
+
+    def send(command, *, deadline):
+        commands.append(command)
+        deadlines.append(deadline)
+        remaining.append(deadline.remaining_ns(harness.owner.now_ns()))
+        receipt = real_send(command, deadline=deadline)
+        gateway.advance_clock(60 if len(commands) == 1 else 40 + offset)
+        return receipt
+
+    gateway.send = send
+    try:
+        receipts = consume(harness, propose(harness.plan, harness.runner.state,
+                                           timestamp=(NOW + 900) / 1000), now_ms=NOW + 900)
+        late = offset >= 0
+        assert harness.runner.last_actuation.reason == ("deadline_exceeded" if late else "accepted")
+        assert [r.battery_name for r in receipts] == (["accu"] if late else ["accu", "accu2"])
+        assert deadlines == [Deadline(MONO + 1_000_000_000, NOW + 1000)] * 2
+        assert remaining == [100_000_000, 40_000_000]
+        assert len(gateway.effect_log) == 6
+        assert harness.store.load_strict().pending_command == (commands[1] if late else None)
+        assert harness.runner.state.battery(0).last_accepted_command == commands[0]
+        assert harness.runner.state.battery(1).recovery_required is late
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_i5_retry_and_query_share_the_remaining_plan_lease(tmp_path, offset):
+    harness = build(tmp_path, plan=i5_short_plan())
+    gateway = harness.gateway
+    gateway.advance_clock(900)
+    gateway.lose_ack()
+    real_send, real_query = gateway.send, gateway.query
+    commands, calls, deadlines = [], [], []
+
+    def send(command, *, deadline):
+        commands.append(command)
+        calls.append("send")
+        deadlines.append(deadline)
+        receipt = real_send(command, deadline=deadline)
+        gateway.advance_clock(40 if len(commands) == 1 else 60 + offset)
+        return receipt
+
+    def query(**kwargs):
+        calls.append("query")
+        deadlines.append(kwargs["deadline"])
+        return real_query(**kwargs)
+
+    gateway.send, gateway.query = send, query
+    try:
+        receipts = consume(harness, propose(harness.plan, harness.runner.state,
+                                           timestamp=(NOW + 900) / 1000), now_ms=NOW + 900)
+        assert harness.runner.last_actuation.reason == ("unconfirmed" if offset < 0 else "deadline_exceeded")
+        assert [r.status for r in receipts] == (["unconfirmed"] if offset < 0 else [])
+        assert calls == (["send", "send", "query"] if offset < 0 else ["send", "send"])
+        assert commands == [commands[0]] * 2
+        assert deadlines == [Deadline(MONO + 1_000_000_000, NOW + 1000)] * len(calls)
+        assert len(gateway.effect_log) == 3
+        assert harness.store.load_strict().pending_command == commands[0]
+        assert harness.runner.state.battery(0).recovery_required is True
+        assert harness.runner.state.battery(1).last_accepted_command is None
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("shift", [-2000, 2000])
+def test_i5_utc_adjustment_during_ack_cannot_reopen_boottime_budget(tmp_path, shift):
+    harness = build(tmp_path, plan=i5_short_plan())
+    gateway = harness.gateway
+    gateway.advance_clock(900)
+    real_send = gateway.send
+    commands = []
+
+    def send(command, *, deadline):
+        commands.append(command)
+        receipt = real_send(command, deadline=deadline)
+        gateway.advance_clock(100)
+        # Transport-side UTC changes after the effect; BOOTTIME has still spent 100 ms.
+        gateway.utc_ms += shift
+        return receipt
+
+    gateway.send = send
+    try:
+        assert consume(harness, propose(harness.plan, harness.runner.state,
+                                        timestamp=(NOW + 900) / 1000), now_ms=NOW + 900) == ()
+        assert harness.runner.last_actuation.reason == "deadline_exceeded"
+        assert len(commands) == 1
+        assert harness.store.load_strict().pending_command == commands[0]
+        assert harness.store.load_strict().last_receipt.status == "accepted"
+        assert harness.runner.state.battery(0).recovery_required is True
+        assert len(gateway.effect_log) == 3
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("edge,power", [("active", 0.0), ("stop", 0.0),
+                                       ("interval", -100.25), ("interval", 100.25)])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_i5_profile_hold_expiry_requires_new_same_power_proposal(tmp_path, edge, power, offset):
+    plan = financial_plan(powers=(power, power), economics_supported=False)
+    first = plan.intervals[0]
+    step = replace(first.battery(0), ac_power_w=power, mean_ac_power_w=power,
+                   stop_ts=None)
+    boundary_ms = NOW + 900_000
+    if edge in ("active", "stop"):
+        step = replace(step, **{f"{'active_from' if edge == 'active' else 'stop'}_ts": NOW_TS + 1})
+        boundary_ms = NOW + 1000
+    plan = replace(plan, intervals=[replace(first, batteries=[step]), *plan.intervals[1:]])
+    harness = build(tmp_path, plan=plan)
+    try:
+        initial = consume(harness, propose(plan, harness.runner.state))[0]
+        old = harness.runner.state.battery(0).last_accepted_command
+        gateway = harness.gateway
+        gateway.advance_clock(boundary_ms + offset - NOW)
+        follow = propose(plan, harness.runner.state, timestamp=gateway.utc_ms / 1000,
+                         owner_binding=harness.owner.binding)
+        assert follow.batteries[0].setpoint_w == power
+        assert follow.batteries[0].write is (offset >= 0)
+        assert old.execute_before_ms == old.hold_until_ms == boundary_ms
+        receipts = consume(harness, follow, now_ms=gateway.utc_ms)
+        if offset < 0:
+            assert receipts == ()
+            assert harness.runner.last_actuation.reason == "no_proposal"
+            assert len(gateway.effect_log) == 3
+        else:
+            assert len(receipts) == 1 and receipts[0].status == "accepted"
+            assert receipts[0].command_id != initial.command_id
+            assert receipts[0].sequence > initial.sequence
+            assert harness.runner.state.battery(0).last_command_w == round(power)
+            assert len(gateway.effect_log) == 6
+    finally:
+        harness.lease.close()
+
+
+def test_i5_profile_hold_is_specific_to_each_battery(tmp_path):
+    plan = financial_plan(batteries=2, powers=(0.0,))
+    first = plan.intervals[0]
+    steps = [replace(first.battery(0), active_from_ts=NOW_TS + 1),
+             replace(first.battery(1), stop_ts=NOW_TS + 2)]
+    plan = replace(plan, intervals=[replace(first, batteries=steps), *plan.intervals[1:]])
+    harness = build(tmp_path, plan=plan)
+    try:
+        assert len(consume(harness, propose(plan, harness.runner.state))) == 2
+        assert [battery.last_accepted_command.hold_until_ms for battery in harness.runner.state.batteries] == [
+            NOW + 1000, NOW + 2000]
+    finally:
+        harness.lease.close()
+
+
 def restart_i4_owner(harness, session="i4-fresh-session"):
     owner = harness.owner
     return owner.start(
@@ -810,13 +1133,14 @@ def test_04_two_batteries_share_one_installation_budget(tmp_path, monkeypatch):
     assert [receipt.battery_name for receipt in receipts] == ["accu", "accu2"]
     sequences = [receipt.sequence for receipt in receipts]
     assert sequences[0] < sequences[1]
-    # One absolute transport window for the whole installation.
+    # One absolute section window for the whole installation. Execution derives
+    # the shorter transport cutoff from the same sample, not from each send.
     assert len({deadline.monotonic_end_ns for deadline in seen}) == 1
     assert len(seen) == 2
     assert seen[0].monotonic_end_ns == (
-        harness.owner.now_ns() + boundary.TRANSPORT_BUDGET_NS)
-    assert seen[0].monotonic_end_ns != (
         harness.owner.now_ns() + boundary.SECTION_BUDGET_NS)
+    assert seen[0].monotonic_end_ns != (
+        harness.owner.now_ns() + boundary.TRANSPORT_BUDGET_NS)
     state = harness.gateway.state
     assert state.sequence_high_water == sequences[1]
 

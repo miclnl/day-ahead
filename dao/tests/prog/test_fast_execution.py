@@ -1029,6 +1029,304 @@ def test_07_a_late_acknowledgement_stays_history_and_refuses(artifact):
 
 # -- the budget --------------------------------------------------------------
 
+@pytest.mark.parametrize("route", ["direct", "section"])
+@pytest.mark.parametrize("finish", ["ack", "write"])
+@pytest.mark.parametrize("epsilon", [0, 20])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_i5_short_plan_lease_bounds_ack_deadline(artifact, route, finish, epsilon, offset):
+    """Timely real effects do not turn an ACK/write at the lease edge into rights."""
+    module = execution()
+    artifact.plan = replace(artifact.plan, financial_context=replace(
+        artifact.plan.financial_context, not_after_ts=NOW_TS + 1))
+    artifact.path.write_text(json.dumps(artifact.plan.to_dict()))
+    layout = owner_layout(artifact.root)
+    gateway = layout.gateway
+    gateway.advance_clock(900)
+    layout.owner.now_ns = lambda: MONO + gateway.monotonic_ns
+    clock = replace(CLOCK, utc_ms=NOW + 900, boottime_ns=MONO + 900_000_000,
+                    uncertainty_ms=epsilon)
+    caller = Deadline(clock.boottime_ns + 10_000_000_000, NOW + 60_000)
+    commands, deadlines, original = [], [], []
+    real_send, real_record = gateway.send, layout.owner.record_receipt
+
+    def send(command, *, deadline):
+        commands.append(command)
+        deadlines.append(deadline)
+        receipt = real_send(command, deadline=deadline)
+        original.append(receipt)
+        if finish == "ack":
+            gateway.advance_clock(100 - epsilon + offset)
+        return receipt
+
+    def record(receipt, **kwargs):
+        real_record(receipt, **kwargs)
+        if finish == "write":
+            gateway.advance_clock(100 - epsilon + offset)
+
+    gateway.send, layout.owner.record_receipt = send, record
+    try:
+        failure, receipt = None, None
+        with publication_lock(artifact.path) as lease:
+            try:
+                if route == "direct":
+                    command = replace(build_command(module, layout, artifact), issued_at_ms=clock.utc_ms)
+                    layout.owner.record_pending_command(command)
+                    receipt = module.send_locked(command, lease=lease, owner=layout.owner,
+                        receiver=gateway, deadline=caller, clock=clock, policy=POLICY)
+                else:
+                    receipt = module.owner_section(lease=lease, owner=layout.owner,
+                        receiver=gateway, request=request(), deadline=caller, clock=clock, policy=POLICY)
+            except module.ExecutionRefused as exc:
+                failure = exc.reason
+        assert failure == (None if offset < 0 else "deadline_exceeded")
+        assert len(commands) == len(original) == 1
+        command = commands[0]
+        assert original[0].status == "accepted"
+        assert original[0].accepted_ts == NOW + 900
+        assert gateway.effect_log == [(command.command_id, part, "accu", -1200)
+                                     for part in ("setpoint", "mode", "stop_inverter")]
+        assert deadlines == [Deadline(MONO + (1000 - epsilon) * 1_000_000, NOW + 1000)]
+        state = layout.store.load_strict()
+        assert state.last_receipt == original[0]
+        assert state.pending_command == (None if offset < 0 else command)
+        assert receipt == (original[0] if offset < 0 else None)
+    finally:
+        layout.lease.close()
+
+
+@pytest.mark.parametrize("bound", ["owner", "caller_wire", "caller_monotone", "command"])
+@pytest.mark.parametrize("offset", [-1, 0, 1])
+def test_i5_direct_send_honors_each_short_bound(artifact, bound, offset):
+    module = execution()
+    layout = owner_layout(artifact.root, requested_not_after_ms=NOW + 100 if bound == "owner" else None)
+    layout.owner.now_ns = lambda: MONO + layout.gateway.monotonic_ns
+    command = build_command(module, layout, artifact)
+    if bound == "command":
+        command = replace(command, execute_before_ms=NOW + 100, hold_until_ms=NOW + 100)
+    layout.owner.record_pending_command(command)
+    caller = Deadline(MONO + (100_000_000 if bound == "caller_monotone" else 10_000_000_000),
+                      NOW + (100 if bound == "caller_wire" else 60_000))
+    real_send = layout.gateway.send
+    seen = []
+
+    def send(payload, *, deadline):
+        seen.append(deadline)
+        receipt = real_send(payload, deadline=deadline)
+        layout.gateway.advance_clock(100 + offset)
+        return receipt
+
+    layout.gateway.send = send
+    try:
+        failure = None
+        with publication_lock(artifact.path) as lease:
+            try:
+                receipt = module.send_locked(command, lease=lease, owner=layout.owner,
+                    receiver=layout.gateway, deadline=caller, clock=CLOCK, policy=POLICY)
+            except module.ExecutionRefused as exc:
+                failure = exc.reason
+        assert failure == (None if offset < 0 else "deadline_exceeded")
+        assert seen[0].monotonic_end_ns == MONO + 100_000_000
+        assert len(layout.gateway.effect_log) == 3
+        assert layout.store.load_strict().last_receipt.status == "accepted"
+        assert layout.store.load_strict().pending_command == (None if offset < 0 else command)
+        if offset < 0:
+            assert receipt.status == "accepted"
+    finally:
+        layout.lease.close()
+
+
+@pytest.mark.parametrize("route", ["direct", "section"])
+@pytest.mark.parametrize("finish,elapsed,late", [
+    ("ack", 749, False), ("ack", 750, True), ("ack", 751, True),
+    ("write", 800, False), ("write", 999, False),
+    ("write", 1000, True), ("write", 1001, True),
+])
+def test_i5_transport_and_result_write_keep_their_original_budgets(artifact, route, finish, elapsed, late):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    layout.owner.now_ns = lambda: MONO + layout.gateway.monotonic_ns
+    real_send, real_record = layout.gateway.send, layout.owner.record_receipt
+    commands = []
+
+    def send(command, *, deadline):
+        commands.append(command)
+        receipt = real_send(command, deadline=deadline)
+        if finish == "ack":
+            layout.gateway.advance_clock(elapsed)
+        return receipt
+
+    def record(receipt, **kwargs):
+        real_record(receipt, **kwargs)
+        if finish == "write":
+            layout.gateway.advance_clock(elapsed)
+
+    layout.gateway.send, layout.owner.record_receipt = send, record
+    caller = Deadline(MONO + 10_000_000_000, NOW + 60_000)
+    try:
+        failure = None
+        with publication_lock(artifact.path) as lease:
+            try:
+                if route == "direct":
+                    command = build_command(module, layout, artifact)
+                    layout.owner.record_pending_command(command)
+                    module.send_locked(command, lease=lease, owner=layout.owner,
+                        receiver=layout.gateway, deadline=caller, clock=CLOCK, policy=POLICY)
+                else:
+                    module.owner_section(lease=lease, owner=layout.owner,
+                        receiver=layout.gateway, request=request(), deadline=caller, clock=CLOCK, policy=POLICY)
+            except module.ExecutionRefused as exc:
+                failure = exc.reason
+        assert failure == ("deadline_exceeded" if late else None)
+        assert len(commands) == 1 and len(layout.gateway.effect_log) == 3
+        assert layout.store.load_strict().last_receipt.status == "accepted"
+        assert layout.store.load_strict().pending_command == (commands[0] if late else None)
+    finally:
+        layout.lease.close()
+
+
+@pytest.mark.parametrize("epsilon,healthy,reason", [
+    (99, True, None), (100, True, "budget_exhausted"),
+    (101, True, "budget_exhausted"), (10_000, True, "budget_exhausted"),
+    (0, False, "clock_unhealthy"),
+])
+@pytest.mark.parametrize("route", ["direct", "section"])
+def test_i5_uncertainty_can_exhaust_the_lease_before_io(artifact, epsilon, healthy, reason, route):
+    module = execution()
+    layout = owner_layout(artifact.root, requested_not_after_ms=NOW + 100)
+    clock = replace(CLOCK, uncertainty_ms=epsilon, healthy=healthy)
+    try:
+        failure = None
+        with publication_lock(artifact.path) as lease:
+            try:
+                if route == "direct":
+                    command = build_command(module, layout, artifact)
+                    layout.owner.record_pending_command(command)
+                    module.send_locked(command, lease=lease, owner=layout.owner,
+                        receiver=layout.gateway, deadline=DEADLINE, clock=clock, policy=POLICY)
+                else:
+                    module.owner_section(lease=lease, owner=layout.owner,
+                        receiver=layout.gateway, request=request(), deadline=DEADLINE,
+                        clock=clock, policy=POLICY)
+            except Exception as exc:
+                failure = exc
+        assert (None if failure is None else type(failure)) == (None if reason is None else module.ExecutionRefused)
+        assert (None if failure is None else failure.reason) == reason
+        assert len(layout.gateway.effect_log) == (3 if reason is None else 0)
+        if route == "section" and reason is not None:
+            assert layout.store.load_strict().last_reserved_sequence == 40
+    finally:
+        layout.lease.close()
+
+
+@pytest.mark.parametrize("edge", ["plan", "owner", "active", "stop", "interval"])
+@pytest.mark.parametrize("field", ["hold", "execute"])
+def test_i5_direct_send_rejects_overwide_command_without_rewriting(artifact, monkeypatch, edge, field):
+    module = execution()
+    plan = artifact.plan
+    if edge == "plan":
+        plan = replace(plan, financial_context=replace(plan.financial_context, not_after_ts=NOW_TS + 1))
+        bound = NOW + 1000
+    elif edge in ("active", "stop"):
+        first = plan.intervals[0]
+        step = replace(first.battery(0), **{f"{'active_from' if edge == 'active' else 'stop'}_ts": NOW_TS + 1})
+        plan = replace(plan, intervals=[replace(first, batteries=[step]), *plan.intervals[1:]])
+        bound = NOW + 1000
+    elif edge == "interval":
+        plan = replace(plan, financial_context=replace(plan.financial_context, not_after_ts=NOW_TS + 1800))
+        bound = NOW + 900_000
+    else:
+        bound = NOW + 100
+    artifact.plan = plan
+    artifact.path.write_text(json.dumps(plan.to_dict()))
+    layout = owner_layout(artifact.root, requested_not_after_ms=bound if edge == "owner" else None)
+    # Profile tests need an owner that really outlives the tested profile edge.
+    if edge == "interval":
+        layout.lease.close()
+        layout.gateway.receiver_max_lease_ms = 3_600_000
+        layout.lease = task_execution.acquire_resource(RESOURCE, lease_dir=artifact.root / "leases")
+        layout.binding = layout.owner.start(writer=layout.lease, receiver=layout.gateway,
+            installation_id=INSTALLATION, owner_session_id="i5-long", requested_not_after_ms=NOW + 3_600_000,
+            deadline=DEADLINE, now_ms=NOW)
+    try:
+        command = replace(build_command(module, layout, artifact),
+                          execute_before_ms=bound + (1 if field == "execute" else 0),
+                          hold_until_ms=bound + 1)
+        layout.owner.record_pending_command(command)
+        before = layout.store.path.read_bytes()
+        calls = observe_receiver_calls(monkeypatch, layout.gateway)
+        failure = None
+        with publication_lock(artifact.path) as lease:
+            try:
+                module.send_locked(command, lease=lease, owner=layout.owner,
+                    receiver=layout.gateway, deadline=DEADLINE, clock=CLOCK, policy=POLICY)
+            except module.ExecutionRefused as exc:
+                failure = exc.reason
+        assert failure == "command_window_invalid"
+        assert calls == []
+        assert layout.store.path.read_bytes() == before
+        assert layout.owner.state.pending_command == command
+        assert layout.gateway.effect_log == []
+    finally:
+        layout.lease.close()
+
+
+@pytest.mark.parametrize("edge", ["active", "interval"])
+@pytest.mark.parametrize("issued_offset", [-101, -100, -1, 0, 1])
+def test_i5_fix1_direct_send_refuses_future_issue_at_profile_edge(tmp_path, monkeypatch, edge, issued_offset):
+    """A future issue cannot select a later segment while execution happens now."""
+    from dao.tests.prog.test_fast_consumer import build, financial_plan
+
+    module = execution()
+    plan = financial_plan(powers=(0.0,))
+    boundary_ms = NOW + 900_000
+    if edge == "active":
+        first = plan.intervals[0]
+        step = replace(first.battery(0), active_from_ts=NOW_TS + 1)
+        plan = replace(plan, intervals=[replace(first, batteries=[step]), *plan.intervals[1:]])
+        boundary_ms = NOW + 1000
+    harness = build(tmp_path, plan=plan)
+    harness.gateway.advance_clock(boundary_ms - 100 - NOW)
+    clock = replace(CLOCK, utc_ms=boundary_ms - 100, boottime_ns=harness.owner.now_ns())
+    try:
+        command = module._build_command(owner=harness.owner, request=request(), plan=plan,
+            sequence=harness.owner.reserve_sequence(writer=harness.lease),
+            clock=replace(clock, utc_ms=boundary_ms + issued_offset))
+        if issued_offset >= 0:
+            assert command.hold_until_ms > boundary_ms
+        harness.owner.record_pending_command(command)
+        before = harness.store.path.read_bytes()
+        state_before = harness.owner.state
+        payload_before = command.to_dict()
+        calls = observe_receiver_calls(monkeypatch, harness.gateway)
+        failure, receipt = None, None
+        with publication_lock(harness.path) as lease:
+            try:
+                receipt = module.send_locked(command, lease=lease, owner=harness.owner,
+                    receiver=harness.gateway, deadline=Deadline(clock.boottime_ns + 1_000_000_000,
+                                                                clock.utc_ms + 60_000),
+                    clock=clock, policy=POLICY)
+            except module.ExecutionRefused as exc:
+                failure = exc.reason
+        future = issued_offset > -100
+        assert failure == ("command_window_invalid" if future else None)
+        assert command.to_dict() == payload_before
+        if future:
+            assert receipt is None
+            assert calls == []
+            assert harness.gateway.effect_log == []
+            assert harness.store.path.read_bytes() == before
+            assert harness.owner.state == state_before
+            assert harness.owner.state.pending_command == command
+        else:
+            assert receipt.status == "accepted"
+            assert receipt.accepted_ts == clock.utc_ms
+            assert calls.count("send") == 1
+            assert len(harness.gateway.effect_log) == 3
+            assert harness.store.load_strict().pending_command is None
+    finally:
+        harness.lease.close()
+
+
 def test_09_an_exhausted_budget_refuses_and_never_sends(artifact):
     module = execution()
     layout = owner_layout(artifact.root)

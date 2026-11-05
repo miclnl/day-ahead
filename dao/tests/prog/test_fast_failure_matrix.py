@@ -1394,9 +1394,11 @@ def test_06_the_correction_after_the_send_withdraws_the_owner_epoch(artifact, la
                                           "created_ts": NOW_TS,
                                           "reason": "registered_financial_inputs_changed"}))
     module = execution()
+    # This is the next section, after the timed-out send and the correction.
+    clock = clock_at(layout.gateway, layout.gateway.utc_ms)
     with publication_lock(artifact.path) as lease:
         assert module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
-                                    request=request(), policy=POLICY, clock=CLOCK,
+                                    request=request(), policy=POLICY, clock=clock,
                                     deadline=SECTION_DEADLINE) is None
     mirror = read_mirror(artifact.root)
     # The invalidation is the new epoch barrier.
@@ -1625,7 +1627,8 @@ def test_09c_the_command_deadline_boundary_is_exact(artifact, offset):
     The command carries its own deadline: `execute_before_ms`. The receiver
     refuses a command that arrives on or after that moment, and it accepts
     the same command one millisecond earlier. The bound is the owner lease
-    here, so the plan lease of the publication stays valid.
+    here, so the plan lease of the publication stays valid. The caller enters
+    with 100 ms left; transport crosses the receiver boundary, not preflight.
     """
     module = execution()
     bound = layout_at(artifact.root, requested_not_after_ms=NOW + LEASE_END_MS)
@@ -1633,17 +1636,39 @@ def test_09c_the_command_deadline_boundary_is_exact(artifact, offset):
         command = build_command(module, bound, artifact)
         assert command.execute_before_ms == NOW + LEASE_END_MS, command
         bound.owner.record_pending_command(command)
-        moment = command.execute_before_ms + offset
-        bound.gateway.advance_clock(LEASE_END_MS + offset)
-        clock = clock_at(bound.gateway, moment)
+        bound.gateway.advance_clock(LEASE_END_MS - 100)
+        clock = clock_at(bound.gateway, bound.gateway.utc_ms)
+        real_send = bound.gateway.send
+        observed = []
+
+        def send(payload, *, deadline):
+            bound.gateway.advance_clock(100 + offset)
+            receipt = real_send(payload, deadline=deadline)
+            observed.append(receipt)
+            return receipt
+
+        bound.gateway.send = send
+        failure = None
         with publication_lock(artifact.path) as lease:
-            receipt = module.send_locked(command, lease=lease, owner=bound.owner,
-                                         receiver=bound.gateway, deadline=SECTION_DEADLINE,
-                                         clock=clock, policy=POLICY)
+            try:
+                returned = module.send_locked(command, lease=lease, owner=bound.owner,
+                                              receiver=bound.gateway, deadline=SECTION_DEADLINE,
+                                              clock=clock, policy=POLICY)
+            except module.ExecutionRefused as exc:
+                failure = exc.reason
+        assert len(observed) == 1, observed
+        receipt = observed[0]
+        assert_identity(receipt, command, what="receiver boundary receipt")
+        assert bound.gateway.utc_ms == command.execute_before_ms + offset
+        assert bound.store.load_strict().last_receipt == receipt
         if offset < 0:
+            assert failure is None and returned == receipt
+            assert bound.store.load_strict().pending_command is None
             assert receipt.status == "accepted", receipt
             assert len(bound.gateway.effect_log) == 3, bound.gateway.effect_log
         else:
+            assert failure == "deadline_exceeded"
+            assert bound.store.load_strict().pending_command == command
             # On the bound and later the command is expired: no effect at all.
             assert receipt.status == "rejected", receipt
             assert receipt.reason == "command_expired", receipt
@@ -1672,13 +1697,32 @@ def test_09d_the_helper_effects_before_the_expiry_stay_visible(artifact):
         helper = bound.gateway.step_helper("setpoint", command=command)
         assert (helper.status, helper.effect) == ("unconfirmed", "partial"), helper
         assert len(bound.gateway.effect_log) == 1, bound.gateway.effect_log
-        # The clock passes the bound of the owner lease.
-        bound.gateway.advance_clock(LEASE_END_MS + 1)
-        clock = clock_at(bound.gateway, NOW + LEASE_END_MS + 1)
+        # Enter while valid, then let transport cross the lease. This still
+        # exercises the receiver's expired partial effect, not caller preflight.
+        bound.gateway.advance_clock(LEASE_END_MS - 100)
+        clock = clock_at(bound.gateway, bound.gateway.utc_ms)
+        real_send = bound.gateway.send
+        observed = []
+
+        def send(payload, *, deadline):
+            bound.gateway.advance_clock(101)
+            receipt = real_send(payload, deadline=deadline)
+            observed.append(receipt)
+            return receipt
+
+        bound.gateway.send = send
         with publication_lock(artifact.path) as lease:
-            receipt = module.send_locked(command, lease=lease, owner=bound.owner,
-                                         receiver=bound.gateway, deadline=SECTION_DEADLINE,
-                                         clock=clock, policy=POLICY)
+            with pytest.raises(module.ExecutionRefused) as error:
+                module.send_locked(command, lease=lease, owner=bound.owner,
+                                   receiver=bound.gateway, deadline=SECTION_DEADLINE,
+                                   clock=clock, policy=POLICY)
+        assert error.value.reason == "deadline_exceeded"
+        assert len(observed) == 1, observed
+        receipt = observed[0]
+        assert_identity(receipt, command, what="expired partial receipt")
+        assert bound.gateway.utc_ms == command.execute_before_ms + 1
+        assert bound.store.load_strict().pending_command == command
+        assert bound.store.load_strict().last_receipt == receipt
         assert receipt.status != "accepted", receipt
         assert receipt.effect == "partial", receipt
         # The earlier effect is still visible and no new effect was written.
@@ -1892,9 +1936,10 @@ def test_09e_a_new_section_after_an_exact_stop_is_allowed(artifact, layout):
     assert_session_barrier(read_mirror(artifact.root), binding, layout.gateway.state.last_barrier)
     # The normal section is allowed again: the transport works again.
     restore_transport(layout.gateway)
+    clock = clock_at(layout.gateway, layout.gateway.utc_ms)
     with publication_lock(artifact.path) as lease:
         receipt = module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
-                                       request=request(), policy=POLICY, clock=CLOCK,
+                                       request=request(), policy=POLICY, clock=clock,
                                        deadline=SECTION_DEADLINE)
     assert receipt.status == "accepted", receipt
     assert receipt.owner_epoch == 10, receipt

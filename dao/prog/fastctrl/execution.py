@@ -179,6 +179,32 @@ def _conservative(observations: list[ActuationReceipt]) -> ActuationReceipt:
     return observations[-1]
 
 
+def _bounded_deadline(deadline: Deadline, *, clock: ClockSample, wire_end_ms: int) -> Deadline:
+    """Translate a wire bound once, conservatively; an absolute budget only shrinks."""
+    if not clock.healthy:
+        raise ExecutionRefused("clock_unhealthy")
+    execute_before = min(deadline.execute_before_ms, wire_end_ms)
+    end = min(deadline.monotonic_end_ns,
+              clock.boottime_ns + (execute_before - clock.utc_ms - clock.uncertainty_ms) * 1_000_000)
+    if end <= clock.boottime_ns:
+        raise ExecutionRefused("budget_exhausted")
+    return Deadline(end, execute_before)
+
+
+def _command_end_ms(plan: FastPlan, *, battery_name: str, at_ms: int,
+                    owner_end_ms: int) -> int:
+    """The next profile edge ends this battery's hold, even at unchanged power."""
+    interval = plan.interval_at(at_ms / 1000)
+    index = plan.spec_index(battery_name)
+    if interval is None or index is None:
+        raise ExecutionRefused("command_window_invalid")
+    step = interval.battery(index)
+    ends = [plan.financial_context.not_after_ts * 1000, owner_end_ms, interval.end_ts * 1000]
+    ends.extend(edge * 1000 for edge in (step.active_from_ts, step.stop_ts)
+                if edge is not None and edge * 1000 > at_ms)
+    return min(ends)
+
+
 def send_locked(command: BatteryCommand, *, lease: PublicationLease,
                 owner: OwnerCoordinator, receiver: FencedDeviceGateway,
                 deadline: Deadline, clock: ClockSample,
@@ -216,34 +242,50 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
         raise ExecutionRefused("pending_command_missing")
     if type(pending) is not BatteryCommand or pending.to_dict() != command.to_dict():
         raise ExecutionRefused("pending_command_mismatch")
+    if command.issued_at_ms > clock.utc_ms:
+        # Future dating cannot select a later profile segment for execution now.
+        raise ExecutionRefused("command_window_invalid")
+    command_end = _command_end_ms(plan, battery_name=command.battery_name,
+                                  at_ms=command.issued_at_ms,
+                                  owner_end_ms=binding.owner_not_after_ms)
+    if command.hold_until_ms > command_end:
+        # Validate the immutable command against the fresh plan and binding;
+        # shortening transport time cannot repair an overwide command payload.
+        raise ExecutionRefused("command_window_invalid")
+    deadline = _bounded_deadline(
+        Deadline(min(deadline.monotonic_end_ns, clock.boottime_ns + SECTION_BUDGET_NS),
+                 deadline.execute_before_ms),
+        clock=clock, wire_end_ms=min(command.execute_before_ms, command_end))
+    transport = Deadline(min(deadline.monotonic_end_ns, clock.boottime_ns + TRANSPORT_BUDGET_NS),
+                         deadline.execute_before_ms)
     now = owner.now_ns
-    if deadline.remaining_ns(now()) == 0:
+    if transport.remaining_ns(now()) == 0:
         raise ExecutionRefused("budget_exhausted")
     try:
-        receipt = receiver.send(command, deadline=deadline)
+        receipt = receiver.send(command, deadline=transport)
     except Exception as exc:
         # Only transport failures are masked; identity refusals stay explicit.
         raise ExecutionRefused("receiver_unavailable") from exc
     if not receipt_matches_command(receipt, command):
         raise ExecutionRefused("receipt_identity_mismatch")
     observations = [receipt]
-    if receipt.status != "accepted" and deadline.remaining_ns(now()) > 0:
+    if receipt.status != "accepted" and transport.remaining_ns(now()) > 0:
         # At most one retry, with exactly the same bytes, id, sequence and deadline.
         try:
-            retried = receiver.send(command, deadline=deadline)
+            retried = receiver.send(command, deadline=transport)
         except Exception as exc:
             raise ExecutionRefused("receiver_unavailable") from exc
         if not receipt_matches_command(retried, command):
             raise ExecutionRefused("receipt_identity_mismatch")
         observations.append(retried)
-        if retried.status != "accepted" and deadline.remaining_ns(now()) > 0:
+        if retried.status != "accepted" and transport.remaining_ns(now()) > 0:
             try:
                 queried = receiver.query(installation_id=command.installation_id,
                                          owner_epoch=command.owner_epoch,
                                          sequence=command.sequence,
-                                         command_id=command.command_id,
-                                         payload_digest=payload_digest(command),
-                                         deadline=deadline)
+                                          command_id=command.command_id,
+                                          payload_digest=payload_digest(command),
+                                         deadline=transport)
             except Exception as exc:
                 raise ExecutionRefused("receiver_unavailable") from exc
             if queried is not None:
@@ -251,13 +293,18 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
                     raise ExecutionRefused("receipt_identity_mismatch")
                 observations.append(queried)
     outcome = _conservative(observations)
-    if outcome.status == "accepted" and deadline.remaining_ns(now()) == 0:
+    if outcome.status == "accepted" and transport.remaining_ns(now()) == 0:
         # A late acknowledgement is history only: it grants no right, clears no
         # pending command and never becomes an accepted command update. The
         # proof itself is kept durably as history, without a second budget.
         owner.record_receipt(outcome, terminal=False)
         raise ExecutionRefused("deadline_exceeded")
     owner.record_receipt(outcome)
+    if deadline.remaining_ns(now()) == 0:
+        # Direct callers need the durable-write check too. Keep the original
+        # section budget, including its lease cap, and restore pending evidence.
+        owner.record_pending_command(command)
+        raise ExecutionRefused("deadline_exceeded")
     return outcome
 
 
@@ -267,7 +314,8 @@ def _build_command(*, owner: OwnerCoordinator, request: CommandRequest, plan: Fa
     if binding is None:
         raise ExecutionRefused("owner_binding_missing")
     context = plan.financial_context
-    execute_before = min(context.not_after_ts * 1000, binding.owner_not_after_ms)
+    execute_before = _command_end_ms(plan, battery_name=request.battery_name, at_ms=clock.utc_ms,
+                                     owner_end_ms=binding.owner_not_after_ms)
     if not clock.utc_ms < execute_before:
         raise ExecutionRefused("command_window_invalid")
     installation = context.basis.meter_id
@@ -307,16 +355,10 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
     if type(deadline) is not Deadline:
         raise ExecutionRefused("deadline_invalid")
     now = owner.now_ns
-    section_start = now()
     # One absolute deadline for the whole installation.
-    end = min(deadline.monotonic_end_ns, section_start + SECTION_BUDGET_NS)
+    end = min(deadline.monotonic_end_ns, clock.boottime_ns + SECTION_BUDGET_NS)
     binding = owner.binding
-    if binding is not None:
-        # A shorter remaining owner lease shortens the deadline.
-        lease_end = clock.boottime_ns + (binding.owner_not_after_ms - clock.utc_ms) * 1_000_000
-        end = min(end, lease_end)
     section = Deadline(end, deadline.execute_before_ms)
-    transport = Deadline(min(end, section_start + TRANSPORT_BUDGET_NS), deadline.execute_before_ms)
     try:
         lease._check()
     except PublicationError as exc:
@@ -326,7 +368,15 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
         # The plan is not ready-v2: no send at all. The owner consumes the
         # invalidation by withdrawing its epoch inside this very section, with
         # the remaining section budget and never with a second window.
-        revoke = Deadline(min(section.monotonic_end_ns, now() + TRANSPORT_BUDGET_NS),
+        try:
+            section = _bounded_deadline(section, clock=clock, wire_end_ms=(
+                binding.owner_not_after_ms if binding is not None else section.execute_before_ms))
+        except ExecutionRefused as exc:
+            if exc.reason != "budget_exhausted":
+                raise
+            owner.report_failure("publication_invalidation_budget_exhausted", durable=True)
+            return None
+        revoke = Deadline(min(section.monotonic_end_ns, clock.boottime_ns + TRANSPORT_BUDGET_NS),
                           section.execute_before_ms)
         if revoke.remaining_ns(now()) == 0:
             # Not enough budget for a safe withdrawal: the epoch is not
@@ -342,6 +392,11 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
     plan = validate_current_locked(lease=lease, expected_digest=plan_digest(plan), clock=clock,
                                    policy=policy)
     _validate_installation(plan, owner=owner)
+    section = _bounded_deadline(section, clock=clock, wire_end_ms=_command_end_ms(
+        plan, battery_name=request.battery_name, at_ms=clock.utc_ms,
+        owner_end_ms=owner.binding.owner_not_after_ms))
+    transport = Deadline(min(section.monotonic_end_ns, clock.boottime_ns + TRANSPORT_BUDGET_NS),
+                         section.execute_before_ms)
     if section.remaining_ns(now()) == 0:
         raise ExecutionRefused("budget_exhausted")
     # The sequence is reserved durably before the send; gaps are allowed.
@@ -354,7 +409,7 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
     owner.record_pending_command(command)
     # send_locked records the result durably in the same mirror.
     receipt = send_locked(command, lease=lease, owner=owner, receiver=receiver,
-                          deadline=transport, clock=clock, policy=policy)
+                          deadline=section, clock=clock, policy=policy)
     # The section checks the deadline after the last durable result write. An
     # overrun is never reported as an accepted command update: the pending
     # command is restored durably and the history stays visible.
