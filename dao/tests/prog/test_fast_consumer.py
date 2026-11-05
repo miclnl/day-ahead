@@ -1389,6 +1389,7 @@ def test_15_a_refusal_without_a_pending_command_proves_no_effect(tmp_path, monke
     decision = propose(harness.plan, harness.runner.state)
     # The owner lease has expired: the section refuses before it records
     # anything, so no command can have reached the device.
+    harness.gateway.advance_clock(600_000)
     receipts = consume(harness, decision, now_ms=NOW + 600_000)
     assert receipts == ()
     verdict = harness.runner.last_actuation

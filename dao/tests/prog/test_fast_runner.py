@@ -104,6 +104,355 @@ def test_i7_early_financial_read_and_sensor_overrun_discards_proposal(tmp_path, 
         harness.lease.close()
 
 
+@pytest.mark.parametrize("ack_ms", [99, 100, 101, 120])
+def test_n1_sensor_delay_cannot_extend_profile_ack_deadline(tmp_path, monkeypatch, ack_ms):
+    """Old tick UTC paired with post-sensor BOOTTIME must not admit a late ACK."""
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import NOW, build, financial_plan
+
+    plan = financial_plan(batteries=2)
+    first = plan.intervals[0]
+    plan = replace(plan, intervals=[replace(first, batteries=[
+        replace(first.battery(0), stop_ts=first.start_ts + 1,
+                ac_power_w=-2000 / 900, mean_ac_power_w=-2000 / 900),
+        replace(first.battery(1), stop_ts=first.start_ts + 2,
+                ac_power_w=-4000 / 900, mean_ac_power_w=-4000 / 900),
+    ]), *plan.intervals[1:]])
+    harness = build(tmp_path, plan=plan)
+    runner, gateway = harness.runner, harness.gateway
+    # A valid whole-second profile edge, 100 ms after tickstart. The independent
+    # BOOTTIME cadence starts at phase zero and remains real throughout the tick.
+    gateway.utc_ms = NOW + 900
+    tick_ts = gateway.utc_ms / 1000
+    monkeypatch.setattr(runner_module, "following_verdict",
+                        lambda *a, **kw: publication.GateVerdict(True, "synthetic"))
+
+    def sensor(ids):
+        gateway.advance_clock(50)
+        return {"sensor.p1_power": ("4000", tick_ts), "sensor.soc": ("50", tick_ts)}
+
+    commands, original = [], []
+    real_send = gateway.send
+
+    def send(command, *, deadline):
+        commands.append(command)
+        receipt = real_send(command, deadline=deadline)
+        original.append(receipt)
+        if len(commands) == 1:
+            gateway.advance_clock(ack_ms - 50)
+        return receipt
+
+    monkeypatch.setattr(runner.gateway, "read", sensor)
+    monkeypatch.setattr(gateway, "send", send)
+    try:
+        decision = runner.tick(tick_ts)
+        assert [battery.write for battery in decision.batteries] == [True, True]
+        assert [battery.setpoint_w for battery in decision.batteries] == [-2000, -2000]
+        assert original[0].status == "accepted"
+        assert original[0].accepted_ts == NOW + 950  # real receiver effect at +50 ms
+        assert commands[0].execute_before_ms == commands[0].hold_until_ms == NOW + 1000
+        late = ack_ms >= 100
+        assert (runner.last_actuation.allowed, runner.last_actuation.reason) == (
+            not late, "deadline_exceeded" if late else "accepted")
+        assert [command.battery_name for command in commands] == (
+            ["accu"] if late else ["accu", "accu2"])
+        assert gateway.effect_log == [(command.command_id, part, command.battery_name, -2000)
+                                     for command in commands
+                                     for part in ("setpoint", "mode", "stop_inverter")]
+        mirror = harness.store.load_strict()
+        assert mirror.last_receipt == original[-1]
+        assert mirror.last_reserved_sequence == (41 if late else 42)
+        assert mirror.pending_command == (commands[0] if late else None)
+        assert runner.last_receipts == ([] if late else original)
+        controller = runner.state.battery(0)
+        assert controller.execution_status == ("unconfirmed" if late else "accepted")
+        assert controller.pending_command == (commands[0] if late else None)
+        assert controller.recovery_required is late
+        assert controller.last_accepted_command == (None if late else commands[0])
+        assert controller.held_setpoint_w == controller.last_command_w == (0 if late else -2000)
+        second = runner.state.battery(1)
+        assert second.pending_command is None and second.recovery_required is False
+        assert second.last_accepted_command == (None if late else commands[1])
+        assert second.held_setpoint_w == (0 if late else -2000)
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("edge,sensor_ms,lease_ms,allowed", [
+    ("active", 99, 0, True), ("active", 100, 0, False),
+    ("stop", 99, 0, True), ("stop", 101, 0, False),
+    ("interval", 99, 0, True), ("interval", 101, 0, False),
+    ("stop", 50, 49, True), ("stop", 50, 50, False),
+])
+def test_n1_original_proposal_window_survives_preparation(
+        tmp_path, monkeypatch, edge, sensor_ms, lease_ms, allowed):
+    """Even equal power cannot relabel an old proposal into the next segment."""
+    from contextlib import contextmanager
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import ownership
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import NOW, NOW_TS, build, financial_plan
+    from dao.tests.prog.test_fast_execution import observe_receiver_calls
+
+    power = -2000 if edge == "interval" else 0
+    plan = financial_plan(powers=(power,), economics_supported=False)
+    first = plan.intervals[0]
+    step = replace(first.battery(0), ac_power_w=power, mean_ac_power_w=power, stop_ts=None)
+    boundary_ms = NOW + 900_000
+    if edge in ("active", "stop"):
+        field = "active_from_ts" if edge == "active" else "stop_ts"
+        step = replace(step, **{field: NOW_TS + 1})
+        boundary_ms = NOW + 1000
+    plan = replace(plan, intervals=[replace(first, batteries=[step]), *plan.intervals[1:]])
+    harness = build(tmp_path, plan=plan)
+    runner, gateway = harness.runner, harness.gateway
+    gateway.utc_ms = boundary_ms - 100
+    tick_ts = gateway.utc_ms / 1000
+    advance = gateway.advance_clock
+    monkeypatch.setattr(runner_module, "following_verdict",
+                        lambda *a, **kw: publication.GateVerdict(True, "synthetic"))
+
+    def sensor(ids):
+        advance(sensor_ms)
+        return {"sensor.p1_power": (str(-power), tick_ts), "sensor.soc": ("50", tick_ts)}
+
+    real_lock = ownership.publication_lock
+
+    @contextmanager
+    def delayed_acquire(path):
+        with real_lock(path) as lease:
+            advance(lease_ms)
+            yield lease
+
+    monkeypatch.setattr(runner.gateway, "read", sensor)
+    monkeypatch.setattr(ownership, "publication_lock", delayed_acquire)
+    calls = observe_receiver_calls(monkeypatch, gateway)
+    before = harness.store.path.read_bytes()
+    try:
+        decision = runner.tick(tick_ts)
+        assert decision.timestamp == tick_ts
+        assert decision.batteries[0].write is True
+        assert decision.batteries[0].setpoint_w == power
+        assert (runner.last_actuation.allowed, runner.last_actuation.reason) == (
+            allowed, "accepted" if allowed else "command_window_invalid")
+        controller = runner.state.battery(0)
+        if allowed:
+            assert calls == ["send", "step_helper", "step_helper", "step_helper"]
+            command = controller.last_accepted_command
+            assert command.issued_at_ms == boundary_ms - 1
+            assert command.execute_before_ms == command.hold_until_ms == boundary_ms
+            assert runner.last_receipts[0].accepted_ts == boundary_ms - 1
+            assert gateway.effect_log == [(command.command_id, part, "accu", power)
+                                         for part in ("setpoint", "mode", "stop_inverter")]
+        else:
+            assert calls == [] and gateway.effect_log == []
+            assert harness.store.path.read_bytes() == before
+            assert harness.owner._sequence_high_water == 40
+            assert controller.last_accepted_command is controller.pending_command is None
+            assert controller.recovery_required is False
+            assert controller.held_setpoint_w == controller.last_command_w == 0
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("sample_delay_ms,ack_ms", [(40, 99), (40, 101), (60, None)])
+def test_n1_delay_inside_utc_sample_cannot_add_profile_budget(
+        tmp_path, monkeypatch, sample_delay_ms, ack_ms):
+    """UTC read latency must be charged against the earlier BOOTTIME anchor."""
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import MONO, NOW, build, financial_plan
+
+    plan = financial_plan()
+    first = plan.intervals[0]
+    step = replace(first.battery(0), stop_ts=first.start_ts + 1,
+                   ac_power_w=-2000 / 900, mean_ac_power_w=-2000 / 900)
+    plan = replace(plan, intervals=[replace(first, batteries=[step]), *plan.intervals[1:]])
+    harness = build(tmp_path, plan=plan)
+    runner, gateway, owner = harness.runner, harness.gateway, harness.owner
+    gateway.utc_ms = NOW + 900
+    tick_ts = gateway.utc_ms / 1000
+    monkeypatch.setattr(runner_module, "following_verdict",
+                        lambda *a, **kw: publication.GateVerdict(True, "synthetic"))
+
+    def sensor(ids):
+        gateway.advance_clock(50)
+        return {"sensor.p1_power": ("2000", tick_ts), "sensor.soc": ("50", tick_ts)}
+
+    delayed = False
+
+    def utc_read():
+        nonlocal delayed
+        utc_ms = gateway.utc_ms
+        if owner._section_lease is not None and not delayed:
+            delayed = True
+            gateway.advance_clock(sample_delay_ms)
+        return utc_ms
+
+    commands, original, deadlines = [], [], []
+    real_send = gateway.send
+
+    def send(command, *, deadline):
+        commands.append(command)
+        deadlines.append(deadline)
+        receipt = real_send(command, deadline=deadline)
+        original.append(receipt)
+        if ack_ms is not None:
+            gateway.advance_clock(NOW + 900 + ack_ms - gateway.utc_ms)
+        return receipt
+
+    monkeypatch.setattr(runner.gateway, "read", sensor)
+    monkeypatch.setattr(owner, "now_ms", utc_read)
+    monkeypatch.setattr(gateway, "send", send)
+    before = harness.store.path.read_bytes()
+    try:
+        decision = runner.tick(tick_ts)
+        assert decision.batteries[0].write is True
+        if ack_ms is None:
+            assert (runner.last_actuation.allowed, runner.last_actuation.reason) == (
+                False, "command_window_invalid")
+            assert commands == [] and gateway.effect_log == []
+            assert harness.store.path.read_bytes() == before
+            assert harness.owner._sequence_high_water == 40
+            controller = runner.state.battery(0)
+            assert controller.last_accepted_command is controller.pending_command is None
+            assert controller.recovery_required is False
+            return
+        assert original[0].status == "accepted"
+        late = ack_ms >= 100
+        assert (runner.last_actuation.allowed, runner.last_actuation.reason) == (
+            not late, "deadline_exceeded" if late else "accepted")
+        assert original[0].accepted_ts == NOW + 990
+        assert deadlines[0].monotonic_end_ns == MONO + 100_000_000
+        assert len(commands) == 1 and len(gateway.effect_log) == 3
+        mirror = harness.store.load_strict()
+        assert mirror.last_receipt == original[0]
+        assert mirror.pending_command == (commands[0] if late else None)
+        controller = runner.state.battery(0)
+        assert controller.recovery_required is late
+        assert controller.last_accepted_command == (None if late else commands[0])
+        assert controller.held_setpoint_w == (0 if late else -2000)
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("next_send", ["battery", "retry"])
+@pytest.mark.parametrize("ack_ms", [799, 800])
+def test_n1_fresh_sample_keeps_section_transport_cutoff(tmp_path, monkeypatch, next_send, ack_ms):
+    """Sampling after lease acquisition cannot renew the shared 750-ms budget."""
+    from contextlib import contextmanager
+
+    from dao.prog.fastctrl import ownership
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.prog.fastctrl.command import Deadline
+    from dao.tests.prog.test_fast_consumer import MONO, NOW, NOW_TS, build, financial_plan
+
+    harness = build(tmp_path, plan=financial_plan(batteries=2 if next_send == "battery" else 1))
+    runner, gateway = harness.runner, harness.gateway
+    monkeypatch.setattr(runner_module, "following_verdict",
+                        lambda *a, **kw: publication.GateVerdict(True, "synthetic"))
+
+    def sensor(ids):
+        gateway.advance_clock(50)
+        return {"sensor.p1_power": ("4000", NOW_TS), "sensor.soc": ("50", NOW_TS)}
+
+    real_lock = ownership.publication_lock
+
+    @contextmanager
+    def delayed_acquire(path):
+        with real_lock(path) as lease:
+            gateway.advance_clock(25)
+            yield lease
+
+    commands, original, deadlines, remaining = [], [], [], []
+    real_send = gateway.send
+
+    def send(command, *, deadline):
+        commands.append(command)
+        deadlines.append(deadline)
+        remaining.append(deadline.remaining_ns(harness.owner.now_ns()))
+        if next_send == "retry" and len(commands) == 1:
+            gateway.enqueue(command)
+            receipt = gateway.deliver()
+        else:
+            if next_send == "retry":
+                for part in ("setpoint", "mode", "stop_inverter"):
+                    gateway.step_helper(part, command=command)
+            receipt = real_send(command, deadline=deadline)
+        original.append(receipt)
+        gateway.advance_clock(400 if len(commands) == 1 else NOW + ack_ms - gateway.utc_ms)
+        return receipt
+
+    monkeypatch.setattr(runner.gateway, "read", sensor)
+    monkeypatch.setattr(ownership, "publication_lock", delayed_acquire)
+    monkeypatch.setattr(gateway, "send", send)
+    try:
+        decision = runner.tick(NOW_TS)
+        assert all(battery.write for battery in decision.batteries)
+        late = ack_ms == 800
+        assert (runner.last_actuation.allowed, runner.last_actuation.reason) == (
+            not late, "deadline_exceeded" if late else "accepted")
+        assert len(commands) == 2
+        assert deadlines == [Deadline(MONO + 800_000_000, NOW + 600_000)] * 2
+        assert remaining == [725_000_000, 325_000_000]
+        if next_send == "retry":
+            assert commands[0] == commands[1]
+        else:
+            assert [command.battery_name for command in commands] == ["accu", "accu2"]
+        assert original[-1].status == "accepted" and original[-1].accepted_ts == NOW + 475
+        mirror = harness.store.load_strict()
+        assert mirror.last_receipt == original[-1]
+        assert mirror.pending_command == (commands[-1] if late else None)
+        controller = runner.state.battery(1 if next_send == "battery" else 0)
+        assert controller.recovery_required is late
+        assert controller.last_accepted_command == (None if late else commands[-1])
+        assert len(gateway.effect_log) == (6 if next_send == "battery" else 3)
+    finally:
+        harness.lease.close()
+
+
+@pytest.mark.parametrize("expires,reason", [("owner", "owner_unavailable"),
+                                           ("plan", "plan_lease_expired")])
+def test_n1_lease_validation_uses_execution_time(tmp_path, monkeypatch, expires, reason):
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import runner as runner_module
+    from dao.tests.prog.test_fast_consumer import LEASE_MS, NOW, NOW_TS, build, financial_plan
+
+    plan = financial_plan()
+    if expires == "plan":
+        plan = replace(plan, financial_context=replace(plan.financial_context, not_after_ts=NOW_TS + 1))
+    harness = build(tmp_path, plan=plan, lease_ms=1000 if expires == "owner" else LEASE_MS)
+    runner, gateway = harness.runner, harness.gateway
+    gateway.utc_ms = NOW + 900
+    tick_ts = gateway.utc_ms / 1000
+    monkeypatch.setattr(runner_module, "following_verdict",
+                        lambda *a, **kw: publication.GateVerdict(True, "synthetic"))
+
+    def sensor(ids):
+        gateway.advance_clock(101)
+        return {"sensor.p1_power": ("2000", tick_ts), "sensor.soc": ("50", tick_ts)}
+
+    monkeypatch.setattr(runner.gateway, "read", sensor)
+    before = harness.store.path.read_bytes()
+    try:
+        decision = runner.tick(tick_ts)
+        assert decision.batteries[0].write is True
+        assert (runner.last_actuation.allowed, runner.last_actuation.reason) == (False, reason)
+        assert harness.store.path.read_bytes() == before
+        assert harness.owner._sequence_high_water == 40
+        assert gateway.effect_log == [] and runner.last_receipts == []
+        assert runner.state.battery(0).pending_command is None
+        if expires == "owner":
+            assert harness.owner.pending_stop_reason == "owner_lease_expired"
+    finally:
+        harness.lease.close()
+
+
 def test_i7_unexpected_v2_releases_legacy_read_before_financial_processing(tmp_path, monkeypatch):
     from contextlib import contextmanager
     from dataclasses import replace

@@ -1234,6 +1234,11 @@ class FastControlRunner:
         Every refusal is explicit and machine-readable. No epoch, installation
         id or command identity is ever invented: without a bound owner or a
         nominally qualified adapter there simply is no command to give.
+
+        ``decision.timestamp`` is the original proposal time. The caller's
+        ``now_ms`` may be that same old tick time, never proof of execution time:
+        owner validation uses the owner clock and execution samples it under
+        the final publication lease.
         """
         self.last_receipts = []
         # The overlap is determined first: the publication of a financial tick
@@ -1244,6 +1249,8 @@ class FastControlRunner:
             return self._deny_financial("missing_financial_context", decision)
         if overlap:
             return self._deny_financial("diagnostics_overlap", decision)
+        if owner is not None:
+            now_ms = owner.now_ms()
         binding = self._owner_binding(owner, now_ms=now_ms)
         if binding is None:
             if owner is not None and owner.binding is not None and now_ms >= owner.binding.owner_not_after_ms:
@@ -1270,20 +1277,29 @@ class FastControlRunner:
             if not allowed or cycle != self._tick_cycle:
                 return self._deny_financial("admission_window_missed", decision)
         context = plan.financial_context
-        clock = ClockSample(utc_ms=int(now_ms), boottime_ns=owner.now_ns(),
-                             boot_id=_boot_id(), uncertainty_ms=0, healthy=True)
-        # One absolute section window for the whole installation; execution caps
-        # transport at 750 ms from this same sample, including retries/next batteries.
+        proposal_ms = int(round(decision.timestamp * 1000))
+        # One absolute section window for the whole installation. The owner caps
+        # transport at 750 ms from section entry, including sampling/acquisition,
+        # retries and next batteries; a fresh UTC sample never renews that budget.
         execute_before = min(context.not_after_ts * 1000, binding.owner_not_after_ms)
-        deadline = Deadline(clock.boottime_ns + execution_boundary.SECTION_BUDGET_NS,
-                            execute_before)
         receipts: list[ActuationReceipt] = []
         accepted_count = 0
         refusal = ""
         try:
+            deadline = Deadline(owner._clock() + execution_boundary.SECTION_BUDGET_NS,
+                                execute_before)
             # The publication lease is taken here and released only after the
             # result has been recorded. There is no nested acquisition.
             with owner.final_section(operation="send", deadline=deadline) as lease:
+                # Anchor BOOTTIME before reading UTC: latency between the reads
+                # must spend budget, never shift a wire deadline into the future.
+                sampled_ns = owner._clock()
+                clock = ClockSample(utc_ms=owner.now_ms(), boottime_ns=sampled_ns,
+                                    boot_id=_boot_id(), uncertainty_ms=0, healthy=True)
+                if clock.utc_ms >= binding.owner_not_after_ms:
+                    owner.pending_stop_reason = "owner_lease_expired"
+                    owner.report_failure("owner_lease_expired")
+                    return self._deny_financial("owner_unavailable", decision)
                 # The proposal is bound to the fresh publication under the lock:
                 # only the published plan may carry this command.
                 try:
@@ -1317,6 +1333,16 @@ class FastControlRunner:
                             self._record_refusal(battery, owner)
                             break
                         try:
+                            # Fresh issuance cannot relabel a proposal across its
+                            # original active/stop/interval edge, even at equal
+                            # power. This check is under the final lease and runs
+                            # before the mechanical boundary may reserve anything.
+                            proposal_end = execution_boundary._command_end_ms(
+                                plan, battery_name=battery.name, at_ms=proposal_ms,
+                                owner_end_ms=binding.owner_not_after_ms)
+                            if (not proposal_ms <= clock.utc_ms < proposal_end
+                                    or owner.now_ms() >= proposal_end):
+                                raise execution_boundary.ExecutionRefused("command_window_invalid")
                             receipt = execution_boundary.owner_section(
                                 lease=lease, owner=owner, receiver=receiver,
                                 request=self._command_request(plan, decision, battery),
