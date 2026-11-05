@@ -75,26 +75,27 @@ def ownership():
     return module
 
 
-def mirror_path(root):
-    return Path(root) / "actuation_owner" / MIRROR
+def mirror_path(root, *, installation_id=INSTALLATION):
+    return Path(root) / "actuation_owner" / (
+        hashlib.sha256(installation_id.encode()).hexdigest() + ".json")
 
 
 def receiver_state_file(root):
     return Path(root) / "receiver" / "receiver-state.json"
 
 
-def read_mirror(root):
-    return json.loads(mirror_path(root).read_text())
+def read_mirror(root, *, installation_id=INSTALLATION):
+    return json.loads(mirror_path(root, installation_id=installation_id).read_text())
 
 
-def provision_mirror(root):
+def provision_mirror(root, *, installation_id=INSTALLATION):
     """The synthetic trusted mirror; production has no bootstrap path."""
     module = ownership()
-    store = module.OwnerStore(Path(root) / "fast_plan.json", INSTALLATION,
+    store = module.OwnerStore(Path(root) / "fast_plan.json", installation_id,
                               lease_dir=Path(root) / "leases")
     store.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     store.path.write_text(json.dumps(module.OwnerState(
-        1, INSTALLATION, "receiver-a", "generation-a", "checkpoint-40", "", 0, 40,
+        1, installation_id, "receiver-a", "generation-a", "checkpoint-40", "", 0, 40,
         "inhibited", None, None, None, None).to_dict()))
     store.path.chmod(0o600)
     return store
@@ -146,6 +147,9 @@ def build_command(module, layout, artifact):
 @pytest.fixture
 def artifact(tmp_path):
     plan = ready_plan()
+    context = plan.financial_context
+    plan = replace(plan, financial_context=replace(
+        context, basis=replace(context.basis, meter_id=INSTALLATION)))
     path = tmp_path / "fast_plan.json"
     path.write_text(json.dumps(plan.to_dict()))
     return SimpleNamespace(root=tmp_path, path=path, plan=plan)
@@ -182,11 +186,12 @@ def owner_worker(root, mode, barrier, go, registered, results, send_started=None
     """The owner process: bind the receiver, then run bounded owner sections."""
     module = execution()
     root = Path(root)
-    store = provision_mirror(root)
-    gateway = FencedReceiver(root / "receiver", initial_state=receiver_state(), utc_ms=NOW)
+    store = provision_mirror(root, installation_id=METER)
+    gateway = FencedReceiver(root / "receiver", initial_state=receiver_state(installation_id=METER),
+                             utc_ms=NOW)
     owner = store_owner(store, gateway)
-    lease = task_execution.acquire_resource(RESOURCE, lease_dir=root / "leases")
-    binding = owner.start(writer=lease, receiver=gateway, installation_id=INSTALLATION,
+    lease = task_execution.acquire_resource(store.resource, lease_dir=root / "leases")
+    binding = owner.start(writer=lease, receiver=gateway, installation_id=METER,
                           owner_session_id="session-new", requested_not_after_ms=NOW + 60_000,
                           deadline=DEADLINE, now_ms=NOW)
     assert binding.owner_epoch == 8, binding
@@ -290,6 +295,24 @@ RECEIVER_ENTRYPOINTS = ("enqueue", "deliver", "inspect", "revoke_and_stop", "bin
                          "restore_files", "snapshot_files", "lose_ack", "step_helper")
 
 
+def observe_receiver_calls(monkeypatch, gateway):
+    """Observe read-only calls as well as writes, keeping the real fake behavior."""
+    calls = []
+
+    def observe(name):
+        real = getattr(gateway, name)
+
+        def entry(*args, **kwargs):
+            calls.append(name)
+            return real(*args, **kwargs)
+
+        return entry
+
+    for name in RECEIVER_ENTRYPOINTS:
+        monkeypatch.setattr(gateway, name, observe(name))
+    return calls
+
+
 def install_receiver_tripwire(path):
     """Make every receiver entrypoint fail and write it down.
 
@@ -358,7 +381,7 @@ def test_01_correction_first_gives_no_send_and_revokes_the_epoch(system):
     assert receipt["queues_fenced"] is True
     assert receipt["safe_state"] == "confirmed"
     # The owner mirror: the epoch is withdrawn, nothing is pending.
-    mirror = read_mirror(system.root)
+    mirror = read_mirror(system.root, installation_id=METER)
     assert (mirror["phase"], mirror["owner_epoch"], mirror["pending_command"]) == ("released", 8, None)
     assert mirror["pending_barrier_id"] is None
 
@@ -387,7 +410,7 @@ def test_02_send_first_then_invalidation_gives_no_new_output(system):
     assert len(state["commands"]) == 1
     assert state["commands"][0]["phase"] == "accepted"
     assert state["epoch_high_water"] == 9
-    mirror = read_mirror(system.root)
+    mirror = read_mirror(system.root, installation_id=METER)
     assert (mirror["phase"], mirror["pending_command"]) == ("released", None)
     assert mirror["last_receipt"]["status"] == "accepted"
 
@@ -699,6 +722,68 @@ def test_06_a_changed_plan_is_refused_even_when_it_is_still_valid(artifact):
 
 
 # -- the bounded send --------------------------------------------------------
+
+@pytest.mark.parametrize("fault", ["none", "plan", "binding", "state", "store", "command",
+                                    "missing_binding", "missing_state"])
+def test_i2_direct_send_rechecks_installation(artifact, monkeypatch, fault):
+    """A valid reservation grants no send right after any identity changes."""
+    module = execution()
+    layout = owner_layout(artifact.root)
+    try:
+        command = build_command(module, layout, artifact)
+        layout.owner.record_pending_command(command)
+        before = layout.store.path.read_bytes()
+        offered = command
+        if fault == "plan":
+            context = artifact.plan.financial_context
+            other = replace(artifact.plan, financial_context=replace(
+                context, basis=replace(context.basis, meter_id="other-installation")))
+            artifact.path.write_text(json.dumps(other.to_dict()))
+            offered = replace(command, plan_digest=module.plan_digest(other))
+        elif fault in ("binding", "state"):
+            current = getattr(layout.owner, fault)
+            setattr(layout.owner, fault, replace(current, installation_id="other-installation"))
+        elif fault == "store":
+            layout.store.installation_id = "other-installation"
+        elif fault == "command":
+            offered = replace(command, installation_id="other-installation")
+        elif fault.startswith("missing_"):
+            setattr(layout.owner, fault.removeprefix("missing_"), None)
+        state_before = layout.owner.state
+        calls = observe_receiver_calls(monkeypatch, layout.gateway)
+        error = None
+        with publication_lock(artifact.path) as lease:
+            # Even the changed plan is valid with the offered digest: this is
+            # an installation refusal, not a stale-publication refusal.
+            module.validate_current_locked(lease=lease, expected_digest=offered.plan_digest,
+                                           clock=CLOCK, policy=POLICY)
+            try:
+                receipt = module.send_locked(offered, lease=lease, owner=layout.owner,
+                                             receiver=layout.gateway, deadline=DEADLINE,
+                                             clock=CLOCK, policy=POLICY)
+            except Exception as exc:
+                error = exc
+        if fault == "none":
+            assert error is None
+            assert receipt.status == "accepted"
+            assert receipt.installation_id == INSTALLATION
+            assert calls.count("send") == 1 and "inspect" not in calls
+            assert layout.store.load_strict().pending_command is None
+            assert layout.store.load_strict().last_reserved_sequence == 41
+            return
+        assert isinstance(error, module.ExecutionRefused), error
+        expected = {"missing_binding": "owner_binding_missing",
+                    "missing_state": "owner_state_missing"}.get(fault, "installation_mismatch")
+        assert error.reason == expected
+        assert calls == []
+        assert layout.gateway.effect_log == []
+        assert layout.store.path.read_bytes() == before
+        assert layout.owner.state == state_before
+        assert read_mirror(artifact.root)["pending_command"] == command.to_dict()
+        assert layout.owner._sequence_high_water == 41
+    finally:
+        layout.lease.close()
+
 
 def test_07_send_locked_refuses_a_changed_pending_command(artifact):
     module = execution()
@@ -1039,6 +1124,99 @@ def test_09_a_result_write_after_the_deadline_restores_the_pending_command(artif
 
 
 # -- the owner section -------------------------------------------------------
+
+@pytest.mark.parametrize("meter", ["sandbox", "other-installation", "Sandbox", " sandbox",
+                                    "sandbox "])
+def test_i2_plan_meter_must_equal_owner_installation(artifact, monkeypatch, meter):
+    """Only exact equality permits reservation; aliases must leave no trace."""
+    module = execution()
+    layout = owner_layout(artifact.root)
+    context = artifact.plan.financial_context
+    plan = replace(artifact.plan, financial_context=replace(
+        context, basis=replace(context.basis, meter_id=meter)))
+    artifact.path.write_text(json.dumps(plan.to_dict()))
+    before = layout.store.path.read_bytes()
+    state_before = layout.owner.state
+    calls = observe_receiver_calls(monkeypatch, layout.gateway)
+    try:
+        error = None
+        with publication_lock(artifact.path) as lease:
+            validated = module.validate_current_locked(lease=lease,
+                expected_digest=module.plan_digest(plan), clock=CLOCK, policy=POLICY)
+            assert validated.financial_context.basis.meter_id == meter
+            try:
+                receipt = module.owner_section(lease=lease, owner=layout.owner,
+                    receiver=layout.gateway, request=request(), policy=POLICY,
+                    clock=CLOCK, deadline=DEADLINE)
+            except module.ExecutionRefused as exc:
+                error = exc
+        if meter == INSTALLATION:
+            assert error is None
+            assert receipt.status == "accepted"
+            assert receipt.installation_id == meter
+            assert calls.count("send") == 1 and "inspect" not in calls
+            assert layout.store.load_strict().last_reserved_sequence == 41
+            return
+        assert error is not None, "a foreign plan must be refused before reservation"
+        assert error.reason == "installation_mismatch"
+        assert calls == []
+        assert layout.gateway.effect_log == []
+        assert layout.store.path.read_bytes() == before
+        assert layout.owner.state == state_before
+        assert layout.owner.state.pending_command is None
+        assert layout.owner._sequence_high_water == 40
+    finally:
+        layout.lease.close()
+
+
+@pytest.mark.parametrize("fault", ["binding", "state", "store", "missing_binding", "missing_state"])
+def test_i2_owner_section_checks_every_identity_before_reserving(artifact, monkeypatch, fault):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    try:
+        if fault in ("binding", "state"):
+            current = getattr(layout.owner, fault)
+            setattr(layout.owner, fault, replace(current, installation_id="other-installation"))
+        elif fault == "store":
+            layout.store.installation_id = "other-installation"
+        else:
+            setattr(layout.owner, fault.removeprefix("missing_"), None)
+        before = layout.store.path.read_bytes()
+        state_before = layout.owner.state
+        calls = observe_receiver_calls(monkeypatch, layout.gateway)
+        error = None
+        with publication_lock(artifact.path) as lease:
+            try:
+                module.owner_section(lease=lease, owner=layout.owner, receiver=layout.gateway,
+                    request=request(), policy=POLICY, clock=CLOCK, deadline=DEADLINE)
+            except Exception as exc:
+                error = exc
+        assert isinstance(error, module.ExecutionRefused), error
+        expected = {"missing_binding": "owner_binding_missing",
+                    "missing_state": "owner_state_missing"}.get(fault, "installation_mismatch")
+        assert error.reason == expected
+        assert calls == []
+        assert layout.gateway.effect_log == []
+        assert layout.store.path.read_bytes() == before
+        assert layout.owner.state == state_before
+        assert layout.owner._sequence_high_water == 40
+    finally:
+        layout.lease.close()
+
+
+def test_i2_build_command_does_not_relabel_a_foreign_plan(artifact):
+    module = execution()
+    layout = owner_layout(artifact.root)
+    context = artifact.plan.financial_context
+    other = replace(artifact.plan, financial_context=replace(
+        context, basis=replace(context.basis, meter_id="other-installation")))
+    try:
+        command = module._build_command(owner=layout.owner, request=request(), plan=other,
+                                        sequence=41, clock=CLOCK)
+        assert command.installation_id == "other-installation"
+    finally:
+        layout.lease.close()
+
 
 def test_08_the_owner_section_sends_once_and_records_the_mirror(artifact):
     module = execution()

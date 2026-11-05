@@ -125,6 +125,23 @@ def validate_current_locked(*, lease: PublicationLease, expected_digest: str,
     return plan
 
 
+def _validate_installation(plan: FastPlan, *, owner: OwnerCoordinator,
+                           command: BatteryCommand | None = None) -> None:
+    """Bind the freshly validated meter to the startup-proven owner identity."""
+    binding = owner.binding
+    if binding is None:
+        raise ExecutionRefused("owner_binding_missing")
+    state = owner.state
+    if state is None:
+        raise ExecutionRefused("owner_state_missing")
+    installation = plan.financial_context.basis.meter_id
+    if not (installation == owner.store.installation_id == state.installation_id
+            == binding.installation_id):
+        raise ExecutionRefused("installation_mismatch")
+    if command is not None and command.installation_id != installation:
+        raise ExecutionRefused("installation_mismatch")
+
+
 def _is_reserved(observation: ActuationReceipt) -> bool:
     """The receiver still holds a live reservation of this very command.
 
@@ -177,8 +194,9 @@ def send_locked(command: BatteryCommand, *, lease: PublicationLease,
     if type(deadline) is not Deadline:
         raise ExecutionRefused("deadline_invalid")
     # An earlier caller check never suffices; the final check runs here.
-    validate_current_locked(lease=lease, expected_digest=command.plan_digest,
-                            clock=clock, policy=policy)
+    plan = validate_current_locked(lease=lease, expected_digest=command.plan_digest,
+                                   clock=clock, policy=policy)
+    _validate_installation(plan, owner=owner, command=command)
     if not owner.store.holds(owner.writer):
         raise ExecutionRefused("owner_lease_missing")
     try:
@@ -252,7 +270,7 @@ def _build_command(*, owner: OwnerCoordinator, request: CommandRequest, plan: Fa
     execute_before = min(context.not_after_ts * 1000, binding.owner_not_after_ms)
     if not clock.utc_ms < execute_before:
         raise ExecutionRefused("command_window_invalid")
-    installation = binding.installation_id
+    installation = context.basis.meter_id
     # Unique, without a timestamp and without an array index.
     fingerprint = hashlib.sha256(installation.encode("utf-8")).hexdigest()[:32]
     return BatteryCommand(
@@ -321,8 +339,9 @@ def owner_section(*, lease: PublicationLease, owner: OwnerCoordinator,
     plan = read.plan
     if section.remaining_ns(now()) == 0:
         raise ExecutionRefused("budget_exhausted")
-    validate_current_locked(lease=lease, expected_digest=plan_digest(plan), clock=clock,
-                            policy=policy)
+    plan = validate_current_locked(lease=lease, expected_digest=plan_digest(plan), clock=clock,
+                                   policy=policy)
+    _validate_installation(plan, owner=owner)
     if section.remaining_ns(now()) == 0:
         raise ExecutionRefused("budget_exhausted")
     # The sequence is reserved durably before the send; gaps are allowed.

@@ -27,6 +27,7 @@ from dao.prog.fastctrl.policy import (
 from dao.prog.fastctrl.publication import GatePolicy
 from dao.prog.fastctrl.runner import FastControlRunner
 from dao.tests.prog.fakes.fenced_receiver import FencedReceiver
+from dao.tests.prog.test_fast_execution import observe_receiver_calls
 from dao.tests.prog.test_fast_ownership import RECEIPT_IDENTITY_MISMATCHES
 from dao.tests.prog.test_fast_receiver import state as receiver_state
 from dao.tests.prog.test_fast_runner import FakeHass, make_config
@@ -77,7 +78,8 @@ def financial_plan(*, batteries=1, powers=(PLAN_W,), economics_supported=True):
                            (name, Decimal("0.94")) for name in names))
     # The lease covers the first two intervals, so a profile transition inside
     # the horizon is reachable without leaving the plan window.
-    context = replace(context, terminal_value=terminal, not_after_ts=NOW_TS + 1800,
+    context = replace(context, basis=replace(context.basis, meter_id=INSTALLATION),
+                       terminal_value=terminal, not_after_ts=NOW_TS + 1800,
                       economics_supported=economics_supported)
     intervals = []
     for index, row in enumerate(plan.intervals):
@@ -162,6 +164,45 @@ def propose(plan, state, *, timestamp=NOW_TS, grid_w=None, limits=None):
 def consume(harness, decision, *, now_ms=NOW):
     return harness.runner._consume_financial_actuation(
         decision, harness.plan, owner=harness.owner, now_ms=now_ms)
+
+
+@pytest.mark.parametrize("meter", ["sandbox", "other-installation", "Sandbox", " sandbox",
+                                    "sandbox "])
+def test_i2_plan_meter_must_equal_owner_installation(tmp_path, monkeypatch, meter):
+    plan = financial_plan(batteries=2)
+    context = plan.financial_context
+    plan = replace(plan, financial_context=replace(
+        context, basis=replace(context.basis, meter_id=meter)))
+    harness = build(tmp_path, plan=plan)
+    try:
+        decision = propose(harness.plan, harness.runner.state)
+        assert [battery.write for battery in decision.batteries] == [True, True]
+        before = harness.store.path.read_bytes()
+        state_before = harness.owner.state
+        calls = observe_receiver_calls(monkeypatch, harness.gateway)
+        receipts = consume(harness, decision)
+        if meter == INSTALLATION:
+            assert [receipt.status for receipt in receipts] == ["accepted", "accepted"]
+            assert [receipt.installation_id for receipt in receipts] == [meter, meter]
+            assert calls.count("send") == 2 and "inspect" not in calls
+            assert harness.runner.last_actuation.allowed is True
+            assert harness.store.load_strict().last_reserved_sequence == 42
+            return
+        assert harness.runner.last_actuation.allowed is False
+        assert harness.runner.last_actuation.reason == "installation_mismatch"
+        assert receipts == ()
+        assert calls == []
+        assert harness.gateway.effect_log == []
+        assert harness.store.path.read_bytes() == before
+        assert harness.owner.state == state_before
+        assert harness.owner.state.pending_command is None
+        assert harness.owner._sequence_high_water == 40
+        for controller in harness.runner.state.batteries:
+            assert controller.pending_command is None
+            assert controller.last_accepted_command is None
+            assert controller.execution_status == "unknown"
+    finally:
+        harness.lease.close()
 
 
 def test_01_the_first_v2_plan_proposes_a_real_command_and_is_accepted(tmp_path):
