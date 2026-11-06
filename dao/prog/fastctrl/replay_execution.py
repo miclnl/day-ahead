@@ -1448,5 +1448,17 @@ class ExecutionReplay:
         unused = ("unused_model_response",) if (self._model is not None and at_ts == self._end
                                                 and self._model_responses.keys() - self._model_used) else ()
         reasons = tuple(dict.fromkeys((*self._history_reasons, *(reason for view in views for reason in view.reasons),
-                                       *unused)))
-        return ExecutionSnapshot(binding, tuple(views), self._writes, deepcopy(tuple(self._trace)), reasons)
+                                        *unused)))
+        # Reuse only strictly validated immutable history. A fresh per-snapshot
+        # memo leaves mutable decisions/nested data detached, without rebuilding
+        # their surrounding command/timing graph or re-running constructors.
+        # HelperResult is only shallowly frozen: nonempty helper payloads still
+        # need a full defensive copy, without assuming their fields are scalar.
+        memo = {}
+        for event in self._trace:
+            if type(event) is ProposalEvent:
+                memo[id(event.command)] = event.command
+                memo[id(event.timing)] = event.timing
+            elif type(event) is not ReceiptEvent or not event.receipt.helper_results:
+                memo[id(event)] = event
+        return ExecutionSnapshot(binding, tuple(views), self._writes, deepcopy(tuple(self._trace), memo), reasons)

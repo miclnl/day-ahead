@@ -26,6 +26,7 @@ import datetime
 import json
 import logging
 import math
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, localcontext
@@ -37,7 +38,7 @@ from dao.prog.settlement.types import PriceQuote, SettlementState, TerminalValue
 from .command import BatteryCommand, plan_digest
 from .plan import (
     BatterySpec, BatteryPlanStep, FastPlan, PlanInterval,
-    profile_energy_kwh, profile_power_at,
+    profile_power_at,
 )
 from .policy import (
     BatteryDecision,
@@ -46,7 +47,6 @@ from .policy import (
     FastControlPolicy,
     Measurement,
     PolicyLimits,
-    apply_accepted_command,
 )
 from .replay_execution import (
     Assumptions,
@@ -59,8 +59,10 @@ from .replay_execution import (
     RecordedExecution,
     ReplayEvent,
     ReplayInput,
+    ReplayScenario,
     SocByBattery,
     model_namespace,
+    validate_replay_input,
 )
 
 #: Default AC/DC conversion efficiency used by the simulation battery model when
@@ -883,213 +885,47 @@ def simulate(
     plan: FastPlan,
     samples: Sequence[Sample],
     limits: PolicyLimits,
-    soc_start: float,
+    soc_start: float | Mapping[str, float | None],
     label: str,
     use_fast_layer: bool,
-    inverter_efficiency: float = DEFAULT_INVERTER_EFFICIENCY,
-    timezone: Optional[datetime.tzinfo] = None,
+    inverter_efficiency: float | Mapping[str, float] = DEFAULT_INVERTER_EFFICIENCY,
+    timezone: datetime.tzinfo | None = None,
     *,
     replay_basis: ReplayBasis | None = None,
+    execution: ReplayScenario | None = None,
 ) -> SimResult:
-    """Replay *samples* against *plan*, with or without the fast layer.
+    """Replay explicit execution and physical assumptions; absent execution is unknown.
 
-    Explicit replay evidence replaces today's tariffs/terminal assumptions. This
-    remains a base-tariff physical reconstruction, NOT historical settlement or
-    advantage: retain the exact settlement opening without inventing bonus or
-    monthly-credit state transitions. F3 owns those trajectories/comparisons.
-    No archive, DB or solver reads are performed here or in the tick loop.
+    Archived quotes/opening/terminal support base-tariff reconstruction only.
+    Settlement comparisons remain pending; this pure path performs no I/O.
     """
-    if not plan.specs:
-        raise ValueError("het plan bevat geen batterij")
-    if replay_basis is not None:
-        try:
-            if type(replay_basis) is not ReplayBasis or plan.format_version != 2 or plan.financial_context is None:
-                raise ValueError("replay_basis_required")
-            replay_basis.check_context(plan.financial_context)
-            if not samples or samples[0].timestamp != replay_basis.opening.asof_ts:
-                raise ValueError("replay_opening_mismatch")
-            if len(plan.intervals) != len(replay_basis.quotes):
-                raise ValueError("replay_quote_coverage_mismatch")
-            intervals, matched_quotes = [], []
-            cursor = replay_basis.basis.planning_start_ts
-            for interval, quote in zip(plan.intervals, replay_basis.quotes, strict=True):
-                if (interval.start_ts != cursor
-                        or (quote.start_ts, quote.end_ts) != (interval.start_ts, interval.end_ts)):
-                    raise ValueError("replay_quote_coverage_mismatch")
-                matched_quotes.append(quote)
-                intervals.append(replace(interval, price_import=float(quote.import_rate),
-                                         price_export=float(quote.export_rate)))
-                cursor = interval.end_ts
-            if cursor != replay_basis.basis.horizon_end_ts:
-                raise ValueError("replay_quote_coverage_mismatch")
-            if tuple(spec.name for spec in plan.specs) != tuple(
-                    name for name, _ in replay_basis.terminal_value.reference_efficiency_by_battery):
-                raise ValueError("replay_terminal_identity_mismatch")
-            plan = replace(plan, intervals=intervals,
-                           price_average=sum(float(q.import_rate) for q in matched_quotes) / len(matched_quotes))
-        except (ValueError, TypeError, AttributeError):
-            return SimResult("unknown_reconstruction: replay_basis_mismatch", energy_cost=None,
-                             wear_cost=None, terminal_value=None)
-        label = f"reconstruction_base_tariffs: {label}"
-    if len(samples) < 2:
-        raise ValueError("te weinig meetpunten om te simuleren")
-
-    spec = plan.specs[0] if len(plan.specs) == 1 else aggregate_spec(plan.specs)
-    if plan.format_version == 2:
-        # Keep every profile edge when using the existing aggregate battery
-        # simulator. Differently timed windows cannot be collapsed to one mean.
-        sim_intervals = []
-        for row in plan.intervals:
-            # SOC belongs to the solver interval, not to an invented trajectory
-            # inside it. Reuse the legacy aggregation convention for every slice.
-            planned_soc = _collapse(row).battery(0)
-            edges = sorted({row.start_ts, row.end_ts, *(
-                edge for step in row.batteries for edge in (step.active_from_ts, step.stop_ts)
-                if edge is not None)})
-            for a, b in zip(edges, edges[1:], strict=False):
-                power = sum(profile_power_at(step, a) for step in row.batteries)
-                mean = sum(profile_energy_kwh(step, a, b) for step in row.batteries) * 3600000 / (b - a)
-                sim_intervals.append(replace(row, start_ts=a, end_ts=b, batteries=[BatteryPlanStep(
-                    ac_power_w=mean, mean_ac_power_w=mean, on_power_w=power,
-                    active_from_ts=a, stop_ts=None,
-                    soc_begin=planned_soc.soc_begin, soc_end=planned_soc.soc_end,
-                )]))
-        # House measurements remain left-held, just as on the legacy path;
-        # split the time integration at profile and interval discontinuities.
-        boundaries = sorted({edge for row in sim_intervals for edge in (row.start_ts, row.end_ts)})
-        split_samples = []
-        for sample, following in zip(samples, samples[1:], strict=False):
-            split_samples.append(sample)
-            split_samples.extend(replace(sample, timestamp=edge) for edge in boundaries
-                                 if sample.timestamp < edge < following.timestamp)
-        samples = [*split_samples, samples[-1]]
-    else:
-        sim_intervals = [_collapse(i) for i in plan.intervals]
-    sim_plan = FastPlan(
-        created_ts=plan.created_ts,
-        interval_s=plan.interval_s,
-        specs=[spec],
-        intervals=sim_intervals,
-        strategy=plan.strategy,
-        price_average=plan.price_average,
-        format_version=plan.format_version,
-        financial_context=plan.financial_context,
+    replay_input = validate_replay_input(
+        plan=plan, sample_points=tuple((sample.timestamp, sample.house_w) for sample in samples),
+        soc_start=soc_start, inverter_efficiency=inverter_efficiency, scenario=execution,
     )
-
-    battery = BatteryModel(spec, soc_start, inverter_efficiency)
-    policy = FastControlPolicy(limits)
-    state = ControllerState()
-    result = SimResult(
-        label=label,
-        soc_start=soc_start,
-        capacity_kwh=spec.capacity_kwh,
-        opening_state=None if replay_basis is None else replay_basis.opening,
-        replay_terminal_value=None if replay_basis is None else replay_basis.terminal_value,
+    basis = _prepare_replay_basis(
+        plan, start_ts=replay_input.sample_points[0][0], replay_basis=replay_basis,
+        recorded=execution is not None and isinstance(execution.execution, RecordedExecution),
     )
-
-    previous_command = 0.0
-    for index in range(len(samples) - 1):
-        sample = samples[index]
-        dt_s = samples[index + 1].timestamp - sample.timestamp
-        if dt_s <= 0:
-            continue
-        dt_h = dt_s / 3600.0
-        interval = sim_plan.interval_at(sample.timestamp)
-        if interval is None:
-            continue
-
-        plan_w = (profile_power_at(interval.battery(0), sample.timestamp)
-                  if plan.format_version == 2 else interval.battery(0).ac_power_w)
-        if use_fast_layer:
-            measurement = Measurement(
-                timestamp=sample.timestamp,
-                grid_w=sample.house_w + previous_command,
-                batteries=[
-                    BatteryMeasurement(
-                        soc=battery.soc, power_w=previous_command, valid=True
-                    )
-                ],
-                grid_valid=True,
-            )
-            day_key = _day_key(sample.timestamp, timezone)
-            policy.account(state, sim_plan, measurement, day_key)
-            decision = policy.decide(sim_plan, measurement, state)
-            for proposal in decision.batteries:
-                # Simulated helper writes always succeed, using the same
-                # acceptance bookkeeping as the production runner.
-                apply_accepted_command(state.battery(proposal.index), proposal)
-            command = decision.batteries[0].setpoint_w
-            wrote = decision.batteries[0].write
-            overriding = decision.batteries[0].override
-        else:
-            command = (profile_energy_kwh(interval.battery(0), sample.timestamp,
-                                         samples[index + 1].timestamp) * 1000 / dt_h
-                       if plan.format_version == 2 else plan_w)
-            wrote = abs(command - previous_command) > 1.0
-            overriding = False
-
-        actual_w, dc_kwh = battery.step(command, dt_h)
-        previous_command = actual_w
-
-        grid_w = sample.house_w + actual_w
-        energy_cost = (
-            interval.price_import * max(grid_w, 0.0)
-            - interval.price_export * max(-grid_w, 0.0)
-        ) * dt_h / 1000.0
-        wear_cost = spec.cycle_cost * dc_kwh
-
-        day = _day_key(sample.timestamp, timezone)
-        metrics = result.days.setdefault(day, DayMetrics(day))
-        metrics.energy_cost += energy_cost
-        metrics.wear_cost += wear_cost
-        metrics.import_kwh += max(grid_w, 0.0) * dt_h / 1000.0
-        metrics.export_kwh += max(-grid_w, 0.0) * dt_h / 1000.0
-        metrics.throughput_kwh += dc_kwh
-        metrics.peak_import_w = max(metrics.peak_import_w, grid_w)
-        metrics.writes += 1 if wrote else 0
-        metrics.override_s += dt_s if overriding else 0.0
-
-        result.energy_cost += energy_cost
-        result.wear_cost += wear_cost
-        result.import_kwh += max(grid_w, 0.0) * dt_h / 1000.0
-        result.export_kwh += max(-grid_w, 0.0) * dt_h / 1000.0
-        result.throughput_kwh += dc_kwh
-        result.peak_import_w = max(result.peak_import_w, grid_w)
-        result.writes += 1 if wrote else 0
-        result.override_s += dt_s if overriding else 0.0
-        result.soc_series.append((sample.timestamp, battery.soc))
-
-    result.soc_end = battery.soc
-    result.duration_h = (samples[-1].timestamp - samples[0].timestamp) / 3600.0
-    # Value what is left in the cells, otherwise ending emptier looks cheaper.
-    # Priced at what it would fetch on delivery: average tariff times the
-    # efficiency of getting it back out to AC.
-    valuation = plan.price_average * max(
-        0.01, spec.discharge_efficiency * inverter_efficiency
-    )
-    if replay_basis is not None:
-        with localcontext() as context:
-            context.prec = 36
-            # The archived reference already contains cell→bus→AC efficiency.
-            capacity = sum(Decimal(str(s.capacity_kwh)) for s in plan.specs)
-            valuation = float(replay_basis.terminal_value.eur_per_ac_kwh * sum(
-                Decimal(str(s.capacity_kwh)) * efficiency for s, (_, efficiency)
-                in zip(plan.specs, replay_basis.terminal_value.reference_efficiency_by_battery, strict=True)) / capacity)
-    result.terminal_value = (
-        (result.soc_end - result.soc_start) * spec.kwh_per_percent * valuation
-    )
-    return result
+    run = _run_replay(basis=basis, replay_input=replay_input, limits=limits,
+                      use_fast_layer=use_fast_layer, timezone=timezone)
+    return _summarize_replay(run=run, basis=basis, replay_input=replay_input,
+                             label=label, timezone=timezone)
 
 
 def compare(
     plan: FastPlan,
     samples: Sequence[Sample],
     limits: PolicyLimits,
-    soc_start: float,
-    inverter_efficiency: float = DEFAULT_INVERTER_EFFICIENCY,
-    timezone: Optional[datetime.tzinfo] = None,
+    soc_start: float | Mapping[str, float | None],
+    inverter_efficiency: float | Mapping[str, float] = DEFAULT_INVERTER_EFFICIENCY,
+    timezone: datetime.tzinfo | None = None,
+    *,
+    replay_basis: ReplayBasis | None = None,
+    baseline_execution: ReplayScenario | None = None,
+    fast_execution: ReplayScenario | None = None,
 ) -> Comparison:
-    """Run both scenarios on identical inputs."""
+    """Run independent execution scenarios on identical plan/house/basis inputs."""
     return Comparison(
         baseline=simulate(
             plan,
@@ -1100,6 +936,8 @@ def compare(
             use_fast_layer=False,
             inverter_efficiency=inverter_efficiency,
             timezone=timezone,
+            replay_basis=replay_basis,
+            execution=baseline_execution,
         ),
         fast=simulate(
             plan,
@@ -1110,6 +948,8 @@ def compare(
             use_fast_layer=True,
             inverter_efficiency=inverter_efficiency,
             timezone=timezone,
+            replay_basis=replay_basis,
+            execution=fast_execution,
         ),
     )
 

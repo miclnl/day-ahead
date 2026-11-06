@@ -1422,3 +1422,166 @@ def test_f3a3_rounding_across_a_profile_edge_cannot_extend_the_original_window()
     assert view_at(run, at_ts).command is None
     assert state.battery(0).last_accepted_command is None
     assert run.snapshot(at_ts).writes == 0
+
+
+def _f3a7_snapshot_runs(kind, *, mutable_helper=False):
+    """A full model trace, also replayed as recorded evidence, with 64 sends."""
+    api = model_api()
+    plan = replay_plan()
+    at_ts, end_ts = T0 + 131, T0 + 140
+    decisions = [proposal(setpoint_w=1000 + index, stop_inverter=None) for index in range(64)]
+    for index, decision in enumerate(decisions):
+        # BatteryDecision is an open mutable dataclass: retain even extra data.
+        decision.notes = {"samples": [index]}
+    case = scenario(api, modeled(api, response_delay_s=.125, application_delay_s=.125,
+        lifecycle=(api.ModelStop(T0 + 130, 0, True, True), api.ModelBind(at_ts, 0))),
+        stop_response="ideal_programmed_stop")
+
+    def make_model():
+        run, state, _ = model_run(api, plan=plan, case=case, end=end_ts)
+        for index, decision in enumerate(decisions):
+            tick = T0 + index * 2
+            run.submit(tick_index=index, at_ts=tick, proposals=(decision,), source="fast")
+            run.advance(tick + .25)
+        run.advance(at_ts)
+        return run, state
+
+    first, first_state = make_model()
+    if kind == "modeled":
+        second, second_state = make_model()
+        return api, (first, second), (first_state, second_state), decisions, case, at_ts
+
+    seed = first.snapshot(at_ts)
+    events = list(seed.trace)
+    if mutable_helper:
+        from dao.prog.fastctrl.command import HelperResult
+
+        # HelperResult is frozen but its constructor does not validate these
+        # reachable fields; sharing an enclosing receipt would leak this list.
+        index = next(i for i, event in enumerate(events) if type(event) is api.ReceiptEvent)
+        observation = events[index]
+        helper = HelperResult("setpoint", ["number.watts"], True, None, 1)
+        events[index] = replace(observation, receipt=replace(observation.receipt, helper_results=(helper,)))
+    case = scenario(api, recorded(api, installation_id=seed.binding.installation_id,
+        receiver_generation=seed.binding.receiver_generation,
+        coverage=(api.ExecutionCoverage("accu", T0, end_ts),), events=tuple(events)),
+        stop_response="ideal_programmed_stop")
+    runs, states = [], []
+    for _ in range(2):
+        state = ControllerState()
+        run = api.ExecutionReplay(plan=plan, scenario=case, controller=state, start_ts=T0, end_ts=end_ts)
+        run.advance(at_ts)
+        runs.append(run)
+        states.append(state)
+    inputs = [event.decision for event in case.execution.events if type(event) is api.ProposalEvent]
+    return api, tuple(runs), tuple(states), inputs, case, at_ts
+
+
+@pytest.mark.parametrize("kind", ["modeled", "recorded"])
+def test_f3a7_snapshot_copywork_does_not_reconstruct_immutable_history(monkeypatch, kind):
+    import copy
+    from collections import Counter
+
+    api, (run, _), _, _, _, at_ts = _f3a7_snapshot_runs(kind)
+    expected = run.snapshot(at_ts)
+    assert type(expected.trace) is tuple
+    assert {type(event) for event in expected.trace} == set(get_args(api.ReplayEvent))
+    assert len(model_events(api, expected, "ProposalEvent")) == 64
+    assert len(model_events(api, expected, "ReceiptEvent")) == 64
+    reconstructed = Counter()
+    immutable_types = (BatteryCommand, ActuationReceipt, Deadline, ClockSample,
+                       api.ReplayAttemptTiming, api.ReplayApplication,
+                       RevokeRequest, BarrierReceipt, OwnerBinding)
+    reconstruct = copy._reconstruct
+
+    def observe(value, *args, **kwargs):
+        if type(value) in immutable_types:
+            reconstructed[type(value).__name__] += 1
+        return reconstruct(value, *args, **kwargs)
+
+    # Count actual historical DTO reconstruction work, not wallclock timing or
+    # source spelling. The detached mutable-decision contract is tested below.
+    monkeypatch.setattr(copy, "_reconstruct", observe)
+    for _ in range(4):
+        actual = run.snapshot(at_ts)
+        assert actual == expected  # Includes every receipt, deadline and order.
+    assert not reconstructed, f"unnecessary historical DTO reconstruction: {dict(reconstructed)}"
+
+
+@pytest.mark.parametrize("kind", ["modeled", "recorded"])
+def test_f3a7_snapshot_decisions_detach_inputs_runs_and_each_snapshot(kind):
+    api, (run, other), states, inputs, case, at_ts = _f3a7_snapshot_runs(kind)
+    before_inputs, before_case, before_states = deepcopy(inputs), deepcopy(case), deepcopy(states)
+    earlier, current, independent = run.snapshot(at_ts), run.snapshot(at_ts), other.snapshot(at_ts)
+    expected = deepcopy(earlier)
+    assert earlier == current == independent
+    proposals = model_events(api, current, "ProposalEvent")
+    assert [event.decision.setpoint_w for event in proposals] == list(range(1000, 1064))
+    proposals[0].decision.setpoint_w = -4999
+    proposals[0].decision.write = False
+    proposals[0].decision.notes["samples"].append("snapshot mutation")
+    assert earlier == independent == expected
+    assert model_events(api, earlier, "ProposalEvent")[0].decision.notes == {"samples": [0]}
+    assert model_events(api, independent, "ProposalEvent")[0].decision.notes == {"samples": [0]}
+    assert inputs == before_inputs and case == before_case and states == before_states
+    assert inputs[0].notes == {"samples": [0]}
+    later = run.snapshot(at_ts)
+    assert later == expected
+    assert model_events(api, later, "ProposalEvent")[0].decision.notes == {"samples": [0]}
+    model_events(api, later, "ProposalEvent")[1].decision.notes["samples"].append("later mutation")
+    assert model_events(api, earlier, "ProposalEvent")[1].decision.notes == {"samples": [1]}
+    assert model_events(api, current, "ProposalEvent")[1].decision.notes == {"samples": [1]}
+    inputs[0].setpoint_w = 9999
+    inputs[0].notes["samples"].append("caller mutation")
+    for active in (run, other):
+        fresh = active.snapshot(at_ts)
+        assert fresh == expected
+        assert model_events(api, fresh, "ProposalEvent")[0].decision.notes == {"samples": [0]}
+        assert model_events(api, fresh, "ProposalEvent")[1].decision.notes == {"samples": [1]}
+    run.advance(at_ts + 1)
+    assert run.snapshot(at_ts + 1) == expected
+
+
+def test_f3a7_snapshot_detaches_mutable_values_nested_inside_frozen_helpers():
+    api, (run, other), _, _, case, at_ts = _f3a7_snapshot_runs("recorded", mutable_helper=True)
+    earlier, current = run.snapshot(at_ts), run.snapshot(at_ts)
+    expected = deepcopy(earlier)
+    observation = model_events(api, current, "ReceiptEvent")[0]
+    observation.receipt.helper_results[0].entity_id.append("snapshot mutation")
+    assert earlier == run.snapshot(at_ts) == other.snapshot(at_ts) == expected
+    source = next(event for event in case.execution.events if type(event) is api.ReceiptEvent)
+    assert source.receipt.helper_results[0].entity_id == ["number.watts"]
+    source.receipt.helper_results[0].entity_id.append("caller mutation")
+    assert run.snapshot(at_ts) == other.snapshot(at_ts) == expected
+
+
+@pytest.mark.parametrize("kind", ["modeled", "recorded"])
+def test_f3a7_snapshot_receipt_application_preserves_earlier_evidence(kind):
+    api = model_api()
+    if kind == "modeled":
+        run, _, _ = model_run(api, response_delay_s=.125, application_delay_s=.125)
+        run.submit(tick_index=0, at_ts=T0, proposals=(proposal(setpoint_w=1000, stop_inverter=None),),
+                   source="fast")
+    else:
+        cmd = replay_command(replay_plan())
+        events = (send_event(api, cmd, T0, replay_timing(api, cmd)),
+                  replay_receipt(api, cmd, T0 + .125, apply_ts=T0 + .25))
+        run, _ = recorded_run(api, events=events)
+    run.advance(T0 + .125)
+    earlier = run.snapshot(T0 + .125)
+    expected = deepcopy(earlier)
+    assert earlier.batteries[0].command is None and earlier.batteries[0].pending is not None
+    observed, = model_events(api, earlier, "ReceiptEvent")
+    assert observed.receipt.status == "accepted"
+    if kind == "modeled":
+        assert observed.application is None
+    else:
+        assert observed.application.at_ts == T0 + .25
+    run.advance(T0 + .25)
+    later = run.snapshot(T0 + .25)
+    assert earlier == expected
+    assert later.batteries[0].command.setpoint_w == 1000 and later.batteries[0].pending is None
+    applied, = model_events(api, later, "ReceiptEvent")
+    assert applied.receipt == observed.receipt
+    assert applied.application.at_ts == T0 + .25 and applied.application.outcome == "accepted"
+    assert applied.application.order > applied.order

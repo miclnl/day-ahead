@@ -307,6 +307,7 @@ class TestPlanReconstruction:
     def test_the_reconstructed_plan_can_drive_the_backtest(self):
         from dao.prog.fastctrl.policy import PolicyLimits
         from dao.prog.fastctrl.simulate import Sample, compare
+        from dao.tests.prog.test_fast_simulate import modeled_case
 
         loader, stamps = self.build_loader()
         plan = loader._plan(
@@ -319,7 +320,9 @@ class TestPlanReconstruction:
             Sample(stamps[0] + offset, 1500.0 if offset % 900 else 4000.0)
             for offset in range(0, 3 * 3600, 60)
         ]
-        result = compare(plan, samples, PolicyLimits(), 70.0)
+        result = compare(plan, samples, PolicyLimits(), 70.0,
+                         baseline_execution=modeled_case("history-baseline"),
+                         fast_execution=modeled_case("history-fast"))
         assert result.baseline.duration_h == pytest.approx(3.0, abs=0.1)
         assert result.fast.import_kwh <= result.baseline.import_kwh
 

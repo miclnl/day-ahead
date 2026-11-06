@@ -169,6 +169,8 @@ def _limits_from_config(config, ha_getter) -> PolicyLimits:
 def cmd_simulate(args) -> int:
     from da_report import Report
 
+    from dao.prog.fastctrl.replay_execution import ModeledExecution, ReplayPhysics, ReplayScenario
+
     report = Report(args.options)
     config = report.config
     spec = _spec_from_config(config, report.ha_getter)
@@ -207,14 +209,24 @@ def cmd_simulate(args) -> int:
     if args.min_benefit is not None:
         limits.min_benefit = args.min_benefit
 
+    physics = ReplayPhysics("battery_model_v1", args.step, "ideal_programmed_stop",
+                            equal_initial_soc=len(window.plan.specs) > 1)
+    model = ModeledExecution(initial_execution="stopped", default_effect="complete",
+                             prepare_delay_s=0, response_delay_s=0, application_delay_s=0)
+    logging.info("Wat-als aggregaatmodel op historische huisinput; geen opgenomen uitvoering; begin-SoC=%s",
+                 window.soc_start)
     comparison = compare(
-        window.plan, window.samples, limits, window.soc_start
+        window.plan, window.samples, limits, window.soc_start,
+        baseline_execution=ReplayScenario("history-aggregate-baseline-model", model, physics),
+        fast_execution=ReplayScenario("history-aggregate-fast-model", model, physics),
     )
     log_comparison(comparison, show_daily=not args.no_daily)
     return 0
 
 
 def cmd_demo(args) -> int:
+    from dao.prog.fastctrl.replay_execution import ModeledExecution, ReplayPhysics, ReplayScenario
+
     spec = BatterySpec(
         name="demo",
         capacity_kwh=args.capacity,
@@ -232,7 +244,15 @@ def cmd_demo(args) -> int:
         min_benefit=args.min_benefit,
         daily_extra_throughput=args.daily_throughput,
     )
-    comparison = compare(plan, samples, limits, soc_start)
+    physics = ReplayPhysics("battery_model_v1", 60, "ideal_programmed_stop",
+                            equal_initial_soc=len(plan.specs) > 1)
+    model = ModeledExecution(initial_execution="stopped", default_effect="complete",
+                             prepare_delay_s=0, response_delay_s=0, application_delay_s=0)
+    comparison = compare(
+        plan, samples, limits, soc_start,
+        baseline_execution=ReplayScenario("demo-baseline-model", model, physics),
+        fast_execution=ReplayScenario("demo-fast-model", model, physics),
+    )
     log_comparison(comparison, show_daily=not args.no_daily)
     return 0
 

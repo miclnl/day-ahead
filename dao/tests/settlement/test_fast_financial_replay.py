@@ -18,6 +18,7 @@ from dao.prog.fastctrl.simulate import Comparison, HistoryLoader, Sample, log_co
 from dao.prog.settlement.publication import FinancialPlanBlocked
 from dao.prog.settlement.tariffs import make_snapshot, quote
 from dao.prog.settlement.types import SettlementState
+from dao.tests.prog.test_fast_simulate import modeled_case
 from dao.tests.settlement.test_fast_contract import ready_plan
 from dao.tests.settlement.test_publication import NOW, START_TS, pricing_config, replay_for_plan
 from dao.tests.settlement.test_publication import system as system
@@ -202,6 +203,8 @@ def test_later_tariff_revision_cannot_change_archived_evidence(system):
 
 
 def test_simulate_uses_explicit_archived_quotes_opening_terminal_without_io(monkeypatch):
+    from dao.prog.fastctrl.simulate import compare
+
     api = replay_api()
     plan, replay = synthetic_replay()
     plan = bind_replay(plan, replay)
@@ -222,23 +225,39 @@ def test_simulate_uses_explicit_archived_quotes_opening_terminal_without_io(monk
     monkeypatch.setattr(HistoryLoader, "_series", forbidden)
     monkeypatch.setattr(api, "read_replay_basis", forbidden)
     samples = [Sample(NOW, 1000), Sample(NOW + 900, 1000)]
-    result = simulate(plan, samples, PolicyLimits(), 50, "sandbox", False, replay_basis=replay)
+    result = simulate(plan, samples, PolicyLimits(), 50, "sandbox", False, replay_basis=replay,
+                      execution=modeled_case("archived-quotes", hold=900))
     assert result.label.startswith("reconstruction_base_tariffs")
     assert result.energy_cost == pytest.approx(0.025)  # 0.25 kWh * archived EUR 0.10, not 999.
     assert result.opening_state is replay.opening
     assert result.replay_terminal_value is replay.terminal_value
     assert result.soc_start == 50  # Settlement opening is not battery SoC.
-    assert simulate(plan, samples, PolicyLimits(), 50, "legacy", False).energy_cost == pytest.approx(249.75)
+    missing_basis = simulate(plan, samples, PolicyLimits(), 50, "missing basis", False,
+                             execution=modeled_case("missing-basis", hold=900))
+    assert missing_basis.energy_cost is missing_basis.total_cost is None
+    assert missing_basis.import_kwh == pytest.approx(.25)
+    assert "replay_basis_required" in missing_basis.reasons
+    comparison = compare(plan, samples, PolicyLimits(), 50, replay_basis=replay,
+                         baseline_execution=modeled_case("archived-baseline", hold=900),
+                         fast_execution=modeled_case("archived-fast", hold=900))
+    assert comparison.baseline.energy_cost == pytest.approx(.025)
+    for side in (comparison.baseline, comparison.fast):
+        assert side.opening_state is replay.opening
+        assert side.replay_terminal_value is replay.terminal_value
+    assert comparison.saving == "unknown_reconstruction: settlement_comparison_pending"
 
 
 def test_simulate_terminal_uses_archived_ac_reference_once_not_new_tariff_or_inverter():
     replay_api()
     plan, replay = synthetic_replay()
     plan = bind_replay(plan, replay)
+    # Keep the full 900s physical oracle within an explicitly valid context.
+    plan.financial_context = replace(plan.financial_context, not_after_ts=plan.horizon_end_ts)
     step = plan.intervals[0].batteries[0]
     step.ac_power_w = step.mean_ac_power_w = step.on_power_w = 1000
     result = simulate(plan, [Sample(NOW, 0), Sample(NOW + 900, 0)], PolicyLimits(), 50,
-                      "sandbox", False, inverter_efficiency=1, replay_basis=replay)
+                      "sandbox", False, inverter_efficiency=1, replay_basis=replay,
+                      execution=modeled_case("archived-terminal", hold=900))
     # 0.25 cell kWh added, then valued with exactly archived EUR/kWh * archived eta 0.94.
     assert result.terminal_value == pytest.approx(float(D("0.25") * D("0.94") *
                             D("0.123456789012345678901234567890123456")))
@@ -258,7 +277,8 @@ def test_simulate_mismatch_is_explicit_unknown_without_a_euro_claim(fault):
         context = replace(context, terminal_value=replace(context.terminal_value, eur_per_ac_kwh=D("0.7")))
     plan = replace(plan, financial_context=context)
     result = simulate(plan, [Sample(NOW, 1000), Sample(NOW + 900, 1000)], PolicyLimits(),
-                      50, "sandbox", False, replay_basis=replay)
+                      50, "sandbox", False, replay_basis=replay,
+                      execution=modeled_case("mismatch", hold=900))
     assert result.label.startswith("unknown_reconstruction:")
     assert result.energy_cost is result.wear_cost is result.terminal_value is result.total_cost is None
 
@@ -300,7 +320,8 @@ def test_fix1_replay_requires_complete_bidirectional_plan_quote_coverage(fault):
         replay = replace(replay, quotes=(replace(replay.quotes[0], end_ts=NOW + 1800), replay.quotes[2]))
     plan = bind_replay(plan, replay)
     result = simulate(plan, [Sample(NOW, 1000), Sample(NOW + 900, 1000)], PolicyLimits(),
-                      50, "sandbox", True, replay_basis=replay)
+                      50, "sandbox", True, replay_basis=replay,
+                      execution=modeled_case("quote-coverage", hold=900))
     assert result.label.startswith("unknown_reconstruction:"), result
     assert result.energy_cost is result.wear_cost is result.terminal_value is result.total_cost is None
 
@@ -326,7 +347,8 @@ def test_fix1_valid_replay_policy_uses_average_of_exactly_paired_quotes(monkeypa
 
     monkeypatch.setattr(FastControlPolicy, "decide", capture_policy)
     samples = [Sample(NOW + i * 900, 1000) for i in range(4)]
-    result = simulate(plan, samples, PolicyLimits(), 50, "sandbox", True, replay_basis=replay)
+    result = simulate(plan, samples, PolicyLimits(), 50, "sandbox", True, replay_basis=replay,
+                      execution=modeled_case("quote-projection", hold=900))
     assert result.label.startswith("reconstruction_base_tariffs:")
     assert observed == [(0.3, [0.1, 0.2, 0.6])] * 3
     assert plan.price_average == 999  # The mutable caller plan is not relabelled.
@@ -336,9 +358,12 @@ def comparison_with_unknown_result(unknown_side):
     plan, replay = synthetic_replay()
     plan = bind_replay(plan, replay)
     samples = [Sample(NOW, 1000), Sample(NOW + 900, 1000)]
-    known = simulate(plan, samples, PolicyLimits(), 50, "legacy", False)
+    known = simulate(plan, samples, PolicyLimits(), 50, "known reconstruction", False,
+                     replay_basis=replay, execution=modeled_case("known", hold=900))
+    assert known.total_cost is not None
     plan = replace(plan, financial_context=replace(plan.financial_context, replay_basis_hash="f" * 64))
-    unknown = simulate(plan, samples, PolicyLimits(), 50, "sandbox", False, replay_basis=replay)
+    unknown = simulate(plan, samples, PolicyLimits(), 50, "sandbox", False, replay_basis=replay,
+                       execution=modeled_case("unknown", hold=900))
     assert unknown.label.startswith("unknown_reconstruction:") and unknown.total_cost is None
     return Comparison(unknown if unknown_side != "fast" else known,
                       unknown if unknown_side != "baseline" else known)

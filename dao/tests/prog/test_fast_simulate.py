@@ -25,6 +25,236 @@ from dao.prog.fastctrl.simulate import (
 T0 = 1_700_000_000
 
 
+def modeled_case(scenario_id, *, hold=60, equal_initial_soc=False):
+    from dao.prog.fastctrl.replay_execution import ModeledExecution, ReplayPhysics, ReplayScenario
+
+    return ReplayScenario(scenario_id, ModeledExecution(
+        initial_execution="stopped", default_effect="complete", prepare_delay_s=0,
+        response_delay_s=0, application_delay_s=0,
+    ), ReplayPhysics("battery_model_v1", hold, "ideal_programmed_stop", equal_initial_soc))
+
+
+def test_f3a7_missing_execution_is_unknown_not_success(caplog):
+    import logging
+
+    from dao.prog.fastctrl.simulate import log_comparison
+
+    plan = flat_plan(make_spec(), battery_w=1000)
+    samples = [Sample(T0, 500), Sample(T0 + 60, 500)]
+    result = simulate(plan, samples, PolicyLimits(), 50, "old positional caller", False, 1, None)
+    assert result.label.startswith("unknown_reconstruction:")
+    assert result.execution_kind == "missing" and result.coverage_status == "unknown"
+    assert "execution_input_missing" in result.reasons
+    for attribute in ("import_kwh", "export_kwh", "throughput_kwh", "soc_end", "peak_import_w",
+                      "energy_cost", "wear_cost", "terminal_value", "total_cost", "cycles", "average_soc"):
+        assert getattr(result, attribute) is None
+    assert result.soc_start_by_battery == (("accu", 50),)
+    assert result.duration_h == pytest.approx(1 / 60)
+    assert result.writes == 0 and result.trace == ()
+    assert result.segments and result.days
+    comparison = compare(plan, samples, PolicyLimits(), 50, 1, None)
+    assert comparison.extra_cycles is None
+    for output in (comparison.saving, comparison.saving_per_day,
+                   comparison.report(), comparison.daily_table()):
+        assert output.startswith("unknown_reconstruction:")
+        assert "Besparing:" not in output and "euro" not in output
+    with caplog.at_level(logging.INFO):
+        log_comparison(comparison)
+    assert "execution_input_missing" in caplog.text
+
+
+@pytest.mark.parametrize("caller", ["demo", "simulate"])
+@pytest.mark.parametrize("gap", [False, True])
+def test_f3a7_callers_are_explicit_models_and_unknown_reports_are_safe(monkeypatch, caplog, caller, gap):
+    import logging
+    import sys
+    from types import SimpleNamespace
+
+    from dao.prog import da_fast
+    from dao.prog.fastctrl.replay_execution import ModeledExecution
+    from dao.prog.fastctrl.simulate import HistoryWindow
+
+    cadence = 60 if caller == "demo" else 30
+    plan = flat_plan(make_spec(name="totaal"))
+    samples = [Sample(T0, 500), Sample(T0 + cadence, 500),
+               Sample(T0 + cadence * (3 if gap else 2), 500)]
+    window = HistoryWindow(plan, samples, 50, cadence, "synthetic recorder fixture",
+                           ["Aangenomen opening-SoC; ontbrekende recorderbron"])
+    config = SimpleNamespace(fast_control=SimpleNamespace(grid_power=object(), batteries=[]),
+                             time_zone="Europe/Amsterdam", interval="15min")
+    loaded, reports, compared = [], [], []
+    report = SimpleNamespace(config=config, ha_getter=object(), db_ha=object(), db_da=object())
+
+    def make_report(options):
+        reports.append(options)
+        return report
+
+    class Loader:
+        def __init__(self, db_ha, db_da, actual_report, zone):
+            assert (db_ha, db_da, actual_report, zone) == (
+                report.db_ha, report.db_da, report, config.time_zone)
+
+        def load(self, **kwargs):
+            loaded.append(kwargs)
+            return window
+
+    def compare_spy(*args, **kwargs):
+        baseline = kwargs.get("baseline_execution")
+        fast = kwargs.get("fast_execution")
+        assert baseline is not None and fast is not None, "caller omitted explicit model scenarios"
+        assert baseline is not fast and baseline.scenario_id != fast.scenario_id
+        for scenario in (baseline, fast):
+            assert isinstance(scenario.execution, ModeledExecution)
+            model, physics = scenario.execution, scenario.physics
+            assert (model.initial_execution, model.default_effect) == ("stopped", "complete")
+            assert (model.prepare_delay_s, model.response_delay_s, model.application_delay_s) == (0, 0, 0)
+            assert (physics.version, physics.house_hold_s, physics.stop_response) == (
+                "battery_model_v1", cadence, "ideal_programmed_stop")
+        result = compare(*args, **kwargs)
+        compared.append(result)
+        return result
+
+    monkeypatch.setitem(sys.modules, "da_report", SimpleNamespace(Report=make_report))
+    monkeypatch.setattr(da_fast, "HistoryLoader", Loader)
+    monkeypatch.setattr(da_fast, "_spec_from_config", lambda *args: plan.specs[0])
+    monkeypatch.setattr(da_fast, "_limits_from_config", lambda *args: PolicyLimits())
+    monkeypatch.setattr(da_fast, "_entity_scales", lambda sensor: [("sensor.grid", 1)])
+    monkeypatch.setattr(da_fast, "synthetic_case", lambda *args, **kwargs: (plan, samples, 50))
+    monkeypatch.setattr(da_fast, "compare", compare_spy)
+    args = da_fast.build_parser().parse_args([caller, *(["--step", "30"] if caller == "simulate" else [])])
+    with caplog.at_level(logging.INFO):
+        assert getattr(da_fast, f"cmd_{caller}")(args) == 0
+    assert len(compared) == 1
+    for result in (compared[0].baseline, compared[0].fast):
+        assert result.execution_kind == "modeled"
+        assert result.soc_start_by_battery == (("totaal", 50),)
+        assert (result.total_cost is None) is gap
+    assert "execution_kind=modeled" in caplog.text
+    for assumption in ("house_hold_s", "ideal_programmed_stop", "fresh_policy_start",
+                       "prepare_delay_s", "response_delay_s", "application_delay_s"):
+        assert assumption in caplog.text
+    if gap:
+        assert "unknown_reconstruction:" in caplog.text
+        assert "Besparing:" not in caplog.text
+    if caller == "simulate":
+        assert reports == [args.options] and len(loaded) == 1
+        assert loaded[0]["step_s"] == 30 and loaded[0]["spec"] is plan.specs[0]
+        assert window.warnings[0] in caplog.text
+        assert "wat-als" in caplog.text.lower() and "aggregaatmodel" in caplog.text.lower()
+        assert "begin-SoC=50" in caplog.text
+    else:
+        assert reports == loaded == []
+
+
+def test_f3a7_compare_isolates_states_and_never_reuses_recorded_ack():
+    from copy import deepcopy
+
+    from dao.prog.fastctrl import replay_execution as replay
+    from dao.tests.prog.test_fast_replay_execution import (
+        replay_command,
+        replay_receipt,
+        replay_timing,
+        send_event,
+    )
+
+    plan = flat_plan(make_spec(charge_efficiency=1, discharge_efficiency=1), battery_w=1000)
+    samples = [Sample(T0, 0), Sample(T0 + 60, 0), Sample(T0 + 120, 0)]
+    opening, efficiencies = {"accu": 50}, {"accu": 1}
+    before = deepcopy((plan, samples, opening, efficiencies))
+    kwargs = dict(inverter_efficiency=efficiencies, baseline_execution=modeled_case("baseline"),
+                  fast_execution=modeled_case("fast"))
+    first = compare(plan, samples, PolicyLimits(), opening, **kwargs)
+    repeated = compare(plan, samples, PolicyLimits(), opening, **kwargs)
+    assert first == repeated
+    assert first.baseline is not first.fast and first.baseline.days is not first.fast.days
+    commands = [{event.command.command_id for event in result.trace
+                 if isinstance(event, replay.ProposalEvent) and event.command is not None}
+                for result in (first.baseline, first.fast)]
+    assert all(commands) and commands[0].isdisjoint(commands[1])
+    assert first.baseline.soc_end == pytest.approx(50 + 1 / 3)
+    assert first.fast.soc_start_by_battery == first.baseline.soc_start_by_battery == (("accu", 50),)
+    assert (plan, samples, opening, efficiencies) == before
+
+    command = replay_command(plan, hold_until_ms=(T0 + 120) * 1000)
+    events = (send_event(replay, command, T0, replay_timing(replay, command)),
+              replay_receipt(replay, command, T0, apply_ts=T0))
+    recorded = _f3a5_recorded(plan, T0, T0 + 120, events)
+    comparison = compare(plan, samples, PolicyLimits(), opening,
+                         inverter_efficiency=efficiencies, baseline_execution=recorded)
+    assert comparison.baseline.trace == events and comparison.baseline.writes == 1
+    assert comparison.baseline.import_kwh == pytest.approx(1 / 30)
+    assert comparison.fast.execution_kind == "missing"
+    assert comparison.fast.trace == () and comparison.fast.import_kwh is None
+    modeled = compare(plan, samples, PolicyLimits(), opening, inverter_efficiency=efficiencies,
+                      baseline_execution=recorded, fast_execution=modeled_case("alternative"))
+    assert modeled.baseline == comparison.baseline
+    assert all(event.command != command for event in modeled.fast.trace
+               if isinstance(event, replay.ProposalEvent))
+    # Selecting fast policy cannot rewrite recorded execution into a counterfactual.
+    same_recording = simulate(plan, samples, PolicyLimits(), opening, "recorded", True,
+                              inverter_efficiency=efficiencies, execution=recorded)
+    assert same_recording.segments == comparison.baseline.segments
+    assert same_recording.trace == events
+
+
+def test_f3a7_existing_simulator_no_write_uses_previous_command(monkeypatch):
+    from dao.prog.fastctrl.policy import (
+        AcceptedCommand,
+        BatteryDecision,
+        Decision,
+        FastControlPolicy,
+    )
+
+    proposals = []
+
+    def decide(policy, plan, measurement, state, **kwargs):
+        first = measurement.timestamp == T0
+        proposal = BatteryDecision(
+            0, "accu", 1000 if first else 1100, 0, first, True, "no-write probe",
+            mode="Aan", soc=50,
+            accepted=AcceptedCommand(1000, T0, True) if first else None,
+        )
+        proposals.append((proposal.setpoint_w, proposal.write))
+        return Decision(measurement.timestamp, batteries=[proposal])
+
+    monkeypatch.setattr(FastControlPolicy, "decide", decide)
+    plan = flat_plan(make_spec(charge_efficiency=1, discharge_efficiency=1))
+    result = simulate(plan, [Sample(T0, 0), Sample(T0 + 60, 0), Sample(T0 + 120, 0)],
+                      PolicyLimits(), 50, "no-write probe", True, inverter_efficiency=1,
+                      execution=modeled_case("no-write"))
+    assert proposals == [(1000, True), (1100, False)]
+    # Both minutes use the accepted 1000 W, never the suppressed 1100 W.
+    assert result.import_kwh == pytest.approx(1 / 30)
+    assert result.export_kwh == 0
+    assert result.throughput_kwh == pytest.approx(1 / 30)
+    assert result.soc_end == pytest.approx(50 + 1 / 3)
+    assert [segment.batteries[0].command_w for segment in result.segments] == [1000, 1000]
+    from dao.prog.fastctrl.replay_execution import ProposalEvent
+
+    suppressed = [event for event in result.trace if isinstance(event, ProposalEvent)
+                  and event.at_ts == T0 + 60]
+    assert len(suppressed) == 1 and suppressed[0].command is None
+
+
+def test_f3a7_existing_simulator_does_not_net_battery_throughput():
+    from dataclasses import replace
+
+    spec = make_spec(charge_efficiency=1, discharge_efficiency=1)
+    plan = flat_plan(spec, battery_w=1000)
+    plan.specs.append(replace(spec, name="second"))
+    for row in plan.intervals:
+        row.batteries.append(BatteryPlanStep(-1000, 50, 50))
+    result = simulate(plan, [Sample(T0, 0), Sample(T0 + 900, 0)], PolicyLimits(),
+                      50, "opposing batteries", False, inverter_efficiency=1,
+                      execution=modeled_case("opposing", hold=900, equal_initial_soc=True))
+    # Each battery moves .25 kWh, even though the site exchanges nothing.
+    assert result.throughput_kwh == pytest.approx(.5)
+    assert result.import_kwh == result.export_kwh == 0
+    assert result.wear_cost == pytest.approx(.005)
+    assert result.soc_end == pytest.approx(50)
+    assert result.soc_end_by_battery == (("accu", 52.5), ("second", 47.5))
+
+
 def f2b_fixed_synthetic_datetime():
     """Freeze only this module's date/local-zone dependency, not process clocks."""
     import datetime as dt
@@ -51,21 +281,29 @@ def f2b_fixed_synthetic_datetime():
                            time=dt.time, timedelta=dt.timedelta)
 
 
-def test_f2b_r17_two_day_synthetic_matches_base_exactly(monkeypatch):
+def test_f2b_r17_two_day_synthetic_explicit_model_is_balanced(monkeypatch):
     from importlib import import_module
 
     module = import_module("dao.prog.fastctrl.simulate")
     monkeypatch.setattr(module, "datetime", f2b_fixed_synthetic_datetime())
     plan, samples, soc = synthetic_case(make_spec(), days=2)
     assert plan.created_ts == 1793574000
-    result = simulate(plan, samples, PolicyLimits(), soc, "R17 BASE", use_fast_layer=True)
-    assert (result.import_kwh, result.export_kwh, result.throughput_kwh,
-            result.writes, result.override_s) == (
-        8.446337648469072, 8.5749187089622, 31.693455013242342, 158, 30000.0,
-    )
+    scenario = modeled_case("R17 explicit model")
+    result = simulate(plan, samples, PolicyLimits(), soc, "R17 model", True, execution=scenario)
+    assert result.coverage_status == "complete" and result.duration_h == 48
+    house_kwh = sum(sample.house_w * (following.timestamp - sample.timestamp) / 3600000
+                    for sample, following in zip(samples, samples[1:], strict=False))
+    charge = sum(b.charge_ac_kwh for segment in result.segments for b in segment.batteries)
+    discharge = sum(b.discharge_ac_kwh for segment in result.segments for b in segment.batteries)
+    assert result.import_kwh - result.export_kwh == pytest.approx(house_kwh + charge - discharge)
+    assert result.throughput_kwh == pytest.approx(charge * .95 + discharge / .95)
+    assert (result.soc_end - soc) * .1 == pytest.approx(charge * .95 * .95 - discharge / (.95 * .95))
+    assert all(20 <= b.soc_end <= 95 for segment in result.segments for b in segment.batteries)
+    assert result.import_kwh > 0 and result.export_kwh > 0 and result.writes > 0
 
 
-def test_f2b_simulator_applies_proposal_between_decisions_without_io(monkeypatch):
+@pytest.mark.parametrize("min_command_interval", [0, 60])
+def test_f2b_simulator_applies_explicit_model_acceptance_between_decisions_without_io(monkeypatch, min_command_interval):
     from dao.prog.fastctrl.policy import FastControlPolicy
 
     observations = []
@@ -83,14 +321,23 @@ def test_f2b_simulator_applies_proposal_between_decisions_without_io(monkeypatch
     plan = flat_plan(make_spec(charge_efficiency=1, discharge_efficiency=1),
                      price=0.4, export=0.1)
     result = simulate(plan, [Sample(T0, 1000), Sample(T0 + 60, 1000), Sample(T0 + 120, 1000)],
-                      PolicyLimits(min_benefit=0, deadband=150), 80, "acceptance", True,
-                      inverter_efficiency=1)
-    assert observations == [((0, 0), (0, 0)), ((-1000, T0), (-1000, T0))]
-    assert result.import_kwh == 0
+                      PolicyLimits(min_benefit=0, deadband=150, min_command_interval=min_command_interval),
+                      80, "acceptance", True,
+                      inverter_efficiency=1, execution=modeled_case("acceptance"))
+    # The explicit opening zero command participates in the real rate limit.
+    # With no rate limit, retain the original two-minute physical oracle.
+    previous = 0 if min_command_interval else -1000
+    assert observations == [((0, T0), (0, T0)), ((previous, T0), (previous, T0))]
+    if min_command_interval:
+        assert result.import_kwh == pytest.approx(1 / 60)
+        assert result.throughput_kwh == pytest.approx(1 / 60)
+        assert result.soc_end == pytest.approx(80 - 1 / 6)
+    else:
+        assert result.import_kwh == 0
+        assert result.throughput_kwh == pytest.approx(1 / 30)
+        assert result.soc_end == pytest.approx(80 - 1 / 3)
     assert result.export_kwh == 0
-    assert result.throughput_kwh == pytest.approx(1 / 30)
-    assert result.soc_end == pytest.approx(80 - 1 / 3)
-    assert result.writes == 1
+    assert result.writes == 2
 
 
 @pytest.mark.parametrize("multiple", [False, True])
@@ -130,34 +377,38 @@ def test_fix1_simulation_preserves_interval_soc_in_real_storage_valuation(monkey
 
     def observe_value(sim_plan, now, index, limits):
         value = original(sim_plan, now, index, limits)
-        observed.append((value, [(row.battery(0).soc_begin, row.battery(0).soc_end)
-                                 for row in sim_plan.intervals]))
+        observed.append((value, [[(step.soc_begin, step.soc_end) for step in row.batteries]
+                                 for row in sim_plan.intervals], sim_plan.financial_context))
         return value
 
     monkeypatch.setattr(policy_module, "estimate_storage_value", observe_value)
     result = simulate(plan, [Sample(plan.intervals[0].start_ts, 1000), Sample(plan.horizon_end_ts, 1000)],
-                      PolicyLimits(), 70, "SOC preservation", use_fast_layer=True)
+                      PolicyLimits(), 70, "SOC preservation", use_fast_layer=True,
+                      execution=modeled_case("soc-preservation", hold=2700, equal_initial_soc=multiple))
     # With >10% capacity slack above the floor, the existing valuation is the
     # surplus 0.2 * 0.9 = 0.18, not the zero-SOC first-window scarcity value 0.09.
     assert observed[0][0] == pytest.approx(0.18)
-    expected = [(70, 60), (60, 50), (50, 35)] if multiple else [(80, 70), (70, 60), (60, 40)]
-    if split:
-        expected = [expected[0], *expected]
-    assert observed[0][1] == expected
+    expected = [[(80, 70)], [(70, 60)], [(60, 40)]]
+    if multiple:
+        for row, pair in zip(expected, [(60, 50), (50, 40), (40, 30)], strict=True):
+            row.append(pair)
+    assert all(rows == expected and context == plan.financial_context for _, rows, context in observed)
     assert result.duration_h == pytest.approx(0.75)
 
 
 def test_fix1_nonzero_profiles_with_different_windows_keep_shape_and_energy(monkeypatch):
     from dataclasses import replace
 
-    from dao.prog.fastctrl.plan import profile_power_at
     from dao.prog.fastctrl.policy import FastControlPolicy
     from dao.tests.settlement.test_fast_contract import ready_plan
 
     plan = ready_plan()
     plan.specs.append(replace(plan.specs[0], name="second"))
     context = plan.financial_context
-    plan.financial_context = replace(context, terminal_value=replace(context.terminal_value,
+    # This is a full-interval physical model; ready_plan's 600s context would
+    # correctly stop both batteries before the last 300s profile slice.
+    plan.financial_context = replace(context, not_after_ts=plan.horizon_end_ts,
+        terminal_value=replace(context.terminal_value,
         reference_efficiency_by_battery=(*context.terminal_value.reference_efficiency_by_battery,
                                          ("second", context.terminal_value.reference_efficiency_by_battery[0][1]))))
     a = plan.intervals[0].start_ts
@@ -176,21 +427,19 @@ def test_fix1_nonzero_profiles_with_different_windows_keep_shape_and_energy(monk
     original = FastControlPolicy.account
 
     def observe_account(policy, state, sim_plan, measurement, day_key, *args, **kwargs):
-        row = sim_plan.interval_at(measurement.timestamp)
-        step = row.battery(0)
-        windows.append((row.start_ts, row.end_ts, step.mean_ac_power_w, step.on_power_w,
-                        step.active_from_ts, step.stop_ts, profile_power_at(step, row.start_ts),
-                        profile_power_at(step, row.end_ts)))
+        windows.append(sim_plan.to_dict())
         return original(policy, state, sim_plan, measurement, day_key, *args, **kwargs)
 
     monkeypatch.setattr(FastControlPolicy, "account", observe_account)
     result = simulate(plan, [Sample(a, -1500), Sample(a + 900, -1500)],
                       PolicyLimits(min_benefit=1e9), 50, "two live profiles", use_fast_layer=True,
-                      inverter_efficiency=1)
-    assert windows == [
-        (a, a + 300, 2000, 2000, a, None, 2000, 0),
-        (a + 300, a + 600, 3000, 3000, a + 300, None, 3000, 0),
-        (a + 600, a + 900, 1000, 1000, a + 600, None, 1000, 0),
+                      inverter_efficiency=1,
+                      execution=modeled_case("two profiles", hold=900, equal_initial_soc=True))
+    assert windows and all(window == plan.to_dict() for window in windows)
+    assert [(s.start_ts, s.end_ts, tuple(b.modeled_ac_w for b in s.batteries)) for s in result.segments] == [
+        (a, a + 300, (2000, 0)),
+        (a + 300, a + 600, (2000, 1000)),
+        (a + 600, a + 900, (0, 1000)),
     ]
     assert result.import_kwh == pytest.approx(1 / 6)
     assert result.export_kwh == pytest.approx(1 / 24)
@@ -218,7 +467,8 @@ def test_simulator_integrates_profile_edges_inside_a_sample_without_mean_fallbac
     plan = FastPlan.from_dict(plan.to_dict())
     samples = [Sample(interval.start_ts, -500), Sample(interval.end_ts, -500)]
     result = simulate(plan, samples, PolicyLimits(), 50, "profile", use_fast_layer=False,
-                      inverter_efficiency=1)
+                      inverter_efficiency=1,
+                      execution=modeled_case("profile", hold=900, equal_initial_soc=multiple))
     # 1500 W import for 450s, then 500 W export for 450s (not net 500 W constant).
     assert result.import_kwh == pytest.approx(0.1875)
     assert result.export_kwh == pytest.approx(0.0625)
@@ -314,7 +564,8 @@ class TestSimulation:
         plan = flat_plan(spec, price=0.40, export=0.10, battery_w=0.0, hours=1)
         samples = [Sample(T0 + s * 60, 1000.0) for s in range(61)]
         result = simulate(
-            plan, samples, PolicyLimits(), 50.0, "base", use_fast_layer=False
+            plan, samples, PolicyLimits(), 50.0, "base", use_fast_layer=False,
+            execution=modeled_case("constant-load"),
         )
         # 1000 W for one hour at 0.40 euro/kWh.
         assert result.energy_cost == pytest.approx(0.40, rel=1e-6)
@@ -327,7 +578,8 @@ class TestSimulation:
         samples = [Sample(T0 + s * 60, 1000.0) for s in range(61)]
         limits = PolicyLimits(min_benefit=0.0, deadband=0.0, energy_budget=5.0)
         result = simulate(
-            plan, samples, limits, 80.0, "fast", use_fast_layer=True
+            plan, samples, limits, 80.0, "fast", use_fast_layer=True,
+            execution=modeled_case("cover-load"),
         )
         assert result.import_kwh < 0.1
         assert result.energy_cost < 0.05
@@ -343,6 +595,7 @@ class TestSimulation:
             samples,
             PolicyLimits(min_benefit=0.0, deadband=0.0, energy_budget=5.0),
             80.0,
+            baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"),
         )
         assert result.fast.soc_end < result.baseline.soc_end
         assert result.fast.terminal_value < result.baseline.terminal_value
@@ -368,6 +621,7 @@ class TestSimulation:
             samples,
             PolicyLimits(min_benefit=0.0, deadband=0.0, energy_budget=5.0),
             80.0,
+            baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"),
         )
         assert result.saving < 0.0
         assert abs(result.saving) == pytest.approx(
@@ -377,7 +631,8 @@ class TestSimulation:
     def test_the_cost_identity_holds(self):
         spec = make_spec()
         plan, samples, soc = synthetic_case(spec, days=1)
-        result = compare(plan, samples, PolicyLimits(), soc)
+        result = compare(plan, samples, PolicyLimits(), soc,
+                         baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"))
         for outcome in (result.baseline, result.fast):
             assert outcome.total_cost == pytest.approx(
                 outcome.energy_cost + outcome.wear_cost - outcome.terminal_value
@@ -388,7 +643,8 @@ class TestSimulation:
         plan = flat_plan(spec, price=0.40, battery_w=0.0, hours=1)
         samples = [Sample(T0 + s * 60, 2000.0) for s in range(61)]
         limits = PolicyLimits(min_benefit=0.0, deadband=0.0, energy_budget=5.0)
-        result = simulate(plan, samples, limits, 80.0, "fast", use_fast_layer=True)
+        result = simulate(plan, samples, limits, 80.0, "fast", use_fast_layer=True,
+                          execution=modeled_case("wear"))
         assert result.wear_cost == pytest.approx(
             0.05 * result.throughput_kwh, rel=1e-9
         )
@@ -398,7 +654,8 @@ class TestSimulation:
         plan = flat_plan(spec, hours=1)
         samples = [Sample(T0 + s * 60, 0.0) for s in range(61)]
         result = simulate(
-            plan, samples, PolicyLimits(), 50.0, "base", use_fast_layer=False
+            plan, samples, PolicyLimits(), 50.0, "base", use_fast_layer=False,
+            execution=modeled_case("cycles"),
         )
         result.throughput_kwh = 20.0
         assert result.cycles == pytest.approx(1.0)
@@ -462,7 +719,8 @@ class TestSyntheticCase:
     def test_the_fast_layer_saves_money_on_it(self):
         spec = make_spec()
         plan, samples, soc = synthetic_case(spec, days=2)
-        result = compare(plan, samples, PolicyLimits(), soc)
+        result = compare(plan, samples, PolicyLimits(), soc,
+                         baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"))
         assert result.saving > 0.0
         assert result.fast.import_kwh < result.baseline.import_kwh
         assert result.fast.export_kwh < result.baseline.export_kwh
@@ -470,22 +728,27 @@ class TestSyntheticCase:
     def test_a_tight_energy_budget_reduces_both_saving_and_wear(self):
         spec = make_spec()
         plan, samples, soc = synthetic_case(spec, days=2)
-        loose = compare(plan, samples, PolicyLimits(energy_budget=2.0), soc)
-        tight = compare(plan, samples, PolicyLimits(energy_budget=0.05), soc)
+        loose = compare(plan, samples, PolicyLimits(energy_budget=2.0), soc,
+                        baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"))
+        tight = compare(plan, samples, PolicyLimits(energy_budget=0.05), soc,
+                        baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"))
         assert tight.saving < loose.saving
         assert tight.fast.throughput_kwh < loose.fast.throughput_kwh
 
     def test_a_high_minimum_benefit_reduces_the_number_of_writes(self):
         spec = make_spec()
         plan, samples, soc = synthetic_case(spec, days=2)
-        eager = compare(plan, samples, PolicyLimits(min_benefit=0.0), soc)
-        lazy = compare(plan, samples, PolicyLimits(min_benefit=0.30), soc)
+        eager = compare(plan, samples, PolicyLimits(min_benefit=0.0), soc,
+                        baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"))
+        lazy = compare(plan, samples, PolicyLimits(min_benefit=0.30), soc,
+                       baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"))
         assert lazy.fast.writes < eager.fast.writes
 
     def test_the_report_renders(self):
         spec = make_spec()
         plan, samples, soc = synthetic_case(spec, days=1)
-        comparison = compare(plan, samples, PolicyLimits(), soc)
+        comparison = compare(plan, samples, PolicyLimits(), soc,
+                             baseline_execution=modeled_case("baseline"), fast_execution=modeled_case("fast"))
         report = comparison.report()
         assert "Besparing" in report
         assert "Totale kosten" in report
