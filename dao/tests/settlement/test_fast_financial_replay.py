@@ -371,4 +371,80 @@ def test_fix1_no_batteries_keeps_specific_configuration_error_with_or_without_re
     kwargs = {"replay_basis": replay} if with_replay else {}
     with pytest.raises(ValueError, match="^het plan bevat geen batterij$"):
         simulate(plan, [Sample(NOW, 1000), Sample(NOW + 900, 1000)], PolicyLimits(),
-                 50, "sandbox", False, **kwargs)
+                  50, "sandbox", False, **kwargs)
+
+
+def test_f3a6_archived_terminal_per_battery_once():
+    from dao.prog.fastctrl.plan import BatteryPlanStep, FastPlan
+    from dao.tests.prog.test_fast_simulate import _f3a5_case, _f3a6_result
+
+    plan, replay = synthetic_replay()
+    plan.specs = [replace(plan.specs[0], charge_efficiency=.8, discharge_efficiency=.6),
+                  replace(plan.specs[0], name="B", capacity_kwh=20, discharge_efficiency=.5)]
+    terminal = replace(replay.terminal_value,
+                       reference_efficiency_by_battery=(("accu", D("0.7")), ("B", D("0.9"))))
+    replay = replace(replay, terminal_value=terminal)
+    plan.financial_context = replace(plan.financial_context, terminal_value=terminal)
+    plan = bind_replay(plan, replay)
+    for row in plan.intervals:
+        row.batteries = [BatteryPlanStep(1500, 40, 40, mean_ac_power_w=1500, on_power_w=1500,
+                                        active_from_ts=row.start_ts, stop_ts=None),
+                         BatteryPlanStep(-1500, 80, 80, mean_ac_power_w=-1500, on_power_w=-1500,
+                                         active_from_ts=row.start_ts, stop_ts=None)]
+    plan = FastPlan.from_dict(plan.to_dict())
+    kwargs = dict(case=_f3a5_case(), soc={"accu": 40, "B": 80},
+                  efficiencies={"accu": .5, "B": 1}, replay_basis=replay)
+    result = _f3a6_result(plan, ((NOW, 0), (NOW + 600, 0)), **kwargs)
+    # A stores .1 cell kWh; B draws .5. Each gets only its OWN archived cell→AC eta.
+    expected = float(D("-0.38") * D("0.123456789012345678901234567890123456"))
+    assert result.terminal_value == expected
+    assert result.soc_end_by_battery == (("accu", 41), ("B", 77.5))
+    assert result.throughput_kwh == pytest.approx(.375)
+    assert result.opening_state is replay.opening
+    assert result.replay_terminal_value is terminal
+    with localcontext() as context:
+        context.prec = 6
+        repeated = _f3a6_result(plan, ((NOW, 0), (NOW + 600, 0)), **kwargs)
+    assert repeated.terminal_value == expected
+    row = plan.intervals[0]
+    row.batteries = [replace(step, ac_power_w=1000 if step.on_power_w > 0 else -1000,
+                            mean_ac_power_w=1000 if step.on_power_w > 0 else -1000,
+                            on_power_w=2 * step.on_power_w, stop_ts=NOW + 300)
+                     for step in row.batteries]
+    alternative = _f3a6_result(FastPlan.from_dict(plan.to_dict()), ((NOW, 0), (NOW + 600, 0)), **kwargs)
+    assert alternative.soc_end_by_battery == result.soc_end_by_battery
+    assert alternative.terminal_value == result.terminal_value
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "hash"])
+def test_f3a6_v2_comparison_waits_for_settlement(fault, caplog):
+    from dao.tests.prog.test_fast_simulate import _f3a5_case, _f3a6_result
+
+    plan, replay = synthetic_replay()
+    plan = bind_replay(plan, replay)
+    plan.price_average = 999
+    plan.intervals = [replace(row, price_import=999, price_export=999) for row in plan.intervals]
+    if fault == "hash":
+        plan.financial_context = replace(plan.financial_context, replay_basis_hash="f" * 64)
+    result = _f3a6_result(plan, ((NOW, 1000), (NOW + 900, 1000)), case=_f3a5_case(),
+                          replay_basis=None if fault == "missing" else replay)
+    assert result.coverage_status == "complete" and result.import_kwh == .25
+    assert result.settlement_comparison_pending is True
+    if fault is None:
+        assert result.label == "reconstruction_base_tariffs: f3a6"
+        assert result.energy_cost == pytest.approx(.025)
+        assert result.opening_state is replay.opening
+        assert result.replay_terminal_value is replay.terminal_value
+        assert result.terminal_value == 0
+    else:
+        assert result.label.startswith("unknown_reconstruction:")
+        assert ("replay_basis_required" if fault == "missing" else "replay_basis_mismatch") in result.reasons
+        assert result.energy_cost is result.wear_cost is result.terminal_value is result.total_cost is None
+    comparison = Comparison(result, result)
+    assert comparison.saving == comparison.saving_per_day == "unknown_reconstruction: settlement_comparison_pending"
+    assert comparison.report().startswith(comparison.saving)
+    assert comparison.daily_table().startswith(comparison.saving)
+    with caplog.at_level(logging.INFO):
+        log_comparison(comparison)
+    assert "settlement_comparison_pending" in caplog.text
+    assert "Besparing:" not in caplog.text and "euro" not in caplog.text

@@ -503,14 +503,14 @@ class DayMetrics:
     """Per day totals, so a saving can be traced back to a specific event."""
 
     day: str
-    energy_cost: float = 0.0
-    wear_cost: float = 0.0
-    import_kwh: float = 0.0
-    export_kwh: float = 0.0
-    throughput_kwh: float = 0.0
-    peak_import_w: float = 0.0
+    energy_cost: float | None = 0.0
+    wear_cost: float | None = 0.0
+    import_kwh: float | None = 0.0
+    export_kwh: float | None = 0.0
+    throughput_kwh: float | None = 0.0
+    peak_import_w: float | None = 0.0
     writes: int = 0
-    override_s: float = 0.0
+    override_s: float | None = 0.0
 
 
 @dataclass
@@ -520,21 +520,32 @@ class SimResult:
     label: str
     energy_cost: float | None = 0.0
     wear_cost: float | None = 0.0
-    import_kwh: float = 0.0
-    export_kwh: float = 0.0
-    throughput_kwh: float = 0.0
-    peak_import_w: float = 0.0
+    import_kwh: float | None = 0.0
+    export_kwh: float | None = 0.0
+    throughput_kwh: float | None = 0.0
+    peak_import_w: float | None = 0.0
     writes: int = 0
-    override_s: float = 0.0
-    soc_start: float = 0.0
-    soc_end: float = 0.0
+    override_s: float | None = 0.0
+    soc_start: float | None = 0.0
+    soc_end: float | None = 0.0
     terminal_value: float | None = 0.0
     capacity_kwh: float = 0.0
     duration_h: float = 0.0
     days: dict[str, DayMetrics] = field(default_factory=dict)
-    soc_series: list[tuple[float, float]] = field(default_factory=list)
+    soc_series: list[tuple[float, float | None]] = field(default_factory=list)
     opening_state: SettlementState | None = None
     replay_terminal_value: TerminalValue | None = None
+    execution_kind: Literal["recorded", "modeled", "missing"] = "missing"
+    coverage_status: Literal["complete", "partial", "unknown"] = "unknown"
+    reasons: Reasons = ()
+    assumptions: Assumptions = ()
+    source_plan_digest: str | None = None
+    execution_plan_digest: str | None = None
+    segments: tuple[ReplaySegment, ...] = ()
+    trace: tuple[ReplayEvent, ...] = ()
+    soc_start_by_battery: SocByBattery = ()
+    soc_end_by_battery: SocByBattery = ()
+    settlement_comparison_pending: bool = False
 
     @property
     def total_cost(self) -> float | None:
@@ -544,17 +555,177 @@ class SimResult:
         return self.energy_cost + self.wear_cost - self.terminal_value
 
     @property
-    def cycles(self) -> float:
+    def cycles(self) -> float | None:
         """Equivalent full cycles, DC throughput over twice the capacity."""
+        if self.throughput_kwh is None:
+            return None
         if self.capacity_kwh <= 0:
             return 0.0
         return self.throughput_kwh / (2.0 * self.capacity_kwh)
 
     @property
-    def average_soc(self) -> float:
+    def average_soc(self) -> float | None:
+        if any(s is None for _, s in self.soc_series):
+            return None
         if not self.soc_series:
             return 0.0
         return sum(s for _, s in self.soc_series) / len(self.soc_series)
+
+
+def _sum_known(values: Sequence[float | None]) -> float | None:
+    return None if any(value is None for value in values) else sum(values)
+
+
+def _summarize_replay(
+    *, run: _ReplayRun, basis: _ReplayBasisView, replay_input: ReplayInput,
+    label: str, timezone: datetime.tzinfo | None,
+) -> SimResult:
+    """Summarize complete quantities only; the segments retain known partials."""
+    plan = basis.source_plan
+    specs = {spec.name: spec for spec in plan.specs}
+    indices = {spec.name: index for index, spec in enumerate(plan.specs)}
+    capacity = sum(spec.capacity_kwh for spec in plan.specs)
+    start, end = replay_input.sample_points[0][0], replay_input.sample_points[-1][0]
+
+    def weighted_soc(socs: SocByBattery) -> float | None:
+        values = dict(socs)
+        if any(values.get(name) is None for name in specs):
+            return None
+        return sum(values[name] * spec.capacity_kwh for name, spec in specs.items()) / capacity
+
+    result = SimResult(label, capacity_kwh=capacity, duration_h=(end - start) / 3600,
+        soc_start=weighted_soc(run.soc_start_by_battery), soc_end=weighted_soc(run.soc_end_by_battery),
+        opening_state=basis.opening, replay_terminal_value=basis.terminal,
+        execution_kind=run.execution_kind, reasons=run.reasons, assumptions=run.assumptions,
+        source_plan_digest=run.source_plan_digest, execution_plan_digest=run.execution_plan_digest,
+        segments=run.segments, trace=run.trace, soc_start_by_battery=run.soc_start_by_battery,
+        soc_end_by_battery=run.soc_end_by_battery, writes=run.writes, override_s=run.override_s,
+        settlement_comparison_pending=plan.format_version == 2, terminal_value=None)
+    result.soc_series.append((start, result.soc_start))
+    reasons = [*basis.reasons, *run.reasons]
+    financial_basis_known = not basis.reasons and (
+        (basis.quotes is not None and basis.opening is not None and basis.terminal is not None)
+        if plan.format_version == 2 else run.execution_kind == "modeled")
+    quotes = {} if basis.quotes is None else {quote.start_ts: quote for quote in basis.quotes}
+    # Only a segment's current accepted command may contribute override time.
+    proposals, overrides = {}, {}
+    recipe = replay_input.scenario.execution if replay_input.scenario is not None else None
+    openings = recipe.opening_acceptances if isinstance(recipe, RecordedExecution) else ()
+    sends = []
+    for event in run.trace:
+        if isinstance(event, ProposalEvent) and event.decision.write and event.command is not None:
+            proposals.setdefault(event.command.command_id, event)
+            if start <= event.at_ts < end:
+                sends.append(event.at_ts)
+
+    def overriding(battery: BatteryReplaySegment, at_ts: float) -> bool:
+        command = battery.command
+        if command is None:
+            return False
+        if command.command_id in overrides:
+            return overrides[command.command_id]
+        proposal = proposals.get(command.command_id)
+        # Opening sends admitted by the fold precede in-window retries, even
+        # at start. Acceptance itself is already established by this segment.
+        from_opening = any(
+            opening.command == command and opening.sent_at_ts is not None
+            and opening.observation.application is not None
+            and opening.sent_at_ts <= opening.observation.at_ts
+            <= opening.observation.application.at_ts <= start for opening in openings)
+        if proposal is not None and proposal.at_ts <= at_ts and not from_opening:
+            overrides[command.command_id] = proposal.decision.override
+            return proposal.decision.override
+        # Opening acceptances have no proposal. Match the runtime's original
+        # plan-at-issue comparison, not the profile at this later segment.
+        interval = basis.execution_plan.interval_at(command.issued_at_ms / 1000)
+        step = interval.battery(indices[command.battery_name])
+        power = (profile_power_at(step, command.issued_at_ms / 1000)
+                 if plan.format_version == 2 else step.ac_power_w)
+        overrides[command.command_id] = command.setpoint_w != int(round(power))
+        return overrides[command.command_id]
+
+    complete, any_known = bool(run.segments), False
+    day_energy: dict[str, Decimal | None] = {}
+    with localcontext() as context:
+        context.prec = 36
+        for segment in run.segments:
+            day = _day_key(segment.start_ts, timezone)
+            metrics = result.days.setdefault(day, DayMetrics(day))
+            dt_s = segment.end_ts - segment.start_ts
+            batteries = segment.batteries
+            site_known = segment.import_kwh is not None and segment.export_kwh is not None
+            segment_complete = site_known and segment.house_w is not None and all(
+                value is not None for battery in batteries for value in (
+                    battery.modeled_ac_w, battery.charge_ac_kwh, battery.discharge_ac_kwh,
+                    battery.dc_throughput_kwh, battery.cell_delta_kwh, battery.soc_begin, battery.soc_end))
+            complete = complete and segment_complete
+            any_known = any_known or site_known or any(b.modeled_ac_w is not None for b in batteries)
+            for attribute, value in (
+                ("import_kwh", segment.import_kwh), ("export_kwh", segment.export_kwh),
+                ("throughput_kwh", _sum_known([b.dc_throughput_kwh for b in batteries])),
+            ):
+                setattr(metrics, attribute, _sum_known([getattr(metrics, attribute), value]))
+            peak = segment.import_kwh * 3600000 / dt_s if site_known else None
+            metrics.peak_import_w = (max(metrics.peak_import_w, peak)
+                                    if metrics.peak_import_w is not None and peak is not None else None)
+            active_overrides = [overriding(b, segment.start_ts) for b in batteries]
+            override = (None if any(b.modeled_ac_w is None for b in batteries)
+                        else dt_s if any(active_overrides) else 0.0)
+            metrics.override_s = _sum_known([metrics.override_s, override])
+            result.soc_series.append((segment.end_ts, weighted_soc(tuple(
+                (battery.battery_name, battery.soc_end) for battery in batteries))))
+            interval = basis.execution_plan.interval_at(segment.start_ts)
+            energy_cost = wear_cost = None
+            if segment_complete and financial_basis_known and interval is not None:
+                quote = quotes.get(interval.start_ts)
+                if plan.format_version == 1:
+                    import_rate, export_rate = Decimal(str(interval.price_import)), Decimal(str(interval.price_export))
+                elif quote is not None and quote.end_ts >= segment.end_ts:
+                    import_rate, export_rate = quote.import_rate, quote.export_rate
+                else:
+                    reasons.append("replay_quote_coverage_mismatch")
+                    import_rate = export_rate = None
+                if import_rate is not None:
+                    energy_cost = (Decimal(str(segment.import_kwh)) * import_rate
+                                   - Decimal(str(segment.export_kwh)) * export_rate)
+                    wear_cost = sum(specs[b.battery_name].cycle_cost * b.dc_throughput_kwh for b in batteries)
+            previous = day_energy.get(day, Decimal(0))
+            day_energy[day] = None if previous is None or energy_cost is None else previous + energy_cost
+            metrics.wear_cost = _sum_known([metrics.wear_cost, wear_cost])
+        for at_ts in sends:
+            result.days[_day_key(at_ts, timezone)].writes += 1
+        # Extra sends counted by the execution fold are opening evidence at the
+        # left boundary; pre-window sends are already excluded by that fold.
+        result.days[_day_key(start, timezone)].writes += run.writes - len(sends)
+        for day, metrics in result.days.items():
+            metrics.energy_cost = None if day_energy[day] is None else float(day_energy[day])
+        for attribute in ("import_kwh", "export_kwh", "throughput_kwh"):
+            setattr(result, attribute, _sum_known([getattr(day, attribute) for day in result.days.values()]))
+        peaks = [day.peak_import_w for day in result.days.values()]
+        result.peak_import_w = None if any(peak is None for peak in peaks) else max(peaks)
+        complete = complete and result.soc_start is not None and result.soc_end is not None
+        result.coverage_status = "complete" if complete else "partial" if any_known else "unknown"
+        if complete and financial_basis_known and all(cost is not None for cost in day_energy.values()):
+            result.energy_cost = float(sum(day_energy.values()))
+            result.wear_cost = _sum_known([day.wear_cost for day in result.days.values()])
+            opening, closing = dict(run.soc_start_by_battery), dict(run.soc_end_by_battery)
+            if basis.terminal is not None:
+                efficiencies = dict(basis.terminal.reference_efficiency_by_battery)
+                result.terminal_value = float(sum(
+                    (Decimal(str(closing[name])) - Decimal(str(opening[name])))
+                    * Decimal(str(spec.capacity_kwh)) / Decimal(100)
+                    * efficiencies[name] * basis.terminal.eur_per_ac_kwh for name, spec in specs.items()))
+                result.label = f"reconstruction_base_tariffs: {label}"
+            else:
+                efficiencies = dict(replay_input.inverter_efficiency_by_battery)
+                result.terminal_value = sum((closing[name] - opening[name]) * spec.kwh_per_percent
+                    * plan.price_average * max(.01, spec.discharge_efficiency * efficiencies[name])
+                    for name, spec in specs.items())
+        else:
+            result.energy_cost = result.wear_cost = None
+            result.label = "unknown_reconstruction: " + (", ".join(dict.fromkeys(reasons)) or "comparison_unavailable")
+    result.reasons = tuple(dict.fromkeys(reasons))
+    return result
 
 
 @dataclass
@@ -566,6 +737,8 @@ class Comparison:
 
     @property
     def saving(self) -> float | str:
+        if self.baseline.settlement_comparison_pending or self.fast.settlement_comparison_pending:
+            return "unknown_reconstruction: settlement_comparison_pending"
         base_cost, fast_cost = self.baseline.total_cost, self.fast.total_cost
         if base_cost is None or fast_cost is None:
             return "unknown_reconstruction: comparison_unavailable"
@@ -580,26 +753,33 @@ class Comparison:
         return saving / days
 
     @property
-    def extra_cycles(self) -> float:
-        return self.fast.cycles - self.baseline.cycles
+    def extra_cycles(self) -> float | None:
+        base, fast = self.baseline.cycles, self.fast.cycles
+        return None if base is None or fast is None else fast - base
 
     def report(self) -> str:
         """Human readable summary, ready for the log or the console."""
         saving = self.saving
+        metadata = [f"{result.label}: execution_kind={result.execution_kind}; coverage_status={result.coverage_status}"
+                    + "".join(f"; {key}={value}" for key, value in result.assumptions)
+                    for result in (self.baseline, self.fast)]
         if isinstance(saving, str):
-            return saving
+            return "\n".join([saving, *metadata])
         base, fast = self.baseline, self.fast
         days = max(1.0, base.duration_h / 24.0)
         lines = [
             "",
             "=" * 72,
+            *metadata,
             f"Fast control backtest over {base.duration_h / 24.0:.1f} dagen",
             "=" * 72,
             f"{'':30}{'zonder':>12}{'met':>12}{'verschil':>14}",
             "-" * 72,
             _row("Energiekosten (euro)", base.energy_cost, fast.energy_cost),
             _row("Slijtagekosten (euro)", base.wear_cost, fast.wear_cost),
-            _row("Restwaarde accu (euro)", -base.terminal_value, -fast.terminal_value),
+            _row("Restwaarde accu (euro)",
+                 None if base.terminal_value is None else -base.terminal_value,
+                 None if fast.terminal_value is None else -fast.terminal_value),
             _row("Totale kosten (euro)", base.total_cost, fast.total_cost),
             "-" * 72,
             _row("Afname net (kWh)", base.import_kwh, fast.import_kwh),
@@ -612,15 +792,16 @@ class Comparison:
             "-" * 72,
             f"{'Setpoint-schrijfacties':30}{base.writes:>12.0f}{fast.writes:>12.0f}",
             f"{'Override actief (uur)':30}"
-            f"{base.override_s / 3600:>12.1f}{fast.override_s / 3600:>12.1f}",
+            f"{_number(None if base.override_s is None else base.override_s / 3600, '.1f'):>12}"
+            f"{_number(None if fast.override_s is None else fast.override_s / 3600, '.1f'):>12}",
             "=" * 72,
             f"Besparing: {self.saving:.2f} euro over {days:.1f} dagen "
             f"= {self.saving_per_day:.3f} euro/dag "
             f"= {self.saving_per_day * 365:.0f} euro/jaar",
-            f"Extra cycli: {self.extra_cycles:+.2f} over de periode "
-            f"({self.extra_cycles / days * 365:+.0f} per jaar)",
+            f"Extra cycli: {_number(self.extra_cycles, '+.2f')} over de periode "
+            f"({_number(None if self.extra_cycles is None else self.extra_cycles / days * 365, '+.0f')} per jaar)",
         ]
-        if fast.throughput_kwh > base.throughput_kwh > 0:
+        if fast.throughput_kwh is not None and base.throughput_kwh is not None and fast.throughput_kwh > base.throughput_kwh > 0:
             extra = fast.throughput_kwh - base.throughput_kwh
             lines.append(
                 f"Besparing per extra kWh accudoorzet: "
@@ -642,23 +823,30 @@ class Comparison:
         ]
         lines.append("-" * 68)
         for key in keys:
-            base = self.baseline.days.get(key, DayMetrics(key))
-            fast = self.fast.days.get(key, DayMetrics(key))
-            base_cost = base.energy_cost + base.wear_cost
-            fast_cost = fast.energy_cost + fast.wear_cost
-            cycles = fast.throughput_kwh / (2.0 * self.fast.capacity_kwh) if (
-                self.fast.capacity_kwh
-            ) else 0.0
+            missing = DayMetrics(key, energy_cost=None, wear_cost=None,
+                                 throughput_kwh=None, peak_import_w=None)
+            base = self.baseline.days.get(key, missing)
+            fast = self.fast.days.get(key, missing)
+            base_cost = _sum_known([base.energy_cost, base.wear_cost])
+            fast_cost = _sum_known([fast.energy_cost, fast.wear_cost])
+            difference = None if base_cost is None or fast_cost is None else base_cost - fast_cost
+            cycles = (None if fast.throughput_kwh is None else fast.throughput_kwh / (2.0 * self.fast.capacity_kwh)
+                      if self.fast.capacity_kwh else 0.0)
             lines.append(
-                f"{key:12}{base_cost:>10.2f}{fast_cost:>10.2f}"
-                f"{base_cost - fast_cost:>11.3f}{cycles:>8.2f}"
-                f"{fast.peak_import_w:>9.0f}{fast.writes:>8.0f}"
+                f"{key:12}{_number(base_cost, '.2f'):>10}{_number(fast_cost, '.2f'):>10}"
+                f"{_number(difference, '.3f'):>11}{_number(cycles, '.2f'):>8}"
+                f"{_number(fast.peak_import_w, '.0f'):>9}{fast.writes:>8.0f}"
             )
         return "\n".join(lines)
 
 
-def _row(label: str, left: float, right: float) -> str:
-    return f"{label:30}{left:>12.2f}{right:>12.2f}{right - left:>+14.3f}"
+def _number(value: float | None, spec: str) -> str:
+    return "unknown" if value is None else format(value, spec)
+
+
+def _row(label: str, left: float | None, right: float | None) -> str:
+    difference = None if left is None or right is None else right - left
+    return f"{label:30}{_number(left, '.2f'):>12}{_number(right, '.2f'):>12}{_number(difference, '+.3f'):>14}"
 
 
 def aggregate_spec(specs: Sequence[BatterySpec], name: str = "totaal") -> BatterySpec:

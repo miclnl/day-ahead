@@ -716,6 +716,190 @@ def test_f3a4_direction_and_fractional_integration(command_w, realized_w):
     assert stop.batteries[0].soc_begin == stop.batteries[0].soc_end == result.soc_end
 
 
+def _f3a6_result(plan, points, *, case=None, soc=50, efficiencies=1,
+                 replay_basis=None, fast=False, timezone=None, limits=None):
+    from importlib import import_module
+
+    from dao.prog.fastctrl.replay_execution import RecordedExecution, validate_replay_input
+
+    api = import_module("dao.prog.fastctrl.simulate")
+    inputs = validate_replay_input(plan=plan, sample_points=points, soc_start=soc,
+                                   inverter_efficiency=efficiencies, scenario=case)
+    basis = api._prepare_replay_basis(plan, start_ts=points[0][0], replay_basis=replay_basis,
+        recorded=case is not None and isinstance(case.execution, RecordedExecution))
+    run = api._run_replay(basis=basis, replay_input=inputs, limits=limits or PolicyLimits(),
+                           use_fast_layer=fast, timezone=timezone)
+    assert callable(getattr(api, "_summarize_replay", None)), "F3a6 private summarizer missing"
+    return api._summarize_replay(run=run, basis=basis, replay_input=inputs,
+                                  label="f3a6", timezone=timezone)
+
+
+@pytest.mark.parametrize("fault", ["battery", "house", "opening", "missing"])
+def test_f3a6_partial_totals_and_consumers_are_unknown(fault, caplog):
+    import logging
+    from datetime import UTC, datetime
+
+    from dao.prog.fastctrl.replay_execution import ModeledExecution, ModelResponse, ModelStop
+    from dao.prog.fastctrl.simulate import Comparison, log_comparison
+
+    midnight = datetime(2026, 11, 6, tzinfo=UTC).timestamp()
+    start = midnight - 60
+    plan = flat_plan(make_spec(charge_efficiency=1, discharge_efficiency=1))
+    plan.created_ts = start
+    plan.specs.append(make_spec(name="B", capacity_kwh=20, charge_efficiency=1, discharge_efficiency=1))
+    plan.intervals = [PlanInterval(start, start + 120, .4, .1, batteries=[
+        BatteryPlanStep(0, 80, 80), BatteryPlanStep(100, 60, 60)])]
+    recipe = ModeledExecution("stopped", "complete", responses=(
+        ModelResponse(1, "fast", "accu", "unknown", 0),), lifecycle=(
+        ModelStop(start + 90, 0, True, True),))
+    case = _f3a5_case(execution=recipe) if fault == "battery" else _f3a5_case(hold=30 if fault == "house" else 4000)
+    result = _f3a6_result(plan, ((start, 1000), (start + 30, 2000), (start + 120, 0)),
+        case=None if fault == "missing" else case, fast=fault == "battery",
+        soc={"accu": None if fault == "opening" else 80, "B": 60}, timezone=UTC,
+        limits=PolicyLimits(min_benefit=0, deadband=1, min_command_interval=0))
+    assert result.coverage_status == ("unknown" if fault == "missing" else "partial")
+    assert result.energy_cost is result.wear_cost is result.terminal_value is result.total_cost is None
+    if fault == "opening":
+        assert result.import_kwh == pytest.approx(1100 * 30 / 3600000 + 2100 * 90 / 3600000)
+        assert result.export_kwh == 0 and result.peak_import_w == pytest.approx(2100)
+    else:
+        assert result.import_kwh is result.export_kwh is result.peak_import_w is None
+    assert result.label.startswith("unknown_reconstruction:")
+    if fault in ("battery", "missing"):
+        assert result.throughput_kwh is result.cycles is None
+        assert result.soc_end is result.average_soc is None
+        assert result.override_s is None
+    elif fault == "opening":
+        # Proven zero response preserves throughput, but cannot invent opening/end SoC.
+        assert result.soc_start is result.soc_end is result.average_soc is None
+        assert result.throughput_kwh == pytest.approx(1 / 300)
+    else:
+        assert result.throughput_kwh == pytest.approx(1 / 300)
+        assert result.soc_end is not None
+    if fault == "battery":
+        assert result.segments[0].import_kwh == 0
+        assert result.segments[-1].batteries[0].modeled_ac_w == 0
+        assert result.segments[-1].batteries[0].soc_end is None
+        assert any(s.batteries[1].charge_ac_kwh > 0 for s in result.segments)
+        assert result.soc_series[0][1] == pytest.approx((80 * 10 + 60 * 20) / 30)
+        assert result.soc_series[-1][1] is None
+    assert len(result.days) == 2
+    final_day = result.days["2026-11-06"]
+    assert final_day.energy_cost is final_day.wear_cost is None
+    assert sum(day.writes for day in result.days.values()) == result.writes
+    for comparison in (Comparison(result, result), Comparison(result, simulate(
+            flat_plan(make_spec()), [Sample(T0, 0), Sample(T0 + 60, 0)],
+            PolicyLimits(), 50, "old", False))):
+        for output in (comparison.saving, comparison.saving_per_day,
+                       comparison.report(), comparison.daily_table()):
+            assert output.startswith("unknown_reconstruction:")
+            assert "Besparing:" not in output and "euro" not in output
+        if result.cycles is None:
+            assert comparison.extra_cycles is None
+        with caplog.at_level(logging.INFO):
+            log_comparison(comparison)
+    assert "unknown_reconstruction:" in caplog.text
+    assert "Besparing:" not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["import_kwh", "export_kwh", "throughput_kwh",
+                                  "peak_import_w", "soc_end", "override_s", "soc_series"])
+def test_f3a6_nullable_numeric_report_and_daily_fields(field, caplog):
+    import logging
+
+    from dao.prog.fastctrl.simulate import Comparison, DayMetrics, SimResult, log_comparison
+
+    result = SimResult("legacy", capacity_kwh=10, soc_series=[(T0, 50)])
+    setattr(result, field, [(T0, None)] if field == "soc_series" else None)
+    result.days["2026-11-06"] = DayMetrics("2026-11-06", energy_cost=None,
+        wear_cost=None, throughput_kwh=None, peak_import_w=None, override_s=None)
+    comparison = Comparison(SimResult("old", capacity_kwh=10), result)
+    if field == "throughput_kwh":
+        assert result.cycles is comparison.extra_cycles is None
+    if field == "soc_series":
+        assert result.average_soc is None
+    assert "unknown" in comparison.report()
+    assert "unknown" in comparison.daily_table()
+    with caplog.at_level(logging.INFO):
+        log_comparison(comparison)
+    assert "unknown" in caplog.text
+
+
+def test_f3a6_legacy_model_wear_and_negative_difference():
+    from dataclasses import replace
+    from datetime import UTC
+
+    from dao.prog.fastctrl.simulate import Comparison
+
+    plan = flat_plan(make_spec(charge_efficiency=.9, discharge_efficiency=.95, cycle_cost=.03), battery_w=1000)
+    plan.specs.append(make_spec(name="B", capacity_kwh=20, charge_efficiency=.85,
+                                discharge_efficiency=.8, cycle_cost=.09))
+    plan.intervals = [replace(row, batteries=[*row.batteries, BatteryPlanStep(-1000, 60, 60)])
+                      for row in plan.intervals]
+    result = _f3a6_result(plan, ((T0, 0), (T0 + 900, 0)), case=_f3a5_case(),
+        soc={"accu": 40, "B": 60}, efficiencies={"accu": .8, "B": .9}, timezone=UTC)
+    assert result.coverage_status == "complete" and result.execution_kind == "modeled"
+    assert result.import_kwh == result.export_kwh == result.peak_import_w == 0
+    assert result.throughput_kwh == pytest.approx(.2 + .25 / .9)
+    assert result.wear_cost == pytest.approx(.03 * .2 + .09 * .25 / .9)
+    assert result.terminal_value == pytest.approx(.18 * .30 * .95 * .8 - .25 / (.9 * .8) * .30 * .8 * .9)
+    assert result.soc_start == pytest.approx(160 / 3)
+    assert result.cycles == pytest.approx((.2 + .25 / .9) / 60)
+    assert result.writes == 2 and next(iter(result.days.values())).writes == 2
+    assert result.override_s == next(iter(result.days.values())).override_s == 0
+    assert result.source_plan_digest == result.execution_plan_digest
+    assert result.trace and dict(result.assumptions)["fresh_policy_start"] == "true"
+    idle = replace(plan, intervals=[replace(row, batteries=[BatteryPlanStep(0, 40, 40),
+        BatteryPlanStep(0, 60, 60)]) for row in plan.intervals])
+    baseline = _f3a6_result(idle, ((T0, 0), (T0 + 900, 0)), case=_f3a5_case(),
+        soc={"accu": 40, "B": 60}, efficiencies={"accu": .8, "B": .9}, timezone=UTC)
+    comparison = Comparison(baseline, result)
+    assert comparison.saving == pytest.approx(-.06496)
+    assert comparison.saving_per_day == comparison.saving
+    assert comparison.extra_cycles == pytest.approx(result.cycles)
+    assert "modeled" in comparison.report() and "fresh_policy_start" in comparison.report()
+    assert "-0.031" in comparison.daily_table()  # Daily costs exclude terminal correction.
+
+
+@pytest.mark.parametrize("retry_delay", [None, .5, 0], ids=["no-retry", "after-start", "at-start"])
+def test_f3a6_recorded_opening_and_daily_override_use_accepted_provenance(retry_delay):
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from dao.prog.fastctrl import replay_execution as execution
+    from dao.tests.prog.test_fast_replay_execution import (
+        replay_command,
+        replay_receipt,
+        replay_timing,
+        send_event,
+    )
+
+    start = int(datetime(2026, 11, 5, 23, 59, 57, tzinfo=UTC).timestamp())
+    plan = flat_plan(make_spec(charge_efficiency=1, discharge_efficiency=1))
+    plan.created_ts = start
+    plan.intervals = [PlanInterval(start, start + 900, .3, .1,
+                                    batteries=[BatteryPlanStep(0, 50, 50)])]
+    command = replay_command(plan)
+    timing = replay_timing(execution, command, anchor=start)
+    observation = replay_receipt(execution, command, start, apply_ts=start, anchor=start)
+    proposal = send_event(execution, command, start, timing)
+    suppressed = execution.ProposalEvent(start + 1, 0,
+        replace(proposal.decision, write=False, override=False, setpoint_w=1100), None, None)
+    events = (replace(proposal, at_ts=start + retry_delay,
+                      decision=replace(proposal.decision, override=False)), suppressed) if retry_delay is not None else (suppressed,)
+    case = _f3a5_recorded(plan, start, start + 6, events)
+    case = replace(case, execution=replace(case.execution, opening_acceptances=(
+        execution.OpeningAcceptance(command, timing, observation, start),)))
+    result = _f3a6_result(plan, ((start, 0), (start + 6, 0)), case=case, timezone=UTC)
+    assert result.execution_kind == "recorded" and result.coverage_status == "complete"
+    assert result.writes == (2 if retry_delay is not None else 1)
+    assert [day.writes for day in result.days.values()] == [result.writes, 0]
+    assert result.import_kwh == pytest.approx(1 / 600)
+    assert result.segments[-1].batteries[0].command == command
+    assert result.override_s == 6
+    assert [day.override_s for day in result.days.values()] == [3, 3]
+
+
 def _f3a5_api():
     from importlib import import_module
 
