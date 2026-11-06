@@ -172,6 +172,115 @@ def test_f3a8_public_recorded_timeline_keeps_late_ack_history_and_unknown_energy
     assert (plan, samples, case, socs, efficiencies) == before
 
 
+@pytest.mark.parametrize("send_at_start", [False, True])
+@pytest.mark.parametrize("safe_stop", [False, True])
+@pytest.mark.parametrize("peer", [False, True])
+def test_f3a_final_i1_public_opening_missing_application_latches_unknown(send_at_start, safe_stop, peer):
+    from copy import deepcopy
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import replay_execution as replay
+    from dao.tests.prog.test_fast_replay_execution import (
+        f3a_final_openings,
+        replay_receipt,
+        replay_timing,
+        stop_events,
+    )
+
+    start, end = T0 + .6, T0 + 2
+    plan = flat_plan(make_spec(charge_efficiency=1, discharge_efficiency=1))
+    if peer:
+        plan.specs.append(make_spec(name="B", capacity_kwh=20, charge_efficiency=1, discharge_efficiency=1))
+        for row in plan.intervals:
+            row.batteries.append(BatteryPlanStep(-500, 60, 60))
+    openings = f3a_final_openings(replay, plan, start if send_at_start else T0 + .5)
+    if peer:
+        other = replace(openings[0].command, command_id="final-opening-B", sequence=2,
+                        battery_name="B", setpoint_w=-500)
+        openings = (replay.OpeningAcceptance(other, replay_timing(replay, other),
+            replay_receipt(replay, other, T0 + .05, apply_ts=T0 + .05), T0), *openings)
+    late = replay_receipt(replay, openings[-1].command, T0 + 1.1, apply_ts=T0 + 1.1)
+    request, barrier = stop_events(replay, request_ts=T0 + 1.2, barrier_ts=T0 + 1.3)
+    stale = replay_receipt(replay, openings[-1].command, T0 + 1.4, apply_ts=T0 + 1.4)
+    events = (late, request, barrier, stale) if safe_stop else (late,)
+    case = _f3a5_recorded(plan, start, end, events)
+    case = replace(case, execution=replace(case.execution, opening_acceptances=openings))
+    samples = [Sample(start, 0), Sample(end, 0)]
+    socs = {"accu": 40, "B": 60} if peer else {"accu": 40}
+    before = deepcopy((plan, samples, socs, case))
+    result = simulate(plan, samples, PolicyLimits(), socs, "opening without application", True,
+                      inverter_efficiency=1, execution=case)
+
+    lost = [s for s in result.segments if not safe_stop or s.start_ts < barrier.at_ts]
+    stopped = [s for s in result.segments if safe_stop and s.start_ts >= barrier.at_ts]
+    assert lost and bool(stopped) is safe_stop
+    assert lost[0].start_ts == start
+    assert lost[-1].end_ts == (barrier.at_ts if safe_stop else end)
+    assert result.coverage_status == ("partial" if peer or safe_stop else "unknown")
+    assert result.execution_kind == "recorded" and result.writes == int(send_at_start)
+    assert result.trace == (*[item.observation for item in openings], *events)
+    assert lost[0].batteries[0].soc_begin == 40
+    for segment in lost:
+        battery = segment.batteries[0]
+        assert battery.execution_status == ("unknown" if segment.start_ts < T0 + 1 else "unconfirmed")
+        assert "execution_application_unproven" in battery.reasons
+        for name in ("command", "command_w", "modeled_ac_w", "charge_ac_kwh", "discharge_ac_kwh",
+                     "dc_throughput_kwh", "cell_delta_kwh", "soc_end"):
+            assert getattr(battery, name) is None
+        assert segment.import_kwh is segment.export_kwh is None
+    for segment in stopped:
+        battery = segment.batteries[0]
+        assert battery.execution_status == "stopped" and battery.command is None
+        assert battery.soc_begin is battery.soc_end is None
+        assert (battery.modeled_ac_w, battery.charge_ac_kwh, battery.discharge_ac_kwh,
+                battery.dc_throughput_kwh, battery.cell_delta_kwh) == (0, 0, 0, 0, 0)
+        assert segment.import_kwh == segment.export_kwh == 0
+    assert result.soc_end_by_battery[0] == ("accu", None)
+    assert "execution_deadline_exceeded" in result.reasons
+    if peer:
+        duration = (barrier.at_ts if safe_stop else end) - start
+        discharge = duration / 7200
+        assert sum(s.batteries[1].discharge_ac_kwh for s in result.segments) == pytest.approx(discharge)
+        assert result.soc_end_by_battery[1] == ("B", pytest.approx(60 - discharge / .2))
+        assert all(s.batteries[1].soc_end is not None for s in result.segments)
+    for name in ("soc_end", "import_kwh", "export_kwh", "throughput_kwh", "energy_cost",
+                 "wear_cost", "terminal_value", "total_cost"):
+        assert getattr(result, name) is None
+    assert (plan, samples, socs, case) == before
+
+
+@pytest.mark.parametrize("sequences", [(4, 3), (3, 4)])
+def test_f3a_final_i2_public_opening_sequences_cannot_be_sorted_into_success(sequences):
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import replay_execution as replay
+    from dao.tests.prog.test_fast_replay_execution import (
+        replay_command,
+        replay_receipt,
+        replay_timing,
+    )
+
+    plan = flat_plan(make_spec(charge_efficiency=1))
+    first = replay_command(plan, sequence=sequences[0])
+    second = replace(first, command_id="final-public-second", sequence=sequences[1], setpoint_w=1200)
+    openings = tuple(replay.OpeningAcceptance(cmd, replay_timing(replay, cmd),
+        replay_receipt(replay, cmd, T0 + at, apply_ts=T0 + at), T0 + at)
+        for cmd, at in ((first, .1), (second, .3)))
+    case = _f3a5_recorded(plan, T0 + .5, T0 + 1.5, ())
+    case = replace(case, execution=replace(case.execution, opening_acceptances=openings))
+    samples = [Sample(T0 + .5, 0), Sample(T0 + 1.5, 0)]
+    if sequences == (4, 3):
+        with pytest.raises(ValueError, match="^replay_duplicate_identity$"):
+            simulate(plan, samples, PolicyLimits(), 40, "descending opening", False, execution=case)
+    else:
+        result = simulate(plan, samples, PolicyLimits(), 40, "increasing opening", False,
+                          inverter_efficiency=1, execution=case)
+        assert result.coverage_status == "complete" and result.writes == 0
+        assert all(s.batteries[0].command == second for s in result.segments)
+        assert result.import_kwh == pytest.approx(1.2 / 3600)
+        assert result.soc_end_by_battery == (("accu", pytest.approx(40 + 1.2 / 360)),)
+
+
 def test_f3a7_missing_execution_is_unknown_not_success(caplog):
     import logging
 

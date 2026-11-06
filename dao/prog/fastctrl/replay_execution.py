@@ -689,24 +689,31 @@ class ExecutionReplay:
         self._position = 0
         self._boundaries = {start_ts, end_ts}
         identities = {}
-        sequence = 0
-        commands = [opening.command for opening in sorted(
-            self._execution.opening_acceptances, key=lambda opening: opening.command.sequence)]
-        commands.extend(event.command for event in self._execution.events
+        commands = [(opening.sent_at_ts, -math.inf, opening.command)
+                    for opening in self._execution.opening_acceptances]
+        commands.extend((*_event_key(event), event.command) for event in self._execution.events
                         if type(event) is ProposalEvent and event.command is not None)
-        for command in commands:
+        for _, _, command in commands:
             previous = identities.get(command.command_id)
             if previous is not None:
                 if previous != command:
                     raise ValueError("replay_duplicate_identity")
                 continue
-            if command.sequence <= sequence:
-                raise ValueError("replay_duplicate_identity")
             identities[command.command_id] = command
-            sequence = command.sequence
             self._boundaries.update((command.execute_before_ms / 1000, command.hold_until_ms / 1000))
             if command.stop_at_ms is not None:
                 self._boundaries.add(command.stop_at_ms / 1000)
+        # Use the fold's proven send chronology, including opening markers at
+        # start. Missing send evidence cannot establish a sequence watermark.
+        sequence, sent_ids = 0, set()
+        for _, _, command in sorted((item for item in commands if item[0] is not None),
+                                     key=lambda item: item[:2]):
+            if command.command_id in sent_ids:
+                continue
+            if command.sequence <= sequence:
+                raise ValueError("replay_duplicate_identity")
+            sent_ids.add(command.command_id)
+            sequence = command.sequence
         for event in self._execution.events:
             if not start_ts <= event.at_ts <= end_ts:
                 raise ValueError("replay_window_invalid")
@@ -1223,14 +1230,23 @@ class ExecutionReplay:
         queue = []
         for opening in openings:
             observation, application = opening.observation, opening.observation.application
-            if (opening.sent_at_ts is None or application is None
-                    or not opening.sent_at_ts <= observation.at_ts <= application.at_ts <= self._start):
+            if opening.sent_at_ts is None or opening.sent_at_ts > self._start:
                 self._trace.append(observation)
                 self._reason("execution_application_unproven")
                 continue
-            queue.extend(((opening.sent_at_ts, -math.inf, opening, False),
-                          (*_event_key(observation), observation, False),
-                          (*_event_key(application), observation, True)))
+            # Transmission establishes pending independently of acceptance.
+            # Incomplete opening evidence must not leave an older command current.
+            queue.append((opening.sent_at_ts, -math.inf, opening, False))
+            if not opening.sent_at_ts <= observation.at_ts <= self._start:
+                self._trace.append(observation)
+                self._reason("execution_application_unproven")
+                continue
+            queue.append((*_event_key(observation), observation, False))
+            if application is not None:
+                if application.at_ts <= self._start:
+                    queue.append((*_event_key(application), observation, True))
+                else:
+                    self._reason("execution_application_unproven")
         # Only strictly pre-window evidence is folded here. Start-boundary
         # evidence shares the regular queue and its lifecycle/application order.
         for at_ts, order, event, application in sorted(queue, key=lambda item: item[:2]):
