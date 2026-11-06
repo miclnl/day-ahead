@@ -18,8 +18,13 @@ from dao.prog.fastctrl.command import (
     RevokeRequest,
     plan_digest,
 )
-from dao.prog.fastctrl.policy import BatteryDecision, ControllerState
-from dao.prog.fastctrl.receiver import payload_digest
+from dao.prog.fastctrl.policy import (
+    BatteryDecision,
+    ControllerState,
+    PolicyLimits,
+    apply_execution_outcome,
+)
+from dao.prog.fastctrl.receiver import payload_digest, receipt_matches_command
 from dao.tests.prog.test_fast_actuator import proposal
 from dao.tests.prog.test_fast_command import command, other_dtos, receipt
 from dao.tests.prog.test_fast_policy import T0, make_plan, make_spec
@@ -992,3 +997,339 @@ def test_f3a2_i1_opening_receipt_after_start_barrier_is_history(send_at_start):
     assert state.battery(0).held_setpoint_w == 0 and state.battery(0).last_change_ts == 0
     assert snapshot.batteries[0].execution_status == "stopped"
     assert snapshot.batteries[0].pending is None
+
+
+def model_api():
+    api = execution_api()
+    assert hasattr(api, "model_namespace"), "F3a3 deterministic model namespace missing"
+    assert hasattr(api.ExecutionReplay, "submit"), "F3a3 declarative model submission missing"
+    return api
+
+
+def model_run(api, *, plan=None, case=None, start=T0, end=T0 + 10, **model_changes):
+    plan = replay_plan() if plan is None else plan
+    case = scenario(api, modeled(api, **model_changes)) if case is None else case
+    points = ((start, 400.0), (end, 400.0))
+    inputs = validate(api, plan=plan, scenario=case, sample_points=points,
+                      soc_start={spec.name: 40.0 for spec in plan.specs})
+    namespace = api.model_namespace(source_plan=plan, execution_plan=plan, sample_points=points,
+                                    limits=PolicyLimits(), replay_input=inputs)
+    state = ControllerState()
+    run = api.ExecutionReplay(plan=plan, scenario=case, controller=state, start_ts=start, end_ts=end,
+                              namespace=namespace)
+    return run, state, namespace
+
+
+def model_events(api, snapshot, kind):
+    return tuple(event for event in snapshot.trace if type(event) is getattr(api, kind))
+
+
+def test_f3a3_model_namespace_and_receipts_are_scenario_local():
+    api = model_api()
+    plan = replay_plan()
+    inputs = validate(api)
+    kwargs = dict(source_plan=plan, execution_plan=plan, sample_points=POINTS,
+                  limits=PolicyLimits(), replay_input=inputs)
+    before = deepcopy(kwargs)
+    namespace = api.model_namespace(**kwargs)
+    assert len(namespace) == 64 and set(namespace) <= set("0123456789abcdef")
+    assert api.model_namespace(**deepcopy(kwargs)) == namespace
+    other_plan = deepcopy(plan)
+    other_plan.intervals[0].price_import = .31
+    other_spec = deepcopy(plan)
+    other_spec.specs[0].capacity_kwh += 1
+    variations = (
+        {"replay_input": replace(inputs, scenario=replace(inputs.scenario, scenario_id="baseline"))},
+        {"limits": replace(kwargs["limits"], deadband=151)},
+        {"replay_input": replace(inputs, soc_by_battery=(("accu", 41),))},
+        {"replay_input": replace(inputs, inverter_efficiency_by_battery=(("accu", .94),))},
+        {"execution_plan": other_spec}, {"execution_plan": other_plan}, {"source_plan": other_plan},
+        {"sample_points": ((POINTS[0][0], 401), POINTS[-1])},
+        {"replay_input": replace(inputs, scenario=scenario(api, modeled(api, application_delay_s=.1)))},
+        {"replay_input": replace(inputs, scenario=scenario(api, modeled(api, responses=(
+            api.ModelResponse(999, "fast", "accu", "partial", .1),))))},
+        {"replay_input": replace(inputs, scenario=scenario(api, modeled(api, lifecycle=(
+            api.ModelStop(T0 + 2, 0, True, False),))))},
+        {"replay_input": replace(inputs, scenario=scenario(api, house_hold_s=30))},
+    )
+    identities = {api.model_namespace(**(kwargs | change)) for change in variations}
+    assert len(identities) == len(variations) and namespace not in identities
+    assert kwargs == before
+    with pytest.raises((TypeError, ValueError)):
+        api.model_namespace(**(kwargs | {"replay_input": validate(api, scenario=scenario(api, recorded(api)))}))
+
+    snapshots = []
+    for scenario_id in ("fast", "fast", "baseline"):
+        case = replace(scenario(api), scenario_id=scenario_id)
+        run, state, identity = model_run(api, case=case, start=T0 + .0006)
+        decision = proposal(setpoint_w=1200.5, mode=None)
+        run.submit(tick_index=0, at_ts=T0 + .0006, proposals=(decision,), source="fast")
+        decision.setpoint_w = 9999
+        view = view_at(run, T0 + .0006)
+        cmd = view.command
+        assert cmd is not None and view.drive_w == 1200
+        assert cmd.command_id == f"replay/{identity}/{cmd.owner_epoch}/1"
+        assert cmd.installation_id == f"replay/{identity}/installation"
+        assert cmd.owner_session_id.startswith(f"replay/{identity}/")
+        assert cmd.plan_digest == plan_digest(plan) and cmd.issued_at_ms == T0 * 1000 + 1
+        snapshot = run.snapshot(T0 + .0006)
+        assert snapshot.binding.receiver_generation.startswith(f"replay/{identity}/")
+        observed, = model_events(api, snapshot, "ReceiptEvent")
+        assert receipt_matches_command(observed.receipt, cmd)
+        assert observed.at_ts == observed.application.at_ts == T0 + .0006
+        assert observed.receipt.accepted_ts == observed.receipt.observed_at_ms == T0 * 1000 + 1
+        assert run.next_boundary(T0 + .0006, T0 + .1) == T0 + .1
+        assert state.battery(0).held_setpoint_w == 1200
+        snapshots.append(snapshot)
+    assert snapshots[0] == snapshots[1]
+    first, other = (model_events(api, snapshot, "ReceiptEvent")[0].receipt for snapshot in snapshots[::2])
+    foreign_cmd = snapshots[2].batteries[0].command
+    assert first.command_id != other.command_id and first.payload_digest != other.payload_digest
+    assert not receipt_matches_command(first, foreign_cmd)
+    pending = ControllerState().battery(0)
+    pending.pending_command = foreign_cmd
+    assert not apply_execution_outcome(pending, outcome="accepted", receipt=first)
+    assert pending.last_accepted_command is None and pending.pending_command == foreign_cmd
+
+
+@pytest.mark.parametrize("effect,status,recovery", [
+    ("complete", "accepted", False), ("none", "unknown", False),
+    ("partial", "unconfirmed", True), ("unknown", "unconfirmed", True),
+    (None, "unconfirmed", True),
+])
+def test_f3a3_explicit_effects_and_missing_selector_never_imply_success(effect, status, recovery):
+    api = model_api()
+    run, state, _ = model_run(api, default_effect=effect)
+    run.submit(tick_index=0, at_ts=T0, proposals=(proposal(),), source="fast")
+    result = view_at(run, T0)
+    if effect is None:
+        assert result.command is None and result.pending is not None and not result.recovery_required
+        assert "execution_model_missing" in result.reasons
+        assert run.next_boundary(T0, T0 + 2) == T0 + .75
+        result = view_at(run, T0 + .75)
+    assert result.execution_status == status and result.recovery_required is recovery
+    assert result.drive_w == (-1200 if effect == "complete" else None)
+    assert state.battery(0).held_setpoint_w == (-1200 if effect == "complete" else 0)
+    receipts = model_events(api, run.snapshot(T0 + .75 if effect is None else T0), "ReceiptEvent")
+    if effect is None:
+        assert not receipts
+    else:
+        assert len(receipts) == 1
+        assert receipts[0].receipt.status == {"complete": "accepted", "none": "rejected",
+                                              "partial": "unconfirmed", "unknown": "unconfirmed"}[effect]
+
+
+def test_f3a3_no_write_does_not_consume_a_selector_or_sequence():
+    api = model_api()
+    responses = (api.ModelResponse(1, "fast", "accu", "partial", .1),
+                 api.ModelResponse(99, "plan", "accu", "complete", 0))
+    run, state, _ = model_run(api, responses=responses)
+    run.submit(tick_index=0, at_ts=T0, proposals=(proposal(setpoint_w=1000),), source="fast")
+    old = view_at(run, T0).command
+    run.advance(T0 + 1)
+    run.submit(tick_index=1, at_ts=T0 + 1, proposals=(proposal(setpoint_w=1100, write=False),), source="fast")
+    assert view_at(run, T0 + 1).command == old
+    assert run.snapshot(T0 + 1).writes == 1 and state.battery(0).held_setpoint_w == 1000
+    run.advance(T0 + 2)
+    run.submit(tick_index=2, at_ts=T0 + 2, proposals=(proposal(setpoint_w=1200),), source="fast")
+    assert view_at(run, T0 + 2).command.sequence == 2
+    run.advance(T0 + 10)
+    snapshot = run.snapshot(T0 + 10)
+    assert len(model_events(api, snapshot, "ReceiptEvent")) == 2
+    assert "unused_model_response" in snapshot.reasons
+    suppressed, = [event for event in model_events(api, snapshot, "ProposalEvent") if not event.decision.write]
+    assert suppressed.command is None and suppressed.timing is None
+
+
+@pytest.mark.parametrize("delay,accepted", [(.049, True), (.05, False), (.051, False)])
+def test_f3a3_one_absolute_budget_for_all_batteries(delay, accepted):
+    api = model_api()
+    run, state, _ = model_run(api, prepare_delay_s=.7, response_delay_s=delay)
+    run.submit(tick_index=0, at_ts=T0, proposals=(proposal(),), source="plan")
+    assert run.next_boundary(T0, T0 + 2) == T0 + .7
+    assert view_at(run, T0 + .7).pending is not None
+    assert view_at(run, T0 + .7).drive_w is None
+    result = view_at(run, T0 + .8)
+    assert (result.command is not None) is accepted
+    assert result.recovery_required is not accepted
+    observed, = model_events(api, run.snapshot(T0 + .8), "ReceiptEvent")
+    assert observed.receipt.status == "accepted"  # Receiver acceptance is not consumer application.
+    assert observed.application.outcome == ("accepted" if accepted else "unconfirmed")
+    sent, = model_events(api, run.snapshot(T0 + .8), "ProposalEvent")
+    assert sent.command.issued_at_ms == T0 * 1000 and sent.at_ts == T0 + .7
+    assert sent.timing.anchor_ts == T0
+    assert sent.timing.receive_deadline.monotonic_end_ns - sent.timing.anchor_clock.boottime_ns == 750_000_000
+    assert state.battery(0).held_setpoint_w == (-1200 if accepted else 0)
+
+
+@pytest.mark.parametrize("application_delay,accepted", [(.374, True), (.375, False), (.376, False)])
+def test_f3a3_result_application_has_its_own_absolute_cutoff(application_delay, accepted):
+    api = model_api()
+    # Binary-exact preparation/response make the middle case truly equal to 1s.
+    run, state, _ = model_run(api, prepare_delay_s=.5, response_delay_s=.125,
+                              application_delay_s=application_delay)
+    run.submit(tick_index=0, at_ts=T0, proposals=(proposal(),), source="fast")
+    assert view_at(run, T0 + .8).command is None
+    observation, = model_events(api, run.snapshot(T0 + .8), "ReceiptEvent")
+    assert observation.application is None  # A scheduled application is not yet evidence.
+    assert run.next_boundary(T0 + .8, T0 + 2) == min(T0 + 1, T0 + .5 + .125 + application_delay)
+    result = view_at(run, T0 + 1.1)
+    assert (result.command is not None) is accepted
+    assert result.recovery_required is not accepted
+    assert state.battery(0).held_setpoint_w == (-1200 if accepted else 0)
+    observation, = model_events(api, run.snapshot(T0 + 1.1), "ReceiptEvent")
+    assert observation.application.outcome == ("accepted" if accepted else "unconfirmed")
+
+
+@pytest.mark.parametrize("separate_source", [False, True])
+def test_f3a3_successive_batteries_and_sources_share_remaining_budget(separate_source):
+    api = model_api()
+    plan = replay_plan(("accu", "second"))
+    responses = (api.ModelResponse(0, "plan", "accu", "complete", .04),
+                 api.ModelResponse(0, "fast" if separate_source else "plan", "second", "complete", .02))
+    run, state, _ = model_run(api, plan=plan, prepare_delay_s=.7, responses=responses)
+    first, second = proposal(setpoint_w=1000), proposal(index=1, name="second", setpoint_w=-1500)
+    run.submit(tick_index=0, at_ts=T0, proposals=(first,) if separate_source else (first, second), source="plan")
+    if separate_source:
+        run.submit(tick_index=0, at_ts=T0, proposals=(second,), source="fast")
+    assert view_at(run, T0 + .73, 1).pending is None
+    assert view_at(run, T0 + .74).drive_w == 1000
+    assert view_at(run, T0 + .74, 1).pending is not None
+    other = view_at(run, T0 + .76, 1)
+    assert other.command is None and other.recovery_required
+    assert state.battery(0).held_setpoint_w == 1000 and state.battery(1).held_setpoint_w == 0
+    sends = model_events(api, run.snapshot(T0 + .76), "ProposalEvent")
+    assert [event.command.sequence for event in sends] == [1, 2]
+    assert [event.at_ts for event in sends] == [T0 + .7, T0 + .7 + .04]
+    assert sends[0].timing.receive_deadline == sends[1].timing.receive_deadline
+
+
+def test_f3a3_pending_subms_latency_and_terminal_failure_block_new_sends():
+    api = model_api()
+    start = T0 + .0006
+    run, _, _ = model_run(api, start=start, response_delay_s=.0001, application_delay_s=.0001)
+    run.submit(tick_index=0, at_ts=start, proposals=(proposal(),), source="fast")
+    assert view_at(run, start).drive_w is None
+    assert run.next_boundary(start, start + .1) == start + .0001
+    assert view_at(run, start + .0001).drive_w is None
+    assert view_at(run, start + .0001 + .0001).drive_w == -1200
+
+    plan = replay_plan(("accu", "second"))
+    run, _, _ = model_run(api, plan=plan, default_effect="partial", response_delay_s=.2)
+    run.submit(tick_index=0, at_ts=T0, proposals=(proposal(), proposal(index=1, name="second")), source="plan")
+    run.advance(T0 + .1)
+    run.submit(tick_index=1, at_ts=T0 + .1, proposals=(proposal(index=1, name="second"),), source="fast")
+    assert view_at(run, T0 + .4).recovery_required
+    assert run.snapshot(T0 + .4).writes == 1
+    assert run.snapshot(T0 + .4).batteries[1].pending is None
+
+
+@pytest.mark.parametrize("fenced,safe", [(False, True), (True, False), (True, True)])
+def test_f3a3_profile_epoch_and_stop_rules_are_receiver_owned(fenced, safe):
+    api = model_api()
+    lifecycle = (api.ModelStop(T0 + .1, 0, fenced, safe), api.ModelBind(T0 + .1, 1),
+                 api.ModelBind(T0 + .3, 0))
+    case = scenario(api, modeled(api, response_delay_s=.2, lifecycle=lifecycle),
+                    stop_response="ideal_programmed_stop")
+    run, state, _ = model_run(api, case=case)
+    opening_binding = run.snapshot(T0).binding
+    assert opening_binding is not None and run.snapshot(T0).batteries[0].drive_w == 0
+    run.submit(tick_index=0, at_ts=T0, proposals=(proposal(),), source="fast")
+    view_at(run, T0 + .3)
+    snapshot = run.snapshot(T0 + .3)
+    accepted_stop = fenced and safe
+    assert snapshot.batteries[0].command is None
+    assert state.battery(0).last_accepted_command is None and state.battery(0).held_setpoint_w == 0
+    barriers = model_events(api, snapshot, "BarrierEvent")
+    assert [event.receipt.status for event in barriers] == ["accepted", "accepted" if accepted_stop else "unconfirmed"]
+    bindings = model_events(api, snapshot, "BindingEvent")
+    assert len(bindings) == (2 if accepted_stop else 1)
+    if accepted_stop:
+        assert snapshot.binding.owner_epoch == opening_binding.owner_epoch + 1
+        assert snapshot.binding.owner_session_id != opening_binding.owner_session_id
+        assert snapshot.batteries[0].drive_w == 0
+    observed, = model_events(api, snapshot, "ReceiptEvent")
+    assert observed.receipt.status == "rejected" and observed.receipt.reason == "epoch_withdrawn"
+    assert "execution_binding_mismatch" in snapshot.reasons  # Reusing a barrier never rebinds.
+
+
+def test_f3a3_unknown_start_and_expired_profile_do_not_acquire_execution_rights():
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    api = model_api()
+    run, _, _ = model_run(api, initial_execution="unknown", lifecycle=(api.ModelBind(T0, 0),))
+    run.submit(tick_index=0, at_ts=T0, proposals=(proposal(),), source="fast")
+    snapshot = view_at(run, T0)
+    assert snapshot.command is None and snapshot.drive_w is None
+    assert run.snapshot(T0).binding is None and run.snapshot(T0).writes == 0
+
+    plan = ready_plan()
+    start = plan.intervals[0].start_ts
+    plan.intervals[0].battery(0).stop_ts = start + 1
+    before = deepcopy(plan)
+    run, state, _ = model_run(api, plan=plan, start=start, end=start + 700, response_delay_s=1.1)
+    binding = run.snapshot(start).binding
+    assert binding.installation_id == plan.financial_context.basis.meter_id
+    assert binding.owner_not_after_ms == (start + 600) * 1000
+    run.submit(tick_index=0, at_ts=start, proposals=(proposal(setpoint_w=-200.6, mode=None),), source="fast")
+    view_at(run, start + 1.1)
+    snapshot = run.snapshot(start + 1.1)
+    sent, = model_events(api, snapshot, "ProposalEvent")
+    assert sent.command.setpoint_w == -201 and sent.command.mode == plan.specs[0].mode_on
+    assert sent.command.execute_before_ms == sent.command.hold_until_ms == (start + 1) * 1000
+    observed, = model_events(api, snapshot, "ReceiptEvent")
+    assert observed.receipt.status == "rejected" and observed.receipt.reason == "command_expired"
+    assert snapshot.batteries[0].recovery_required and state.battery(0).held_setpoint_w == 0
+    assert plan == before
+    recorded_replay, _ = recorded_run(api)
+    with pytest.raises((TypeError, ValueError)):
+        recorded_replay.submit(tick_index=0, at_ts=T0, proposals=(proposal(),), source="fast")
+
+
+def test_f3a3_generated_application_order_roundtrips_through_recorded_fold():
+    api = model_api()
+    case = scenario(api, modeled(api, response_delay_s=.25, application_delay_s=.25,
+                                lifecycle=(api.ModelStop(T0 + .5, 0, True, True),)),
+                    stop_response="ideal_programmed_stop")
+    run, state, _ = model_run(api, case=case)
+    run.submit(tick_index=0, at_ts=T0, proposals=(proposal(),), source="fast")
+    view_at(run, T0 + .5)
+    snapshot = run.snapshot(T0 + .5)
+    observation, = model_events(api, snapshot, "ReceiptEvent")
+    barrier = model_events(api, snapshot, "BarrierEvent")[-1]
+    assert observation.application.at_ts == barrier.at_ts
+    assert observation.application.order > barrier.order
+    folded, folded_state = recorded_run(
+        api, events=snapshot.trace, opening_binding=None, stop_response="ideal_programmed_stop",
+        installation_id=barrier.receipt.installation_id, receiver_generation=barrier.receipt.receiver_generation)
+    assert view_at(folded, T0 + .5) == snapshot.batteries[0]
+    assert folded_state.battery(0).held_setpoint_w == state.battery(0).held_setpoint_w == 0
+    assert folded_state.battery(0).last_accepted_command is None
+
+
+def test_f3a3_namespace_retains_unrounded_legacy_plan_inputs():
+    api = model_api()
+    plan = replay_plan()
+    changed = deepcopy(plan)
+    changed.price_average += .00000001
+    assert plan_digest(changed) == plan_digest(plan)  # The legacy wire DTO rounds this field.
+    kwargs = dict(source_plan=plan, execution_plan=plan, sample_points=POINTS,
+                  limits=PolicyLimits(), replay_input=validate(api))
+    original = api.model_namespace(**kwargs)
+    assert api.model_namespace(**(kwargs | {"execution_plan": changed})) != original
+    assert api.model_namespace(**(kwargs | {"source_plan": changed})) != original
+
+
+def test_f3a3_rounding_across_a_profile_edge_cannot_extend_the_original_window():
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    api = model_api()
+    plan = ready_plan()
+    start = plan.intervals[0].start_ts
+    plan.intervals[0].battery(0).stop_ts = start + 1
+    run, state, _ = model_run(api, plan=plan, start=start, end=start + 10)
+    at_ts = start + .9996
+    run.submit(tick_index=0, at_ts=at_ts, proposals=(proposal(),), source="fast")
+    assert view_at(run, at_ts).command is None
+    assert state.battery(0).last_accepted_command is None
+    assert run.snapshot(at_ts).writes == 0

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Literal
 
@@ -26,10 +28,18 @@ from .policy import (
     AcceptedCommand,
     BatteryDecision,
     ControllerState,
+    PolicyLimits,
     apply_execution_outcome,
     current_execution_command,
 )
-from .receiver import ReceiverState, classify_bind, receipt_matches_command
+from .receiver import (
+    ReceiverState,
+    classify_bind,
+    classify_effect,
+    classify_revoke,
+    classify_send,
+    receipt_matches_command,
+)
 
 Reasons = tuple[str, ...]
 SamplePoints = tuple[tuple[float, float], ...]
@@ -519,6 +529,30 @@ def wire_ms(at_ts: float) -> int:
     return int(round(at_ts * 1000))
 
 
+def model_namespace(*, source_plan: FastPlan, execution_plan: FastPlan, sample_points: SamplePoints,
+                    limits: PolicyLimits, replay_input: ReplayInput) -> str:
+    """Local repeatability identity, including the complete declarative recipe."""
+    _typed(source_plan, FastPlan)
+    _typed(execution_plan, FastPlan)
+    _typed(limits, PolicyLimits)
+    _typed(replay_input, ReplayInput)
+    if replay_input.scenario is None or type(replay_input.scenario.execution) is not ModeledExecution:
+        raise ValueError("replay_value_invalid")
+    snapshot = dict(version="execution_model_v1", source_plan_digest=plan_digest(source_plan),
+                    execution_plan_digest=plan_digest(execution_plan), sample_points=_samples(sample_points),
+                    limits=asdict(limits), replay_input=asdict(replay_input))
+    # Legacy wire serialization rounds several policy inputs. Retain those
+    # in-memory values as well; v2's strict snapshot already preserves them.
+    snapshot["source_plan"] = asdict(source_plan) if source_plan.format_version == 1 else source_plan.to_dict()
+    snapshot["execution_plan"] = (asdict(execution_plan) if execution_plan.format_version == 1
+                                  else execution_plan.to_dict())
+    try:
+        encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (ValueError, TypeError) as error:
+        raise ValueError("replay_value_invalid") from error
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class BatteryExecutionView:
     battery_name: str
@@ -559,6 +593,30 @@ class _Attempt:
         return (self.apply_end if self.received else self.receive_end) if self.open else None
 
 
+@dataclass
+class _ModelBudget:
+    at_ts: float
+    clock: ClockSample
+    cursor: float
+    failed: bool = False
+    sources: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _ModelSend:
+    tick_index: int
+    source: str
+    decision: BatteryDecision
+    binding: OwnerBinding | None
+
+
+@dataclass(frozen=True)
+class _ModelEffect:
+    command: BatteryCommand
+    timing: ReplayAttemptTiming
+    effect: str
+
+
 class ExecutionReplay:
     """Fold supplied evidence locally; no owner, transport or clock acquisition.
 
@@ -578,15 +636,17 @@ class ExecutionReplay:
         _number(end_ts)
         if start_ts >= end_ts:
             raise ValueError("replay_window_invalid")
-        _typed(scenario.execution, RecordedExecution)
         self._plan, self._scenario = deepcopy(plan), deepcopy(scenario)
         self._execution = self._scenario.execution
+        self._model = self._execution if type(self._execution) is ModeledExecution else None
         self._controller = controller
         self._start, self._end, self._now = start_ts, end_ts, start_ts
         self._digest = plan_digest(self._plan)
         self._names = tuple(spec.name for spec in plan.specs)
         if not self._names or len(set(self._names)) != len(self._names):
             raise ValueError("replay_battery_mapping_invalid")
+        if self._model is not None:
+            self._init_model(namespace)
         self._states = tuple(controller.battery(i) for i in range(len(self._names)))
         for state in self._states:
             state._current_accepted_command = None
@@ -678,7 +738,231 @@ class ExecutionReplay:
             request, barrier = self._execution.opening_stop
             self._request(StopRequestEvent(request.requested_at_ms / 1000, 0, request))
             self._stop(BarrierEvent(start_ts, 0, barrier))
+        if self._model is not None:
+            # Lifecycle order is declarative. Generated work follows existing
+            # lifecycle evidence at the same float time, before the next send.
+            for index, event in enumerate(self._model.lifecycle):
+                if not start_ts <= event.at_ts <= end_ts:
+                    raise ValueError("replay_window_invalid")
+                self._enqueue(event.at_ts, index * 3, event)
+            if self._model.initial_execution == "stopped":
+                self._enqueue(start_ts, -3, ModelStop(start_ts, -3, True, True))
+                self._enqueue(start_ts, -1, ModelBind(start_ts, -1))
         self.advance(start_ts)
+
+    def _init_model(self, namespace: str | None) -> None:
+        if (type(namespace) is not str or len(namespace) != 64
+                or any(character not in "0123456789abcdef" for character in namespace)):
+            raise ValueError("replay_value_invalid")
+        self._model_root = f"replay/{namespace}"
+        context = self._plan.financial_context
+        installation = context.basis.meter_id if context is not None else f"{self._model_root}/installation"
+        generation = f"{self._model_root}/generation"
+        self._model_receiver = ReceiverState(
+            1, installation, f"{self._model_root}/receiver", generation, f"{self._model_root}/anchor",
+            1, 0, None, 0, 0, (), True, True, None, None, f"{self._model_root}/queue")
+        # Complete coverage is a model assumption, never historical evidence.
+        # Both variants then use exactly the same evidence consumer below.
+        self._execution = RecordedExecution(installation, generation, None, (), None, tuple(
+            ExecutionCoverage(name, self._start, self._end) for name in self._names), ())
+        end = min(self._end, self._plan.horizon_end_ts)
+        if context is not None:
+            end = min(end, context.not_after_ts)
+        self._model_lease_end = wire_ms(end)
+        # Reserve ordered slots for request/barrier/binding before generated
+        # responses at the same time. Trace order must also survive re-folding.
+        self._model_order = len(self._model.lifecycle) * 3
+        self._model_sequence = 0
+        self._model_budgets: dict[int, _ModelBudget] = {}
+        self._model_attempt_budgets: dict[str, _ModelBudget] = {}
+        self._model_responses = {(item.tick_index, item.source, item.battery_name): item
+                                 for item in self._model.responses}
+        if any(item.battery_name not in self._names for item in self._model.responses):
+            raise ValueError("replay_model_selector_invalid")
+        self._model_used = set()
+
+    def _order(self) -> int:
+        self._model_order += 1
+        return self._model_order
+
+    def _enqueue(self, at_ts: float, order: int, event, application=False) -> None:
+        self._queue.append((at_ts, order, event, application))
+        self._queue[self._position:] = sorted(self._queue[self._position:], key=lambda item: item[:2])
+        self._boundaries.add(at_ts)
+
+    def _model_clock(self, at_ts: float, timing: ReplayAttemptTiming | None = None) -> ClockSample:
+        mono = round((at_ts - self._start) * 1e9) if timing is None else self._mono(timing, at_ts)
+        return ClockSample(wire_ms(at_ts), mono, f"{self._model_root}/boot", 0, True)
+
+    def submit(self, *, tick_index: int, at_ts: float, proposals: tuple[BatteryDecision, ...],
+               source: Literal["plan", "fast"]) -> None:
+        """Queue model proposals; all sources share the tick's original budget."""
+        if self._model is None:
+            raise TypeError("replay_value_invalid")
+        if type(tick_index) is not int or tick_index < 0:
+            raise ValueError("replay_model_selector_invalid")
+        _choice(source, ("plan", "fast"), "replay_model_selector_invalid")
+        _number(at_ts)
+        if not self._now <= at_ts < self._end:
+            raise ValueError("replay_time_order_invalid")
+        decisions = deepcopy(_tuple(proposals))
+        indices = set()
+        for decision in decisions:
+            _decision(decision)
+            if (decision.index >= len(self._names) or self._names[decision.index] != decision.name
+                    or decision.index in indices):
+                raise ValueError("replay_battery_mapping_invalid")
+            indices.add(decision.index)
+        budget = self._model_budgets.get(tick_index)
+        if budget is None:
+            if self._model_budgets and (tick_index <= max(self._model_budgets)
+                                       or at_ts <= self._model_budgets[max(self._model_budgets)].at_ts):
+                raise ValueError("replay_time_order_invalid")
+            budget = _ModelBudget(at_ts, self._model_clock(at_ts), at_ts + self._model.prepare_delay_s)
+            self._model_budgets[tick_index] = budget
+        if budget.at_ts != at_ts or source in budget.sources:
+            raise ValueError("replay_model_selector_invalid")
+        self.advance(at_ts)
+        budget.sources.add(source)
+        for decision in sorted(decisions, key=lambda item: item.index):
+            if not decision.write:
+                event = ProposalEvent(at_ts, self._order(), decision, None, None)
+                self._enqueue(at_ts, event.order, event)
+                continue
+            task = _ModelSend(tick_index, source, decision, self._binding)
+            # Sends come after response/application work at an equal float time.
+            # This also drains zero-latency work without creating a Q(t)/1000 gap.
+            self._enqueue(budget.cursor, math.inf, task)
+            response = self._model_responses.get((tick_index, source, decision.name))
+            effect = response.effect if response is not None else self._model.default_effect
+            delay = response.delay_s if response is not None else self._model.response_delay_s
+            budget.cursor = (budget.cursor + delay + self._model.application_delay_s if effect is not None
+                             else max(budget.cursor, at_ts + .75))
+
+    def _model_stop(self, event: ModelStop, order: int) -> None:
+        receiver = self._model_receiver
+        request = RevokeRequest(receiver.installation_id, receiver.epoch_high_water,
+                                f"{self._model_root}/barrier/{receiver.epoch_high_water}",
+                                "model_stop", wire_ms(event.at_ts))
+        self._fold(StopRequestEvent(event.at_ts, order, request))
+        result = classify_revoke(receiver, request, receiver_now_upper_ms=wire_ms(event.at_ts),
+                                 queues_drained=event.queues_fenced, safe_state_confirmed=event.safe_state_confirmed)
+        self._model_receiver = result.state
+        self._binding = None
+        self._safe_since = [None] * len(self._names)
+        for attempt in self._attempts.values():
+            if attempt.open:
+                self._model_attempt_budgets[attempt.command.command_id].failed = True
+        self._fold(BarrierEvent(event.at_ts, order + 1, result.receipt))
+
+    def _model_bind(self, event: ModelBind, order: int) -> None:
+        receiver = self._model_receiver
+        now = wire_ms(event.at_ts)
+        if now >= self._model_lease_end or event.at_ts >= self._model_lease_end / 1000:
+            self._reason("execution_context_expired")
+            return
+        result = classify_bind(
+            receiver, installation_id=receiver.installation_id, barrier_id=receiver.pending_barrier_id or "missing",
+            expected_epoch=receiver.epoch_high_water,
+            owner_session_id=f"{self._model_root}/owner/{receiver.epoch_high_water}",
+            requested_not_after_ms=self._model_lease_end, receiver_max_lease_ms=self._model_lease_end - now,
+            receiver_now_upper_ms=now)
+        self._model_receiver = result.state
+        if result.binding is None:
+            self._reason("execution_binding_mismatch")
+        else:
+            self._fold(BindingEvent(event.at_ts, order, result.binding))
+
+    def _model_send(self, task: _ModelSend, at_ts: float) -> None:
+        budget, decision, binding = self._model_budgets[task.tick_index], task.decision, task.binding
+        if budget.failed or any(attempt.open for attempt in self._attempts.values()) or any(
+                state.recovery_required for state in self._states):
+            budget.failed = True
+            self._reason("execution_unconfirmed", decision.index)
+            return
+        if binding is None or binding != self._binding:
+            budget.failed = True
+            self._reason("execution_binding_mismatch", decision.index)
+            return
+        issued = wire_ms(budget.at_ts)
+        try:
+            interval = self._plan.interval_at(budget.at_ts)
+            if interval is None or interval is not self._plan.interval_at(issued / 1000):
+                raise ExecutionRefused("command_window_invalid")
+            if self._plan.financial_context is not None:
+                step = interval.battery(decision.index)
+                if any(budget.at_ts < edge <= issued / 1000 for edge in (step.active_from_ts, step.stop_ts)
+                       if edge is not None):
+                    raise ExecutionRefused("command_window_invalid")
+                end = _command_end_ms(self._plan, battery_name=decision.name, at_ms=issued,
+                                      owner_end_ms=binding.owner_not_after_ms)
+            else:
+                end = min(wire_ms(interval.end_ts), wire_ms(self._end), binding.owner_not_after_ms)
+            receive = _bounded_deadline(Deadline(budget.clock.boottime_ns + 750_000_000, end),
+                                        clock=budget.clock, wire_end_ms=end)
+            apply = _bounded_deadline(Deadline(budget.clock.boottime_ns + 1_000_000_000, end),
+                                      clock=budget.clock, wire_end_ms=end)
+            timing = ReplayAttemptTiming(budget.at_ts, budget.clock, receive, apply)
+            clock = self._model_clock(at_ts, timing)
+            timing = ReplayAttemptTiming(budget.at_ts, budget.clock,
+                _bounded_deadline(receive, clock=clock, wire_end_ms=end),
+                _bounded_deadline(apply, clock=clock, wire_end_ms=end))
+        except ExecutionRefused:
+            budget.failed = True
+            self._reason("execution_deadline_exceeded", decision.index)
+            return
+        setpoint, mode, stop = self._command_payload(decision, issued)
+        self._model_sequence += 1
+        command = BatteryCommand(binding.installation_id, decision.name, binding.owner_session_id,
+            binding.owner_epoch, self._model_sequence,
+            f"{self._model_root}/{binding.owner_epoch}/{self._model_sequence}", self._digest,
+            issued, end, end, setpoint, mode, stop)
+        self._model_attempt_budgets[command.command_id] = budget
+        self._boundaries.update((end / 1000,))
+        if stop is not None:
+            self._boundaries.add(stop / 1000)
+        self._fold(ProposalEvent(at_ts, self._order(), decision, command, timing))
+        result = classify_send(self._model_receiver, command, receiver_now_upper_ms=clock.utc_ms,
+                               clock_healthy=True, clock_uncertainty_ms=0)
+        self._model_receiver = result.state
+        selector = (task.tick_index, task.source, decision.name)
+        response = self._model_responses.get(selector)
+        if response is not None:
+            self._model_used.add(selector)
+        if result.status == "rejected":
+            self._model_receipt(result.receipt, timing, at_ts)
+            return
+        effect = response.effect if response is not None else self._model.default_effect
+        delay = response.delay_s if response is not None else self._model.response_delay_s
+        if effect is None:
+            self._reason("execution_model_missing", decision.index)
+        else:
+            self._enqueue(at_ts + delay, self._order(), _ModelEffect(command, timing, effect))
+
+    def _model_effect(self, task: _ModelEffect, at_ts: float) -> None:
+        result = classify_effect(self._model_receiver, task.command, receiver_now_upper_ms=wire_ms(at_ts),
+                                 clock_healthy=True, clock_uncertainty_ms=0, outcome=task.effect)
+        self._model_receiver = result.state
+        self._model_receipt(result.receipt, task.timing, at_ts)
+
+    def _model_receipt(self, receipt: ActuationReceipt, timing: ReplayAttemptTiming, at_ts: float) -> None:
+        order = self._order()
+        applied = at_ts + self._model.application_delay_s
+        outcome = "unknown" if receipt.status == "rejected" else receipt.status
+        application = ReplayApplication(applied, self._order(), self._model_clock(applied, timing), outcome)
+        event = ReceiptEvent(at_ts, order, receipt, self._model_clock(at_ts, timing), application)
+        self._fold(replace(event, application=None))
+        self._enqueue(applied, application.order, event, True)
+
+    def _model_application(self, event: ReceiptEvent) -> None:
+        # Publish the consumer outcome only after the common fold has performed
+        # its final checks. A scheduled success is not application evidence.
+        outcome = self._fold(event, application=True) or "unconfirmed"
+        evidence = replace(event, application=replace(event.application, outcome=outcome))
+        for index, raw in enumerate(self._trace):
+            if type(raw) is ReceiptEvent and _event_key(raw) == _event_key(event):
+                self._trace[index] = evidence
+                break
 
     def _reason(self, reason: str, index: int | None = None) -> None:
         if reason not in self._history_reasons:
@@ -728,7 +1012,12 @@ class ExecutionReplay:
             return False
 
     def _payload_matches(self, event: ProposalEvent) -> bool:
-        decision, command = event.decision, event.command
+        command = event.command
+        return (command.battery_name == event.decision.name
+                and (command.setpoint_w, command.mode, command.stop_at_ms)
+                == self._command_payload(event.decision, command.issued_at_ms))
+
+    def _command_payload(self, decision: BatteryDecision, issued_at_ms: int) -> tuple[int, str, int | None]:
         spec = self._plan.spec(decision.index)
         setpoint = int(round(decision.setpoint_w))
         mode = decision.mode
@@ -742,11 +1031,10 @@ class ExecutionReplay:
                 except ValueError:
                     pass
         else:
-            interval = self._plan.interval_at(command.issued_at_ms / 1000)
+            interval = self._plan.interval_at(issued_at_ms / 1000)
             if interval is not None and interval.battery(decision.index).stop_ts is not None:
                 stop = int(interval.battery(decision.index).stop_ts) * 1000
-        return (command.battery_name == decision.name and command.setpoint_w == setpoint
-                and command.mode == mode and command.stop_at_ms == stop)
+        return setpoint, mode, stop
 
     @staticmethod
     def _mono(timing: ReplayAttemptTiming, at_ts: float) -> int:
@@ -792,6 +1080,8 @@ class ExecutionReplay:
         if not attempt.open:
             return
         attempt.open = False
+        if self._model is not None:
+            self._model_attempt_budgets[attempt.command.command_id].failed = True
         self._reason(reason, attempt.index)
         apply_execution_outcome(self._states[attempt.index], outcome=outcome, pending=attempt.command)
 
@@ -887,7 +1177,7 @@ class ExecutionReplay:
             if attempt.observation is None:
                 attempt.observation = event
 
-    def _apply(self, event: ReceiptEvent) -> None:
+    def _apply(self, event: ReceiptEvent) -> str | None:
         attempt = self._observations.get(_event_key(event))
         if attempt is None or not attempt.open:
             return
@@ -902,6 +1192,7 @@ class ExecutionReplay:
             self._finish(attempt, reason)
         elif event.receipt.status == "rejected" and application.outcome == "unknown":
             self._finish(attempt, "execution_rejected", outcome="unknown")
+            return "unknown"
         elif application.outcome != "accepted" or event.receipt.status != "accepted":
             self._finish(attempt, "execution_unconfirmed")
         elif not self._covered(attempt.index, attempt.sent_key[0], application.at_ts):
@@ -922,6 +1213,8 @@ class ExecutionReplay:
                 plan_w = (profile_power_at(step, command.issued_at_ms / 1000)
                           if self._plan.financial_context is not None else step.ac_power_w)
                 state.override_active = command.setpoint_w != int(round(plan_w))
+            return "accepted"
+        return "unconfirmed"
 
     def _openings(self, openings: tuple[OpeningAcceptance, ...]) -> None:
         queue = []
@@ -954,6 +1247,8 @@ class ExecutionReplay:
         binding = self._binding
         epoch = binding.owner_epoch if binding is not None else (
             self._barrier.current_epoch if self._barrier is not None else request.expected_epoch)
+        if self._model is not None:
+            epoch = self._model_receiver.epoch_high_water
         if (request.installation_id != self._execution.installation_id or request.expected_epoch != epoch
                 or request.requested_at_ms > wire_ms(event.at_ts)):
             self._reason("execution_barrier_unproven")
@@ -966,8 +1261,11 @@ class ExecutionReplay:
         if barrier.barrier_id in self._seen_barriers:
             return
         if (own is None or event.at_ts < own.at_ts or barrier.status != "accepted"
-                or (self._binding is not None and self._binding.owner_epoch != own.request.expected_epoch)
-                or (self._barrier is not None and self._barrier.current_epoch != own.request.expected_epoch)
+                or (self._model is None and self._binding is not None
+                    and self._binding.owner_epoch != own.request.expected_epoch)
+                or (self._model is None and self._barrier is not None
+                    and self._barrier.current_epoch != own.request.expected_epoch)
+                or (self._model is not None and self._model_receiver.last_barrier != barrier)
                 or barrier.installation_id != self._execution.installation_id
                 or barrier.receiver_generation != self._execution.receiver_generation
                 or barrier.revoked_through_epoch != own.request.expected_epoch
@@ -1030,6 +1328,34 @@ class ExecutionReplay:
                              attempt.index)
                 self._finish(attempt, "execution_deadline_exceeded")
 
+    def _fold(self, event: ReplayEvent, *, application=False) -> str | None:
+        if application:
+            return self._apply(event)
+        elif type(event) is ReceiptEvent:
+            self._receive(event)
+        else:
+            self._trace.append(event)
+            if type(event) is ProposalEvent:
+                if event.decision.write:
+                    if event.command is None:
+                        index = event.decision.index
+                        self._safe_since[index] = None
+                        apply_execution_outcome(self._states[index], outcome="unconfirmed")
+                        for attempt in self._attempts.values():
+                            if attempt.index == index:
+                                attempt.open = False
+                        self._reason("execution_input_missing", index)
+                    else:
+                        self._writes += 1
+                        self._send(event.command, _event_key(event), event.timing, event.decision,
+                                   payload_matches=self._payload_matches(event))
+            elif type(event) is StopRequestEvent:
+                self._request(event)
+            elif type(event) is BarrierEvent:
+                self._stop(event)
+            elif type(event) is BindingEvent:
+                self._bind(event)
+
     def advance(self, at_ts: float) -> None:
         _number(at_ts)
         if at_ts < self._now or at_ts > self._end:
@@ -1040,37 +1366,23 @@ class ExecutionReplay:
                 break
             self._expire(time)
             self._position += 1
-            if application:
-                self._apply(event)
-            elif type(event) is OpeningAcceptance:
+            if type(event) is OpeningAcceptance:
                 # The existing opening-send marker captures pending before its
                 # receipt. A send on the left boundary is an in-window attempt.
                 self._writes += 1
                 self._send(event.command, (time, order), event.timing, None)
-            elif type(event) is ReceiptEvent:
-                self._receive(event)
+            elif type(event) is ModelStop:
+                self._model_stop(event, order)
+            elif type(event) is ModelBind:
+                self._model_bind(event, order)
+            elif type(event) is _ModelSend:
+                self._model_send(event, time)
+            elif type(event) is _ModelEffect:
+                self._model_effect(event, time)
+            elif self._model is not None and application:
+                self._model_application(event)
             else:
-                self._trace.append(event)
-                if type(event) is ProposalEvent:
-                    if event.decision.write:
-                        if event.command is None:
-                            index = event.decision.index
-                            self._safe_since[index] = None
-                            apply_execution_outcome(self._states[index], outcome="unconfirmed")
-                            for attempt in self._attempts.values():
-                                if attempt.index == index:
-                                    attempt.open = False
-                            self._reason("execution_input_missing", index)
-                        else:
-                            self._writes += 1
-                            self._send(event.command, _event_key(event), event.timing, event.decision,
-                                       payload_matches=self._payload_matches(event))
-                elif type(event) is StopRequestEvent:
-                    self._request(event)
-                elif type(event) is BarrierEvent:
-                    self._stop(event)
-                elif type(event) is BindingEvent:
-                    self._bind(event)
+                self._fold(event, application=application)
         self._expire(at_ts)
         self._now = at_ts
 
@@ -1130,5 +1442,8 @@ class ExecutionReplay:
                                                state.recovery_required, state.pending_command,
                                                state.override_active if accepted is not None else False,
                                                tuple(dict.fromkeys(reasons))))
-        reasons = tuple(dict.fromkeys((*self._history_reasons, *(reason for view in views for reason in view.reasons))))
+        unused = ("unused_model_response",) if (self._model is not None and at_ts == self._end
+                                                and self._model_responses.keys() - self._model_used) else ()
+        reasons = tuple(dict.fromkeys((*self._history_reasons, *(reason for view in views for reason in view.reasons),
+                                       *unused)))
         return ExecutionSnapshot(binding, tuple(views), self._writes, deepcopy(tuple(self._trace)), reasons)
