@@ -490,3 +490,227 @@ class TestSyntheticCase:
         assert "Besparing" in report
         assert "Totale kosten" in report
         assert len(comparison.daily_table().splitlines()) >= 3
+
+
+def _f3a4_physics():
+    from importlib import import_module
+
+    module = import_module("dao.prog.fastctrl.simulate")
+    names = ("BatteryReplaySegment", "ReplaySegment", "_next_physical_boundary",
+             "_integrate_replay_segment")
+    missing = [name for name in names if not hasattr(module, name)]
+    assert not missing, f"F3a4 private physics API missing: {missing}"
+    return module
+
+
+def _f3a4_execution(*powers):
+    from dao.prog.fastctrl.replay_execution import BatteryExecutionView, ExecutionSnapshot
+    from dao.tests.prog.test_fast_command import command
+
+    views = []
+    for index, (name, power) in enumerate(powers):
+        accepted = command(battery_name=name, setpoint_w=power,
+                           command_id=f"physics-{name}", sequence=index + 1,
+                           issued_at_ms=T0 * 1000, execute_before_ms=T0 * 1000 + 1000,
+                           hold_until_ms=(T0 + 7200) * 1000,
+                           mode="Aan" if power else "Uit")
+        views.append(BatteryExecutionView(name, accepted, float(power), "accepted",
+                                          False, None, False, ()))
+    return ExecutionSnapshot(None, tuple(views), 0, (), ())
+
+
+def test_f3a4_gross_flows_and_soc_saturation():
+    from dataclasses import FrozenInstanceError
+
+    physics = _f3a4_physics()
+    a = BatteryModel(make_spec(name="A", charge_efficiency=.9, discharge_efficiency=.95),
+                     soc=50, inverter_efficiency=.8)
+    b = BatteryModel(make_spec(name="B", capacity_kwh=20,
+                              charge_efficiency=.85, discharge_efficiency=.8),
+                     soc=50, inverter_efficiency=.9)
+    models = {"B": b, "A": a}  # Physical identity must not depend on dict order.
+    execution = _f3a4_execution(("A", 1000), ("B", -1000))
+    assert physics._next_physical_boundary(start_ts=T0, end_ts=T0 + 900,
+                                           models=models, execution=execution) == T0 + 900
+    assert (a.soc, b.soc) == (50, 50)
+    segment = physics._integrate_replay_segment(start_ts=T0, end_ts=T0 + 900,
+                                               house_w=0, models=models, execution=execution)
+    first, second = segment.batteries
+    assert (first.battery_name, second.battery_name) == ("A", "B")
+    assert (segment.start_ts, segment.end_ts, segment.house_w) == (T0, T0 + 900, 0)
+    assert segment.import_kwh == segment.export_kwh == 0
+    assert (first.modeled_ac_w, second.modeled_ac_w) == (1000, -1000)
+    assert (first.charge_ac_kwh, first.discharge_ac_kwh) == (.25, 0)
+    assert (second.charge_ac_kwh, second.discharge_ac_kwh) == (0, .25)
+    assert first.dc_throughput_kwh == pytest.approx(.2)
+    assert first.cell_delta_kwh == pytest.approx(.18)
+    assert (first.soc_begin, first.soc_end) == pytest.approx((50, 51.8))
+    assert second.dc_throughput_kwh == pytest.approx(.25 / .9)
+    assert second.cell_delta_kwh == pytest.approx(-.25 / (.9 * .8))
+    assert second.soc_end == pytest.approx(50 - .25 / (.9 * .8) / .2)
+    assert (a.soc, b.soc) == (first.soc_end, second.soc_end)
+    for result, view in zip(segment.batteries, execution.batteries, strict=True):
+        assert result.command is view.command
+        assert result.command_w == view.command.setpoint_w
+        assert result.execution_status == "accepted"
+        assert result.reasons == ()
+    with pytest.raises(FrozenInstanceError):
+        first.soc_end = 0
+    with pytest.raises(FrozenInstanceError):
+        segment.import_kwh = 1
+
+    # Averaging the clipped power across the hour would erase the .05 import.
+    full = BatteryModel(make_spec(name="A", charge_efficiency=1, discharge_efficiency=1),
+                        soc=94, inverter_efficiency=1)
+    models = {"A": full}
+    execution = _f3a4_execution(("A", 1000))
+    split = physics._next_physical_boundary(start_ts=T0, end_ts=T0 + 3600,
+                                            models=models, execution=execution)
+    assert split == T0 + 360
+    assert full.soc == 94
+    charging = physics._integrate_replay_segment(start_ts=T0, end_ts=split, house_w=-500,
+                                                models=models, execution=execution)
+    assert full.soc == 95
+    assert physics._next_physical_boundary(start_ts=split, end_ts=T0 + 3600,
+                                           models=models, execution=execution) == T0 + 3600
+    idle = physics._integrate_replay_segment(start_ts=split, end_ts=T0 + 3600, house_w=-500,
+                                            models=models, execution=execution)
+    assert charging.import_kwh == pytest.approx(.05)
+    assert charging.export_kwh == idle.import_kwh == 0
+    assert idle.export_kwh == pytest.approx(.45)
+    assert charging.batteries[0].dc_throughput_kwh == pytest.approx(.1)
+    assert charging.batteries[0].cell_delta_kwh == pytest.approx(.1)
+    assert idle.batteries[0].modeled_ac_w == idle.batteries[0].dc_throughput_kwh == 0
+    assert idle.batteries[0].soc_begin == idle.batteries[0].soc_end == 95
+    assert idle.batteries[0].command_w == 1000
+    assert idle.batteries[0].execution_status == "accepted"
+
+    # The earliest boundary may belong to the other battery, discharging through
+    # its own efficiency chain: .1 kWh cells -> .072 kWh AC -> 259.2 seconds.
+    a.soc, b.soc = 94, 20.5
+    models = {"A": a, "B": b}
+    execution = _f3a4_execution(("A", 1000), ("B", -1000))
+    split = physics._next_physical_boundary(start_ts=T0, end_ts=T0 + 900,
+                                            models=models, execution=execution)
+    assert split == pytest.approx(T0 + 259.2, rel=0, abs=1e-6)
+    limited = physics._integrate_replay_segment(start_ts=T0, end_ts=split, house_w=0,
+                                               models=models, execution=execution)
+    assert limited.batteries[1].soc_end == 20
+    assert limited.batteries[1].discharge_ac_kwh == pytest.approx(.072)
+    assert limited.batteries[1].dc_throughput_kwh == pytest.approx(.08)
+    assert limited.batteries[1].cell_delta_kwh == pytest.approx(-.1)
+    assert physics._next_physical_boundary(start_ts=split, end_ts=T0 + 900,
+                                           models=models, execution=execution) == pytest.approx(
+                                               T0 + 500, rel=0, abs=1e-6)
+
+
+def test_f3a4_unknown_is_not_zero_and_never_reanchors_soc():
+    from dataclasses import replace
+
+    physics = _f3a4_physics()
+    models = {name: BatteryModel(make_spec(name=name, charge_efficiency=1,
+                                          discharge_efficiency=1), 50, 1)
+              for name in ("A", "B")}
+    execution = _f3a4_execution(("A", 1000), ("B", -1000))
+    prefix = physics._integrate_replay_segment(start_ts=T0, end_ts=T0 + 900, house_w=0,
+                                              models=models, execution=execution)
+    a, b = execution.batteries
+    unknown = replace(a, command=None, drive_w=None, execution_status="unconfirmed",
+                      recovery_required=True, pending=a.command, reasons=("execution_unconfirmed",))
+    unknown_execution = replace(execution, batteries=(unknown, b))
+    lost = physics._integrate_replay_segment(start_ts=T0 + 900, end_ts=T0 + 1800, house_w=0,
+                                            models=models, execution=unknown_execution)
+    assert prefix.batteries[0].soc_end == 52.5
+    assert prefix.batteries[0].charge_ac_kwh == .25
+    assert lost.batteries[0].soc_begin == 52.5
+    assert lost.batteries[0].soc_end is None
+    assert lost.batteries[0].command is lost.batteries[0].command_w is None
+    assert lost.batteries[0].execution_status == "unconfirmed"
+    assert "execution_unconfirmed" in lost.batteries[0].reasons
+    for name in ("modeled_ac_w", "charge_ac_kwh", "discharge_ac_kwh",
+                 "dc_throughput_kwh", "cell_delta_kwh"):
+        assert getattr(lost.batteries[0], name) is None
+    assert models["A"] is None
+    assert models["B"].soc == lost.batteries[1].soc_end == 45
+    assert lost.batteries[1].discharge_ac_kwh == lost.batteries[1].dc_throughput_kwh == .25
+    assert lost.import_kwh is lost.export_kwh is None
+
+    stopped = replace(unknown, pending=None, drive_w=0, execution_status="stopped",
+                      recovery_required=False, reasons=())
+    stop_execution = replace(execution, batteries=(stopped, b))
+    assert physics._next_physical_boundary(start_ts=T0 + 1800, end_ts=T0 + 2700,
+                                           models=models, execution=stop_execution) == T0 + 2700
+    stop = physics._integrate_replay_segment(start_ts=T0 + 1800, end_ts=T0 + 2700, house_w=0,
+                                            models=models, execution=stop_execution)
+    stopped_result = stop.batteries[0]
+    assert stopped_result.command is stopped_result.command_w is None
+    assert stopped_result.execution_status == "stopped"
+    assert stopped_result.soc_begin is stopped_result.soc_end is None
+    assert "replay_soc_missing" in stopped_result.reasons
+    assert (stopped_result.modeled_ac_w, stopped_result.charge_ac_kwh,
+            stopped_result.discharge_ac_kwh, stopped_result.dc_throughput_kwh,
+            stopped_result.cell_delta_kwh) == (0, 0, 0, 0, 0)
+    assert (stop.import_kwh, stop.export_kwh) == (0, .25)
+    assert models["A"] is None
+
+    # A later accepted command cannot reconstruct the missing energy or SoC.
+    resumed = physics._integrate_replay_segment(start_ts=T0 + 2700, end_ts=T0 + 3600,
+                                               house_w=0, models=models, execution=execution)
+    assert resumed.batteries[0].command is a.command
+    assert resumed.batteries[0].command_w == 1000
+    assert resumed.batteries[0].modeled_ac_w is None
+    assert resumed.batteries[0].soc_begin is resumed.batteries[0].soc_end is None
+    assert models["A"] is None
+    assert models["B"].soc == 40
+
+    # Missing house data affects the site alone, even with a latched peer.
+    gap = physics._integrate_replay_segment(start_ts=T0 + 3600, end_ts=T0 + 4500,
+                                           house_w=None, models=models, execution=stop_execution)
+    assert gap.house_w is gap.import_kwh is gap.export_kwh is None
+    assert gap.batteries[1].cell_delta_kwh == -.25
+    assert gap.batteries[1].soc_end == models["B"].soc == 37.5
+    assert gap.batteries[1].reasons == ()
+    after_gap = physics._integrate_replay_segment(start_ts=T0 + 4500, end_ts=T0 + 5400,
+                                                 house_w=0, models=models, execution=stop_execution)
+    assert (after_gap.import_kwh, after_gap.export_kwh) == (0, .25)
+    assert models["A"] is None
+    assert models["B"].soc == 35
+    assert execution.batteries == (a, b)
+
+
+@pytest.mark.parametrize("command_w, realized_w", [(1001, 1000.25), (-1001, -1000.75), (0, 0)])
+def test_f3a4_direction_and_fractional_integration(command_w, realized_w):
+    from dataclasses import replace
+
+    physics = _f3a4_physics()
+    spec = make_spec(name="A", max_charge_w=1000.25, max_discharge_w=1000.75,
+                     charge_efficiency=1, discharge_efficiency=1)
+    model = BatteryModel(spec, 50, 1)
+    execution = _f3a4_execution(("A", command_w))
+    start, end = T0 + .0006, T0 + .0014
+    assert physics._next_physical_boundary(start_ts=start, end_ts=end,
+                                           models={"A": model}, execution=execution) == end
+    segment = physics._integrate_replay_segment(start_ts=start, end_ts=end, house_w=0,
+                                               models={"A": model}, execution=execution)
+    result = segment.batteries[0]
+    energy = abs(realized_w) * (end - start) / 3_600_000
+    assert (segment.start_ts, segment.end_ts) == (start, end)
+    assert result.command_w == command_w
+    assert result.modeled_ac_w == realized_w  # No rounding of physical clipping.
+    assert result.charge_ac_kwh == pytest.approx(energy if command_w > 0 else 0, abs=1e-15)
+    assert result.discharge_ac_kwh == pytest.approx(energy if command_w < 0 else 0, abs=1e-15)
+    assert result.charge_ac_kwh * result.discharge_ac_kwh == 0
+    assert result.dc_throughput_kwh == pytest.approx(energy, abs=1e-15)
+    assert result.cell_delta_kwh == pytest.approx(energy if command_w >= 0 else -energy, abs=1e-15)
+    assert segment.import_kwh == result.charge_ac_kwh
+    assert segment.export_kwh == result.discharge_ac_kwh
+
+    # A programmed stop can retain a nonzero current command, but its physical
+    # drive is zero. Only the command boundary quantizes power, never this helper.
+    stopped = replace(execution.batteries[0], drive_w=0)
+    stop = physics._integrate_replay_segment(start_ts=end, end_ts=end + .25, house_w=0,
+                                            models={"A": model},
+                                            execution=replace(execution, batteries=(stopped,)))
+    assert stop.batteries[0].command_w == command_w
+    assert stop.batteries[0].modeled_ac_w == stop.batteries[0].cell_delta_kwh == 0
+    assert stop.batteries[0].soc_begin == stop.batteries[0].soc_end == result.soc_end

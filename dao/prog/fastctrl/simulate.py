@@ -32,6 +32,7 @@ from typing import Callable, Optional, Sequence
 from dao.prog.settlement.replay import ReplayBasis
 from dao.prog.settlement.types import SettlementState, TerminalValue
 
+from .command import BatteryCommand
 from .plan import (
     BatterySpec, BatteryPlanStep, FastPlan, PlanInterval,
     profile_energy_kwh, profile_power_at,
@@ -44,6 +45,7 @@ from .policy import (
     PolicyLimits,
     apply_accepted_command,
 )
+from .replay_execution import ExecutionSnapshot, Reasons
 
 #: Default AC/DC conversion efficiency used by the simulation battery model when
 #: the plan does not carry the inverter's own stage curve.
@@ -119,6 +121,115 @@ class BatteryModel:
             drawn_kwh = available_kwh
         self.soc -= drawn_kwh / spec.kwh_per_percent
         return power, dc_kwh
+
+
+@dataclass(frozen=True)
+class BatteryReplaySegment:
+    """One battery's execution evidence and independently modeled gross flows."""
+
+    battery_name: str
+    command: BatteryCommand | None
+    execution_status: str
+    reasons: Reasons
+    command_w: float | None
+    modeled_ac_w: float | None
+    charge_ac_kwh: float | None
+    discharge_ac_kwh: float | None
+    dc_throughput_kwh: float | None
+    cell_delta_kwh: float | None
+    soc_begin: float | None
+    soc_end: float | None
+
+
+@dataclass(frozen=True)
+class ReplaySegment:
+    """A half-open physical slice with nullable site import and export."""
+
+    start_ts: float
+    end_ts: float
+    house_w: float | None
+    batteries: tuple[BatteryReplaySegment, ...]
+    import_kwh: float | None
+    export_kwh: float | None
+
+
+def _next_physical_boundary(
+    *, start_ts: float, end_ts: float, models: dict[str, BatteryModel | None],
+    execution: ExecutionSnapshot,
+) -> float:
+    """Find saturation without advancing models or quantizing physical time."""
+    boundary = end_ts
+    for view in execution.batteries:
+        model = models[view.battery_name]
+        if model is None or view.drive_w is None:
+            continue
+        spec = model.spec
+        power = max(-spec.max_discharge_w, min(spec.max_charge_w, view.drive_w))
+        # Invert only the duration of BatteryModel.step's existing cell-energy
+        # chain. The integrator still delegates all realized flows to step.
+        if power > 0:
+            remaining_kwh = max(0.0, (spec.soc_max - model.soc) * spec.kwh_per_percent)
+            cell_kw = power * model.inverter_efficiency / 1000.0 * spec.charge_efficiency
+        elif power < 0:
+            remaining_kwh = max(0.0, (model.soc - spec.soc_min) * spec.kwh_per_percent)
+            cell_kw = -power / 1000.0 / model.inverter_efficiency / spec.discharge_efficiency
+        else:
+            continue
+        at_ts = start_ts + remaining_kwh / cell_kw * 3600.0
+        # A saturated model already clips to zero; never repeat a zero span.
+        if start_ts < at_ts < boundary:
+            boundary = at_ts
+    return boundary
+
+
+def _integrate_replay_segment(
+    *, start_ts: float, end_ts: float, house_w: float | None,
+    models: dict[str, BatteryModel | None], execution: ExecutionSnapshot,
+) -> ReplaySegment:
+    """Integrate an already split slice, mutating only this run's own models.
+
+    None is an irreversible unknown-SoC latch. Proven zero drive can still have
+    known zero flows after that latch, but cannot reconstruct the lost SoC.
+    """
+    dt_h = (end_ts - start_ts) / 3600.0
+    batteries = []
+    grid_w = house_w
+    for view in execution.batteries:
+        model = models[view.battery_name]
+        soc_begin = model.soc if model is not None else None
+        if view.drive_w is None:
+            models[view.battery_name] = model = None
+        if model is None:
+            actual_w = dc_kwh = cell_delta_kwh = 0.0 if view.drive_w == 0 else None
+            soc_end = None
+            reasons = tuple(dict.fromkeys((*view.reasons, "replay_soc_missing")))
+        else:
+            actual_w, dc_kwh = model.step(view.drive_w, dt_h)
+            soc_end = model.soc
+            cell_delta_kwh = (soc_end - soc_begin) * model.spec.kwh_per_percent
+            reasons = view.reasons
+        charge_kwh = None if actual_w is None else max(0.0, actual_w) * dt_h / 1000.0
+        discharge_kwh = None if actual_w is None else max(0.0, -actual_w) * dt_h / 1000.0
+        batteries.append(BatteryReplaySegment(
+            battery_name=view.battery_name,
+            command=view.command,
+            execution_status=view.execution_status,
+            reasons=reasons,
+            command_w=float(view.command.setpoint_w) if view.command is not None else None,
+            modeled_ac_w=actual_w,
+            charge_ac_kwh=charge_kwh,
+            discharge_ac_kwh=discharge_kwh,
+            dc_throughput_kwh=dc_kwh,
+            cell_delta_kwh=cell_delta_kwh,
+            soc_begin=soc_begin,
+            soc_end=soc_end,
+        ))
+        grid_w = None if grid_w is None or actual_w is None else grid_w + actual_w
+    return ReplaySegment(
+        start_ts=start_ts, end_ts=end_ts, house_w=house_w, batteries=tuple(batteries),
+        import_kwh=None if grid_w is None else max(0.0, grid_w) * dt_h / 1000.0,
+        export_kwh=None if grid_w is None else max(0.0, -grid_w) * dt_h / 1000.0,
+    )
 
 
 @dataclass
