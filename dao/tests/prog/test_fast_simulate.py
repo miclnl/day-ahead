@@ -34,6 +34,144 @@ def modeled_case(scenario_id, *, hold=60, equal_initial_soc=False):
     ), ReplayPhysics("battery_model_v1", hold, "ideal_programmed_stop", equal_initial_soc))
 
 
+def _f3a8_recorded_timeline():
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import replay_execution as replay
+    from dao.prog.fastctrl.policy import BatteryDecision
+    from dao.tests.prog.test_fast_replay_execution import (
+        replay_command,
+        replay_receipt,
+        replay_timing,
+        send_event,
+        stop_events,
+    )
+
+    plan = flat_plan(make_spec(charge_efficiency=.9, discharge_efficiency=.8))
+    plan.specs.append(make_spec(name="B", capacity_kwh=20, discharge_efficiency=.8))
+    for row in plan.intervals:
+        row.batteries.append(BatteryPlanStep(-500, 60, 60))
+    first = replay_command(plan, hold_until_ms=(T0 + 10) * 1000)
+    other = replace(first, battery_name="B", command_id="opening-B", sequence=4, setpoint_w=-500)
+    openings = tuple(replay.OpeningAcceptance(
+        cmd, replay_timing(replay, cmd),
+        replay_receipt(replay, cmd, T0, apply_ts=T0, order=order, apply_order=order + 1), T0,
+    ) for cmd, order in ((first, 1), (other, 3)))
+    suppressed = replay.ProposalEvent(T0 + 1, 0, BatteryDecision(
+        0, "accu", 1100, 0, False, True, "suppressed"), None, None)
+    new = replace(first, command_id="delayed-A", sequence=5, setpoint_w=1200,
+                  issued_at_ms=(T0 + 2) * 1000, execute_before_ms=(T0 + 4) * 1000)
+    # The attempt budget starts before 700 ms preparation, not at send.
+    sent = send_event(replay, new, T0 + 2.7, replay_timing(replay, new, anchor=T0 + 2))
+    late = replay_receipt(replay, new, T0 + 2.8, apply_ts=T0 + 2.9,
+                          accepted_ts=T0 * 1000 + 2701, anchor=T0 + 2)
+    request, barrier = stop_events(replay, request_ts=T0 + 3.1, barrier_ts=T0 + 3.2)
+    stale = replay_receipt(replay, new, T0 + 3.3, apply_ts=T0 + 3.4,
+                           accepted_ts=T0 * 1000 + 2701, anchor=T0 + 2)
+    case = _f3a5_recorded(plan, T0, T0 + 12, (suppressed, sent, late, request, barrier, stale))
+    case = replace(case, scenario_id="f3a8-recorded",
+                   execution=replace(case.execution, opening_acceptances=openings))
+    return plan, [Sample(T0, 0), Sample(T0 + 12, 0)], case
+
+
+def test_f3a8_public_recorded_timeline_keeps_late_ack_history_and_unknown_energy(monkeypatch):
+    from copy import deepcopy
+
+    from dao.prog.fastctrl import replay_execution as replay
+    from dao.prog.fastctrl.command import plan_digest
+    from dao.prog.fastctrl.receiver import payload_digest, receipt_matches_command
+
+    plan, samples, case = _f3a8_recorded_timeline()
+    opening, other = (item.command for item in case.execution.opening_acceptances)
+    suppressed, sent, late, request, barrier, stale = case.execution.events
+    socs, efficiencies = {"accu": 40, "B": 60}, {"accu": .8, "B": .9}
+    before = deepcopy((plan, samples, case, socs, efficiencies))
+    payload = sent.command.to_dict(), payload_digest(sent.command)
+    snapshots = {}
+    snapshot = replay.ExecutionReplay.snapshot
+
+    def observe(self, at_ts):
+        result = snapshot(self, at_ts)
+        snapshots[at_ts] = result
+        return result
+
+    monkeypatch.setattr(replay.ExecutionReplay, "snapshot", observe)
+    result = simulate(plan, samples, PolicyLimits(), socs, "recorded chain", True,
+                      inverter_efficiency=efficiencies, execution=case)
+    assert result.execution_kind == "recorded" and result.coverage_status == "partial"
+    assert result.source_plan_digest == result.execution_plan_digest == plan_digest(plan)
+    assert result.trace == tuple(item.observation for item in case.execution.opening_acceptances) + case.execution.events
+    assert result.writes == 3  # Two opening sends and one new send; write=False adds none.
+    for at in (T0, T0 + 1, T0 + 2):
+        state = snapshots[at]
+        assert state.writes == 2
+        assert [(b.command, b.drive_w, b.pending, b.recovery_required) for b in state.batteries] == [
+            (opening, 1000, None, False), (other, -500, None, False)]
+    assert suppressed.command is suppressed.timing is None
+    pending = snapshots[sent.at_ts].batteries[0]
+    assert (pending.command, pending.drive_w, pending.pending, pending.execution_status,
+            pending.recovery_required) == (None, None, sent.command, "unknown", False)
+    assert sent.command.issued_at_ms < replay.wire_ms(sent.at_ts)
+    assert snapshots[sent.at_ts].writes == 3
+    assert late.receipt.status == stale.receipt.status == "accepted"
+    assert late.application.outcome == stale.application.outcome == "accepted"
+    assert late.receipt.accepted_ts < sent.command.execute_before_ms
+    assert receipt_matches_command(late.receipt, sent.command)
+    assert receipt_matches_command(stale.receipt, sent.command)
+    # Expiry at anchor+.75 leaves only 50 ms after send. Late acceptance and
+    # the stop REQUEST cannot clear that pending/recovery state.
+    for at in (T0 + 2.75, late.at_ts, late.application.at_ts, request.at_ts):
+        state = snapshots[at].batteries[0]
+        assert (state.command, state.drive_w, state.pending, state.execution_status,
+                state.recovery_required) == (None, None, sent.command, "unconfirmed", True)
+        assert "execution_deadline_exceeded" in state.reasons
+        peer = snapshots[at].batteries[1]
+        assert (peer.command, peer.drive_w, peer.pending, peer.recovery_required) == (other, -500, None, False)
+    for at in (barrier.at_ts, stale.at_ts, stale.application.at_ts, T0 + 4, T0 + 10):
+        state = snapshots[at]
+        assert state.binding is None
+        assert all(b.command is b.pending is None and b.drive_w == 0 and not b.recovery_required
+                   for b in state.batteries)
+        assert state.batteries[0].execution_status == "stopped"
+
+    prefix = [s for s in result.segments if s.end_ts <= sent.at_ts]
+    lost = [s for s in result.segments if sent.at_ts <= s.start_ts < barrier.at_ts]
+    stopped = [s for s in result.segments if s.start_ts >= barrier.at_ts]
+    assert prefix and lost and stopped
+    assert prefix[-1].end_ts == lost[0].start_ts == sent.at_ts
+    assert lost[-1].end_ts == stopped[0].start_ts == barrier.at_ts
+    assert all(s.batteries[0].command_w == s.batteries[0].modeled_ac_w == 1000 for s in prefix)
+    assert sum(s.batteries[0].charge_ac_kwh for s in prefix) == pytest.approx(2.7 / 3600)
+    assert sum(s.batteries[0].dc_throughput_kwh for s in prefix) == pytest.approx(2.7 / 3600 * .8)
+    assert sum(s.batteries[0].cell_delta_kwh for s in prefix) == pytest.approx(2.7 / 3600 * .72)
+    assert sum(s.import_kwh for s in prefix) == pytest.approx(2.7 / 7200)
+    assert lost[0].batteries[0].soc_begin == prefix[-1].batteries[0].soc_end
+    for segment in lost:
+        assert segment.import_kwh is segment.export_kwh is None
+        battery = segment.batteries[0]
+        for field in ("command", "command_w", "modeled_ac_w", "charge_ac_kwh", "discharge_ac_kwh",
+                      "dc_throughput_kwh", "cell_delta_kwh", "soc_end"):
+            assert getattr(battery, field) is None
+    for segment in stopped:
+        battery = segment.batteries[0]
+        assert battery.soc_begin is battery.soc_end is None
+        assert "replay_soc_missing" in battery.reasons
+        assert (battery.command_w, battery.modeled_ac_w, battery.charge_ac_kwh, battery.discharge_ac_kwh,
+                battery.dc_throughput_kwh, battery.cell_delta_kwh) == (None, 0, 0, 0, 0, 0)
+        assert segment.import_kwh == segment.export_kwh == 0
+    assert all(s.batteries[0].soc_end is None for s in (*lost, *stopped))
+    assert all(s.batteries[1].soc_begin is not None and s.batteries[1].soc_end is not None for s in result.segments)
+    assert sum(s.batteries[1].discharge_ac_kwh for s in result.segments) == pytest.approx(3.2 / 7200)
+    assert sum(s.batteries[1].dc_throughput_kwh for s in result.segments) == pytest.approx(3.2 / 7200 / .9)
+    assert sum(s.batteries[1].cell_delta_kwh for s in result.segments) == pytest.approx(-3.2 / 7200 / .72)
+    assert result.soc_end_by_battery == (("accu", None), ("B", pytest.approx(60 - 3.2 / 7200 / .72 / .2)))
+    for field in ("soc_end", "import_kwh", "export_kwh", "throughput_kwh", "energy_cost", "wear_cost",
+                  "terminal_value", "total_cost"):
+        assert getattr(result, field) is None
+    assert (sent.command.to_dict(), payload_digest(sent.command)) == payload
+    assert (plan, samples, case, socs, efficiencies) == before
+
+
 def test_f3a7_missing_execution_is_unknown_not_success(caplog):
     import logging
 
