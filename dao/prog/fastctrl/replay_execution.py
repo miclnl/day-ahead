@@ -6,6 +6,7 @@ import math
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
 from .command import (
@@ -16,9 +17,19 @@ from .command import (
     Deadline,
     OwnerBinding,
     RevokeRequest,
+    plan_digest,
 )
-from .plan import FastPlan
-from .policy import AcceptedCommand, BatteryDecision
+from .execution import ExecutionRefused, _bounded_deadline, _command_end_ms
+from .plan import NO_STOP_SENTINEL, FastPlan, profile_power_at
+from .policy import (
+    POWER_EPS,
+    AcceptedCommand,
+    BatteryDecision,
+    ControllerState,
+    apply_execution_outcome,
+    current_execution_command,
+)
+from .receiver import ReceiverState, classify_bind, receipt_matches_command
 
 Reasons = tuple[str, ...]
 SamplePoints = tuple[tuple[float, float], ...]
@@ -506,3 +517,618 @@ def validate_replay_input(*, plan: FastPlan, sample_points: SamplePoints,
 def wire_ms(at_ts: float) -> int:
     """Q only: wire quantization never changes the physical float timeline."""
     return int(round(at_ts * 1000))
+
+
+@dataclass(frozen=True, slots=True)
+class BatteryExecutionView:
+    battery_name: str
+    command: BatteryCommand | None
+    drive_w: float | None
+    execution_status: str
+    recovery_required: bool
+    pending: BatteryCommand | None
+    override: bool
+    reasons: Reasons
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionSnapshot:
+    binding: OwnerBinding | None
+    batteries: tuple[BatteryExecutionView, ...]
+    writes: int
+    trace: tuple[ReplayEvent, ...]
+    reasons: Reasons
+
+
+@dataclass
+class _Attempt:
+    command: BatteryCommand
+    index: int
+    sent_key: tuple[float, int]
+    binding: OwnerBinding | None
+    timing: ReplayAttemptTiming | None
+    decision: BatteryDecision | None
+    receive_end: float | None = None
+    apply_end: float | None = None
+    received: bool = False
+    observation: ReceiptEvent | None = None
+    open: bool = True
+
+    @property
+    def cutoff(self) -> float | None:
+        return (self.apply_end if self.received else self.receive_end) if self.open else None
+
+
+class ExecutionReplay:
+    """Fold supplied evidence locally; no owner, transport or clock acquisition.
+
+    The controller belongs to this run. Only the canonical reducer can establish
+    acceptance; the adapter proves the captured pending, clocks and application
+    first. The small receiver state used for binding is an evidence mirror, not
+    a live receiver or a claim of historical authenticity.
+    """
+
+    def __init__(self, *, plan: FastPlan, scenario: ReplayScenario,
+                 controller: ControllerState, start_ts: float, end_ts: float,
+                 namespace: str | None = None):
+        _typed(plan, FastPlan)
+        _typed(scenario, ReplayScenario)
+        _typed(controller, ControllerState)
+        _number(start_ts)
+        _number(end_ts)
+        if start_ts >= end_ts:
+            raise ValueError("replay_window_invalid")
+        _typed(scenario.execution, RecordedExecution)
+        self._plan, self._scenario = deepcopy(plan), deepcopy(scenario)
+        self._execution = self._scenario.execution
+        self._controller = controller
+        self._start, self._end, self._now = start_ts, end_ts, start_ts
+        self._digest = plan_digest(self._plan)
+        self._names = tuple(spec.name for spec in plan.specs)
+        if not self._names or len(set(self._names)) != len(self._names):
+            raise ValueError("replay_battery_mapping_invalid")
+        self._states = tuple(controller.battery(i) for i in range(len(self._names)))
+        for state in self._states:
+            state._current_accepted_command = None
+        self._reasons = [[] for _ in self._names]
+        self._history_reasons = []
+        self._trace = []
+        self._writes = 0
+        self._attempts: dict[str, _Attempt] = {}
+        self._observations: dict[tuple[float, int], _Attempt] = {}
+        self._receipt_reasons: dict[tuple[float, int], str] = {}
+        self._accepted: list[_Attempt | None] = [None] * len(self._names)
+        self._safe_since: list[float | None] = [None] * len(self._names)
+        self._requests: dict[str, StopRequestEvent] = {}
+        self._barrier = None
+        self._seen_barriers = set()
+        self._receiver_id = None
+        self._bound_epoch = 0
+        self._last_session = None
+        self._binding = self._execution.opening_binding
+        if self._binding is not None:
+            if not self._binding_matches(self._binding) or self._binding.owner_not_after_ms <= wire_ms(start_ts):
+                self._reason("execution_binding_mismatch")
+                self._binding = None
+            else:
+                self._receiver_id = self._binding.receiver_id
+                self._bound_epoch = self._binding.owner_epoch
+                self._last_session = self._binding.owner_session_id
+        self._coverage = {name: [] for name in self._names}
+        for span in self._execution.coverage:
+            if span.battery_name not in self._names:
+                raise ValueError("replay_battery_mapping_invalid")
+            if span.start_ts < start_ts or span.end_ts > end_ts:
+                raise ValueError("replay_window_invalid")
+            self._coverage[span.battery_name].append((span.start_ts, span.end_ts))
+        for spans in self._coverage.values():
+            spans.sort()
+        self._queue = []
+        self._position = 0
+        self._boundaries = {start_ts, end_ts}
+        identities = {}
+        sequence = 0
+        commands = [opening.command for opening in sorted(
+            self._execution.opening_acceptances, key=lambda opening: opening.command.sequence)]
+        commands.extend(event.command for event in self._execution.events
+                        if type(event) is ProposalEvent and event.command is not None)
+        for command in commands:
+            previous = identities.get(command.command_id)
+            if previous is not None:
+                if previous != command:
+                    raise ValueError("replay_duplicate_identity")
+                continue
+            if command.sequence <= sequence:
+                raise ValueError("replay_duplicate_identity")
+            identities[command.command_id] = command
+            sequence = command.sequence
+            self._boundaries.update((command.execute_before_ms / 1000, command.hold_until_ms / 1000))
+            if command.stop_at_ms is not None:
+                self._boundaries.add(command.stop_at_ms / 1000)
+        for event in self._execution.events:
+            if not start_ts <= event.at_ts <= end_ts:
+                raise ValueError("replay_window_invalid")
+            if type(event) is ProposalEvent:
+                decision = event.decision
+                if (decision.index >= len(self._names) or self._names[decision.index] != decision.name
+                        or (event.command is not None and event.command.battery_name != decision.name)):
+                    raise ValueError("replay_battery_mapping_invalid")
+            self._queue.append((*_event_key(event), event, False))
+            if type(event) is ReceiptEvent and event.application is not None:
+                self._queue.append((*_event_key(event.application), event, True))
+            if type(event) is BindingEvent:
+                self._boundaries.add(event.binding.owner_not_after_ms / 1000)
+        for spans in self._coverage.values():
+            for start, end in spans:
+                self._boundaries.update((start, end))
+        for interval in plan.intervals:
+            self._boundaries.update((interval.start_ts, interval.end_ts))
+            for step in interval.batteries:
+                self._boundaries.update(edge for edge in (step.active_from_ts, step.stop_ts) if edge is not None)
+        if self._binding is not None:
+            self._boundaries.add(self._binding.owner_not_after_ms / 1000)
+        if plan.financial_context is not None:
+            self._boundaries.add(plan.financial_context.not_after_ts)
+        self._openings(self._execution.opening_acceptances)
+        # Input event order was validated by RecordedExecution. Merge all
+        # application keys, including opening evidence exactly on window start.
+        self._queue.sort(key=lambda item: item[:2])
+        self._boundaries.update(item[0] for item in self._queue)
+        if self._execution.opening_stop is not None:
+            request, barrier = self._execution.opening_stop
+            self._request(StopRequestEvent(request.requested_at_ms / 1000, 0, request))
+            self._stop(BarrierEvent(start_ts, 0, barrier))
+        self.advance(start_ts)
+
+    def _reason(self, reason: str, index: int | None = None) -> None:
+        if reason not in self._history_reasons:
+            self._history_reasons.append(reason)
+        if index is not None and reason not in self._reasons[index]:
+            self._reasons[index].append(reason)
+
+    def _binding_matches(self, binding: OwnerBinding) -> bool:
+        context = self._plan.financial_context
+        return (binding.installation_id == self._execution.installation_id
+                and binding.receiver_generation == self._execution.receiver_generation
+                and (context is None or binding.installation_id == context.basis.meter_id))
+
+    def _covered(self, index: int, since: float, at_ts: float) -> bool:
+        cursor = max(since, self._start)
+        for start, end in self._coverage[self._names[index]]:
+            if start > cursor:
+                return False
+            if end > cursor:
+                if at_ts < end:
+                    return True
+                cursor = end
+        return False
+
+    def _command_bound(self, command: BatteryCommand, binding: OwnerBinding) -> int:
+        if self._plan.financial_context is not None:
+            return _command_end_ms(self._plan, battery_name=command.battery_name,
+                                   at_ms=command.issued_at_ms, owner_end_ms=binding.owner_not_after_ms)
+        interval = self._plan.interval_at(command.issued_at_ms / 1000)
+        if interval is None:
+            raise ExecutionRefused("command_window_invalid")
+        return min(interval.end_ts * 1000, binding.owner_not_after_ms)
+
+    def _command_matches(self, command: BatteryCommand, at_ts: float) -> bool:
+        binding = self._binding
+        if (binding is None or not self._binding_matches(binding)
+                or command.installation_id != binding.installation_id
+                or command.owner_epoch != binding.owner_epoch
+                or command.owner_session_id != binding.owner_session_id
+                or command.plan_digest != self._digest or command.battery_name not in self._names
+                or not command.issued_at_ms <= wire_ms(at_ts) < command.execute_before_ms
+                or at_ts >= command.execute_before_ms / 1000):
+            return False
+        try:
+            return command.hold_until_ms <= self._command_bound(command, binding)
+        except ExecutionRefused:
+            return False
+
+    def _payload_matches(self, event: ProposalEvent) -> bool:
+        decision, command = event.decision, event.command
+        spec = self._plan.spec(decision.index)
+        setpoint = int(round(decision.setpoint_w))
+        mode = decision.mode
+        if mode is None:
+            mode = spec.mode_on if abs(setpoint) >= POWER_EPS else spec.mode_off
+        stop = None
+        if decision.stop_inverter is not None:
+            if decision.stop_inverter != NO_STOP_SENTINEL:
+                try:
+                    stop = wire_ms(datetime.fromisoformat(decision.stop_inverter).timestamp())
+                except ValueError:
+                    pass
+        else:
+            interval = self._plan.interval_at(command.issued_at_ms / 1000)
+            if interval is not None and interval.battery(decision.index).stop_ts is not None:
+                stop = int(interval.battery(decision.index).stop_ts) * 1000
+        return (command.battery_name == decision.name and command.setpoint_w == setpoint
+                and command.mode == mode and command.stop_at_ms == stop)
+
+    @staticmethod
+    def _mono(timing: ReplayAttemptTiming, at_ts: float) -> int:
+        return timing.anchor_clock.boottime_ns + round((at_ts - timing.anchor_ts) * 1e9)
+
+    def _timing_ends(self, attempt: _Attempt, timing: ReplayAttemptTiming | None,
+                     at_ts: float) -> tuple[float, float] | None:
+        if timing is None or attempt.binding is None:
+            return None
+        clock = timing.anchor_clock
+        receive, apply = timing.receive_deadline, timing.apply_deadline
+        if (not clock.healthy or clock.utc_ms != wire_ms(timing.anchor_ts) or timing.anchor_ts > at_ts
+                or receive.monotonic_end_ns > apply.monotonic_end_ns
+                or receive.execute_before_ms > apply.execute_before_ms):
+            return None
+        try:
+            bound = min(attempt.command.execute_before_ms, self._command_bound(attempt.command, attempt.binding))
+            if any(_bounded_deadline(deadline, clock=clock, wire_end_ms=bound) != deadline
+                   for deadline in (receive, apply)):
+                return None
+        except ExecutionRefused:
+            return None
+        return tuple(min(timing.anchor_ts + (deadline.monotonic_end_ns - clock.boottime_ns) / 1e9,
+                         deadline.execute_before_ms / 1000, bound / 1000) for deadline in (receive, apply))
+
+    def _clock_reason(self, attempt: _Attempt, clock: ClockSample | None,
+                      at_ts: float, *, application=False) -> str | None:
+        timing = attempt.timing
+        if (timing is None or clock is None or not clock.healthy
+                or clock.boot_id != timing.anchor_clock.boot_id or clock.utc_ms != wire_ms(at_ts)
+                or clock.boottime_ns != self._mono(timing, at_ts)):
+            return "execution_deadline_unknown"
+        deadline = timing.apply_deadline if application else timing.receive_deadline
+        end = attempt.apply_end if application else attempt.receive_end
+        bound = min(deadline.execute_before_ms, attempt.command.execute_before_ms,
+                    self._command_bound(attempt.command, attempt.binding))
+        if (end is None or at_ts >= end or deadline.remaining_ns(clock.boottime_ns) <= 0
+                or clock.utc_ms + clock.uncertainty_ms >= bound or at_ts >= bound / 1000):
+            return "execution_deadline_exceeded"
+        return None
+
+    def _finish(self, attempt: _Attempt, reason: str, *, outcome="unconfirmed") -> None:
+        if not attempt.open:
+            return
+        attempt.open = False
+        self._reason(reason, attempt.index)
+        apply_execution_outcome(self._states[attempt.index], outcome=outcome, pending=attempt.command)
+
+    def _send(self, command: BatteryCommand, key: tuple[float, int], timing: ReplayAttemptTiming | None,
+              decision: BatteryDecision | None, *, payload_matches=True) -> _Attempt:
+        index = self._names.index(command.battery_name) if command.battery_name in self._names else None
+        if index is None:
+            raise ValueError("replay_battery_mapping_invalid")
+        state = self._states[index]
+        previous = self._attempts.get(command.command_id)
+        if previous is not None:
+            if not payload_matches:
+                self._reason("execution_binding_mismatch", index)
+                self._finish(previous, "execution_binding_mismatch")
+                return previous
+            if not self._command_matches(command, key[0]):
+                self._reason("execution_binding_mismatch", index)
+                return previous
+            ends = self._timing_ends(previous, timing, key[0])
+            old = previous.timing
+            if (ends is None or old is None or timing.anchor_clock.boot_id != old.anchor_clock.boot_id
+                    or self._mono(old, timing.anchor_ts) != timing.anchor_clock.boottime_ns
+                    or timing.receive_deadline.monotonic_end_ns > old.receive_deadline.monotonic_end_ns
+                    or timing.apply_deadline.monotonic_end_ns > old.apply_deadline.monotonic_end_ns
+                    or timing.receive_deadline.execute_before_ms > old.receive_deadline.execute_before_ms
+                    or timing.apply_deadline.execute_before_ms > old.apply_deadline.execute_before_ms):
+                self._finish(previous, "execution_deadline_unknown")
+            elif previous.open:
+                previous.timing = timing
+                previous.receive_end, previous.apply_end = ends
+                if previous.observation is not None:
+                    observed = previous.observation
+                    reason = self._clock_reason(previous, observed.received_clock, observed.at_ts)
+                    if reason is not None:
+                        self._finish(previous, reason)
+                self._expire(key[0])
+            return previous
+        attempt = _Attempt(command, index, key, self._binding, timing, decision)
+        self._attempts[command.command_id] = attempt
+        self._safe_since[index] = None
+        if decision is not None and decision.restores:
+            state.restore_pending = True
+        if state.recovery_required or any(item.open and item is not attempt and item.index == index
+                                          for item in self._attempts.values()):
+            self._finish(attempt, "execution_unconfirmed")
+            for item in self._attempts.values():
+                if item.index == index:
+                    item.open = False
+            return attempt
+        state.pending_command = command
+        apply_execution_outcome(state, outcome="unknown")
+        if not payload_matches or not self._command_matches(command, key[0]):
+            self._finish(attempt, "execution_binding_mismatch")
+            return attempt
+        ends = self._timing_ends(attempt, timing, key[0])
+        if ends is None:
+            self._finish(attempt, "execution_deadline_unknown")
+        else:
+            attempt.receive_end, attempt.apply_end = ends
+            self._expire(key[0])
+        return attempt
+
+    def _receive(self, event: ReceiptEvent) -> None:
+        self._trace.append(event)
+        attempt = self._attempts.get(event.receipt.command_id)
+        if attempt is None or not attempt.open:
+            return
+        reason = None
+        if not receipt_matches_command(event.receipt, attempt.command) or _event_key(event) <= attempt.sent_key:
+            reason = "execution_receipt_mismatch"
+        reason = reason or self._clock_reason(attempt, event.received_clock, event.at_ts)
+        if (reason is not None and attempt.observation is not None and attempt.observation.receipt == event.receipt
+                and (event.application is None or event.application.outcome == "accepted")):
+            # A late duplicate is history, not a timeout of the earlier timely
+            # observation. A timely duplicate can carry its own application.
+            return
+        receipt, command = event.receipt, attempt.command
+        if (wire_ms(event.at_ts) < receipt.observed_at_ms or receipt.observed_at_ms < command.issued_at_ms
+                or (receipt.accepted_ts is not None and not
+                    command.issued_at_ms <= receipt.accepted_ts <= receipt.observed_at_ms)
+                or (receipt.accepted_ts is not None and receipt.accepted_ts >= command.execute_before_ms)):
+            reason = reason or "execution_receipt_mismatch"
+        self._observations[_event_key(event)] = attempt
+        if reason is not None:
+            # A raw observation, including incomplete clock evidence, is not a
+            # terminal consumer outcome. Fold its application or expire pending
+            # at the original deadline; never run application work at receipt.
+            self._receipt_reasons[_event_key(event)] = reason
+            self._reason(reason, attempt.index)
+            return
+        if receipt.status == "accepted":
+            attempt.received = True
+            if attempt.observation is None:
+                attempt.observation = event
+
+    def _apply(self, event: ReceiptEvent) -> None:
+        attempt = self._observations.get(_event_key(event))
+        if attempt is None or not attempt.open:
+            return
+        application, command = event.application, attempt.command
+        state = self._states[attempt.index]
+        if state.pending_command != command or state.recovery_required or self._binding != attempt.binding:
+            return
+        reason = self._clock_reason(attempt, application.clock, application.at_ts, application=True)
+        reason = reason or self._receipt_reasons.get(_event_key(event))
+        reason = reason or self._clock_reason(attempt, event.received_clock, event.at_ts)
+        if reason is not None:
+            self._finish(attempt, reason)
+        elif event.receipt.status == "rejected" and application.outcome == "unknown":
+            self._finish(attempt, "execution_rejected", outcome="unknown")
+        elif application.outcome != "accepted" or event.receipt.status != "accepted":
+            self._finish(attempt, "execution_unconfirmed")
+        elif not self._covered(attempt.index, attempt.sent_key[0], application.at_ts):
+            self._finish(attempt, "execution_history_missing")
+        elif apply_execution_outcome(state, outcome="accepted", pending=command, receipt=event.receipt):
+            attempt.open = False
+            self._accepted[attempt.index] = attempt
+            state.held_setpoint_w = float(command.setpoint_w)
+            state.held_stop_inverter_cleared = state.stop_inverter_cleared
+            state.last_change_ts = event.receipt.accepted_ts / 1000
+            if attempt.decision is not None:
+                state.override_active = attempt.decision.override
+                if attempt.decision.restores:
+                    state.restore_pending = False
+            else:
+                interval = self._plan.interval_at(command.issued_at_ms / 1000)
+                step = interval.battery(attempt.index)
+                plan_w = (profile_power_at(step, command.issued_at_ms / 1000)
+                          if self._plan.financial_context is not None else step.ac_power_w)
+                state.override_active = command.setpoint_w != int(round(plan_w))
+
+    def _openings(self, openings: tuple[OpeningAcceptance, ...]) -> None:
+        queue = []
+        for opening in openings:
+            observation, application = opening.observation, opening.observation.application
+            if (opening.sent_at_ts is None or application is None
+                    or not opening.sent_at_ts <= observation.at_ts <= application.at_ts <= self._start):
+                self._trace.append(observation)
+                self._reason("execution_application_unproven")
+                continue
+            queue.extend(((opening.sent_at_ts, -math.inf, opening, False),
+                          (*_event_key(observation), observation, False),
+                          (*_event_key(application), observation, True)))
+        # Only strictly pre-window evidence is folded here. Start-boundary
+        # evidence shares the regular queue and its lifecycle/application order.
+        for at_ts, order, event, application in sorted(queue, key=lambda item: item[:2]):
+            if at_ts == self._start:
+                self._queue.append((at_ts, order, event, application))
+                continue
+            self._expire(at_ts)
+            if type(event) is OpeningAcceptance:
+                self._send(event.command, (at_ts, order), event.timing, None)
+            elif application:
+                self._apply(event)
+            else:
+                self._receive(event)
+
+    def _request(self, event: StopRequestEvent) -> None:
+        request = event.request
+        binding = self._binding
+        epoch = binding.owner_epoch if binding is not None else (
+            self._barrier.current_epoch if self._barrier is not None else request.expected_epoch)
+        if (request.installation_id != self._execution.installation_id or request.expected_epoch != epoch
+                or request.requested_at_ms > wire_ms(event.at_ts)):
+            self._reason("execution_barrier_unproven")
+            return
+        self._requests[request.barrier_id] = event
+
+    def _stop(self, event: BarrierEvent) -> None:
+        barrier = event.receipt
+        own = self._requests.get(barrier.barrier_id)
+        if barrier.barrier_id in self._seen_barriers:
+            return
+        if (own is None or event.at_ts < own.at_ts or barrier.status != "accepted"
+                or (self._binding is not None and self._binding.owner_epoch != own.request.expected_epoch)
+                or (self._barrier is not None and self._barrier.current_epoch != own.request.expected_epoch)
+                or barrier.installation_id != self._execution.installation_id
+                or barrier.receiver_generation != self._execution.receiver_generation
+                or barrier.revoked_through_epoch != own.request.expected_epoch
+                or barrier.current_epoch != own.request.expected_epoch + 1
+                or not barrier.queues_fenced or barrier.safe_state != "confirmed"
+                or not own.request.requested_at_ms <= barrier.accepted_ts <= wire_ms(event.at_ts)):
+            self._reason("execution_barrier_unproven")
+            return
+        self._seen_barriers.add(barrier.barrier_id)
+        self._barrier = barrier
+        self._binding = None
+        for index, state in enumerate(self._states):
+            state._current_accepted_command = None
+            pending = state.pending_command
+            if pending is not None and (pending.installation_id != barrier.installation_id
+                                       or pending.owner_epoch > barrier.revoked_through_epoch
+                                       or pending.issued_at_ms > barrier.accepted_ts):
+                continue
+            self._safe_since[index] = event.at_ts
+            if pending is not None or state.recovery_required:
+                apply_execution_outcome(state, outcome="stopped")
+            for attempt in self._attempts.values():
+                if attempt.index == index:
+                    attempt.open = False
+
+    def _bind(self, event: BindingEvent) -> None:
+        binding, barrier = event.binding, self._barrier
+        now_ms = wire_ms(event.at_ts)
+        if (barrier is None or not self._binding_matches(binding)
+                or (self._receiver_id is not None and binding.receiver_id != self._receiver_id)
+                or binding.owner_session_id == self._last_session
+                or binding.owner_not_after_ms <= now_ms or event.at_ts >= binding.owner_not_after_ms / 1000):
+            self._reason("execution_binding_mismatch")
+            return
+        mirror = ReceiverState(
+            schema_version=1, installation_id=self._execution.installation_id, receiver_id=binding.receiver_id,
+            receiver_generation=self._execution.receiver_generation, anchor_checkpoint="recorded-evidence",
+            epoch_high_water=barrier.current_epoch, sequence_high_water=0,
+            bound_owner_session_id=self._binding.owner_session_id if self._binding else None,
+            bound_owner_epoch=self._bound_epoch, owner_not_after_ms=0, commands=(), inhibited=True,
+            queue_known=True, pending_barrier_id=barrier.barrier_id, last_barrier=barrier,
+            queue_generation="recorded-evidence")
+        result = classify_bind(mirror, installation_id=binding.installation_id, barrier_id=binding.barrier_id,
+                               expected_epoch=binding.owner_epoch, owner_session_id=binding.owner_session_id,
+                               requested_not_after_ms=binding.owner_not_after_ms,
+                               receiver_max_lease_ms=binding.owner_not_after_ms - now_ms,
+                               receiver_now_upper_ms=now_ms)
+        if result.status != "accepted" or result.binding != binding:
+            self._reason("execution_binding_mismatch")
+            return
+        self._binding = binding
+        self._bound_epoch = binding.owner_epoch
+        self._last_session = binding.owner_session_id
+        self._receiver_id = binding.receiver_id
+
+    def _expire(self, at_ts: float) -> None:
+        for attempt in self._attempts.values():
+            if attempt.cutoff is not None and attempt.cutoff <= at_ts:
+                self._reason("execution_application_unproven" if attempt.received else "execution_receipt_missing",
+                             attempt.index)
+                self._finish(attempt, "execution_deadline_exceeded")
+
+    def advance(self, at_ts: float) -> None:
+        _number(at_ts)
+        if at_ts < self._now or at_ts > self._end:
+            raise ValueError("replay_time_order_invalid")
+        while self._position < len(self._queue):
+            time, order, event, application = self._queue[self._position]
+            if time > at_ts or time >= self._end:
+                break
+            self._expire(time)
+            self._position += 1
+            if application:
+                self._apply(event)
+            elif type(event) is OpeningAcceptance:
+                # The existing opening-send marker captures pending before its
+                # receipt. A send on the left boundary is an in-window attempt.
+                self._writes += 1
+                self._send(event.command, (time, order), event.timing, None)
+            elif type(event) is ReceiptEvent:
+                self._receive(event)
+            else:
+                self._trace.append(event)
+                if type(event) is ProposalEvent:
+                    if event.decision.write:
+                        if event.command is None:
+                            index = event.decision.index
+                            self._safe_since[index] = None
+                            apply_execution_outcome(self._states[index], outcome="unconfirmed")
+                            for attempt in self._attempts.values():
+                                if attempt.index == index:
+                                    attempt.open = False
+                            self._reason("execution_input_missing", index)
+                        else:
+                            self._writes += 1
+                            self._send(event.command, _event_key(event), event.timing, event.decision,
+                                       payload_matches=self._payload_matches(event))
+                elif type(event) is StopRequestEvent:
+                    self._request(event)
+                elif type(event) is BarrierEvent:
+                    self._stop(event)
+                elif type(event) is BindingEvent:
+                    self._bind(event)
+        self._expire(at_ts)
+        self._now = at_ts
+
+    def next_boundary(self, after_ts: float, before_ts: float) -> float:
+        _number(after_ts)
+        _number(before_ts)
+        if before_ts < after_ts:
+            raise ValueError("replay_time_order_invalid")
+        lower = max(after_ts, self._now)
+        candidates = [edge for edge in self._boundaries if lower < edge <= before_ts]
+        candidates.extend(attempt.cutoff for attempt in self._attempts.values()
+                          if attempt.cutoff is not None and lower < attempt.cutoff <= before_ts)
+        return min(candidates, default=before_ts)
+
+    def snapshot(self, at_ts: float) -> ExecutionSnapshot:
+        _number(at_ts)
+        if at_ts != self._now:
+            raise ValueError("replay_time_order_invalid")
+        binding = self._binding
+        if binding is not None and (wire_ms(at_ts) >= binding.owner_not_after_ms
+                                    or at_ts >= binding.owner_not_after_ms / 1000):
+            binding = None
+        views = []
+        for index, state in enumerate(self._states):
+            reasons = list(self._reasons[index])
+            accepted = self._accepted[index]
+            command = current_execution_command(state, binding=binding, now_ms=wire_ms(at_ts),
+                                                expected_digest=self._digest)
+            since = accepted.sent_key[0] if accepted is not None else self._start
+            covered = self._covered(index, since, at_ts)
+            if not covered:
+                command = None
+                reasons.append("execution_history_missing")
+            if command is not None and at_ts >= min(command.hold_until_ms, binding.owner_not_after_ms) / 1000:
+                command = None
+            drive = float(command.setpoint_w) if command is not None else None
+            ideal_stop = self._scenario.physics.stop_response == "ideal_programmed_stop"
+            if command is not None and command.stop_at_ms is not None and at_ts >= command.stop_at_ms / 1000:
+                drive = 0.0 if ideal_stop else None
+            if drive is None and ideal_stop and state.pending_command is None and not state.recovery_required:
+                safe = self._safe_since[index]
+                if safe is not None and self._covered(index, safe, at_ts):
+                    drive = 0.0
+                elif (covered and accepted is not None and state.execution_status == "accepted"
+                      and self._binding == accepted.binding and at_ts >= accepted.command.hold_until_ms / 1000):
+                    drive = 0.0
+            if command is None:
+                if accepted is not None and state.pending_command is None and self._safe_since[index] is None:
+                    reasons.append("execution_context_expired")
+                elif state.pending_command is not None and not state.recovery_required:
+                    attempt = self._attempts.get(state.pending_command.command_id)
+                    if attempt is not None and attempt.open:
+                        reasons.append("execution_application_unproven" if attempt.received else "execution_receipt_missing")
+                elif accepted is None and self._safe_since[index] is None and not reasons:
+                    reasons.append("execution_history_missing")
+            views.append(BatteryExecutionView(self._names[index], command, drive, state.execution_status,
+                                               state.recovery_required, state.pending_command,
+                                               state.override_active if accepted is not None else False,
+                                               tuple(dict.fromkeys(reasons))))
+        reasons = tuple(dict.fromkeys((*self._history_reasons, *(reason for view in views for reason in view.reasons))))
+        return ExecutionSnapshot(binding, tuple(views), self._writes, deepcopy(tuple(self._trace)), reasons)

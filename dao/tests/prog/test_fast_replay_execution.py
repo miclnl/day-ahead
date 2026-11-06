@@ -8,8 +8,18 @@ from typing import get_args, get_type_hints
 
 import pytest
 
-from dao.prog.fastctrl.command import ActuationReceipt, BatteryCommand, ClockSample, Deadline
-from dao.prog.fastctrl.policy import BatteryDecision
+from dao.prog.fastctrl.command import (
+    ActuationReceipt,
+    BarrierReceipt,
+    BatteryCommand,
+    ClockSample,
+    Deadline,
+    OwnerBinding,
+    RevokeRequest,
+    plan_digest,
+)
+from dao.prog.fastctrl.policy import BatteryDecision, ControllerState
+from dao.prog.fastctrl.receiver import payload_digest
 from dao.tests.prog.test_fast_actuator import proposal
 from dao.tests.prog.test_fast_command import command, other_dtos, receipt
 from dao.tests.prog.test_fast_policy import T0, make_plan, make_spec
@@ -390,3 +400,595 @@ def test_f3a1_wire_rounding_keeps_original_float_points():
     assert api.wire_ms(.0015) == 2
     assert result.sample_points == POINTS
     assert result.sample_points[0][0] != api.wire_ms(POINTS[0][0]) / 1000
+
+
+def execution_api():
+    api = contract()
+    assert hasattr(api, "ExecutionReplay"), "F3a2 recorded execution fold missing"
+    return api
+
+
+def replay_clock(at_ts, *, anchor=T0):
+    return ClockSample(int(round(at_ts * 1000)), 10_000_000_000 + round((at_ts - anchor) * 1e9),
+                       "replay-boot", 0, True)
+
+
+def replay_timing(api, cmd, *, anchor=T0, receive=.75, apply=1):
+    clock = replay_clock(anchor, anchor=anchor)
+    return api.ReplayAttemptTiming(anchor, clock,
+                                   Deadline(clock.boottime_ns + round(receive * 1e9), cmd.execute_before_ms),
+                                   Deadline(clock.boottime_ns + round(apply * 1e9), cmd.execute_before_ms))
+
+
+def replay_command(plan, **changes):
+    start = plan.intervals[0].start_ts
+    return command(**(dict(
+        installation_id=plan.financial_context.basis.meter_id if plan.financial_context else "synthetic",
+        plan_digest=plan_digest(plan), issued_at_ms=start * 1000,
+        execute_before_ms=(start + 2) * 1000, hold_until_ms=(start + 8) * 1000,
+        setpoint_w=1000,
+    ) | changes))
+
+
+def replay_receipt(api, cmd, at_ts, *, apply_ts=None, order=1, apply_order=2,
+                   status="accepted", effect="complete", outcome="accepted", accepted_ts=None,
+                   anchor=T0):
+    raw = receipt(
+        installation_id=cmd.installation_id, battery_name=cmd.battery_name,
+        owner_session_id=cmd.owner_session_id, owner_epoch=cmd.owner_epoch, sequence=cmd.sequence,
+        command_id=cmd.command_id, plan_digest=cmd.plan_digest, payload_digest=payload_digest(cmd),
+        accepted_ts=(cmd.issued_at_ms if accepted_ts is None else accepted_ts) if status == "accepted" else None,
+        observed_at_ms=int(round(at_ts * 1000)), status=status, effect=effect,
+    )
+    application = None if apply_ts is None else api.ReplayApplication(
+        apply_ts, apply_order, replay_clock(apply_ts, anchor=anchor), outcome)
+    return api.ReceiptEvent(at_ts, order, raw, replay_clock(at_ts, anchor=anchor), application)
+
+
+def send_event(api, cmd, at_ts, timing, *, order=0, **decision_changes):
+    return api.ProposalEvent(at_ts, order, proposal(**(dict(
+        name=cmd.battery_name, setpoint_w=cmd.setpoint_w, stop_inverter=None,
+    ) | decision_changes)), cmd, timing)
+
+
+def recorded_run(api, *, plan=None, events=(), openings=(), start=T0, end=T0 + 10,
+                 coverage=None, stop_response="unknown", controller=None, **execution_changes):
+    plan = replay_plan() if plan is None else plan
+    cmd = replay_command(plan)
+    binding = OwnerBinding(cmd.installation_id, "receiver-a", "generation-a", "session-a", 2,
+                           "opening-barrier", int((end + 10) * 1000))
+    if coverage is None:
+        coverage = tuple(api.ExecutionCoverage(spec.name, start, end) for spec in plan.specs)
+    execution = recorded(api, **(dict(
+        installation_id=cmd.installation_id, opening_binding=binding,
+        events=events, opening_acceptances=openings, coverage=coverage,
+    ) | execution_changes))
+    controller = ControllerState() if controller is None else controller
+    case = scenario(api, execution, stop_response=stop_response)
+    before = deepcopy((plan, case))
+    run = api.ExecutionReplay(plan=plan, scenario=case, controller=controller,
+                              start_ts=start, end_ts=end)
+    assert (plan, case) == before
+    return run, controller
+
+
+def view_at(run, at_ts, index=0):
+    run.advance(at_ts)
+    return run.snapshot(at_ts).batteries[index]
+
+
+def stop_events(api, *, request_ts=T0 + .25, barrier_ts=T0 + .3, barrier_order=4, **changes):
+    request = RevokeRequest("synthetic", 2, "stop-a", "operator_stop", round(request_ts * 1000))
+    barrier = BarrierReceipt(**(dict(
+        installation_id="synthetic", barrier_id="stop-a", revoked_through_epoch=2, current_epoch=3,
+        status="accepted", accepted_ts=round(barrier_ts * 1000), queues_fenced=True,
+        safe_state="confirmed", receiver_generation="generation-a", reason="barrier_accepted",
+    ) | changes))
+    return api.StopRequestEvent(request_ts, 0, request), api.BarrierEvent(barrier_ts, barrier_order, barrier)
+
+
+def test_f3a2_issued_before_send_and_missing_send_evidence():
+    api = execution_api()
+    plan = replay_plan()
+    cmd = replay_command(plan)
+    timing = replay_timing(api, cmd)
+    observation = replay_receipt(api, cmd, T0 + .2, apply_ts=T0 + .2)
+    original_bytes, digest = cmd.to_dict(), payload_digest(cmd)
+    run, state = recorded_run(api, plan=plan, events=(send_event(api, cmd, T0 + .1, timing), observation))
+    assert view_at(run, T0).command is None
+    pending = view_at(run, T0 + .1)
+    assert pending.command is None and pending.drive_w is None and pending.pending == cmd
+    assert not pending.recovery_required
+    assert view_at(run, T0 + .199).command is None
+    accepted = view_at(run, T0 + .2)
+    assert accepted.command == cmd and accepted.drive_w == 1000 and accepted.override
+    assert state.battery(0).held_setpoint_w == 1000
+    assert cmd.to_dict() == original_bytes and payload_digest(cmd) == digest
+    assert run.snapshot(T0 + .2).writes == 1
+
+    for sent, expected in ((T0 + .1, cmd), (None, None), (T0 + .21, None)):
+        opening = api.OpeningAcceptance(cmd, timing, observation, sent)
+        opened, _ = recorded_run(api, plan=plan, start=T0 + .3, openings=(opening,))
+        assert view_at(opened, T0 + .3).command == expected
+        assert observation in opened.snapshot(T0 + .3).trace
+    future = replace(cmd, issued_at_ms=cmd.issued_at_ms + 101)
+    refused, _ = recorded_run(api, plan=plan, events=(send_event(api, future, T0 + .1, timing),
+        replay_receipt(api, future, T0 + .2, apply_ts=T0 + .2)))
+    assert view_at(refused, T0 + .2).command is None
+    assert "execution_binding_mismatch" in refused.snapshot(T0 + .2).reasons
+
+
+@pytest.mark.parametrize("stage,offset", [(stage, offset) for stage in ("receive", "apply")
+                                         for offset in (-.001, 0, .001)])
+def test_f3a2_effective_deadlines_and_late_application(stage, offset):
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    timing = replay_timing(api, cmd)
+    receive = T0 + .75 + offset if stage == "receive" else T0 + .749
+    applied = receive if stage == "receive" else T0 + 1 + offset
+    observation = replay_receipt(api, cmd, receive, apply_ts=applied, accepted_ts=cmd.issued_at_ms + 701)
+    run, state = recorded_run(api, events=(send_event(api, cmd, T0 + .7, timing), observation))
+    assert view_at(run, T0 + .7).pending == cmd
+    assert run.next_boundary(T0 + .7, T0 + 2) == min(receive, T0 + .75)
+    result = view_at(run, applied)
+    if offset < 0:
+        assert result.command == cmd and result.drive_w == 1000 and result.pending is None
+        assert state.battery(0).held_setpoint_w == 1000
+    else:
+        assert result.command is None and result.drive_w is None and result.pending == cmd
+        assert result.execution_status == "unconfirmed" and result.recovery_required
+        assert state.battery(0).held_setpoint_w == 0 and state.battery(0).last_change_ts == 0
+        assert "execution_deadline_exceeded" in result.reasons
+    assert observation in run.snapshot(applied).trace
+    assert run.next_boundary(applied, T0 + 2) > applied
+
+
+@pytest.mark.parametrize("missing", ["timing", "receipt", "application", "raw-partial"])
+def test_f3a2_missing_evidence_expires_at_the_original_cutoff(missing):
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    timing = None if missing == "timing" else replay_timing(api, cmd)
+    events = [send_event(api, cmd, T0 + .7, timing)]
+    if missing in ("application", "raw-partial"):
+        events.append(replay_receipt(api, cmd, T0 + .72,
+                                    **({"status": "unconfirmed", "effect": "partial"}
+                                       if missing == "raw-partial" else {})))
+    events.append(replay_receipt(api, cmd, T0 + 1.1, apply_ts=T0 + 1.1, order=3, apply_order=4))
+    run, state = recorded_run(api, events=tuple(events))
+    cutoff = T0 + (1 if missing == "application" else .75)
+    if missing != "timing":
+        assert not view_at(run, cutoff - .001).recovery_required
+        assert run.next_boundary(cutoff - .001, T0 + 2) == cutoff
+    else:
+        cutoff = T0 + .7
+    expired = view_at(run, cutoff)
+    assert expired.pending == cmd and expired.recovery_required and expired.command is None
+    assert expired.execution_status == "unconfirmed"
+    assert ("execution_deadline_unknown" if missing == "timing" else "execution_deadline_exceeded") in expired.reasons
+    assert view_at(run, T0 + 1.1).command is None
+    assert state.battery(0).last_accepted_command is None and state.battery(0).held_setpoint_w == 0
+
+
+@pytest.mark.parametrize("application_first", [False, True])
+def test_f3a2_subms_order_and_barrier_precedence(application_first):
+    api = execution_api()
+    at_ts = T0 + .0006
+    cmd = replay_command(replay_plan(), issued_at_ms=T0 * 1000 + 1)
+    timing = replay_timing(api, cmd)
+    observed = replay_receipt(api, cmd, at_ts, apply_ts=at_ts)
+    run, _ = recorded_run(api, events=(send_event(api, cmd, at_ts, timing), observed))
+    assert run.next_boundary(T0, T0 + .1) == at_ts
+    assert view_at(run, at_ts).drive_w == 1000
+    assert run.next_boundary(at_ts, T0 + .1) == T0 + .1
+
+    delayed = replace(observed, application=replace(observed.application, at_ts=T0 + .0008,
+                                                    clock=replay_clock(T0 + .0008)))
+    run, _ = recorded_run(api, events=(send_event(api, cmd, at_ts, timing), delayed))
+    assert view_at(run, at_ts).command is None
+    assert run.next_boundary(at_ts, T0 + .1) == T0 + .0008
+    assert view_at(run, T0 + .0008).drive_w == 1000
+
+    request, barrier = stop_events(api)
+    observed = replay_receipt(api, cmd, T0 + .2, apply_ts=T0 + .3,
+                              apply_order=3 if application_first else 5)
+    run, state = recorded_run(api, events=(send_event(api, cmd, at_ts, timing), observed, request, barrier),
+                              stop_response="ideal_programmed_stop")
+    stopped = view_at(run, T0 + .3)
+    assert stopped.command is None and stopped.drive_w == 0 and not stopped.recovery_required
+    assert state.battery(0).held_setpoint_w == (1000 if application_first else 0)
+    assert state.battery(0).last_accepted_command == (cmd if application_first else None)
+
+
+def test_f3a2_no_write_rejected_and_partial_keep_distinct_states():
+    api = execution_api()
+    plan = replay_plan()
+    old = replay_command(plan)
+    timing = replay_timing(api, old)
+    opening = api.OpeningAcceptance(old, timing, replay_receipt(api, old, T0 + .1, apply_ts=T0 + .1), T0)
+    no_write = api.ProposalEvent(T0 + .3, 0, proposal(setpoint_w=1100, write=False, override=False), None, None)
+    for status, effect, outcome in (("rejected", "none", "unknown"), ("unconfirmed", "partial", "unconfirmed")):
+        new = replace(old, command_id="command-b", sequence=4, setpoint_w=1200, issued_at_ms=(T0 * 1000 + 400))
+        events = (no_write, send_event(api, new, T0 + .4, timing, restores=True, override=False),
+                  replay_receipt(api, new, T0 + .5, apply_ts=T0 + .6, status=status, effect=effect, outcome=outcome))
+        run, state = recorded_run(api, openings=(opening,), start=T0 + .2, events=events)
+        unchanged = view_at(run, T0 + .3)
+        assert unchanged.drive_w == 1000 and unchanged.command == old and unchanged.override
+        assert run.snapshot(T0 + .3).writes == 0
+        assert view_at(run, T0 + .4).drive_w is None
+        assert state.battery(0).restore_pending
+        result = view_at(run, T0 + .6)
+        assert result.command is None and result.drive_w is None and result.pending == new
+        assert result.recovery_required is (status == "unconfirmed")
+        assert result.execution_status == outcome
+        assert state.battery(0).last_accepted_command == old and state.battery(0).held_setpoint_w == 1000
+        assert state.battery(0).restore_pending
+        assert ("execution_rejected" if status == "rejected" else "execution_unconfirmed") in result.reasons
+
+
+@pytest.mark.parametrize("bad", [
+    {"barrier_id": "foreign"}, {"receiver_generation": "foreign"}, {"installation_id": "foreign"},
+    {"revoked_through_epoch": 1}, {"current_epoch": 4}, {"accepted_ts": T0 * 1000 - 1},
+    {"accepted_ts": T0 * 1000 + 301},
+    {"status": "unconfirmed", "accepted_ts": None, "queues_fenced": False},
+    {"status": "unconfirmed", "accepted_ts": None, "safe_state": "unknown"},
+])
+def test_f3a2_stop_fences_old_receipts_and_rebind_is_single_use(bad):
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    timing = replay_timing(api, cmd)
+    partial = replay_receipt(api, cmd, T0 + .1, apply_ts=T0 + .2,
+                             status="unconfirmed", effect="partial", outcome="unconfirmed")
+    request, wrong = stop_events(api, **bad)
+    _, exact = stop_events(api, barrier_ts=T0 + .4)
+    new = OwnerBinding("synthetic", "receiver-a", "generation-a", "session-b", 3, "stop-a", (T0 + 20) * 1000)
+    events = (send_event(api, cmd, T0, timing), partial, request, wrong, exact,
+              api.BindingEvent(T0 + .5, 0, new),
+              replay_receipt(api, cmd, T0 + .6, apply_ts=T0 + .6, order=1, apply_order=2),
+              api.BindingEvent(T0 + .7, 0, replace(new, owner_session_id="session-c")),
+              send_event(api, cmd, T0 + .8, timing))
+    run, state = recorded_run(api, events=events, stop_response="ideal_programmed_stop")
+    assert view_at(run, T0 + .3).recovery_required
+    assert run.snapshot(T0 + .3).binding.owner_epoch == 2
+    stopped = view_at(run, T0 + .4)
+    assert stopped.execution_status == "stopped" and not stopped.recovery_required and stopped.pending is None
+    assert stopped.command is None and stopped.drive_w == 0
+    assert run.snapshot(T0 + .4).binding is None
+    view_at(run, T0 + .7)
+    assert run.snapshot(T0 + .7).binding == new
+    assert state.battery(0).last_accepted_command is None and state.battery(0).held_setpoint_w == 0
+    assert view_at(run, T0 + .8).command is None
+    assert "execution_binding_mismatch" in run.snapshot(T0 + .8).reasons
+
+
+def test_f3a2_exact_retry_keeps_identity_and_budget():
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    timing = replay_timing(api, cmd)
+    first = send_event(api, cmd, T0 + .1, timing)
+    retry = send_event(api, cmd, T0 + .7, timing)
+    observed = replay_receipt(api, cmd, T0 + .751, apply_ts=T0 + .751)
+    run, state = recorded_run(api, events=(first, retry, observed))
+    assert view_at(run, T0 + .7).pending == cmd
+    assert run.snapshot(T0 + .7).writes == 2
+    assert run.next_boundary(T0 + .7, T0 + 2) == T0 + .75
+    assert view_at(run, T0 + .75).recovery_required
+    assert view_at(run, T0 + .751).command is None
+    assert state.battery(0).last_accepted_command is None
+    with pytest.raises(ValueError, match="^replay_duplicate_identity$"):
+        run, _ = recorded_run(api, events=(first, replace(retry, command=replace(cmd, setpoint_w=1001))))
+        run.advance(T0 + .7)
+    extended = replace(retry, timing=replay_timing(api, cmd, anchor=T0 + .7))
+    run, _ = recorded_run(api, events=(first, extended, observed))
+    assert view_at(run, T0 + .751).command is None
+    assert "execution_deadline_unknown" in run.snapshot(T0 + .751).reasons
+
+
+@pytest.mark.parametrize("flaw", ["clock-boot", "clock-mono", "clock-utc", "clock-health", "clock-missing",
+                                  "anchor-health", "anchor-utc", "uncertainty", "mapping",
+                                  "receipt-payload", "receipt-session", "application-outcome"])
+def test_f3a2_unproven_clock_or_receipt_never_updates_held(flaw):
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    timing = replay_timing(api, cmd)
+    observed = replay_receipt(api, cmd, T0 + .2, apply_ts=T0 + .3)
+    if flaw.startswith("clock-"):
+        changes = {"clock-boot": {"boot_id": "other"}, "clock-mono": {"boottime_ns": 1},
+                   "clock-utc": {"utc_ms": 1}, "clock-health": {"healthy": False}}
+        observed = replace(observed, received_clock=None if flaw == "clock-missing" else
+                           replace(observed.received_clock, **changes[flaw]))
+    elif flaw in ("anchor-health", "anchor-utc"):
+        timing = replace(timing, anchor_clock=replace(timing.anchor_clock,
+            **({"healthy": False} if flaw == "anchor-health" else {"utc_ms": 1})))
+    elif flaw == "uncertainty":
+        observed = replace(observed, application=replace(observed.application,
+            clock=replace(observed.application.clock, uncertainty_ms=2000)))
+    elif flaw == "mapping":
+        observed = replace(observed, application=replace(observed.application,
+            clock=replace(observed.application.clock, boottime_ns=1)))
+    elif flaw.startswith("receipt-"):
+        observed = replace(observed, receipt=replace(observed.receipt,
+            **({"payload_digest": "0" * 64} if flaw == "receipt-payload" else {"owner_session_id": "foreign"})))
+    else:
+        observed = replace(observed, application=replace(observed.application, outcome="unknown"))
+    run, state = recorded_run(api, events=(send_event(api, cmd, T0 + .1, timing), observed))
+    assert view_at(run, T0 + 1).command is None
+    assert state.battery(0).held_setpoint_w == 0 and state.battery(0).last_accepted_command is None
+    assert observed in run.snapshot(T0 + 1).trace
+
+
+def test_f3a2_coverage_hold_and_snapshots_do_not_resurrect_history():
+    api = execution_api()
+    cmd = replay_command(replay_plan(), hold_until_ms=(T0 + 2) * 1000)
+    timing = replay_timing(api, cmd)
+    observed = replay_receipt(api, cmd, T0 + .2, apply_ts=T0 + .2)
+    coverage = (api.ExecutionCoverage("accu", T0, T0 + .4),
+                api.ExecutionCoverage("accu", T0 + .5, T0 + 10))
+    run, state = recorded_run(api, events=(send_event(api, cmd, T0, timing), observed), coverage=coverage)
+    assert view_at(run, T0 + .2).drive_w == 1000
+    assert run.next_boundary(T0 + .2, T0 + 1) == T0 + .4
+    assert view_at(run, T0 + .4).drive_w is None
+    assert view_at(run, T0 + .5).drive_w is None
+    before = deepcopy(state)
+    first = run.snapshot(T0 + .5)
+    assert run.snapshot(T0 + .5) == first and state == before
+    assert "execution_history_missing" in first.batteries[0].reasons
+    with pytest.raises(ValueError, match="^replay_time_order_invalid$"):
+        run.advance(T0 + .4)
+    with pytest.raises(ValueError, match="^replay_time_order_invalid$"):
+        run.snapshot(T0 + .6)
+    for stop_response, expected in (("unknown", None), ("ideal_programmed_stop", 0)):
+        run, state = recorded_run(api, events=(send_event(api, cmd, T0, timing), observed),
+                                  stop_response=stop_response)
+        assert view_at(run, T0 + 1).drive_w == 1000
+        assert run.next_boundary(T0 + 1, T0 + 3) == T0 + 2
+        expired = view_at(run, T0 + 2)
+        assert expired.command is None and expired.drive_w == expected
+        assert state.battery(0).last_accepted_command == cmd
+
+
+def test_f3a2_v2_plan_and_profile_limit_are_not_rewritten():
+    from dao.tests.settlement.test_fast_contract import ready_plan
+
+    api = execution_api()
+    plan = ready_plan()
+    start = plan.intervals[0].start_ts
+    plan.intervals[0].battery(0).stop_ts = start + 1
+    for hold, accepted in ((start + 1, True), (start + 2, False)):
+        cmd = replay_command(plan, execute_before_ms=(start + 1) * 1000, hold_until_ms=hold * 1000)
+        timing = replay_timing(api, cmd, anchor=start, apply=.9)
+        observation = replay_receipt(api, cmd, start + .2, apply_ts=start + .2, anchor=start)
+        run, _ = recorded_run(api, plan=plan, start=start, end=start + 10, events=(
+            send_event(api, cmd, start + .1, timing, stop_inverter="2000-01-01 00:00:00"), observation))
+        # The sentinel clears the profile stop, but cannot extend its command window.
+        result = view_at(run, start + .2)
+        assert (result.command == cmd) is accepted
+        if not accepted:
+            assert "execution_binding_mismatch" in result.reasons
+
+
+def test_f3a2_duplicate_receipt_is_history_while_original_application_is_pending():
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    timing = replay_timing(api, cmd)
+    original = replay_receipt(api, cmd, T0 + .2, apply_ts=T0 + .9)
+    duplicate = replace(original, at_ts=T0 + .8, received_clock=replay_clock(T0 + .8), application=None)
+    run, state = recorded_run(api, events=(send_event(api, cmd, T0, timing), original, duplicate))
+    assert view_at(run, T0 + .8).pending == cmd
+    assert not state.battery(0).recovery_required
+    assert view_at(run, T0 + .9).drive_w == 1000
+    assert run.snapshot(T0 + .9).trace[-2:] == (original, duplicate)
+
+
+def test_f3a2_shorter_retry_rechecks_captured_receive_evidence():
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    timing = replay_timing(api, cmd)
+    observation = replay_receipt(api, cmd, T0 + .7, apply_ts=T0 + .9)
+    retry = send_event(api, cmd, T0 + .71, replay_timing(api, cmd, receive=.6))
+    run, state = recorded_run(api, events=(send_event(api, cmd, T0, timing), observation, retry))
+    result = view_at(run, T0 + .9)
+    assert result.command is None and result.recovery_required and result.pending == cmd
+    assert state.battery(0).held_setpoint_w == 0
+
+
+def test_f3a2_stale_different_barrier_cannot_withdraw_a_new_context():
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    request, barrier = stop_events(api)
+    late_request = replace(request, at_ts=T0 + .26,
+                           request=replace(request.request, barrier_id="older-unanswered-request"))
+    late_barrier = replace(barrier, at_ts=T0 + .7,
+                           receipt=replace(barrier.receipt, barrier_id="older-unanswered-request"))
+    binding = OwnerBinding("synthetic", "receiver-a", "generation-a", "session-b", 3, "stop-a", (T0 + 20) * 1000)
+    new = replace(cmd, command_id="new-epoch", sequence=4, owner_epoch=3, owner_session_id="session-b",
+                  issued_at_ms=T0 * 1000 + 500)
+    events = (request, late_request, barrier, api.BindingEvent(T0 + .4, 0, binding),
+              send_event(api, new, T0 + .5, replay_timing(api, new)),
+              replay_receipt(api, new, T0 + .6, apply_ts=T0 + .6), late_barrier)
+    run, _ = recorded_run(api, events=events, stop_response="ideal_programmed_stop")
+    assert view_at(run, T0 + .6).command == new
+    result = view_at(run, T0 + .7)
+    assert result.command == new and result.drive_w == 1000
+    assert run.snapshot(T0 + .7).binding == binding
+    assert "execution_barrier_unproven" in run.snapshot(T0 + .7).reasons
+
+
+def test_f3a2_missing_command_evidence_cannot_leave_an_older_application_open():
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    observed = replay_receipt(api, cmd, T0 + .2, apply_ts=T0 + .4)
+    unknown_send = api.ProposalEvent(T0 + .3, 0, proposal(), None, None)
+    run, state = recorded_run(api, events=(send_event(api, cmd, T0, replay_timing(api, cmd)),
+                                          observed, unknown_send))
+    assert view_at(run, T0 + .3).recovery_required
+    assert view_at(run, T0 + .4).command is None
+    assert state.battery(0).held_setpoint_w == 0 and state.battery(0).last_accepted_command is None
+
+
+def test_f3a2_opening_applications_share_the_causal_timeline():
+    api = execution_api()
+    old = replay_command(replay_plan())
+    new = replace(old, command_id="opening-b", sequence=4, issued_at_ms=T0 * 1000 + 300, setpoint_w=1200)
+    timing = replay_timing(api, old)
+    # A second send while the first application's outcome is still unproven
+    # cannot be made into a clean succession by folding whole receipts at once.
+    openings = (api.OpeningAcceptance(old, timing,
+        replay_receipt(api, old, T0 + .2, apply_ts=T0 + .6), T0),
+        api.OpeningAcceptance(new, timing,
+        replay_receipt(api, new, T0 + .4, apply_ts=T0 + .5), T0 + .3))
+    run, state = recorded_run(api, start=T0 + .7, openings=openings)
+    result = view_at(run, T0 + .7)
+    assert result.command is None and result.recovery_required
+    assert state.battery(0).held_setpoint_w == 0 and state.battery(0).last_accepted_command is None
+
+
+def test_f3a2_stop_only_clears_the_covered_pending_epoch_and_preserves_other_battery():
+    api = execution_api()
+    plan = replay_plan(("accu", "second"))
+    old = replay_command(plan)
+    other = replace(old, command_id="other-epoch", sequence=4, battery_name="second", owner_epoch=4)
+    timing = replay_timing(api, old)
+    request, barrier = stop_events(api)
+    events = (send_event(api, old, T0, timing),
+              replay_receipt(api, old, T0 + .1, apply_ts=T0 + .1, status="unconfirmed", effect="partial",
+                             outcome="unconfirmed"),
+              send_event(api, other, T0 + .2, timing, index=1), request, barrier)
+    run, state = recorded_run(api, plan=plan, events=events, stop_response="ideal_programmed_stop")
+    result = view_at(run, T0 + .3)
+    assert not result.recovery_required and result.drive_w == 0
+    second = run.snapshot(T0 + .3).batteries[1]
+    assert second.pending == other and second.recovery_required and second.drive_w is None
+    assert state.battery(1).last_accepted_command is None
+
+
+def test_f3a2_retry_proposal_still_has_to_match_the_original_payload():
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    timing = replay_timing(api, cmd)
+    retry = send_event(api, cmd, T0 + .2, timing, setpoint_w=1200)
+    run, state = recorded_run(api, events=(send_event(api, cmd, T0, timing), retry,
+        replay_receipt(api, cmd, T0 + .3, apply_ts=T0 + .3)))
+    assert view_at(run, T0 + .3).command is None
+    assert state.battery(0).held_setpoint_w == 0
+    assert "execution_binding_mismatch" in run.snapshot(T0 + .3).reasons
+
+
+@pytest.mark.parametrize("application", [False, True])
+def test_f3a2_unproven_receipt_is_not_an_early_terminal_consumer_outcome(application):
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    observation = replay_receipt(api, cmd, T0 + .2, apply_ts=T0 + .4 if application else None)
+    observation = replace(observation, received_clock=None)
+    run, _ = recorded_run(api, events=(send_event(api, cmd, T0, replay_timing(api, cmd)), observation))
+    cutoff = T0 + (.4 if application else .75)
+    result = view_at(run, cutoff - .001)
+    assert result.pending == cmd and result.command is None and not result.recovery_required
+    assert "execution_deadline_unknown" in result.reasons
+    assert view_at(run, cutoff).recovery_required
+
+
+def test_f3a2_ideal_hold_stop_can_coincide_with_owner_expiration():
+    api = execution_api()
+    cmd = replay_command(replay_plan(), hold_until_ms=(T0 + 2) * 1000)
+    binding = OwnerBinding("synthetic", "receiver-a", "generation-a", "session-a", 2,
+                           "opening-barrier", (T0 + 2) * 1000)
+    run, state = recorded_run(api, opening_binding=binding, stop_response="ideal_programmed_stop", events=(
+        send_event(api, cmd, T0, replay_timing(api, cmd)),
+        replay_receipt(api, cmd, T0 + .2, apply_ts=T0 + .2)))
+    assert view_at(run, T0 + 1).command == cmd
+    expired = view_at(run, T0 + 2)
+    assert expired.command is None and expired.drive_w == 0
+    assert run.snapshot(T0 + 2).binding is None
+    assert state.battery(0).last_accepted_command == cmd
+
+
+def test_f3a2_one_uncertain_battery_does_not_destroy_independent_acceptance():
+    api = execution_api()
+    plan = replay_plan(("accu", "second"))
+    first = replay_command(plan)
+    second = replace(first, command_id="independent", sequence=4, battery_name="second", setpoint_w=-1500)
+    timing = replay_timing(api, first)
+    run, _ = recorded_run(api, plan=plan, events=(
+        send_event(api, first, T0, timing), send_event(api, second, T0, timing, order=1, index=1),
+        replay_receipt(api, first, T0 + .1, apply_ts=T0 + .2, status="unconfirmed", effect="partial",
+                       outcome="unconfirmed"),
+        replay_receipt(api, second, T0 + .1, apply_ts=T0 + .2, order=3, apply_order=4)))
+    assert view_at(run, T0 + .2).recovery_required
+    other = run.snapshot(T0 + .2).batteries[1]
+    assert other.command == second and other.drive_w == -1500 and not other.recovery_required
+
+
+def test_f3a2_duplicate_with_its_own_timely_application_can_finish_open_pending():
+    api = execution_api()
+    cmd = replay_command(replay_plan())
+    original = replay_receipt(api, cmd, T0 + .2)
+    duplicate = replace(original, at_ts=T0 + .3, received_clock=replay_clock(T0 + .3),
+        application=api.ReplayApplication(T0 + .4, 2, replay_clock(T0 + .4), "accepted"))
+    run, state = recorded_run(api, events=(send_event(api, cmd, T0, replay_timing(api, cmd)), original, duplicate))
+    assert view_at(run, T0 + .3).command is None
+    assert view_at(run, T0 + .4).command == cmd
+    assert state.battery(0).held_setpoint_w == 1000
+
+
+def test_f3a2_ambiguous_command_battery_mapping_is_rejected_before_folding():
+    api = execution_api()
+    plan = replay_plan(("accu", "second"))
+    cmd = replay_command(plan, battery_name="second")
+    event = send_event(api, cmd, T0, replay_timing(api, cmd), name="accu", index=0)
+    with pytest.raises(ValueError, match="^replay_battery_mapping_invalid$"):
+        recorded_run(api, plan=plan, events=(event,))
+
+
+@pytest.mark.parametrize("at_start", ["application", "receipt-application", "send-receipt-application"])
+@pytest.mark.parametrize("application_first", [False, True])
+def test_f3a2_i1_opening_start_events_obey_barrier_order(at_start, application_first):
+    api = contract()
+    cmd = replay_command(replay_plan())
+    start = T0 + .3
+    sent = start if at_start == "send-receipt-application" else T0 + .1
+    received = T0 + .2 if at_start == "application" else start
+    observation = replay_receipt(api, cmd, received, apply_ts=start,
+                                 apply_order=2 if application_first else 5,
+                                 accepted_ts=round(received * 1000))
+    opening = api.OpeningAcceptance(cmd, replay_timing(api, cmd), observation, sent)
+    request, barrier = stop_events(api, request_ts=start, barrier_ts=start)
+    request = replace(request, order=3)
+    run, state = recorded_run(api, start=start, openings=(opening,), events=(request, barrier),
+                              stop_response="ideal_programmed_stop")
+
+    battery = state.battery(0)
+    assert battery.last_accepted_command == (cmd if application_first else None)
+    assert battery.held_setpoint_w == (1000 if application_first else 0)
+    assert battery.last_change_ts == (observation.receipt.accepted_ts / 1000 if application_first else 0)
+    assert battery.last_command_w == (1000 if application_first else 0)
+    assert battery.held_stop_inverter_cleared is application_first
+    snapshot = run.snapshot(start)
+    view = snapshot.batteries[0]
+    assert view.command is None and view.drive_w == 0
+    assert view.pending is None and not view.recovery_required
+    if not application_first:
+        assert view.execution_status == "stopped"
+    assert snapshot.trace == (observation, request, barrier)
+    assert snapshot.writes == (1 if sent == start else 0)
+    assert run.next_boundary(start, start + .1) == start + .1
+    run.advance(start)
+    assert run.snapshot(start) == snapshot
+
+
+@pytest.mark.parametrize("send_at_start", [False, True])
+def test_f3a2_i1_opening_receipt_after_start_barrier_is_history(send_at_start):
+    api = contract()
+    cmd = replay_command(replay_plan())
+    start = T0 + .3
+    observation = replay_receipt(api, cmd, start, order=6, apply_ts=start, apply_order=7)
+    opening = api.OpeningAcceptance(cmd, replay_timing(api, cmd), observation,
+                                    start if send_at_start else T0 + .1)
+    request, barrier = stop_events(api, request_ts=start, barrier_ts=start)
+    request = replace(request, order=3)
+    run, state = recorded_run(api, start=start, openings=(opening,), events=(request, barrier))
+    snapshot = run.snapshot(start)
+    assert snapshot.trace == (request, barrier, observation)
+    assert state.battery(0).last_accepted_command is None
+    assert state.battery(0).held_setpoint_w == 0 and state.battery(0).last_change_ts == 0
+    assert snapshot.batteries[0].execution_status == "stopped"
+    assert snapshot.batteries[0].pending is None
