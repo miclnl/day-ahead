@@ -1141,6 +1141,95 @@ def test_f3a3_no_write_does_not_consume_a_selector_or_sequence():
     assert suppressed.command is None and suppressed.timing is None
 
 
+def test_f3a5_policy_no_write_cannot_relabel_accepted_execution_override():
+    from dao.prog.fastctrl.policy import BatteryMeasurement, FastControlPolicy, Measurement
+
+    api = model_api()
+    plan = make_plan([.4], [1000], specs=[make_spec(cycle_cost=0)], export_discount=.3)
+    run, state, _ = model_run(api, plan=plan)
+    run.submit(tick_index=0, at_ts=T0, proposals=(BatteryDecision(
+        0, "accu", 1000, 1000, True, False, "plan"),), source="plan")
+    before = view_at(run, T0)
+    assert before.command.setpoint_w == 1000 and before.override is False
+    policy = FastControlPolicy(PolicyLimits(
+        storage_value_mode="fixed", storage_value_fixed=.3, round_trip_efficiency=1,
+        min_benefit=0, deadband=150, release_deviation=50, min_command_interval=0))
+    measurement = Measurement(T0, -100, [BatteryMeasurement(soc=50, power_w=1000)])
+    policy.account(state, plan, measurement, "2023-11-14", owner_binding=run.snapshot(T0).binding)
+    decision = policy.decide(plan, measurement, state, owner_binding=run.snapshot(T0).binding)
+    suppressed, = decision.batteries
+    assert suppressed.override is True and suppressed.write is False
+    assert suppressed.setpoint_w == 1000 and "deadband" in suppressed.reason
+    run.submit(tick_index=0, at_ts=T0, proposals=tuple(decision.batteries), source="fast")
+    after = view_at(run, T0)
+    assert after.command == before.command and run.snapshot(T0).writes == 1
+    assert after.override is False  # The accepted plan command was not replaced.
+
+
+def test_f3a5_suppressed_plan_cannot_clear_accepted_override():
+    from dao.prog.fastctrl.policy import BatteryMeasurement, FastControlPolicy, Measurement
+
+    api = model_api()
+    plan = make_plan([.4], [1000])
+    response = api.ModelResponse(2, "plan", "accu", "complete", .1)
+    run, state, _ = model_run(api, plan=plan, responses=(response,))
+    run.submit(tick_index=0, at_ts=T0, proposals=(BatteryDecision(
+        0, "accu", 1100, 1000, True, True, "override",
+        stop_inverter="2023-11-14T22:13:28+00:00"),), source="fast")
+    before = view_at(run, T0)
+    assert before.command.setpoint_w == 1100 and before.override is True
+    run.advance(T0 + 1)
+    policy = FastControlPolicy(PolicyLimits(deadband=150))
+    measurement = Measurement(T0 + 1, 0, [BatteryMeasurement(soc=50, power_w=1100)])
+    # An unsent release changes policy intent, not the accepted execution. The
+    # following disabled decision is suppressed against the still-held 1100 W.
+    release = policy.release(plan, measurement, state, "disabled", owner_binding=run.snapshot(T0 + 1).binding)
+    assert release.batteries[0].write and not release.batteries[0].override
+    decision = policy.decide(plan, measurement, state, enabled=[False], owner_binding=run.snapshot(T0 + 1).binding)
+    suppressed, = decision.batteries
+    assert suppressed.setpoint_w == 1000 and not suppressed.write and not suppressed.override
+    run.submit(tick_index=1, at_ts=T0 + 1, proposals=tuple(decision.batteries), source="fast")
+    after = view_at(run, T0 + 1)
+    assert after.command == before.command and run.snapshot(T0 + 1).writes == 1
+    saved = deepcopy(state)
+    assert run.snapshot(T0 + 1).batteries[0] == after
+    assert state == saved
+    assert after.override is True
+
+    # A send is still insufficient: only its applied acceptance changes the
+    # accepted provenance. The old override remains historical while pending.
+    run.submit(tick_index=2, at_ts=T0 + 2, proposals=(replace(suppressed, write=True),), source="plan")
+    pending = view_at(run, T0 + 2)
+    assert pending.command is None and pending.pending is not None and pending.override is True
+    applied = view_at(run, T0 + 2.1)
+    assert applied.command != before.command and applied.command.setpoint_w == 1000
+    assert applied.override is False and run.snapshot(T0 + 2.1).writes == 2
+
+
+@pytest.mark.parametrize("version, setpoint, expected", [(1, 1000, False), (1, 1100, True),
+                                                        (2, 2000, False), (2, 1000, True)])
+def test_f3a5_opening_override_uses_accepted_profile_not_policy_state(version, setpoint, expected):
+    from dao.tests.settlement.test_fast_profile import shaped_plan
+
+    api = execution_api()
+    plan = make_plan([.4], [1000]) if version == 1 else shaped_plan()
+    issued = plan.intervals[0].start_ts
+    cmd = replay_command(plan, setpoint_w=setpoint)
+    observation = replay_receipt(api, cmd, issued + .1, apply_ts=issued + .2, anchor=issued)
+    opening = api.OpeningAcceptance(cmd, replay_timing(api, cmd, anchor=issued), observation, issued)
+    run, state = recorded_run(api, plan=plan, start=issued + 1, end=issued + 5, openings=(opening,))
+    before = run.snapshot(issued + 1)
+    assert before.batteries[0].command == cmd and before.batteries[0].override is expected
+    assert before.writes == 0
+    # Isolate the opening (which has no ProposalEvent) from mutable policy
+    # intent; the real-policy paths in the two controls above prove that input.
+    state.battery(0).override_active = not expected
+    saved = deepcopy(state)
+    after = run.snapshot(issued + 1)
+    assert state == saved
+    assert after == before
+
+
 @pytest.mark.parametrize("delay,accepted", [(.049, True), (.05, False), (.051, False)])
 def test_f3a3_one_absolute_budget_for_all_batteries(delay, accepted):
     api = model_api()

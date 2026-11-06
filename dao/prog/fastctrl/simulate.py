@@ -23,21 +23,24 @@ resolution you have and read the resolution warning the loader prints.
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import math
-from dataclasses import dataclass, field, replace
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, localcontext
-from typing import Callable, Optional, Sequence
+from typing import Callable, Literal, Optional, Sequence
 
 from dao.prog.settlement.replay import ReplayBasis
-from dao.prog.settlement.types import SettlementState, TerminalValue
+from dao.prog.settlement.types import PriceQuote, SettlementState, TerminalValue
 
-from .command import BatteryCommand
+from .command import BatteryCommand, plan_digest
 from .plan import (
     BatterySpec, BatteryPlanStep, FastPlan, PlanInterval,
     profile_energy_kwh, profile_power_at,
 )
 from .policy import (
+    BatteryDecision,
     BatteryMeasurement,
     ControllerState,
     FastControlPolicy,
@@ -45,7 +48,20 @@ from .policy import (
     PolicyLimits,
     apply_accepted_command,
 )
-from .replay_execution import ExecutionSnapshot, Reasons
+from .replay_execution import (
+    Assumptions,
+    BatteryExecutionView,
+    ExecutionReplay,
+    ExecutionSnapshot,
+    ModeledExecution,
+    ProposalEvent,
+    Reasons,
+    RecordedExecution,
+    ReplayEvent,
+    ReplayInput,
+    SocByBattery,
+    model_namespace,
+)
 
 #: Default AC/DC conversion efficiency used by the simulation battery model when
 #: the plan does not carry the inverter's own stage curve.
@@ -230,6 +246,256 @@ def _integrate_replay_segment(
         import_kwh=None if grid_w is None else max(0.0, grid_w) * dt_h / 1000.0,
         export_kwh=None if grid_w is None else max(0.0, -grid_w) * dt_h / 1000.0,
     )
+
+
+@dataclass(frozen=True)
+class _ReplayBasisView:
+    source_plan: FastPlan
+    execution_plan: FastPlan
+    quotes: tuple[PriceQuote, ...] | None
+    opening: SettlementState | None
+    terminal: TerminalValue | None
+    reasons: Reasons
+
+
+def _prepare_replay_basis(
+    plan: FastPlan, *, start_ts: float, replay_basis: ReplayBasis | None, recorded: bool,
+) -> _ReplayBasisView:
+    """Keep execution identity separate from the exact archived financial basis."""
+    if not plan.specs:
+        raise ValueError("het plan bevat geen batterij")
+    source = deepcopy(plan)
+    execution = deepcopy(source)
+    if replay_basis is None:
+        reasons = ("replay_basis_required",) if plan.format_version == 2 else ()
+        return _ReplayBasisView(source, execution, None, None, None, reasons)
+    try:
+        if type(replay_basis) is not ReplayBasis or source.format_version != 2 or source.financial_context is None:
+            raise ValueError("replay_basis_required")
+        replay_basis.check_context(source.financial_context)
+        if start_ts != replay_basis.opening.asof_ts:
+            raise ValueError("replay_opening_mismatch")
+        if len(source.intervals) != len(replay_basis.quotes):
+            raise ValueError("replay_quote_coverage_mismatch")
+        cursor = replay_basis.basis.planning_start_ts
+        intervals = []
+        for interval, quote in zip(source.intervals, replay_basis.quotes, strict=True):
+            if (interval.start_ts != cursor
+                    or (quote.start_ts, quote.end_ts) != (interval.start_ts, interval.end_ts)):
+                raise ValueError("replay_quote_coverage_mismatch")
+            intervals.append(replace(interval, price_import=float(quote.import_rate),
+                                     price_export=float(quote.export_rate)))
+            cursor = interval.end_ts
+        if cursor != replay_basis.basis.horizon_end_ts:
+            raise ValueError("replay_quote_coverage_mismatch")
+        if tuple(spec.name for spec in source.specs) != tuple(
+                name for name, _ in replay_basis.terminal_value.reference_efficiency_by_battery):
+            raise ValueError("replay_terminal_identity_mismatch")
+        if not recorded:
+            projection = replace(source, intervals=intervals, price_average=sum(
+                float(quote.import_rate) for quote in replay_basis.quotes) / len(intervals))
+            execution = FastPlan.from_dict(projection.to_dict())
+    except (ValueError, TypeError, AttributeError):
+        return _ReplayBasisView(source, execution, None, None, None, ("replay_basis_mismatch",))
+    return _ReplayBasisView(source, execution, replay_basis.quotes,
+                            replay_basis.opening, replay_basis.terminal_value, ())
+
+
+@dataclass(frozen=True)
+class _ReplayRun:
+    segments: tuple[ReplaySegment, ...]
+    trace: tuple[ReplayEvent, ...]
+    soc_start_by_battery: SocByBattery
+    soc_end_by_battery: SocByBattery
+    writes: int
+    override_s: float | None
+    execution_kind: Literal["recorded", "modeled", "missing"]
+    reasons: Reasons
+    assumptions: Assumptions
+    source_plan_digest: str | None
+    execution_plan_digest: str | None
+
+
+def _replay_digest(plan: FastPlan) -> str | None:
+    try:
+        return plan_digest(plan)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _replay_measurement(segment: ReplaySegment, *, closing: bool) -> Measurement | None:
+    """Adapt modeled response only; never let policy fall back to an old held fact."""
+    if segment.house_w is None or any(
+            battery.modeled_ac_w is None or battery.soc_end is None for battery in segment.batteries):
+        return None
+    return Measurement(
+        timestamp=segment.end_ts if closing else segment.start_ts,
+        grid_w=segment.house_w + sum(battery.modeled_ac_w for battery in segment.batteries),
+        batteries=[BatteryMeasurement(
+            soc=battery.soc_end if closing else battery.soc_begin, power_w=battery.modeled_ac_w,
+        ) for battery in segment.batteries],
+    )
+
+
+def _run_replay(
+    *, basis: _ReplayBasisView, replay_input: ReplayInput, limits: PolicyLimits,
+    use_fast_layer: bool, timezone: datetime.tzinfo | None,
+) -> _ReplayRun:
+    """Compose the pure execution fold, production policy and per-battery physics."""
+    plan = basis.execution_plan
+    points = replay_input.sample_points
+    start, end = points[0][0], points[-1][0]
+    scenario = replay_input.scenario
+    recipe = scenario.execution if scenario is not None else None
+    modeled = isinstance(recipe, ModeledExecution)
+    kind = "missing" if recipe is None else "modeled" if modeled else "recorded"
+    reasons = [*basis.reasons, *replay_input.reasons]
+    source_digest, execution_digest = _replay_digest(basis.source_plan), _replay_digest(plan)
+    if source_digest is None or execution_digest is None:
+        reasons.append("execution_binding_mismatch")
+    socs = dict(replay_input.soc_by_battery)
+    efficiencies = dict(replay_input.inverter_efficiency_by_battery)
+    models = {spec.name: None if socs[spec.name] is None else BatteryModel(
+        spec, socs[spec.name], efficiencies[spec.name]) for spec in plan.specs}
+    state = ControllerState()
+    policy = FastControlPolicy(limits)
+    execution = None
+    assumptions = []
+    if scenario is not None:
+        assumptions.extend((
+            ("scenario_id", scenario.scenario_id),
+            ("physics", json.dumps(asdict(scenario.physics), sort_keys=True)),
+            ("inverter_efficiency_by_battery", json.dumps(replay_input.inverter_efficiency_by_battery)),
+            ("policy_measurements", "modeled_response"),
+        ))
+        if modeled:
+            assumptions.extend((("execution_model", json.dumps(asdict(recipe), sort_keys=True)),
+                                ("fresh_policy_start", "true"), ("clock", "healthy_virtual_utc"),
+                                ("clock_uncertainty_ms", "0"), ("io_authority", "none")))
+        if execution_digest is not None and (not modeled or source_digest is not None):
+            namespace = model_namespace(source_plan=basis.source_plan, execution_plan=plan,
+                sample_points=points, limits=limits, replay_input=replay_input) if modeled else None
+            execution = ExecutionReplay(plan=plan, scenario=scenario, controller=state,
+                                         start_ts=start, end_ts=end, namespace=namespace)
+
+    # Policy selectors depend only on the supplied samples and original profiles.
+    ticks = {at for at, _ in points[:-1]}
+    for interval in plan.intervals:
+        ticks.update(edge for edge in (interval.start_ts, interval.end_ts) if start <= edge < end)
+        ticks.update(edge for step in interval.batteries for edge in (step.active_from_ts, step.stop_ts)
+                     if edge is not None and start <= edge < end)
+    tick_indices = {at: index for index, at in enumerate(sorted(ticks))}
+    boundaries = {*ticks, end}
+    if scenario is not None:
+        boundaries.update(at + scenario.physics.house_hold_s for at, _ in points[:-1]
+                          if start < at + scenario.physics.house_hold_s < end)
+    date = datetime.datetime.fromtimestamp(start, timezone).date() + datetime.timedelta(days=1)
+    midnight = datetime.datetime.combine(date, datetime.time(), timezone).timestamp()
+    while midnight < end:
+        boundaries.add(midnight)
+        date += datetime.timedelta(days=1)
+        midnight = datetime.datetime.combine(date, datetime.time(), timezone).timestamp()
+    boundaries = sorted(boundaries)
+    boundary_index = sample_index = 0
+    cursor = start
+    segments = []
+    override_s = 0.0
+    policy_known = True
+    snapshot = ExecutionSnapshot(None, tuple(BatteryExecutionView(
+        spec.name, None, None, "unknown", False, None, False,
+        ("execution_input_missing" if recipe is None else "execution_binding_mismatch",),
+    ) for spec in plan.specs), 0, (), ())
+    while cursor < end:
+        while sample_index + 1 < len(points) and points[sample_index + 1][0] <= cursor:
+            sample_index += 1
+        sample_ts, house_w = points[sample_index]
+        if scenario is None or cursor >= sample_ts + scenario.physics.house_hold_s:
+            house_w = None
+            if scenario is not None:
+                reasons.append("replay_house_missing")
+        while boundaries[boundary_index] <= cursor:
+            boundary_index += 1
+        next_edge = boundaries[boundary_index]
+        if execution is not None:
+            # The preceding slice was closed and accounted before this advance.
+            execution.advance(cursor)
+            snapshot = execution.snapshot(cursor)
+        if modeled and execution is not None and cursor in tick_indices:
+            tick = tick_indices[cursor]
+            interval = plan.interval_at(cursor)
+            if interval is not None and (not use_fast_layer or (plan.format_version == 1 and (
+                    cursor == start or cursor == interval.start_ts))):
+                proposals = []
+                for index, spec in enumerate(plan.specs):
+                    step = interval.battery(index)
+                    power = profile_power_at(step, cursor) if plan.format_version == 2 else step.ac_power_w
+                    current = snapshot.batteries[index].command
+                    proposals.append(BatteryDecision(index, spec.name, power, power,
+                        current is None or current.setpoint_w != int(round(power)), False, "plan",
+                        mode=step.mode, stop_inverter=step.stop_inverter if plan.format_version == 1 else None,
+                        soc=None if models[spec.name] is None else models[spec.name].soc))
+                execution.submit(tick_index=tick, at_ts=cursor, proposals=tuple(proposals), source="plan")
+                execution.advance(cursor)
+                snapshot = execution.snapshot(cursor)
+            if use_fast_layer and policy_known:
+                # A preview on disposable models uses exactly the same clipping
+                # chain as integration. No proposal supplies a measured watt.
+                preview_end = _next_physical_boundary(start_ts=cursor, end_ts=next_edge,
+                                                       models=models, execution=snapshot)
+                preview = _integrate_replay_segment(start_ts=cursor, end_ts=preview_end, house_w=house_w,
+                    models={name: replace(model) if model is not None else None for name, model in models.items()},
+                    execution=snapshot)
+                measurement = _replay_measurement(preview, closing=False)
+                if measurement is not None:
+                    day = _day_key(cursor, timezone)
+                    if cursor == start or state.day_key != day:
+                        policy.account(state, plan, measurement, day, owner_binding=snapshot.binding)
+                    decision = policy.decide(plan, measurement, state, owner_binding=snapshot.binding)
+                    execution.submit(tick_index=tick, at_ts=cursor,
+                                     proposals=tuple(decision.batteries), source="fast")
+                    execution.advance(cursor)
+                    snapshot = execution.snapshot(cursor)
+        reasons.extend(snapshot.reasons)
+        if execution is not None:
+            next_edge = execution.next_boundary(cursor, next_edge)
+        next_edge = _next_physical_boundary(start_ts=cursor, end_ts=next_edge, models=models, execution=snapshot)
+        segment = _integrate_replay_segment(start_ts=cursor, end_ts=next_edge, house_w=house_w,
+                                            models=models, execution=snapshot)
+        segments.append(segment)
+        reasons.extend(reason for battery in segment.batteries for reason in battery.reasons)
+        if any(battery.modeled_ac_w is None for battery in segment.batteries):
+            override_s = None
+        elif override_s is not None and any(view.override and view.command is not None for view in snapshot.batteries):
+            override_s += next_edge - cursor
+        if modeled and use_fast_layer and policy_known:
+            measurement = _replay_measurement(segment, closing=True)
+            if measurement is None:
+                policy_known = False
+                reasons.append("policy_history_unknown")
+            else:
+                policy.account(state, plan, measurement, _day_key(cursor, timezone), owner_binding=snapshot.binding)
+        cursor = next_edge
+    if execution is not None:
+        execution.advance(end)
+        snapshot = execution.snapshot(end)
+        # End is excluded: coverage/holds ending here do not spoil the window.
+        reasons.extend(reason for reason in snapshot.reasons if reason == "unused_model_response")
+    elif isinstance(recipe, RecordedExecution):
+        # An invalid plan identity cannot establish acceptance, but keep the raw
+        # observations available alongside the explicit unknown physical slices.
+        trace = tuple(opening.observation for opening in recipe.opening_acceptances
+                      if opening.observation.at_ts < end) + tuple(event for event in recipe.events
+                                                                 if start <= event.at_ts < end)
+        # Count supplied send evidence even when no acceptance can be derived.
+        writes = sum(isinstance(event, ProposalEvent) and event.decision.write and event.command is not None
+                     for event in trace)
+        writes += sum(opening.sent_at_ts is not None and start <= opening.sent_at_ts < end
+                      for opening in recipe.opening_acceptances)
+        snapshot = replace(snapshot, trace=deepcopy(trace), writes=writes)
+    return _ReplayRun(tuple(segments), snapshot.trace, replay_input.soc_by_battery,
+        tuple((spec.name, None if models[spec.name] is None else models[spec.name].soc) for spec in plan.specs),
+        snapshot.writes, override_s, kind, tuple(dict.fromkeys(reasons)), tuple(assumptions),
+        source_digest, execution_digest)
 
 
 @dataclass

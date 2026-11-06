@@ -587,6 +587,8 @@ class _Attempt:
     received: bool = False
     observation: ReceiptEvent | None = None
     open: bool = True
+    # Captured on applied acceptance; later policy intent cannot relabel it.
+    override: bool = False
 
     @property
     def cutoff(self) -> float | None:
@@ -1204,7 +1206,7 @@ class ExecutionReplay:
             state.held_stop_inverter_cleared = state.stop_inverter_cleared
             state.last_change_ts = event.receipt.accepted_ts / 1000
             if attempt.decision is not None:
-                state.override_active = attempt.decision.override
+                attempt.override = attempt.decision.override
                 if attempt.decision.restores:
                     state.restore_pending = False
             else:
@@ -1212,7 +1214,8 @@ class ExecutionReplay:
                 step = interval.battery(attempt.index)
                 plan_w = (profile_power_at(step, command.issued_at_ms / 1000)
                           if self._plan.financial_context is not None else step.ac_power_w)
-                state.override_active = command.setpoint_w != int(round(plan_w))
+                attempt.override = command.setpoint_w != int(round(plan_w))
+            state.override_active = attempt.override
             return "accepted"
         return "unconfirmed"
 
@@ -1440,7 +1443,7 @@ class ExecutionReplay:
                     reasons.append("execution_history_missing")
             views.append(BatteryExecutionView(self._names[index], command, drive, state.execution_status,
                                                state.recovery_required, state.pending_command,
-                                               state.override_active if accepted is not None else False,
+                                               accepted.override if accepted is not None else False,
                                                tuple(dict.fromkeys(reasons))))
         unused = ("unused_model_response",) if (self._model is not None and at_ts == self._end
                                                 and self._model_responses.keys() - self._model_used) else ()

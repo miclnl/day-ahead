@@ -714,3 +714,484 @@ def test_f3a4_direction_and_fractional_integration(command_w, realized_w):
     assert stop.batteries[0].command_w == command_w
     assert stop.batteries[0].modeled_ac_w == stop.batteries[0].cell_delta_kwh == 0
     assert stop.batteries[0].soc_begin == stop.batteries[0].soc_end == result.soc_end
+
+
+def _f3a5_api():
+    from importlib import import_module
+
+    module = import_module("dao.prog.fastctrl.simulate")
+    names = ("_ReplayBasisView", "_prepare_replay_basis", "_ReplayRun", "_run_replay")
+    missing = [name for name in names if not hasattr(module, name)]
+    assert not missing, f"F3a5 private orchestration API missing: {missing}"
+    return module
+
+
+def _f3a5_case(*, execution=None, hold=4000):
+    from dao.prog.fastctrl.replay_execution import ModeledExecution, ReplayPhysics, ReplayScenario
+
+    return ReplayScenario("f3a5", execution or ModeledExecution("stopped", "complete"),
+                          ReplayPhysics("battery_model_v1", hold, "ideal_programmed_stop"))
+
+
+def _f3a5_run(plan, points, *, case=None, fast=False, replay_basis=None, soc=50,
+              limits=None, timezone=None):
+    from dao.prog.fastctrl.replay_execution import RecordedExecution, validate_replay_input
+
+    api = _f3a5_api()
+    inputs = validate_replay_input(plan=plan, sample_points=points, soc_start=soc,
+                                   inverter_efficiency=1, scenario=case)
+    basis = api._prepare_replay_basis(plan, start_ts=points[0][0], replay_basis=replay_basis,
+                                      recorded=case is not None and isinstance(case.execution, RecordedExecution))
+    return api._run_replay(basis=basis, replay_input=inputs, limits=limits or PolicyLimits(),
+                           use_fast_layer=fast, timezone=timezone)
+
+
+def _f3a5_recorded(plan, start, end, events):
+    from dao.prog.fastctrl.command import OwnerBinding
+    from dao.prog.fastctrl.replay_execution import ExecutionCoverage, RecordedExecution
+
+    installation = plan.financial_context.basis.meter_id if plan.financial_context else "synthetic"
+    binding = OwnerBinding(installation, "receiver-a", "generation-a", "session-a", 2,
+                           "opening-barrier", int((end + 10) * 1000))
+    return _f3a5_case(execution=RecordedExecution(
+        installation, "generation-a", binding, (), None,
+        tuple(ExecutionCoverage(spec.name, start, end) for spec in plan.specs), tuple(events)))
+
+
+def test_f3a5_no_write_integrates_current_not_proposal(monkeypatch):
+    from dao.prog.fastctrl import replay_execution as replay
+    from dao.prog.fastctrl.policy import BatteryDecision, FastControlPolicy
+    from dao.tests.prog.test_fast_replay_execution import (
+        replay_command,
+        replay_receipt,
+        replay_timing,
+        send_event,
+    )
+
+    api = _f3a5_api()
+    plan = flat_plan(make_spec(charge_efficiency=1), battery_w=1000)
+    command = replay_command(plan)
+    events = (send_event(replay, command, T0, replay_timing(replay, command)),
+              replay_receipt(replay, command, T0, apply_ts=T0),
+              replay.ProposalEvent(T0 + 1, 0, BatteryDecision(
+                  0, "accu", 1100, 1000, False, True, "suppressed"), None, None))
+    case = _f3a5_recorded(plan, T0, T0 + 2, events)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("recorded execution recomputed policy")
+
+    monkeypatch.setattr(FastControlPolicy, "account", forbidden)
+    monkeypatch.setattr(FastControlPolicy, "decide", forbidden)
+    run = _f3a5_run(plan, ((T0, 0), (T0 + 2, 0)), case=case, fast=True)
+    assert isinstance(run, api._ReplayRun)
+    assert [s.batteries[0].modeled_ac_w for s in run.segments] == [1000, 1000]
+    assert sum(s.batteries[0].charge_ac_kwh for s in run.segments) == pytest.approx(1 / 1800)
+    assert run.soc_end_by_battery == (("accu", pytest.approx(50 + 1 / 180)),)
+    assert run.writes == 1 and run.execution_kind == "recorded"
+    assert run.trace == events
+
+
+@pytest.mark.parametrize("delay", [0, .0001])
+def test_f3a5_float_edges_are_not_wire_edges(delay):
+    from dao.prog.fastctrl.replay_execution import ModeledExecution, ModelStop, ProposalEvent
+
+    _f3a5_api()
+    start, end = T0 + .0006, T0 + .1006
+    plan = flat_plan(make_spec(charge_efficiency=1), battery_w=1000)
+    model = ModeledExecution("stopped", "complete", response_delay_s=delay,
+                             lifecycle=(ModelStop(end, 0, True, True),))
+    run = _f3a5_run(plan, ((start, 0), (end, 0)), case=_f3a5_case(execution=model))
+    assert [(s.start_ts, s.end_ts) for s in run.segments] == (
+        [(start, end)] if delay == 0 else [(start, start + delay), (start + delay, end)])
+    assert all(event.at_ts < end for event in run.trace)
+    assert run.writes == 1
+    assert len([event for event in run.trace if isinstance(event, ProposalEvent)]) == 1
+    if delay == 0:
+        assert run.segments[0].batteries[0].charge_ac_kwh == pytest.approx((end - start) / 3600)
+        assert run.soc_end_by_battery[0][1] > 50
+    else:
+        assert run.segments[0].batteries[0].command is None
+        assert run.segments[1].batteries[0].command.setpoint_w == 1000
+        assert all(s.batteries[0].modeled_ac_w is None for s in run.segments)
+        assert run.soc_end_by_battery == (("accu", None),)
+
+
+def _f3a5_shaped_pair():
+    from dataclasses import replace
+
+    from dao.tests.settlement.test_fast_profile import shaped_plan
+
+    plan = shaped_plan()
+    start = plan.intervals[0].start_ts
+    # A partial first solver interval, followed by two full intervals.
+    plan.interval_s = 3600
+    plan.financial_context = replace(plan.financial_context,
+        not_after_ts=start + 7200,
+        basis=replace(plan.financial_context.basis, horizon_end_ts=start + 9000))
+    plan.specs.append(replace(plan.specs[0], name="B", capacity_kwh=20))
+    terminal = plan.financial_context.terminal_value
+    plan.financial_context = replace(plan.financial_context, terminal_value=replace(terminal,
+        reference_efficiency_by_battery=(*terminal.reference_efficiency_by_battery,
+                                         ("B", terminal.reference_efficiency_by_battery[0][1]))))
+    rows = []
+    for index, (a, b) in enumerate(((start, start + 1800), (start + 1800, start + 5400),
+                                   (start + 5400, start + 9000))):
+        first = BatteryPlanStep(-400 if index == 0 else 0, 80 - index * 10, 70 - index * 10,
+                                mean_ac_power_w=-400 if index == 0 else 0,
+                                on_power_w=-500 if index == 0 else 0,
+                                active_from_ts=a, stop_ts=a + 1440 if index == 0 else None)
+        second = BatteryPlanStep(250 if index == 0 else 0, 60 - index * 10, 50 - index * 10,
+                                 mean_ac_power_w=250 if index == 0 else 0,
+                                 on_power_w=500 if index == 0 else 0,
+                                 active_from_ts=a + 600 if index == 0 else a,
+                                 stop_ts=a + 1500 if index == 0 else None)
+        rows.append(PlanInterval(a, b, .4, .1, batteries=[first, second]))
+    plan.intervals = rows
+    return FastPlan.from_dict(plan.to_dict())
+
+
+def test_f3a5_profile_shape_and_original_policy_context(monkeypatch):
+    from copy import deepcopy
+
+    from dao.prog.fastctrl.policy import FastControlPolicy
+    from dao.prog.fastctrl.replay_execution import ProposalEvent
+
+    _f3a5_api()
+    plan = _f3a5_shaped_pair()
+    before = deepcopy(plan)
+    start = plan.intervals[0].start_ts
+    points = ((start, 0), (start + 1900, 0))
+    baseline = _f3a5_run(plan, points, case=_f3a5_case(), soc={"accu": 80, "B": 60})
+    assert [(s.start_ts - start, s.end_ts - start) for s in baseline.segments] == [
+        (0, 600), (600, 1440), (1440, 1500), (1500, 1800), (1800, 1900)]
+    assert [tuple(b.modeled_ac_w for b in s.batteries) for s in baseline.segments] == [
+        (-500, 0), (-500, 500), (0, 500), (0, 0), (0, 0)]
+    assert sum(s.batteries[0].discharge_ac_kwh for s in baseline.segments) == pytest.approx(.2)
+    assert sum(s.batteries[1].charge_ac_kwh for s in baseline.segments) == pytest.approx(.125)
+    assert any(isinstance(e, ProposalEvent) and e.command is not None and e.at_ts == start + 1800
+               for e in baseline.trace)  # Same zero profile still needs a new hold acceptance.
+
+    calls = []
+    real_account, real_decide = FastControlPolicy.account, FastControlPolicy.decide
+
+    def account(self, state, actual_plan, measurement, day_key, *args, **kwargs):
+        assert actual_plan == before
+        calls.append(("account", measurement.timestamp,
+                      tuple(b.power_w for b in measurement.batteries)))
+        return real_account(self, state, actual_plan, measurement, day_key, *args, **kwargs)
+
+    def decide(self, actual_plan, measurement, state, *args, **kwargs):
+        assert actual_plan == before
+        assert kwargs["owner_binding"].installation_id == plan.financial_context.basis.meter_id
+        calls.append(("decide", measurement.timestamp,
+                      tuple(b.power_w for b in measurement.batteries)))
+        return real_decide(self, actual_plan, measurement, state, *args, **kwargs)
+
+    monkeypatch.setattr(FastControlPolicy, "account", account)
+    monkeypatch.setattr(FastControlPolicy, "decide", decide)
+    fast = _f3a5_run(plan, points, case=_f3a5_case(), fast=True, soc={"accu": 80, "B": 60},
+                     limits=PolicyLimits(min_benefit=1e9))
+    assert [at - start for kind, at, _ in calls if kind == "decide"] == [0, 600, 1440, 1500, 1800]
+    # Account closes A's response before the new zero-profile proposal at stop.
+    assert ("account", start + 1440, (-500, 500)) in calls
+    assert sum(s.batteries[0].discharge_ac_kwh for s in fast.segments) == pytest.approx(.2)
+    assert fast.soc_end_by_battery == (("accu", pytest.approx(78)), ("B", pytest.approx(60.625)))
+    assert dict(fast.assumptions)["fresh_policy_start"] == "true"
+    assert plan == before
+
+
+def test_f3a5_unknown_soc_is_latched_without_hiding_other_battery(monkeypatch):
+    from datetime import UTC, datetime
+
+    from dao.prog.fastctrl.policy import FastControlPolicy
+    from dao.prog.fastctrl.replay_execution import (
+        ModeledExecution,
+        ModelResponse,
+        ModelStop,
+        ProposalEvent,
+    )
+
+    _f3a5_api()
+    midnight = datetime(2026, 11, 6, tzinfo=UTC).timestamp()
+    start = int(midnight - 60)
+    plan = flat_plan(make_spec(charge_efficiency=1, discharge_efficiency=1), battery_w=0)
+    plan.created_ts = start
+    plan.specs.append(make_spec(name="B", charge_efficiency=1, discharge_efficiency=1))
+    plan.intervals = [PlanInterval(start + i * 120, start + (i + 1) * 120, .4, .1,
+                                  batteries=[BatteryPlanStep(0, 50, 50), BatteryPlanStep(100, 50, 50)])
+                      for i in range(3)]
+    model = ModeledExecution("stopped", "complete", responses=(
+        ModelResponse(1, "fast", "accu", "unknown", 0),), lifecycle=(
+        ModelStop(start + 180, 0, True, True),))
+    calls = []
+    decide = FastControlPolicy.decide
+
+    def observe(self, actual_plan, measurement, state, *args, **kwargs):
+        calls.append(measurement.timestamp)
+        return decide(self, actual_plan, measurement, state, *args, **kwargs)
+
+    monkeypatch.setattr(FastControlPolicy, "decide", observe)
+    points = tuple((start + offset, house) for offset, house in ((0, 1000), (30, 2000), (240, 0)))
+    run = _f3a5_run(plan, points, case=_f3a5_case(execution=model), fast=True,
+                     soc={"accu": 80, "B": 60}, timezone=UTC,
+                     limits=PolicyLimits(min_benefit=0, deadband=1, min_command_interval=0))
+    assert calls == [start, start + 30]
+    assert run.segments[0].batteries[0].modeled_ac_w == -1100
+    assert any(s.end_ts == midnight for s in run.segments)
+    assert all(s.batteries[0].soc_end is None for s in run.segments if s.start_ts >= start + 30)
+    assert run.soc_end_by_battery[0] == ("accu", None)
+    assert run.soc_end_by_battery[1][1] is not None
+    assert any(s.batteries[1].charge_ac_kwh > 0 for s in run.segments if s.start_ts >= start + 30)
+    assert run.segments[-1].batteries[0].modeled_ac_w == 0
+    assert "policy_history_unknown" in run.reasons
+    assert not any(isinstance(e, ProposalEvent) and e.decision.override and e.at_ts > start + 30
+                   for e in run.trace)
+
+    # A house gap alone does not destroy either battery's independent SoC.
+    gap = _f3a5_run(plan, ((start, 0), (start + 90, 0)),
+                     case=_f3a5_case(hold=30), soc={"accu": 80, "B": 60})
+    assert gap.segments[-1].house_w is gap.segments[-1].import_kwh is None
+    assert all(soc is not None for _, soc in gap.soc_end_by_battery)
+
+
+def test_f3a5_recorded_digest_and_model_quote_projection_are_separate(monkeypatch):
+    from copy import deepcopy
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import replay_execution as execution
+    from dao.prog.fastctrl.command import plan_digest
+    from dao.prog.fastctrl.policy import FastControlPolicy
+    from dao.tests.prog.test_fast_replay_execution import (
+        replay_command,
+        replay_receipt,
+        replay_timing,
+        send_event,
+    )
+    from dao.tests.settlement.test_fast_financial_replay import bind_replay, synthetic_replay
+
+    api = _f3a5_api()
+    plan, replay = synthetic_replay()
+    plan = bind_replay(plan, replay)
+    plan.price_average = 999
+    plan.intervals = [replace(row, price_import=999, price_export=999) for row in plan.intervals]
+    before = deepcopy(plan)
+    start = plan.intervals[0].start_ts
+    points = ((start, 1000), (start + 2, 1000))
+    recorded_basis = api._prepare_replay_basis(plan, start_ts=start, replay_basis=replay, recorded=True)
+    model_basis = api._prepare_replay_basis(plan, start_ts=start, replay_basis=replay, recorded=False)
+    assert recorded_basis.execution_plan == recorded_basis.source_plan == before
+    assert recorded_basis.quotes == model_basis.quotes == replay.quotes
+    assert model_basis.opening is replay.opening and model_basis.terminal is replay.terminal_value
+    assert model_basis.execution_plan.price_average == pytest.approx(.1)
+    assert all(row.price_import == .1 for row in model_basis.execution_plan.intervals)
+    assert model_basis.execution_plan.financial_context == before.financial_context
+    assert model_basis.execution_plan.specs == before.specs
+    assert [row.batteries for row in model_basis.execution_plan.intervals] == [row.batteries for row in before.intervals]
+
+    cmd = replay_command(plan)
+    events = (send_event(execution, cmd, start, replay_timing(execution, cmd, anchor=start)),
+              replay_receipt(execution, cmd, start, apply_ts=start, anchor=start))
+    recorded = _f3a5_run(plan, points, case=_f3a5_recorded(plan, start, start + 2, events), replay_basis=replay)
+    assert recorded.source_plan_digest == recorded.execution_plan_digest == plan_digest(before)
+    assert recorded.segments[0].batteries[0].command == cmd
+    observed = []
+    decide = FastControlPolicy.decide
+
+    def capture(self, actual_plan, *args, **kwargs):
+        observed.append(actual_plan)
+        return decide(self, actual_plan, *args, **kwargs)
+
+    monkeypatch.setattr(FastControlPolicy, "decide", capture)
+    model = _f3a5_run(plan, points, case=_f3a5_case(), replay_basis=replay, fast=True)
+    assert observed == [model_basis.execution_plan]
+    assert model.source_plan_digest == recorded.source_plan_digest
+    assert model.execution_plan_digest == plan_digest(model_basis.execution_plan) != model.source_plan_digest
+    assert all(event.command.plan_digest == model.execution_plan_digest for event in model.trace
+               if isinstance(event, execution.ProposalEvent) and event.command is not None)
+    assert plan == before
+
+
+@pytest.mark.parametrize("fault", ["missing", "hash", "opening", "truncated", "duplicate", "empty"])
+def test_f3a5_financial_mismatch_retains_physics_or_explicit_unknown(fault):
+    from dataclasses import replace
+
+    from dao.tests.settlement.test_fast_financial_replay import bind_replay, synthetic_replay
+
+    api = _f3a5_api()
+    plan, replay = synthetic_replay()
+    plan = bind_replay(plan, replay)
+    start = plan.intervals[0].start_ts
+    if fault == "missing":
+        replay = None
+    elif fault == "hash":
+        plan = replace(plan, financial_context=replace(plan.financial_context, replay_basis_hash="f" * 64))
+    elif fault == "opening":
+        start += 1
+    elif fault == "truncated":
+        plan.intervals = plan.intervals[:1]
+    elif fault == "duplicate":
+        plan.intervals[1] = plan.intervals[0]
+    else:
+        plan.intervals = []
+    basis = api._prepare_replay_basis(plan, start_ts=start, replay_basis=replay, recorded=False)
+    assert basis.reasons and basis.quotes is basis.opening is basis.terminal is None
+    run = _f3a5_run(plan, ((start, 1000), (start + 2, 1000)), case=_f3a5_case(), replay_basis=replay)
+    assert set(basis.reasons) <= set(run.reasons)
+    if fault in ("truncated", "duplicate", "empty"):
+        assert run.source_plan_digest is run.execution_plan_digest is None
+        assert run.writes == 0
+        assert all(b.modeled_ac_w is None for s in run.segments for b in s.batteries)
+    else:
+        assert run.source_plan_digest == run.execution_plan_digest
+        assert run.segments[0].import_kwh == pytest.approx(2 / 3600)
+
+
+def test_f3a5_missing_scenario_never_creates_a_model(monkeypatch):
+    api = _f3a5_api()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("missing execution input constructed a model")
+
+    monkeypatch.setattr(api, "ExecutionReplay", forbidden)
+    run = _f3a5_run(flat_plan(make_spec()), ((T0, 0), (T0 + 60, 0)))
+    assert run.execution_kind == "missing" and run.writes == 0 and run.trace == ()
+    assert "execution_input_missing" in run.reasons
+    assert run.segments[0].batteries[0].modeled_ac_w is None
+    assert run.soc_start_by_battery == (("accu", 50),)
+    assert run.soc_end_by_battery == (("accu", None),)
+
+
+def test_f3a5_suppressed_override_has_no_executed_duration():
+    from dao.prog.fastctrl.replay_execution import ProposalEvent
+
+    plan = flat_plan(make_spec(charge_efficiency=1, cycle_cost=0), battery_w=1000, price=.4, export=.1)
+    limits = PolicyLimits(storage_value_mode="fixed", storage_value_fixed=.3, round_trip_efficiency=1,
+                          min_benefit=0, deadband=150, release_deviation=50, min_command_interval=0)
+    run = _f3a5_run(plan, ((T0, -1100), (T0 + 30, -1100), (T0 + 60, -1100)),
+                     case=_f3a5_case(), fast=True, limits=limits)
+    proposals = [event for event in run.trace if isinstance(event, ProposalEvent)]
+    assert [(event.decision.write, event.decision.override) for event in proposals] == [
+        (True, False), (False, True), (False, True)]
+    assert all(s.batteries[0].command.setpoint_w == 1000 for s in run.segments)
+    assert sum(s.batteries[0].charge_ac_kwh for s in run.segments) == pytest.approx(1 / 60)
+    assert run.writes == 1 and run.override_s == 0
+
+
+def test_f3a5_account_closes_response_before_current_tick_decision(monkeypatch):
+    from dao.prog.fastctrl.policy import FastControlPolicy
+
+    plan = flat_plan(make_spec(charge_efficiency=1, cycle_cost=0), battery_w=1000, price=.4, export=.1)
+    limits = PolicyLimits(storage_value_mode="fixed", storage_value_fixed=.3, round_trip_efficiency=1,
+                          min_benefit=0, deadband=1, min_command_interval=0)
+    calls = []
+    account, decide = FastControlPolicy.account, FastControlPolicy.decide
+
+    def capture(kind, state, measurement):
+        calls.append((kind, measurement.timestamp, measurement.battery(0).power_w,
+                      measurement.grid_w, state.battery(0).last_accepted_command.setpoint_w))
+
+    def observe_account(self, state, actual_plan, measurement, day_key, *args, **kwargs):
+        capture("account", state, measurement)
+        return account(self, state, actual_plan, measurement, day_key, *args, **kwargs)
+
+    def observe_decide(self, actual_plan, measurement, state, *args, **kwargs):
+        capture("decide", state, measurement)
+        return decide(self, actual_plan, measurement, state, *args, **kwargs)
+
+    monkeypatch.setattr(FastControlPolicy, "account", observe_account)
+    monkeypatch.setattr(FastControlPolicy, "decide", observe_decide)
+    run = _f3a5_run(plan, ((T0, -1000), (T0 + 60, -2000), (T0 + 120, -2000)),
+                     case=_f3a5_case(), fast=True, limits=limits)
+    assert calls == [("account", T0, 1000, 0, 1000), ("decide", T0, 1000, 0, 1000),
+                     ("account", T0 + 60, 1000, 0, 1000), ("decide", T0 + 60, 1000, -1000, 1000),
+                     ("account", T0 + 120, 2000, 0, 2000)]
+    assert sum(s.batteries[0].charge_ac_kwh for s in run.segments) == pytest.approx(.05)
+    assert run.soc_end_by_battery == (("accu", pytest.approx(50.5)),)
+    assert run.writes == 2 and run.override_s == 60
+
+
+@pytest.mark.parametrize("delay", [0, .1])
+def test_f3a5_latency_does_not_renumber_sample_and_interval_ticks(delay):
+    from dao.prog.fastctrl.replay_execution import (
+        ModeledExecution,
+        ModelResponse,
+        ProposalEvent,
+        ReceiptEvent,
+    )
+
+    plan = flat_plan(make_spec(charge_efficiency=1), battery_w=1000)
+    plan.intervals = [PlanInterval(T0 + i, T0 + i + 1, .4, .1,
+                                  batteries=[BatteryPlanStep(1000 + i * 1000, 50, 50)]) for i in range(2)]
+    execution = ModeledExecution("stopped", "complete", response_delay_s=delay,
+        responses=(ModelResponse(2, "plan", "accu", "none", 0),))
+    run = _f3a5_run(plan, ((T0, 0), (T0 + .5, 0), (T0 + 2, 0)),
+                     case=_f3a5_case(execution=execution))
+    proposals = [event for event in run.trace if isinstance(event, ProposalEvent)]
+    assert [event.at_ts for event in proposals] == [T0, T0 + .5, T0 + 1]
+    assert [event.command.sequence if event.command else None for event in proposals] == [1, None, 2]
+    receipts = [event for event in run.trace if isinstance(event, ReceiptEvent)]
+    assert [(event.at_ts, event.receipt.status) for event in receipts] == [
+        (T0 + delay, "accepted"), (T0 + 1, "rejected")]
+    assert "unused_model_response" not in run.reasons
+
+
+def test_f3a5_dst_hours_and_local_midnights_keep_distinct_utc_boundaries():
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Europe/Amsterdam")
+    start = int(datetime(2026, 10, 24, 21, 30, tzinfo=UTC).timestamp())
+    end = start + 26 * 3600
+    first_hour, second_hour = start + 3 * 3600, start + 4 * 3600
+    first_midnight, second_midnight = start + 1800, end - 1800
+    plan = flat_plan(make_spec(), battery_w=0)
+    plan.created_ts = start
+    plan.intervals = [PlanInterval(start, end, .4, .1, batteries=[BatteryPlanStep(0, 50, 50)])]
+    run = _f3a5_run(plan, ((start, 1000), (first_hour, 2000), (second_hour, 3000), (end, 3000)),
+                     case=_f3a5_case(hold=48 * 3600), timezone=zone)
+    assert [s.start_ts for s in run.segments] == [
+        start, first_midnight, first_hour, second_hour, second_midnight]
+    assert [(datetime.fromtimestamp(at, zone).hour, datetime.fromtimestamp(at, zone).fold)
+            for at in (first_hour, second_hour)] == [(2, 0), (2, 1)]
+    assert second_midnight - first_midnight == 25 * 3600
+    assert sum(s.import_kwh for s in run.segments) == pytest.approx(71)
+    assert run.soc_end_by_battery == (("accu", 50),) and run.writes == 1
+
+
+@pytest.mark.parametrize("source, expected_writes", [("send", 1), ("opening", 1), ("prior-opening", 0)])
+def test_f3a5_invalid_plan_retains_recorded_send_count_without_acceptance(monkeypatch, source, expected_writes):
+    from dataclasses import replace
+
+    from dao.prog.fastctrl import replay_execution as execution
+    from dao.tests.prog.test_fast_replay_execution import (
+        replay_command,
+        replay_receipt,
+        replay_timing,
+        send_event,
+    )
+    from dao.tests.settlement.test_fast_financial_replay import bind_replay, synthetic_replay
+
+    api = _f3a5_api()
+    plan, replay = synthetic_replay()
+    plan = bind_replay(plan, replay)
+    issued = plan.intervals[0].start_ts
+    start = issued + 1 if source == "prior-opening" else issued
+    cmd = replay_command(plan)
+    timing = replay_timing(execution, cmd, anchor=issued)
+    observation = replay_receipt(execution, cmd, issued, apply_ts=issued, anchor=issued)
+    events = (send_event(execution, cmd, issued, timing), observation) if source == "send" else ()
+    case = _f3a5_recorded(plan, start, start + 2, events)
+    if source != "send":
+        case = replace(case, execution=replace(case.execution, opening_acceptances=(
+            execution.OpeningAcceptance(cmd, timing, observation, issued),)))
+    plan.intervals = plan.intervals[:1]  # No valid canonical identity for this supplied snapshot.
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid plan identity acquired an execution runtime")
+
+    monkeypatch.setattr(api, "ExecutionReplay", forbidden)
+    run = _f3a5_run(plan, ((start, 0), (start + 2, 0)), case=case, replay_basis=replay)
+    assert run.source_plan_digest is run.execution_plan_digest is None
+    assert run.trace == (events if events else (observation,))
+    assert all(s.batteries[0].command is None and s.batteries[0].modeled_ac_w is None for s in run.segments)
+    assert run.writes == expected_writes
