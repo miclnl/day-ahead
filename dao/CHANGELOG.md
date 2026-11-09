@@ -2,6 +2,52 @@
 # Day Ahead Optimizer
 # Unreleased
 
+## Het tabblad Accuracy zei dat er geen prognoses waren
+Gemeld vanaf een draaiende installatie: het tabblad stond leeg. Bovenaan
+"Nog geen prognoses gearchiveerd", daaronder een tabel zonder regels en twee
+grafieken zonder tekening. Het archief was er wel: het rapport scoorde er
+3011 paren over dertig dagen.
+
+Er zaten twee fouten in, die elkaar niet versterkten maar wel samen de pagina
+leeg lieten.
+
+De eerste was een vensterlijst die op twee plaatsen stond. De rapportage
+draait met een eigen venster — dertig dagen — en schrijft precies die
+vensters weg in `accuracy.json`. De pagina had een lijst van zichzelf: zeven
+en achtentwintig dagen, met achtentwintig als voorinstelling. De pagina vroeg
+dus om een venster dat nooit was geschreven, vond niets, en concludeerde
+dat er geen archief was. De vensterlijst staat nu alleen nog in de rapportage:
+de endpoint zegt welke vensters er zijn en lost een gevraagd venster op naar
+het venster dat er ook is, en de pagina bouwt zijn keuzelijst daaruit.
+
+De tweede was een race tussen het ophalen van de data en het laden van
+Chart.js. Chart.js zit in een uitgestelde module, dus `window.Chart` bestaat
+pas nadat het document geparseerd is. De pagina zette zijn eerste verzoek op
+terwijl het document nog werd geparseerd, en het antwoord kon dus binnenkomen
+vóórdat de bundel was uitgevoerd. De grafieken werden dan stilzwijgend
+overgeslagen en bleven leeg, terwijl de data er was. De pagina haalt de data
+nu op zodra het document klaar is met parsen.
+
+Twee dingen vielen pas op toen de grafieken er waren. Chart.js v4 heeft geen
+palet meer: een dataset zonder eigen kleur wordt in het grijs getekend, dus
+"voorspeld" en "gemeten" waren twee grijze lijnen boven elkaar, en de vijf
+componenten in de afwijking per uur waren allemaal grijs. Elke reeks heeft nu
+een eigen kleur. En het canvas was 120 pixels hoog: de legenda en de uurlabels
+namen daar 92 van, zodat er 28 pixels overbleven voor de lijnen zelf. De
+hoogte staat nu op een eigen doos om de grafiek heen — een responsieve grafiek
+neemt de hoogte van zijn doos, en een canvas op zichzelf heeft er geen — en
+die doos is 280 en 240 pixels hoog.
+
+Een rapport met onbruikbare metadata kan de pagina niet meer laten struikelen.
+De vensters worden dan uit de componenten zelf gelezen, want die dragen
+dezelfde informatie; anders zou de pagina weer zeggen dat er geen archief is.
+
+De tabel toont nu de afwijking per component per vooruitblik, met aantal,
+bias en MAE; de grafiek voorspeld tegenover gemeten over de laatste 48 uur
+tekent weer; en de afwijking per uur van de dag staat er weer bij. Het
+venster kiest voortaan wat het rapport heeft gemaakt, en het andere venster
+kan de lezer zelf kiezen.
+
 # 2026.11.9
 
 ## Een factuur toetsen aan het afgerekende boek

@@ -277,6 +277,48 @@ def _recent_pairs(days: int = 2):
         return {}
 
 
+def _report_windows(report) -> list:
+    """The windows the report produced.
+
+    The keys of the component windows are the truth: the page looks its
+    data up by exactly those keys, so a window that they do not have is
+    not offered. The "days" field of the report repeats them and is only
+    used when no component has a window at all.
+    """
+    if not isinstance(report, dict):
+        return []
+
+    windows: set = set()
+    components = report.get("components")
+    if isinstance(components, dict):
+        for component in components.values():
+            component_windows = component.get("windows") if isinstance(component, dict) else None
+            if not isinstance(component_windows, dict):
+                continue
+            for key in component_windows:
+                try:
+                    day = int(key)
+                except (TypeError, ValueError):
+                    continue
+                # "030" is not the window 30: the page looks its data up
+                # by the key, so only the canonical spelling counts.
+                if day > 0 and str(day) == str(key):
+                    windows.add(day)
+    if windows:
+        return sorted(windows)
+
+    days = report.get("days")
+    if isinstance(days, (list, tuple)):
+        return sorted(
+            {
+                day
+                for day in days
+                if isinstance(day, int) and not isinstance(day, bool) and day > 0
+            }
+        )
+    return []
+
+
 @api.route("/accuracy/")
 def accuracy():
     """Everything the accuracy page shows, in one call.
@@ -288,6 +330,11 @@ def accuracy():
     could not be evaluated is NaN, and Flask would serialise that as a bare
     NaN, which JSON.parse rejects -- the page would then show its "no
     archive yet" message over a perfectly good archive.
+
+    The requested window is resolved against the windows the report wrote.
+    The report runs with its own window (30 days by default), so a page that
+    asks for a different one used to find nothing and to conclude that
+    there was no archive at all.
     """
     from dao.prog.config.loader import json_safe
 
@@ -298,11 +345,17 @@ def accuracy():
 
     baseload_dir = _DATA_PATH / "forecast" / "baseload"
     profile = _read_json_or_none(baseload_dir / "profile.json")
+    report = _read_json_or_none(_DATA_PATH / "forecast" / "accuracy.json")
+
+    windows = _report_windows(report)
+    if windows and days not in windows:
+        days = windows[-1]
 
     return json_safe(
         {
             "days": days,
-            "accuracy": _read_json_or_none(_DATA_PATH / "forecast" / "accuracy.json"),
+            "windows": windows,
+            "accuracy": report,
             "baseload": {
                 "selection": _read_json_or_none(baseload_dir / "selection.json"),
                 "status": _read_json_or_none(baseload_dir / "status.json"),

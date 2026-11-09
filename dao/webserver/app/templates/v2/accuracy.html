@@ -9,10 +9,7 @@
 
 <div class="mb-3">
   <label for="days" class="form-label">Venster</label>
-  <select id="days" class="form-select" style="max-width: 12rem;">
-    <option value="7">7 dagen</option>
-    <option value="28" selected>28 dagen</option>
-  </select>
+  <select id="days" class="form-select" style="max-width: 12rem;"></select>
 </div>
 
 <div id="empty-state" class="alert alert-info d-none">
@@ -47,11 +44,17 @@
 <div class="mb-2">
   <select id="recent-component" class="form-select" style="max-width: 16rem;"></select>
 </div>
-<canvas id="recent-chart" height="120"></canvas>
+<!-- The height lives on the container, not on the canvas: a responsive
+     chart takes the height of its box, and a canvas on its own has none. -->
+<div style="height: 280px;">
+  <canvas id="recent-chart"></canvas>
+</div>
 
 <!-- 4. Bias per hour -->
 <h2 class="h4 mt-4">Afwijking per uur van de dag</h2>
-<canvas id="bias-chart" height="120"></canvas>
+<div style="height: 240px;">
+  <canvas id="bias-chart"></canvas>
+</div>
 
 <script>
 (function () {
@@ -59,9 +62,17 @@
     "0": "< 1 uur", "1": "1-4 uur", "4": "4-12 uur",
     "12": "12-24 uur", "24": ">= 24 uur",
   };
+  // Chart.js v4 has no palette: a dataset without a colour of its own is
+  // drawn in the default grey, so two series would be indistinguishable.
+  const FORECAST_COLOR = "#0d6efd";
+  const MEASURED_COLOR = "#198754";
+  const SERIES_COLORS = ["#0d6efd", "#198754", "#dc3545", "#fd7e14", "#20c997", "#6f42c1"];
   let recentChart = null;
   let biasChart = null;
   let payload = null;
+  let reportedWindows = [];
+  // The window the reader picked; null means "the one the report produced".
+  let requestedDays = null;
 
   function card(title, lines) {
     const body = lines.map((l) => `<div class="small">${l}</div>`).join("");
@@ -151,11 +162,13 @@
       data: {
         labels: series.map((p) => p.tijd.slice(5, 16).replace("T", " ")),
         datasets: [
-          { label: "voorspeld", data: series.map((p) => p.forecast), borderWidth: 1 },
-          { label: "gemeten", data: series.map((p) => p.measured), borderWidth: 1 },
+          { label: "voorspeld", data: series.map((p) => p.forecast), borderWidth: 1,
+            borderColor: FORECAST_COLOR, backgroundColor: FORECAST_COLOR },
+          { label: "gemeten", data: series.map((p) => p.measured), borderWidth: 1,
+            borderColor: MEASURED_COLOR, backgroundColor: MEASURED_COLOR },
         ],
       },
-      options: { responsive: true, interaction: { intersect: false } },
+      options: { responsive: true, maintainAspectRatio: false, interaction: { intersect: false } },
     });
   }
 
@@ -168,7 +181,9 @@
       const hours = Array.from({ length: 24 }, (_, h) => String(h));
       const values = hours.map((h) => (window.by_hour[h] ? window.by_hour[h].bias : null));
       if (values.some((v) => v !== null)) {
-        datasets.push({ label: name, data: values, borderWidth: 1 });
+        const color = SERIES_COLORS[datasets.length % SERIES_COLORS.length];
+        datasets.push({ label: name, data: values, borderWidth: 1,
+                        borderColor: color, backgroundColor: color });
       }
     });
     const ctx = document.getElementById("bias-chart");
@@ -177,8 +192,26 @@
     biasChart = new window.Chart(ctx, {
       type: "bar",
       data: { labels: Array.from({ length: 24 }, (_, h) => `${h}:00`), datasets },
-      options: { responsive: true },
+      options: { responsive: true, maintainAspectRatio: false },
     });
+  }
+
+  function applyWindows(data) {
+    // The report decides which windows exist: it is run with a window of
+    // its own (30 days by default). A list kept here could disagree with
+    // it, and a window that was never written leaves the table empty and
+    // the page claiming that there is no archive at all.
+    const select = document.getElementById("days");
+    const windows = data.windows || [];
+    if (windows.join(",") !== reportedWindows.join(",")) {
+      reportedWindows = windows;
+      select.innerHTML = "";
+      windows.forEach((w) => select.add(new Option(`${w} dagen`, String(w))));
+    }
+    select.disabled = !windows.length;
+    if (windows.length) {
+      select.value = String(data.days);
+    }
   }
 
   function render() {
@@ -191,14 +224,14 @@
   }
 
   function load() {
-    const days = document.getElementById("days").value;
+    const query = requestedDays === null ? "" : `?days=${requestedDays}`;
     document.getElementById("load-error").classList.add("d-none");
-    fetch(`{{ url_for('api.accuracy') }}?days=${days}`)
+    fetch(`{{ url_for('api.accuracy') }}${query}`)
       .then((response) => {
         if (!response.ok) { throw new Error(`HTTP ${response.status}`); }
         return response.json();
       })
-      .then((data) => { payload = data; render(); })
+      .then((data) => { payload = data; applyWindows(payload); render(); })
       .catch((error) => {
         // Not the same thing as an empty archive: a failed request or a
         // response the browser cannot parse is a fault to go looking for,
@@ -209,11 +242,18 @@
       });
   }
 
-  document.getElementById("days").addEventListener("change", load);
+  document.getElementById("days").addEventListener("change", () => {
+    requestedDays = Number(document.getElementById("days").value);
+    load();
+  });
   document.getElementById("recent-component").addEventListener("change", () => {
     if (payload) { renderRecent(payload); }
   });
-  load();
+  // Chart.js lives in a deferred module bundle, so window.Chart only
+  // exists once the document has been parsed. Fetching while the document
+  // was still parsing meant the response could arrive before the bundle
+  // had run, and the charts were then silently skipped.
+  document.addEventListener("DOMContentLoaded", load);
 })();
 </script>
 {% endblock %}
