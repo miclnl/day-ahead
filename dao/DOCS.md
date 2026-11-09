@@ -46,6 +46,7 @@
 [Beperkte hardware](#draaien-op-beperkte-hardware) <br>
 [CO2 emissie](#co2-emissie) <br>
 [Api](#api) <br>
+[Leveranciersvergelijking](#leveranciersvergelijking-compare-invoice) <br>
 [Terminal](#terminal)
 
 **Opmerking**: De verwijzingen in bovenstaand menu en ook verwijzingen naar plaatjes werken niet in de documentatie pagina van de 
@@ -2588,6 +2589,492 @@ series:
 ````
 Voor de uitleg van deze instellingen verwijs ik je (voorlopig)naar de documentatie van de apexcharts:<br/>
 ```https://github.com/RomRider/apexcharts-card/blob/master/README.md```
+
+---
+
+## Leveranciersvergelijking (compare-invoice)
+
+### Wat dit is, en wat het niet is
+
+`compare-invoice` is een **handmatige, alleen-lezen vergelijking** tussen één
+leveranciersperiode en het afgerekende boek van DAO+. De route opent de
+boekdatabase op een aparte, alleen-lezen verbinding, leest één boekgeneratie
+(standaard de nieuwste; met `--generation` de gepinde) en drukt een rapport
+af. De route schrijft niets: geen boek, geen tarief, geen publicatie, geen
+taakstatus, geen archief.
+
+Dat is iets anders dan `reconcile --scheduled`. De geplande `reconcile`
+berekent het boek en publiceert een nieuwe generatie; `compare-invoice`
+vergelijkt wat er al staat. Je gebruikt de handmatige vergelijking als je een
+factuur wilt toetsen — niet als onderdeel van de planning.
+
+De vergelijking is **geen betaling en geen goedkeuring**. Een `matched`
+rapport betekent alleen dat het geboekte bedrag gelijk is aan wat de leverancier
+aanleverde binnen de afgesproken afronding. Het is geen leveranciersfactuur,
+geen financiële vaststelling en geen vrijgave om te betalen. Er is geen
+leveranciersgoedkeuring en er wordt niets geactiveerd: `prices.settlement.mode`
+blijft `off`, `shadow` of `active` zoals je het had ingesteld, en de
+vergelijkroute verandert daar niets aan.
+
+Er is ook geen nieuwe instelling bijgekomen. De route gebruikt de meter die al
+in `options.json` staat (`prices.settlement.meter id`) en de database die bij
+die configuratie hoort. Er is geen nieuw veld in `config_schema.json`.
+
+### Het genormaliseerde leveranciersbestand
+
+Het bestand is één JSON-bestand met **exacte** sleutelsets: elk veld dat hieronder
+staat moet aanwezig zijn, en een sleutel die hier niet staat wordt geweigerd.
+Bedragen zijn **tekst**, nooit getallen — zo blijft de decimalnotatie van de
+leverancier intact. `null` betekent "niet bekend" en is alleen toegestaan op de
+plaatsen die hieronder als nullable staan aangemerkt; een ontbrekende sleutel is
+geen `null` maar een fout.
+
+Top-level (`supplier-period-v1`):
+
+| veld | type | nullable | betekenis |
+|---|---|---|---|
+| `schema_version` | tekst | nee | moet `supplier-period-v1` zijn |
+| `meter_id` | tekst | nee | de installatie; moet gelijk zijn aan `prices.settlement.meter id` |
+| `contract_id` | tekst | nee | het contract-id van de tariefsnapshot |
+| `timezone` | tekst | nee | IANA-zone, bijvoorbeeld `Europe/Amsterdam` |
+| `start_ts` | geheel getal | nee | begin van de periode, UTC-epoch, **inclusief** |
+| `end_ts` | geheel getal | nee | einde van de periode, UTC-epoch, **exclusief** |
+| `currency` | tekst | nee | `EUR` |
+| `energy_unit` | tekst | nee | `kWh` |
+| `sign_convention` | tekst | nee | `cost_positive_revenue_positive` |
+| `total_scope` | tekst | nee | `book_close_events_v1` |
+| `import_kwh` | decimaal | ja | verbruik over de periode |
+| `export_kwh` | decimaal | ja | teruglevering over de periode |
+| `import_amounts` | object of `null` | ja | de verbruiksbedragen |
+| `base_export_amounts` | object of `null` | ja | de terugleveringsbedragen zonder bonus |
+| `bonus_amounts` | object of `null` | ja | de bonusbedragen |
+| `credits` | lijst of `null` | ja | de credits van de periode |
+| `total` | decimaal | ja | het totaal van de leverancier |
+| `rounding` | object of `null` | ja | de afrondingsdeclaratie |
+
+Bedragenobject (`ex_vat`, `vat`, `gross`); elk van de drie velden is nullable:
+
+| veld | type | nullable |
+|---|---|---|
+| `ex_vat` | decimaal | ja |
+| `vat` | decimaal | ja |
+| `gross` | decimaal | ja |
+
+Credit:
+
+| veld | type | nullable |
+|---|---|---|
+| `kind` | tekst | nee |
+| `period_start_ts` | geheel getal | nee |
+| `period_end_ts` | geheel getal | nee |
+| `amounts` | object of `null` | ja |
+
+Afrondingsdeclaratie:
+
+| veld | type | nullable |
+|---|---|---|
+| `method` | tekst | nee |
+| `money_quantum` | decimaal | ja |
+| `money_mode` | tekst | ja |
+| `aggregation` | tekst | ja |
+| `total_rule` | tekst | ja |
+| `energy_quantum` | decimaal | ja |
+| `energy_mode` | tekst | ja |
+| `evidence_ref` | tekst | ja |
+
+#### Voorbeeld: een synthetische periode die volledig overeenkomt
+
+Alle waarden hieronder zijn synthetisch. Er staat geen echte leverancier, geen
+echt contract en geen echte nota in.
+
+<!-- e1f:supplier-period-example -->
+```json
+{
+  "schema_version": "supplier-period-v1",
+  "meter_id": "synthetic-grid",
+  "contract_id": "synthetic-2027",
+  "timezone": "Europe/Amsterdam",
+  "start_ts": 1798758000,
+  "end_ts": 1798759800,
+  "currency": "EUR",
+  "energy_unit": "kWh",
+  "sign_convention": "cost_positive_revenue_positive",
+  "total_scope": "book_close_events_v1",
+  "import_kwh": "0.6",
+  "export_kwh": "0.6",
+  "import_amounts": {"ex_vat": "0.06", "vat": "0", "gross": "0.06"},
+  "base_export_amounts": {"ex_vat": "0.06", "vat": "0", "gross": "0.06"},
+  "bonus_amounts": {"ex_vat": "0", "vat": "0", "gross": "0"},
+  "credits": [],
+  "total": "0",
+  "rounding": {
+    "method": "period_component_half_up_v1",
+    "money_quantum": "0.01",
+    "money_mode": "ROUND_HALF_UP",
+    "aggregation": "sum_unrounded_then_round_each_component",
+    "total_rule": "sum_rounded_gross_components",
+    "energy_quantum": "0.001",
+    "energy_mode": "ROUND_HALF_UP",
+    "evidence_ref": "synthetic-rounding-v1"
+  }
+}
+```
+<!-- /e1f:supplier-period-example -->
+
+#### Voorbeeld: alle nullable velden expliciet null
+
+Een leverancier die niets aanlevert, levert dat ook expliciet: `null` op elke
+nullable plek. Dit bestand is geldig, maar het is **niet vergelijkbaar** — zonder
+bedragen, zonder creditset en zonder afrondingsdeclaratie is er niets om tegen
+het boek te leggen.
+
+<!-- e1f:supplier-period-null-example -->
+```json
+{
+  "schema_version": "supplier-period-v1",
+  "meter_id": "synthetic-grid",
+  "contract_id": "synthetic-2027",
+  "timezone": "Europe/Amsterdam",
+  "start_ts": 1798758000,
+  "end_ts": 1798759800,
+  "currency": "EUR",
+  "energy_unit": "kWh",
+  "sign_convention": "cost_positive_revenue_positive",
+  "total_scope": "book_close_events_v1",
+  "import_kwh": null,
+  "export_kwh": null,
+  "import_amounts": null,
+  "base_export_amounts": null,
+  "bonus_amounts": null,
+  "credits": null,
+  "total": null,
+  "rounding": null
+}
+```
+<!-- /e1f:supplier-period-null-example -->
+
+#### Voorbeeld: expliciete nulls ín de bedragen, de credit en de afronding
+
+<!-- e1f:supplier-period-partial-null-example -->
+```json
+{
+  "schema_version": "supplier-period-v1",
+  "meter_id": "synthetic-grid",
+  "contract_id": "synthetic-2027",
+  "timezone": "Europe/Amsterdam",
+  "start_ts": 1798758000,
+  "end_ts": 1801436400,
+  "currency": "EUR",
+  "energy_unit": "kWh",
+  "sign_convention": "cost_positive_revenue_positive",
+  "total_scope": "book_close_events_v1",
+  "import_kwh": "0.6",
+  "export_kwh": "0.6",
+  "import_amounts": {"ex_vat": null, "vat": null, "gross": "0.06"},
+  "base_export_amounts": {"ex_vat": null, "vat": null, "gross": "0.06"},
+  "bonus_amounts": {"ex_vat": null, "vat": null, "gross": "0"},
+  "credits": [
+    {
+      "kind": "spot_zero",
+      "period_start_ts": 1798758000,
+      "period_end_ts": 1801436400,
+      "amounts": {"ex_vat": null, "vat": null, "gross": "0.20"}
+    }
+  ],
+  "total": null,
+  "rounding": {
+    "method": "period_component_half_up_v1",
+    "money_quantum": "0.01",
+    "money_mode": "ROUND_HALF_UP",
+    "aggregation": "sum_unrounded_then_round_each_component",
+    "total_rule": "sum_rounded_gross_components",
+    "energy_quantum": "0.001",
+    "energy_mode": "ROUND_HALF_UP",
+    "evidence_ref": null
+  }
+}
+```
+<!-- /e1f:supplier-period-partial-null-example -->
+
+### Afronding: de declaratie en het bewijs
+
+Vergelijken kan alleen als de leverancier zegt hoe hij afrondt. De enige
+aangenomen declaratie is:
+
+```
+method         = period_component_half_up_v1
+money_quantum  = 0.01
+money_mode     = ROUND_HALF_UP
+aggregation    = sum_unrounded_then_round_each_component
+total_rule     = sum_rounded_gross_components
+energy_quantum = 0.001 (of 1 … 0.000000001)
+energy_mode    = ROUND_HALF_UP
+evidence_ref   = <tekst die naar het afrondingsvoorschrift verwijst>
+```
+
+* Zonder `rounding`, of zonder `evidence_ref`, is het hele rapport **niet
+  vergelijkbaar** (reden `rounding_missing`): het energiequantum staat in
+  dezelfde declaratie, dus ook de kWh-componenten vallen dan weg. Een
+  afronding die niet aan bovenstaande voldoet geeft `rounding_unsupported`.
+* `evidence_ref` is geen formaliteit: het is de verwijzing naar het
+  afrondingsvoorschrift waarmee de leverancier rekende. Zonder die verwijzing
+  mag DAO+ niet aannemen dat zijn eigen afronding die van de leverancier is.
+* Er wordt nooit opnieuw afgerond. Een leverancierbedrag dat niet op het
+  quantum past is `supplier_quantum_mismatch` en daarmee niet vergelijkbaar —
+  het wordt niet "afgerond" tot het quantum.
+
+### Het energiequantum
+
+`energy_quantum` is het quantum van de energiebedragen in kWh. Toegestaan zijn
+de machten van tien tot en met 1e-9: `1`, `0.1`, `0.01`, `0.001`, `0.0001`, …
+tot `0.000000001`. `0.03` is géén toegestaan quantum. Het quantum heeft twee
+rollen: het **toetst de leverancierwaarde** (een leverancierbedrag dat niet op
+het quantum past is `supplier_quantum_mismatch`) en het **levert de vergelijkbare
+boekwaarde** door die boekwaarde één keer af te ronden. Het geboekte bedrag zelf
+wordt nooit herberekend: `book_value` blijft de ongeronde opgeslagen waarde, en
+het quantum herberekent die nooit.
+
+### Credits: de identiteit van een afgesloten maand
+
+`total_scope` moet `book_close_events_v1` zijn: het totaal van de leverancier is
+het totaal van de **boeksluitingen** binnen de periode. Een credit is geen losse
+regel maar een identiteit:
+
+```
+(kind, period_start_ts, period_end_ts)
+```
+
+Voor de maandelijkse teruglevering (`spot_zero`) is dat het maandvenster plus de
+soort. DAO+ herkent zo'n credit alleen als de boekregel die de maand afsluit er
+ook echt bij hoort: hetzelfde contract-id, dezelfde tijdzone, en een afsluitende
+regel die op `period_end_ts` eindigt. Ligt die binding er niet, dan is de credit
+`credit_identity_unproven`: hij blijft zichtbaar met zijn reden en wordt nooit
+hernoemd, weggelaten of stilletjes naar een ander venster verschoven.
+
+Een credit die de leverancier wel aanlevert maar die niet in het boek staat (of
+omgekeerd) geeft `credit_set_mismatch` op de creditset. De twee sets worden niet
+stilzwijgend gelijkgemaakt.
+
+### De bronpin, een no-op en gemengde runs
+
+Elk rapport draagt de **pin** van het boek waartegen het vergeleken is: de
+meter, de generatie, de revisies, het vuile-tijdstip, de periodegrenzen, de
+`view_digest` en het leesmoment. Een boekbeeld dat onderweg verandert, wordt
+geweigerd in plaats van half vervangen.
+
+```json
+{
+  "meter_id": "synthetic-grid",
+  "generation": 1,
+  "view_input_revision": 3,
+  "current_generation": 1,
+  "current_input_revision": 3,
+  "dirty_from_ts": null,
+  "start_ts": 1798758000,
+  "end_ts": 1798759800,
+  "view_digest": "72fe59e7a1077c20b2ffbbb972ecfd5e9aefb2e52294f4ca95c297cb1023ffbe",
+  "read_ts": 1806534000
+}
+```
+
+* **Pin.** De `view_digest` is de canonieke digest van het boekbeeld dat is
+  gelezen. De vergelijking weigert een beeld dat niet meer klopt met de pin.
+* **No-op.** Een consolidatie die niets verandert — dezelfde invoer, dezelfde
+  prijzen, geen contractwijziging — levert **geen** nieuwe generatie. De
+  boekreferentie kan wél een hogere *inputrevisie* hebben: een registratie
+  buiten de geboekte dekking telt mee in de revisie. Die twee identiteiten blijven
+  gescheiden, en dat is geen conflict. Wat wél een conflict is, is een run die
+  *boven* de revisie van het gelezen boekbeeld ligt.
+* **Gemengde runs.** Eén boekgeneratie kan regels uit verschillende runs
+  bevatten: een late correctie herwaardeert maar een deel van de periode. Elke
+  regel draagt zijn eigen `run_id` en `valid_from_generation`, en de bronkey is
+  de canonieke regel
+  `["settlement-line-v1", meter_id, start_ts, valid_from_generation, run_id, line_content_hash]`.
+  Tègenstrijdige versies van dezelfde regel in dezelfde primaire versie zijn een
+  conflict (`source_mismatch`) — geen last-write-wins. Dezelfde regel die in twee
+  rollen voorkomt (een gewone regel én een creditsluitregel) met dezelfde
+  volledige bron is **één** bewijsreferentie, nooit dubbel geld.
+
+### Wat het rapport zegt: status per component en totaal
+
+Het rapport heeft een **status per component** en één **totale status**.
+
+| component | eenheid | wat het is |
+|---|---|---|
+| `import_kwh`, `export_kwh` | kWh | de energie van de periode |
+| `import.gross`, `import.ex_vat`, `import.vat` | EUR | verbruik |
+| `base_export.gross`, `base_export.ex_vat`, `base_export.vat` | EUR | teruglevering zonder bonus |
+| `bonus.gross`, `bonus.ex_vat`, `bonus.vat` | EUR | bonus |
+| `credit:<soort>:<begin>:<eind>.gross` / `.ex_vat` / `.vat` | EUR | per credit |
+| `net_cost` | EUR | het totaal |
+
+Elke component is een object met een eigen status. De vier bedragvelden hebben
+elk een eigen betekenis:
+
+| veld | betekenis |
+|---|---|
+| `book_value` | de **ongeronde** geboekte waarde: de som van de opgeslagen boekbedragen, ongewijzigd door welke afronding dan ook |
+| `supplier_value` | de waarde zoals de leverancier die aanlevert |
+| `comparable_book_value` | de **eenmaal afgeronde** boekwaarde volgens de afrondingsdeclaratie (EUR op `money_quantum` = 0.01, kWh op `energy_quantum`) |
+| `delta` | `supplier_value` − `comparable_book_value`; alleen gevuld wanneer de component vergelijkbaar is |
+
+De afronding gebeurt dus op de **vergelijkbare** boekwaarde, niet op de
+leverancierwaarde: het quantum toetst de leverancierwaarde én levert de
+vergelijkbare boekwaarde. Het geboekte bedrag zelf (`book_value`) wordt nooit
+herberekend. Is een component niet vergelijkbaar, dan zijn
+`comparable_book_value` en `delta` `null` en staat de reden in `reasons`.
+
+```json
+{
+  "key": "import.gross",
+  "unit": "EUR",
+  "book_value": "0.06",
+  "supplier_value": "0.06",
+  "comparable_book_value": "0.06",
+  "delta": "0",
+  "status": "matched",
+  "quality": "estimated",
+  "reasons": [],
+  "source_keys": [
+    "[\"settlement-line-v1\",\"synthetic-grid\",1798758000,1,\"bf10a015-79d1-4023-9c82-589e48b36c09\",\"084337331fab36da92b2a76cfb6178017bd48ad6fb57e116c02c27e6256955fa\"]",
+    "[\"settlement-line-v1\",\"synthetic-grid\",1798758900,1,\"bf10a015-79d1-4023-9c82-589e48b36c09\",\"ea737582ffa338006ffacc3772a99125da7e99b808a04c47469f75fc2515cf09\"]"
+  ]
+}
+```
+
+De `run_id` en de hashes in `source_keys` veranderen per draaiing; de vorm niet.
+`quality` is de kwaliteit van het geboekte materiaal: `measured`, `estimated` of
+`incomplete`. Het totaal heeft dezelfde vorm:
+
+```json
+{
+  "key": "net_cost",
+  "unit": "EUR",
+  "book_value": "0",
+  "supplier_value": "0",
+  "comparable_book_value": "0",
+  "delta": "0",
+  "status": "matched",
+  "quality": "estimated",
+  "reasons": [],
+  "source_keys": [
+    "[\"settlement-line-v1\",\"synthetic-grid\",1798758000,1,\"bf10a015-79d1-4023-9c82-589e48b36c09\",\"084337331fab36da92b2a76cfb6178017bd48ad6fb57e116c02c27e6256955fa\"]",
+    "[\"settlement-line-v1\",\"synthetic-grid\",1798758900,1,\"bf10a015-79d1-4023-9c82-589e48b36c09\",\"ea737582ffa338006ffacc3772a99125da7e99b808a04c47469f75fc2515cf09\"]"
+  ]
+}
+```
+
+De **totale status** volgt een vaste precedentie: `not_comparable` gaat boven
+`different`, en `different` gaat boven `matched`. Een component die niet
+vergelijkbaar is maakt dus het hele rapport `not_comparable`, ook als een ander
+component wél een verschil laat zien. "Netto gelijk" met verschillende
+componenten is dus géén `matched`: het totaal is dan `different` terwijl de
+energie `matched` is. Het rapport heeft daarnaast een `freshness`
+(`current`, `outdated`, `unknown`) en een lijst `reasons` met onder meer
+`book_outdated`, `book_unknown`, `component_not_comparable` en
+`component_different`.
+
+Bij het totaal wijken `book_value` en `comparable_book_value` bewust af van
+elkaar: `book_value` is letterlijk het geboekte netto (`view.net_cost`), terwijl
+`comparable_book_value` de getekende som van de **afgeronde bruto-componenten**
+is. Die twee mogen dus door afrondingsvolgorde verschillen; het totaal wordt
+daarom nooit opnieuw afgerond.
+
+**Bonus-btw onbekend.** Zodra er in de periode bonusopbrengst is waarvan de
+btw-splitsing niet is vastgesteld, zijn `bonus.ex_vat` en `bonus.vat` **niet
+vergelijkbaar** met reden `bonus_vat_split_unavailable`. `bonus.gross` mag in
+dat geval wél `matched` zijn: het bruto bedrag staat in het boek, de splitsing
+niet. De structurele bonus-nul voor `bonus.ex_vat` en `bonus.vat` geldt alleen
+als **beide** voorwaarden kloppen: de geboekte bonusopbrengst is nul **én** de
+bonus is in het bijbehorende tariefsnapshot aantoonbaar afwezig of
+uitgeschakeld. Die voorwaarden zijn een **én**, geen **of**: een boek zonder
+bonusopbrengst maar met een nog actieve bonus in de snapshot voldoet niet, en
+`bonus.ex_vat`/`bonus.vat` blijven dan onvergelijkbaar met reden
+`bonus_vat_split_unavailable`. Voldoet de combinatie, dan zijn die twee
+componenten nul en vergelijkbaar; een nulbonus die alleen door een cap, een
+venster of een onbekende basis ontstond levert die structurele splitsing
+niet.
+
+### Exitcodes
+
+| code | betekenis |
+|---|---|
+| 0 | `matched` — elk component en het totaal zijn gelijk |
+| 3 | `different` — minstens één component wijkt af |
+| 4 | `not_comparable` — minstens één component is niet vergelijkbaar, of het boek is verouderd of onbekend |
+| 2 | geweigerd: ongeldig argument, ongeldig bestand, ongeldige configuratie of een andere meter — dit gebeurt **vóór** er een database wordt geopend |
+| 1 | operationele fout: de database ontbreekt, het boek is onleesbaar, of de boekread botste met een schrijver |
+
+Bij 2 en 1 krijg je **geen** financieel rapport: alleen een vaste foutcategorie op
+stderr, zonder inhoud, paden of secrets.
+
+### Twee bekende beperkingen uit de rapportlookup
+
+**Een boekregel zonder tariefdekking heeft geen bewezen kWh.** In het
+energierapport (`get_grid_data` en de API) wordt de kWh per regel pas toegevoegd
+als de gedeelde historische reader de regel aan haar eigen geregistreerde invoer
+én tariefsnapshot kan binden. Een regel zonder tariefdekking — of met een
+ontbrekende of strijdige bron — levert **geen** kWh: het veld blijft leeg in
+plaats van een schatting te tonen. Het bedrag blijft wel staan; alleen de
+energie blijft onbekend. Dat is een bewuste beperking: liever een leeg veld dan
+een kWh die niet bij de geboekte invoer hoort.
+
+**De historische lookup kost één extra read per `_book_grid`-aanroep.** Elke
+aanroep van `_book_grid` doet naast de gewone boekread nog één
+`read_reconciliation`: de gedeelde historische lezer haalt daar de bewezen kWh
+op. Hoe vaak dat gebeurt hangt af van het rapport:
+
+* het energierooster leest één bereik per gedekt contractbereik: een dagrooster
+  kost daar **één** extra historische read (gemeten in de E2E-keten);
+* de rapportages die elk uur apart afrekenen roepen `_book_grid` **per uur** aan
+  (`recalc_df_ha` en `_settlement_saving_cost` in `da_report.py`): een
+  dagrooster kost daar **24** extra historische reads (gemeten: 24
+  `_book_grid`-aanroepen en 24 `read_reconciliation`-reads op 24 uurrijen).
+
+Elke `read_reconciliation` is zelf één transactie met een vast aantal
+statements: gemeten op een venster van 2880 boekregels zijn dat **8** SQL
+statements, en ongeveer **9×** zo lang als de gewone `read` op hetzelfde venster
+(8,6–9,2× over meerdere metingen). Dat aantal statements hangt niet af van de
+venstergrootte: gemeten over vensters van 4 tot 11 520 boekregels blijft het 8.
+Vóór de bulkselectie waren dat drie statements per boekregel plus vijf vaste
+statements (8645 statements op hetzelfde venster van 2880 regels) en circa 15×
+de leestijd; de reviewer mat op die oudere code 12,4×.
+
+Er is bewust **geen cache** toegevoegd: de extra read is de prijs van het
+causale bewijs, en het ontwerp schrijft er geen caching voor.
+
+### Privacy: provenance is gevoelig, een digest is geen anonimisering
+
+De `provenance` in het rapport bevat de geregistreerde bronnen van het boek: de
+`run_id`, de input- en resultaathashes, de snapshot-hashes, de meter-id, de
+sensorbronnen en het volledige tariefbeeld. Dat is **gevoelige informatie**: het
+beschrijft hoe jouw installie is gemeten en afgerekend, en het kan met andere
+gegevens uit de database worden verbonden.
+
+Een digest is **geen anonimisering**. Een SHA-256 over een canonieke weergave
+is voor één regel niet terug te draaien, maar het is een *vingerafdruk* van een
+concrete invoer: twee gelijke boeken geven dezelfde digest, en een digest uit
+een klein, goed bekend domein is met een gokslag terug te vinden. Behandel
+`view_digest`, `input_hash`, `result_hash`, `snapshot_hash`,
+`line_content_hash` en `run_id` daarom als interne identifiers, niet als iets
+dat je zonder meer extern deelt.
+
+Het rapport gaat naar stdout. Fouten gaan naar stderr en bevatten alleen een
+vaste categorie, nooit inhoud, paden of secrets.
+
+### Wat hier nog niet bewezen is
+
+* Alleen **lokaal** bewezen, op SQLite. De PostgreSQL- en MariaDB-cel zijn
+  openstaande externe gates. De boektests zijn geparametriseerd over een echte
+  server zodra `SETTLEMENT_TEST_POSTGRESQL_URL` of
+  `SETTLEMENT_TEST_MARIADB_URL` gezet is — maar met de verplichte
+  testprefix zijn juist die variabelen weg. Er is dus **geen server gedraaid**
+  en er is geen serverclaim.
+* Alle voorbeelden in deze sectie zijn **synthetisch**. Er zit geen echte
+  leveranciersfactuur, geen echt contract en geen echte 2027-periode in het
+  bewijs.
+* `matched` is geen vrijgave: geen leveranciersgoedkeuring, geen
+  betalingsopdracht, geen activering.
 
 ---
 

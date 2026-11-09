@@ -494,3 +494,193 @@ def test_missing_reference_prefix_is_unknown_not_actual_month_state(reference_mo
         assert frame[reference_fields].isna().all().all(), period
     fields = ["cost", "profit", "netto_cost", *reference_fields]
     pd.testing.assert_frame_equal(frames["month"][fields], pd.concat([frames["before"], frames["after"]])[fields])
+
+
+def e1e_resigned(snapshot, **overrides):
+    """A synthetic tariff with its own correct hash but an unsupported rule version."""
+    from dataclasses import asdict
+    from hashlib import sha256
+
+    from dao.prog.settlement.tariffs import _canonical_default
+
+    item = replace(snapshot, **overrides)
+    content = asdict(item)
+    del content["snapshot_hash"]
+    canonical = json.dumps(content, default=_canonical_default, sort_keys=True, separators=(",", ":"))
+    return replace(item, snapshot_hash=sha256(canonical.encode("utf-8")).hexdigest())
+
+
+def test_e1e_old_grid_gets_historical_kwh(system, report):
+    """The pinned generation proves its own kWh; the latest input is not the history."""
+    first = system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="e1e-g1")
+    system.meter.items[0] = replace(system.meter.items[0], import_kwh="2")
+    second = system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="e1e-g2")
+    assert second.generation == first.generation + 1
+
+    historical = report._book_grid(START_TS, START_TS + 900, "uur", generation=first.generation)
+    assert historical.consumption.iloc[0] == Decimal("1")
+    assert historical.production.iloc[0] == Decimal("0")
+    assert historical.cost.iloc[0] == Decimal("0.10")
+    assert historical.attrs["view"].generation == first.generation
+
+    current = report._book_grid(START_TS, START_TS + 900, "uur")
+    assert current.consumption.iloc[0] == Decimal("2")
+    assert current.cost.iloc[0] == Decimal("0.20")
+    assert current.attrs["view"].generation == second.generation
+
+
+def test_e1e_source_mismatch_keeps_amounts_and_null_energy(system, report):
+    """A defective registered source hides no book amount and proves no energy."""
+    from sqlalchemy import select
+
+    from dao.prog.settlement import repository as r
+
+    system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="e1e-mismatch")
+    with system.engine.begin() as connection:
+        stored = connection.execute(select(r._INPUT)).mappings().first()
+        content = json.loads(stored["input_json"])
+        content["import_kwh"] = "999"
+        connection.execute(r._INPUT.update().values(input_json=json.dumps(content)))
+
+    frame = report._book_grid(START_TS, START_TS + 900, "uur")
+    assert pd.isna(frame.consumption.iloc[0])
+    assert pd.isna(frame.production.iloc[0])
+    assert frame.cost.iloc[0] == Decimal("0.10")
+    assert frame.quality.iloc[0] == "measured"
+
+
+@pytest.mark.parametrize("change", ["freshness", "lines", "adjustments"])
+def test_e1e_basis_change_refuses_enrichment(system, report, monkeypatch, change):
+    """An additional read describing another book is refused, never silently adopted."""
+    from dataclasses import replace
+
+    from dao.prog.settlement.repository import ConcurrentSettlementError
+    from dao.prog.settlement.types import PeriodAdjustment
+
+    system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="e1e-basis")
+    original = system.repo.read_reconciliation
+
+    def altered(*args, **kwargs):
+        basis = original(*args, **kwargs)
+        view = basis.view
+        if change == "freshness":
+            view = replace(view, freshness="outdated" if view.freshness == "current" else "current")
+        elif change == "lines":
+            view = replace(view, lines=())
+        else:
+            fabricated = PeriodAdjustment("spot_zero", START_TS, START_TS + 900, Decimal("0.10"),
+                                          Decimal("0.02"), Decimal("0.12"), Decimal("0.10"), "estimated")
+            view = replace(view, adjustments=(fabricated,))
+        return replace(basis, view=view)
+
+    monkeypatch.setattr(system.repo, "read_reconciliation", altered)
+    with pytest.raises(ConcurrentSettlementError):
+        report._book_grid(START_TS, START_TS + 900, "uur")
+
+
+def test_e1e_missing_source_evidence_leaves_energy_unknown(system, report):
+    """A missing tariff row leaves the row unproven; the book amount stays visible."""
+    from dao.prog.settlement import repository as r
+
+    system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="e1e-tariff-gap")
+    with system.engine.begin() as connection:
+        connection.execute(r._TARIFF.delete())
+
+    frame = report._book_grid(START_TS, START_TS + 900, "uur")
+    assert pd.isna(frame.consumption.iloc[0])
+    assert pd.isna(frame.production.iloc[0])
+    assert frame.cost.iloc[0] == Decimal("0.10")
+
+
+@pytest.mark.parametrize("scenario", ["rule", "bonus"])
+def test_e1e_financial_unsupported_does_not_hide_proven_energy(system, report, terms, monkeypatch, scenario):
+    """Financially unsupported details never hide proven kWh or add a report status."""
+    if scenario == "rule":
+        system.service.snapshots = (e1e_resigned(system.snapshot, rule_version="synthetic-v1"),)
+        expected_profit = Decimal("0")
+    else:
+        from datetime import date
+
+        from dao.prog.settlement.types import BonusRules
+
+        bonus = BonusRules(True, "pv only", date(2027, 1, 1), "30", "0.2", "ex_vat", "0", "5000",
+                           tuple((month, (0, 24)) for month in range(1, 13)))
+        system.service.snapshots = (terms(rule_version="tariffs-v1", bonus=bonus,
+                                          supply_start=date(2027, 1, 1)),)
+        system.meter.items[0] = replace(system.meter.items[0], export_kwh="1")
+        expected_profit = Decimal("0.13")
+
+    view = system.service.consolidate(START_TS, START_TS + 900, publish=True, reason="e1e-unsupported")
+    assert view.lines[0].bonus_revenue is not None
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("the report must not resolve energy through the current input lookup")
+
+    monkeypatch.setattr(system.repo, "read_inputs", forbidden)
+    frame = report._book_grid(START_TS, START_TS + 900, "uur")
+    assert frame.consumption.iloc[0] == Decimal("1")
+    assert frame.cost.iloc[0] == Decimal("0.10")
+    assert frame.profit.iloc[0] == expected_profit
+    # The book report keeps its own contract; no supplier/comparator status is imposed.
+    assert list(frame.columns) == ["uur", "vanaf", "tot", "consumption", "production", "cost", "profit",
+                                   "datasoort", "freshness", "generation", "quality", "netto_consumption",
+                                   "netto_cost", "bonus_kind", "quality_label"]
+    assert frame.attrs["view"].generation == view.generation
+    assert frame.attrs["view"].net_cost == view.net_cost
+
+
+@pytest.mark.parametrize("scenario", ["credit", "dst"])
+def test_e1e_grid_api_keeps_credit_and_dst_placement(system, report, terms, scenario):
+    """The grid API keeps the credit at end-1 and both real wintertime hours."""
+    if scenario == "credit":
+        from dao.prog.settlement.engine import settle_series
+        from dao.prog.settlement.metering import merge_inputs
+        from dao.prog.settlement.types import (
+            MeterInterval,
+            MonthState,
+            SettlementState,
+            SpotInterval,
+        )
+        from dao.tests.settlement.conftest import MONTH_END_TS
+        from dao.tests.settlement.test_repository import METER
+
+        at = MONTH_END_TS - 900
+        snapshot = terms(monthly_export_floor="spot_zero")
+        reading = MeterInterval(at, MONTH_END_TS, "0", "1", "0", "verified_pv", "measured", ("synthetic-close",))
+        prices = (SpotInterval(at // 3600 * 3600, MONTH_END_TS, "-0.20", "synthetic-hour", "measured"),)
+        items = merge_inputs((reading,), prices, (snapshot,), meter_id=METER)
+        system.repo.register_inputs(METER, items, (snapshot,), 0)
+        batch = system.repo.read_inputs(METER, at, MONTH_END_TS)
+        opening = SettlementState(at, None, MonthState(snapshot.contract_id, START_TS, MONTH_END_TS, "0", (), True))
+        system.repo.commit(METER, settle_series(batch.items, batch.snapshots, opening), batch, 0,
+                           "synthetic-close")
+        report.periodes = {"synthetic": {"vanaf": at, "tot": MONTH_END_TS, "interval": "uur"}}
+
+        rows = json.loads(report.get_api_data("grid", "synthetic"))["data"]
+        assert len(rows) == 1
+        assert rows[0]["time"] == "2027-01-31 23:45"
+        assert Decimal(str(rows[0]["consumption"])) == Decimal("0")
+        assert Decimal(str(rows[0]["production"])) == Decimal("1")
+        assert Decimal(str(rows[0]["profit"])) == Decimal("0")
+        settlement = json.loads(report.get_api_data("settlement", "synthetic"))["data"]
+        assert settlement[1]["kind"] == "spot_zero"
+        assert settlement[1]["time"] == MONTH_END_TS - 1
+        assert settlement[1]["credit_total"] == "0.2"
+    else:
+        from dao.prog.settlement.types import MeterInterval, SpotInterval
+
+        start = int(dt.datetime(2027, 10, 31, 0, tzinfo=dt.UTC).timestamp())
+        end = start + 7200
+        system.clock[0] = end + 86400
+        system.meter.items = [MeterInterval(at, at + 900, "0.25", "0", "0", "verified_pv", "measured",
+                                           ("synthetic-wintertime",)) for at in range(start, end, 900)]
+        system.spots[:] = [SpotInterval(start, start + 3600, "0.10", "synthetic-hour", "measured"),
+                           SpotInterval(start + 3600, end, "0.40", "synthetic-hour", "measured")]
+        system.service.consolidate(start, end, publish=True, reason="e1e-wintertime")
+        report.periodes = {"wintertime": {"vanaf": start, "tot": end, "interval": "uur"}}
+
+        rows = json.loads(report.get_api_data("grid", "wintertime"))["data"]
+        assert [row["time"] for row in rows] == ["2027-10-31 02:00", "2027-10-31 02:00"]
+        assert [row["time_ts"] for row in rows] == [start * 1000, (start + 3600) * 1000]
+        assert [Decimal(str(row["cost"])) for row in rows] == [Decimal("0.10"), Decimal("0.40")]
+        assert [Decimal(str(row["consumption"])) for row in rows] == [Decimal("1.0"), Decimal("1.0")]

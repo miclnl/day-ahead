@@ -11,12 +11,12 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date
-from decimal import Decimal, localcontext
+from decimal import Decimal, InvalidOperation, localcontext
 from functools import cache
 from hashlib import sha256
 from time import time
 from types import UnionType
-from typing import Protocol, Union, get_args, get_origin, get_type_hints
+from typing import Literal, Protocol, Union, get_args, get_origin, get_type_hints
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -51,6 +51,16 @@ from dao.prog.settlement.metering import (
     _spot_index,
     _spot_window,
 )
+from dao.prog.settlement.reconciliation import (
+    BookSourcePin,
+    CreditSource,
+    LineSource,
+    ReconciliationBasis,
+    ReconciliationSources,
+    RunSource,
+    _canonical_json,
+    _digest,
+)
 from dao.prog.settlement.tariffs import _canonical_default, resolve_snapshot
 from dao.prog.settlement.types import (
     InputBatch,
@@ -66,6 +76,9 @@ from dao.prog.settlement.types import (
 )
 
 _BATCH_SIZE = 250
+# Bulk-sleutels per SELECT. Bovengrens zodat de gebonden parameters onder de
+# 999-parametergrens van de oudste SQLite blijven (max 2 * 400 + 1).
+_BULK_KEYS = 400
 _METADATA = MetaData()
 _TEXT = Text().with_variant(LONGTEXT(), "mysql", "mariadb")
 _TABLE_OPTIONS = {
@@ -202,6 +215,13 @@ class ConcurrentSettlementError(RuntimeError):
     """De geregistreerde invoer of financiële generatie is inmiddels gewijzigd."""
 
 
+class ReconciliationReadError(RuntimeError):
+    """The selected authoritative book cannot be constructed without substitution."""
+
+    def __init__(self):
+        super().__init__("book_view_unreadable")
+
+
 class PriceInputMismatch(ValueError):
     """Gesloten samengestelde invoer stemt niet overeen met de raw prijsgrondslag."""
 
@@ -270,6 +290,253 @@ def _restore(value, annotation):
 
 def _load(cls, content: str):
     return _restore(json.loads(content), cls)
+
+
+def _read_shape(value, annotation):
+    """Check stored canonical JSON shape before the existing DTO restoration.
+
+    This read boundary deliberately does not coerce JSON numbers into Decimal
+    text or let a malformed container escape as an AttributeError/KeyError.
+    """
+    origin, args = get_origin(annotation), get_args(annotation)
+    if origin in (Union, UnionType):
+        if value is None and type(None) in args:
+            return
+        return _read_shape(value, next(kind for kind in args if kind is not type(None)))
+    if is_dataclass(annotation):
+        annotations = _annotations(annotation)
+        if not isinstance(value, dict) or value.keys() != annotations.keys():
+            raise ValueError("stored DTO shape")
+        for name, kind in annotations.items():
+            _read_shape(value[name], kind)
+    elif origin is tuple:
+        if not isinstance(value, list):
+            raise ValueError("stored sequence shape")
+        kinds = (args[0],) * len(value) if args[-1] is Ellipsis else args
+        for item, kind in zip(value, kinds, strict=True):
+            _read_shape(item, kind)
+    elif annotation in (Decimal, date):
+        if not isinstance(value, str):
+            raise ValueError("stored decimal/date shape")
+    elif origin is Literal:
+        if not any(type(value) is type(option) and value == option for option in args):
+            raise ValueError("stored literal shape")
+    elif type(value) is not annotation:
+        raise ValueError("stored scalar shape")
+
+
+def _read_dto(cls, content):
+    value = json.loads(content)
+    _read_shape(value, cls)
+    return _restore(value, cls)
+
+
+def _read_run(row):
+    hashes = json.loads(row["snapshot_hashes_json"])
+    _read_shape(hashes, tuple[str, ...])
+    return RunSource(row["run_id"], row["generation"], row["input_revision"], row["engine_version"],
+                     row["input_hash"], row["result_hash"], tuple(hashes))
+
+
+def _read_header(book):
+    if book is None:
+        return None
+    for name in ("generation", "input_revision"):
+        _revision(book[name])
+    for name in ("dirty_from_ts", "source_watermark_ts"):
+        value = book[name]
+        # Same supported UTC year 1..9999 range as the reconciliation DTOs.
+        # Classify malformed stored header values before constructing the pin.
+        if value is not None and (type(value) is not int or not -62135596800 <= value <= 253402300799):
+            raise ValueError("stored header timestamp")
+    _read_shape(json.loads(book["snapshot_hashes_json"]), tuple[str, ...])
+    return tuple(book[name] for name in ("generation", "input_revision", "dirty_from_ts",
+                                        "snapshot_hashes_json", "source_watermark_ts"))
+
+
+class _ReconciliationRead:
+    """Connection-local SELECT evidence; no current-input or producer capability."""
+
+    def __init__(self, connection, meter_id):
+        self.connection = connection
+        self.meter_id = meter_id
+        self.runs = {}
+        # Bronrijen met een primaire sleutel zijn invoeg-onder-immuut: een
+        # gevonden rij blijft dezelfde rij. De lezer haalt ze daarom in bulk op
+        # in plaats van per boekregel opnieuw op te vragen. Ontbrekende rijen
+        # worden niet bewaard; die blijven per regel opgehaald, zodat een
+        # latere registratie net als voorheen zichtbaar kan worden.
+        self._run_rows = {}
+        self._input_rows = {}
+        self._tariff_rows = {}
+
+    def prefetch_runs(self, run_ids):
+        """Bewaar de producerrijen van de opgegeven runs (sleutel is uniek)."""
+        pending = [run_id for run_id in dict.fromkeys(run_ids)
+                   if run_id is not None and run_id not in self._run_rows]
+        for offset in range(0, len(pending), _BULK_KEYS):
+            chunk = pending[offset:offset + _BULK_KEYS]
+            for row in self.connection.execute(
+                    select(_RUN).where(_RUN.c.run_id.in_(chunk))).mappings():
+                self._run_rows[row["run_id"]] = row
+
+    def prefetch_inputs(self, rows):
+        """Bewaar de invoerrijen van de zichtbare boekregels (interval-PK)."""
+        for row in rows:
+            self._input_rows[(row["start_ts"], row["input_revision"])] = row
+
+    def prefetch_tariffs(self, snapshot_hashes):
+        """Bewaar de tariefrijen van de opgegeven snapshot-hashes."""
+        pending = [value for value in dict.fromkeys(snapshot_hashes)
+                   if value is not None and value not in self._tariff_rows]
+        for offset in range(0, len(pending), _BULK_KEYS):
+            chunk = pending[offset:offset + _BULK_KEYS]
+            for row in self.connection.execute(
+                    select(_TARIFF).where(_TARIFF.c.snapshot_hash.in_(chunk))).mappings():
+                self._tariff_rows[row["snapshot_hash"]] = row
+
+    def run(self, run_id):
+        row = self._run_rows.get(run_id)
+        if row is None:
+            row = self.connection.execute(select(_RUN).where(_RUN.c.run_id == run_id)).mappings().first()
+            if row is not None:
+                self._run_rows[run_id] = row
+        if row is None:
+            return None, "source_missing"
+        try:
+            result = _read_run(row)
+            if row["meter_id"] != self.meter_id or result.generation <= 0 or result.input_revision <= 0:
+                raise ValueError("producer identity")
+        except (ValueError, TypeError):
+            return None, "source_mismatch"
+        self.runs[run_id] = result
+        return result, None
+
+    def line(self, row, line, generation):
+        issues = set()
+        run, issue = self.run(row["run_id"])
+        if issue:
+            issues.add(issue)
+        if (row["meter_id"] != self.meter_id or line.meter_id != self.meter_id
+            or any(row[name] != getattr(line, name) for name in
+                   ("start_ts", "end_ts", "input_revision", "input_hash", "snapshot_hash"))
+            or row["content_hash"] != _hash(_json(line))
+            or any(row[name] != _decimal(getattr(line, name)) for name in
+                   ("import_cost", "base_export_revenue", "bonus_revenue", "bonus_kwh"))
+            or not row["valid_from_generation"] <= generation
+            or (row["valid_to_generation"] is not None and generation >= row["valid_to_generation"])
+            or (run is not None and (run.generation != row["valid_from_generation"]
+                                    or line.input_revision > run.input_revision
+                                    or (line.snapshot_hash is not None and line.snapshot_hash not in run.snapshot_hashes)))):
+            issues.add("source_mismatch")
+        item = snapshot = input_hash = None
+        key = (row["start_ts"], row["input_revision"])
+        source = self._input_rows.get(key)
+        if source is None:
+            source = self.connection.execute(select(_INPUT).where(
+                _INPUT.c.meter_id == self.meter_id, _INPUT.c.start_ts == row["start_ts"],
+                _INPUT.c.input_revision == row["input_revision"],
+            )).mappings().first()
+            if source is not None:
+                self._input_rows[key] = source
+        if source is None:
+            issues.add("source_missing")
+        else:
+            input_hash = source["content_hash"]
+            try:
+                content = json.loads(source["input_json"])
+                if not isinstance(content, dict) or "input_revision" in content:
+                    raise ValueError("stored input shape")
+                # The canonical registered payload excludes its row revision.
+                # Reattach only the revision from this exact historical join.
+                content = {**content, "input_revision": source["input_revision"]}
+                _read_shape(content, InputInterval)
+                item = _restore(content, InputInterval)
+                if (any(getattr(item, name) != source[name] for name in
+                        ("meter_id", "start_ts", "end_ts", "input_revision", "input_hash"))
+                    or source["end_ts"] != line.end_ts or source["input_hash"] != line.input_hash
+                    or source["content_hash"] != _hash(_input_content(item))):
+                    raise ValueError("input identity")
+            except (ValueError, TypeError, InvalidOperation):
+                item = None
+                issues.add("source_mismatch")
+        if row["snapshot_hash"] is None:
+            issues.add("source_missing")
+        else:
+            source = self._tariff_rows.get(row["snapshot_hash"])
+            if source is None:
+                source = self.connection.execute(select(_TARIFF).where(
+                    _TARIFF.c.snapshot_hash == row["snapshot_hash"],
+                )).mappings().first()
+                if source is not None:
+                    self._tariff_rows[row["snapshot_hash"]] = source
+            if source is None:
+                issues.add("source_missing")
+            else:
+                try:
+                    snapshot = _read_dto(TariffSnapshot, source["snapshot_json"])
+                    content = asdict(snapshot)
+                    del content["snapshot_hash"]
+                    if (snapshot.snapshot_hash != row["snapshot_hash"]
+                        or _hash(_json(content)) != row["snapshot_hash"]
+                        or snapshot.valid_from_ts > line.start_ts
+                        or (snapshot.valid_to_ts is not None and snapshot.valid_to_ts < line.end_ts)):
+                        raise ValueError("snapshot identity")
+                except (ValueError, TypeError, InvalidOperation):
+                    snapshot = None
+                    issues.add("source_mismatch")
+        return LineSource(
+            _canonical_json(["settlement-line-v1", self.meter_id, row["start_ts"],
+                             row["valid_from_generation"], row["run_id"], row["content_hash"]]),
+            line.start_ts, line.end_ts, line.input_revision, line.input_hash, line.snapshot_hash,
+            row["valid_from_generation"], row["run_id"], row["content_hash"], input_hash,
+            item, snapshot, tuple(sorted(issues)),
+        )
+
+    def credit(self, row, adjustment):
+        issues = set()
+        run, issue = self.run(row["run_id"])
+        if issue:
+            issues.add(issue)
+        if (row["meter_id"] != self.meter_id
+            or any(row[name] != getattr(adjustment, name) for name in ("kind", "period_start_ts", "period_end_ts"))
+            or row["content_hash"] != _hash(_json(adjustment))
+            or any(row[name] != _decimal(getattr(adjustment, name)) for name in
+                   ("credit_ex_vat", "credit_vat", "credit_total", "basis_ex_vat"))
+            or (run is not None and run.generation != row["valid_from_generation"])):
+            issues.add("source_mismatch")
+        closing = source = contract = timezone = None
+        if run is not None:
+            candidates = self.connection.execute(select(_INTERVAL).where(
+                _INTERVAL.c.meter_id == self.meter_id, _INTERVAL.c.end_ts == adjustment.period_end_ts,
+                _valid(_INTERVAL, run.generation),
+            )).mappings().all()
+            if len(candidates) == 1:
+                try:
+                    closing = _read_dto(SettlementLine, candidates[0]["line_json"])
+                except (ValueError, TypeError, InvalidOperation):
+                    issues.add("source_mismatch")
+                else:
+                    source = self.line(candidates[0], closing, run.generation)
+                    month = closing.after_state.month
+                    if (not source.issues and source.snapshot is not None and month is not None
+                        and closing.end_ts == adjustment.period_end_ts
+                        and closing.after_state.asof_ts == closing.end_ts and month.complete
+                        and (month.period_start_ts, month.period_end_ts) ==
+                            (adjustment.period_start_ts, adjustment.period_end_ts)
+                        and month.contract_id == source.snapshot.contract_id):
+                        contract, timezone = month.contract_id, source.snapshot.timezone
+        if contract is None:
+            issues.add("credit_identity_unproven")
+        if adjustment.kind != "spot_zero":
+            issues.add("credit_kind_unsupported")
+        return CreditSource(
+            _canonical_json(["settlement-credit-v1", self.meter_id, row["kind"], row["period_start_ts"],
+                             row["period_end_ts"], row["valid_from_generation"], row["run_id"], row["content_hash"]]),
+            adjustment.kind, adjustment.period_start_ts, adjustment.period_end_ts,
+            row["valid_from_generation"], row["run_id"], row["content_hash"], contract, timezone,
+            closing, source, tuple(sorted(issues)),
+        )
 
 
 def _meter(meter_id: str):
@@ -898,6 +1165,98 @@ class SettlementRepository:
             if published != 1:
                 raise ConcurrentSettlementError("Settlement pointer publication lost its dual CAS")
             return generation
+
+    def read_reconciliation(
+        self, meter_id: str, start_ts: int, end_ts: int, *, generation: int | None = None,
+    ) -> ReconciliationBasis:
+        """Read the pinned book and its exact historical evidence on one connection."""
+        _meter(meter_id)
+        _bounds(start_ts, end_ts)
+        if generation is not None:
+            _revision(generation)
+        with self.engine.connect() as connection, connection.begin():
+            book_query = select(_BOOK).where(_BOOK.c.meter_id == meter_id)
+            book = connection.execute(book_query).mappings().first()
+            try:
+                header = _read_header(book)
+            except (ValueError, TypeError):
+                raise ReconciliationReadError() from None
+            current, revision = (0, 0) if book is None else (book["generation"], book["input_revision"])
+            pinned = current if generation is None else generation
+            if pinned > current:
+                raise ValueError("Requested financial generation has not been published")
+            reader = _ReconciliationRead(connection, meter_id)
+            line_rows = adjustment_rows = ()
+            try:
+                if pinned == 0:
+                    view = SettlementView(meter_id, 0, 0, revision, "unknown", (), (), Decimal("0"), None,
+                                          start_ts, end_ts, False, int(time()), None,
+                                          None if book is None else book["dirty_from_ts"])
+                else:
+                    run = connection.execute(select(_RUN).where(
+                        _RUN.c.meter_id == meter_id, _RUN.c.generation == pinned,
+                    )).mappings().first()
+                    if run is None:
+                        raise ValueError("selected run missing")
+                    source_run = _read_run(run)
+                    reader.runs[source_run.run_id] = source_run
+                    visible = (
+                        _INTERVAL.c.meter_id == meter_id,
+                        _INTERVAL.c.start_ts >= start_ts,
+                        _INTERVAL.c.start_ts < end_ts,
+                        _valid(_INTERVAL, pinned),
+                    )
+                    line_rows = connection.execute(
+                        select(_INTERVAL).where(*visible).order_by(_INTERVAL.c.start_ts)).mappings().all()
+                    adjustment_rows = connection.execute(select(_ADJUSTMENT).where(
+                        _ADJUSTMENT.c.meter_id == meter_id, _ADJUSTMENT.c.period_end_ts > start_ts,
+                        _ADJUSTMENT.c.period_end_ts <= end_ts, _valid(_ADJUSTMENT, pinned),
+                    ).order_by(_ADJUSTMENT.c.period_end_ts, _ADJUSTMENT.c.kind,
+                               _ADJUSTMENT.c.period_start_ts)).mappings().all()
+                    if (len({row["start_ts"] for row in line_rows}) != len(line_rows)
+                        or len({(row["kind"], row["period_start_ts"], row["period_end_ts"])
+                                for row in adjustment_rows}) != len(adjustment_rows)):
+                        raise ValueError("ambiguous book version")
+                    adjustment_rows = [row for row in adjustment_rows if not row["tombstone"]]
+                    # Bronbewijs in bulk ophalen: dezelfde rijen, dezelfde
+                    # sleutels, maar niet meer dan een paar statements voor het
+                    # hele venster. De toets per regel blijft ongewijzigd.
+                    reader.prefetch_runs(
+                        [source_run.run_id]
+                        + [row["run_id"] for row in line_rows]
+                        + [row["run_id"] for row in adjustment_rows])
+                    reader.prefetch_inputs(connection.execute(select(_INPUT).select_from(_INTERVAL.join(
+                        _INPUT, and_(_INPUT.c.meter_id == _INTERVAL.c.meter_id,
+                                     _INPUT.c.start_ts == _INTERVAL.c.start_ts,
+                                     _INPUT.c.input_revision == _INTERVAL.c.input_revision),
+                    )).where(*visible)).mappings().all())
+                    reader.prefetch_tariffs([row["snapshot_hash"] for row in line_rows])
+                    lines = tuple(_read_dto(SettlementLine, row["line_json"]) for row in line_rows)
+                    adjustments = tuple(_read_dto(PeriodAdjustment, row["adjustment_json"]) for row in adjustment_rows)
+                    subtotal, complete = _totals(lines, adjustments, start_ts, end_ts)
+                    fresh = pinned == current and book["dirty_from_ts"] is None
+                    validated_revision = revision if fresh else run["input_revision"]
+                    view = SettlementView(
+                        meter_id, pinned, validated_revision, revision, "current" if fresh else "outdated",
+                        lines, adjustments, subtotal, subtotal if complete else None, start_ts, end_ts,
+                        complete, run["captured_ts"], run["source_watermark_ts"], book["dirty_from_ts"],
+                    )
+            except (ValueError, TypeError, InvalidOperation):
+                raise ReconciliationReadError() from None
+            lines = tuple(reader.line(row, line, pinned) for row, line in zip(line_rows, view.lines, strict=True))
+            credits = tuple(reader.credit(row, credit) for row, credit in
+                            zip(adjustment_rows, view.adjustments, strict=True))
+            last = connection.execute(book_query).mappings().first()
+            # Compare raw fields first: even a malformed new header is movement.
+            last_header = None if last is None else tuple(last[name] for name in (
+                "generation", "input_revision", "dirty_from_ts", "snapshot_hashes_json", "source_watermark_ts"))
+            if header != last_header:
+                raise ConcurrentSettlementError("Registered book changed during reconciliation read")
+            pin = BookSourcePin(meter_id, pinned, view.input_revision, current, revision, view.dirty_from_ts,
+                                start_ts, end_ts, _digest(view), int(time()))
+            sources = ReconciliationSources(pin, tuple(sorted(reader.runs.values(), key=lambda run: run.generation)),
+                                            lines, credits, ())
+            return ReconciliationBasis(view, sources)
 
     def read(self, meter_id: str, start_ts: int, end_ts: int, generation: int | None = None) -> SettlementView:
         _meter(meter_id)

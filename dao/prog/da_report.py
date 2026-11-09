@@ -1454,6 +1454,41 @@ class Report(DaBase):
 
             raise ConcurrentSettlementError("Afrekenbasis wijzigde tijdens het samengestelde rapport")
 
+    @staticmethod
+    def _check_report_sources(view, basis):
+        """De aanvullende bronread moet hetzelfde boek beschrijven als de rapportbasis.
+
+        De drie revisievelden, de versheid en de exacte regel- en creditinhoud
+        mogen niet verschillen; anders zou het rapport stilletjes een ander
+        boek tonen dan het bedrag dat het zelf gelezen heeft.
+        """
+        if ((view.generation, view.input_revision, view.current_input_revision, view.freshness)
+                != (basis.generation, basis.input_revision, basis.current_input_revision, basis.freshness)
+                or view.lines != basis.lines or view.adjustments != basis.adjustments):
+            from dao.prog.settlement.repository import ConcurrentSettlementError
+
+            raise ConcurrentSettlementError("Afrekenbron wijzigde tijdens het samengestelde rapport")
+
+    def _book_energy(self, service, view, start, end):
+        """Exact bewezen historische energie voor de gepinde boekgeneratie.
+
+        De gedeelde historische lezer bindt elke boekregel aan zijn eigen
+        geregistreerde invoer; de actuele invoerlookup is geen geschiedenis.
+        Alleen een regel zonder ontbrekende of strijdige bron levert kWh: een
+        onvolledig of tegenstrijdig bewezen boekregel blijft onbekend, net als
+        een ontbrekende invoer. De financiële onvolledigheid van de regel zelf
+        (bonus-btw, onbekende tariefregel) blijft buiten deze kWh-toets.
+        """
+        basis = service.repository.read_reconciliation(service.meter_id, self._settlement_epoch(start),
+                                                       self._settlement_epoch(end), generation=view.generation)
+        self._check_report_sources(view, basis.view)
+        proven = {}
+        for source in basis.sources.lines:
+            if source.issues or source.item is None:
+                continue  # Zonder bewezen identiteit blijft de energie onbekend.
+            proven[(source.start_ts, source.input_revision, source.input_hash)] = source.item
+        return proven
+
     def get_settlement_data(self, start, end, *, generation=None) -> pd.DataFrame:
         service = self.settlement_service()
         view = service.repository.read(service.meter_id, self._settlement_epoch(start), self._settlement_epoch(end),
@@ -1496,9 +1531,7 @@ class Report(DaBase):
         view = frame.attrs["view"]
         if basis is not None:
             self._check_report_basis(view, basis)
-        batch = service.repository.read_inputs(service.meter_id, start, end,
-                                               expected_input_revision=view.current_input_revision)
-        inputs = {(item.start_ts, item.input_revision, item.input_hash): item for item in batch.items}
+        energy = self._book_energy(service, view, start, end)
         rows = []
         for row in frame.to_dict("records"):
             if row["kind"] == "interval" and row["end_ts"] > end:
@@ -1508,7 +1541,7 @@ class Report(DaBase):
             label = moment.strftime("%Y-%m-%d %H:00%z" if interval == "uur" else
                                     "%Y-%m-%d" if interval == "dag" else "%Y-%m")
             is_line = row["kind"] == "interval"
-            item = inputs.get((at, row.get("line_input_revision"), row.get("input_hash"))) if is_line else None
+            item = energy.get((at, row.get("line_input_revision"), row.get("input_hash"))) if is_line else None
             profit = _amount_sum((row["base_export_revenue"], row["bonus_revenue"])) if is_line else row["credit_total"]
             rows.append({interval: label, "vanaf": moment,
                          "tot": datetime.datetime.fromtimestamp(row["end_ts"], ZoneInfo(self.time_zone)),

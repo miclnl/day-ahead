@@ -21,6 +21,457 @@ from dao.tests.settlement.conftest import MONTH_END_TS, START_TS
 METER = "synthetic-grid"
 
 
+def e1c_read(repo, start=START_TS, end=START_TS + 1800, generation=None):
+    return repo.read_reconciliation(METER, start, end, generation=generation)
+
+
+def e1c_credit_history(repo, terms, inputs, opening, *, bonus_rules=None, meter=None):
+    """Real publications retaining an unchanged adjustment across two runs."""
+    from datetime import date
+
+    start = MONTH_END_TS - 1800
+    options = dict(rule_version="tariffs-v1", monthly_export_floor="spot_zero")
+    if bonus_rules is not None:
+        options.update(bonus=replace(bonus_rules, windows=tuple((m, (0, 24)) for m in range(1, 13))),
+                       supply_start=date(2027, 1, 1), price_interval_seconds=900)
+    first = terms(**options)
+
+    def compute(batch):
+        initial = opening(asof_ts=start)
+        initial = replace(initial, month=replace(initial.month, contract_id=batch.snapshots[0].contract_id),
+                          bonus=None if bonus_rules is None else replace(initial.bonus, asof_ts=start))
+        return settle_series(batch.items, batch.snapshots, initial)
+
+    exports = ("1", "1") if bonus_rules is None else ("4999", "2")
+    spot = "-0.10" if bonus_rules is None else "0.10"
+    def items(snapshot, exports, first_spot):
+        if bonus_rules is None:
+            return inputs([snapshot], start=start, imports=("0", "0"), exports=exports, spot=spot)
+        readings = [meter(start_ts=start + i * 900, end_ts=start + (i + 1) * 900,
+                          import_kwh=Decimal("0"), export_kwh=Decimal(export))
+                    for i, export in enumerate(exports)]
+        prices = [SpotInterval(start + i * 900, start + (i + 1) * 900, Decimal(price),
+                               "synthetic-quarter-price", "measured")
+                  for i, price in enumerate((first_spot, "0.10"))]
+        return merge_inputs(readings, prices, [snapshot], meter_id=METER)
+
+    publish(repo, items(first, exports, spot), [first], compute)
+    old = e1c_read(repo, start, MONTH_END_TS)
+    second = terms(**options, contract_id="new-contract") if bonus_rules is None else first
+    exports = exports if bonus_rules is None else ("5000", "2")
+    publish(repo, items(second, exports, spot if bonus_rules is None else "0.09998"),
+            [second], compute, revision=1, generation=1)
+    return old, e1c_read(repo, start, MONTH_END_TS)
+
+
+@pytest.mark.parametrize("change", ["meter", "price_snapshot"])
+def test_e1c_old_generation_uses_exact_inputs_and_snapshot(repo, terms, inputs, calculate, monkeypatch, change):
+    snapshots = [terms(rule_version="tariffs-v1")]
+    publish(repo, inputs(snapshots), snapshots, calculate)
+    original = e1c_read(repo)
+    new = snapshots if change == "meter" else [terms(rule_version="tariffs-v1", source_versions=(("new", "2"),))]
+    publish(repo, inputs(new, imports=("1", "2") if change == "meter" else ("1", "1"),
+                         spot="0.10" if change == "meter" else "0.20"), new, calculate, revision=1, generation=1)
+    def forbidden(*args, **kwargs):
+        pytest.fail("current input/price lookup on historical read")
+    monkeypatch.setattr(repo, "read_inputs", forbidden)
+    monkeypatch.setattr(repo, "read_prices", forbidden)
+    historical, current = e1c_read(repo, generation=1), e1c_read(repo)
+    assert historical.view.net_cost == Decimal("0.20")
+    assert historical.view.freshness == "outdated"
+    assert historical.sources.lines == original.sources.lines
+    assert sum(s.item.import_kwh for s in historical.sources.lines) == 2
+    assert all(s.item.spot_ex_vat == Decimal("0.10") and s.snapshot == snapshots[0]
+               for s in historical.sources.lines)
+    assert current.view.net_cost == Decimal("0.30" if change == "meter" else "0.40")
+    assert current.view.freshness == "current"
+    assert historical.sources.pin.view_digest != current.sources.pin.view_digest
+
+
+def test_e1c_mixed_runs_and_noop_revision(repo, terms, inputs, calculate):
+    snapshots = [terms(rule_version="tariffs-v1")]
+    publish(repo, inputs(snapshots), snapshots, calculate)
+    publish(repo, inputs(snapshots, imports=("1", "2")), snapshots, calculate, revision=1, generation=1)
+    basis = e1c_read(repo)
+    assert [s.valid_from_generation for s in basis.sources.lines] == [1, 2]
+    assert [s.input_revision for s in basis.sources.lines] == [1, 2]
+    assert {r.generation for r in basis.sources.runs} == {1, 2}
+    repo.register_prices(METER, [SpotInterval(START_TS + 3600, START_TS + 7200, Decimal("0.3"),
+                                            "future", "measured")], 2)
+    batch = repo.read_inputs(METER, START_TS, START_TS + 1800)
+    assert repo.commit(METER, calculate(batch), batch, 2, "noop") == 2
+    new = e1c_read(repo)
+    assert new.view.input_revision == 3 and new.view.freshness == "current"
+    assert new.sources.lines == basis.sources.lines
+    assert new.sources.runs == basis.sources.runs
+    assert all(s.input_revision <= next(r.input_revision for r in new.sources.runs if r.run_id == s.run_id)
+               for s in new.sources.lines)
+
+
+def test_e1c_credit_uses_producer_closing_line(repo, terms, inputs, opening):
+    from dao.prog.settlement.reconciliation import reconcile
+    from dao.tests.settlement.test_reconciliation import e1b_rounding, supplier
+
+    old, new = e1c_credit_history(repo, terms, inputs, opening)
+    assert old.view.net_cost == 0
+    assert sum(line.base_export_revenue for line in old.view.lines) == Decimal("-0.20")
+    assert old.view.adjustments[0].credit_total == Decimal("0.20")
+    assert old.view.adjustments[0].quality == "estimated"
+    credit = new.sources.credits[0]
+    assert credit == old.sources.credits[0]
+    assert credit.contract_id == "synthetic-2027"
+    assert credit.closing_line == old.view.lines[-1]
+    assert credit.closing_source == old.sources.lines[-1]
+    assert new.sources.lines[-1].snapshot.contract_id == "new-contract"
+    assert credit.closing_source.source_key != new.sources.lines[-1].source_key
+    assert not credit.issues
+    assert {r.generation for r in new.sources.runs} == {1, 2}
+    report = reconcile(new.view, supplier(meter_id=METER, contract_id="new-contract",
+                                         start_ts=MONTH_END_TS - 1800, end_ts=MONTH_END_TS,
+                                         rounding=e1b_rounding()), sources=new.sources)
+    credit_components = [c for c in report.components if c.key.startswith("credit:")]
+    assert credit_components and all(c.status == "not_comparable" and c.delta is None for c in credit_components)
+    assert any("contract_mismatch" in c.reasons for c in credit_components)
+
+
+def test_e1c_same_input_different_state_source_keys(repo, terms, inputs, opening, bonus_rules, meter):
+    from dao.prog.settlement.reconciliation import _canonical_json, reconcile
+    from dao.tests.settlement.test_reconciliation import e1b_rounding, supplier
+
+    old, new = e1c_credit_history(repo, terms, inputs, opening, bonus_rules=bonus_rules, meter=meter)
+    a, b = old.sources.lines[-1], new.sources.lines[-1]
+    assert old.view.lines[-1].bonus_revenue == Decimal("0.03")
+    assert new.view.lines[-1].bonus_revenue == 0
+    assert old.view.adjustments == new.view.adjustments
+    assert old.view.adjustments[0].basis_ex_vat == Decimal("500.1")
+    assert old.view.lines[0].base_export_revenue == new.view.lines[0].base_export_revenue == Decimal("499.9")
+    assert (a.input_hash, a.input_revision, a.snapshot_hash) == (b.input_hash, b.input_revision, b.snapshot_hash)
+    assert a.source_key != b.source_key and a.line_content_hash != b.line_content_hash
+    assert a.valid_from_generation == 1 and b.valid_from_generation == 2
+    assert old.sources.credits[0].closing_source == a
+    assert new.sources.credits[0].closing_source == a
+    assert json.loads(a.source_key) == ["settlement-line-v1", METER, a.start_ts, 1, a.run_id, a.line_content_hash]
+    # Same primary version in both roles cannot become two alternate contents.
+    conflicting = replace(a, line_content_hash="conflicting-content", source_key=_canonical_json(
+        ["settlement-line-v1", METER, a.start_ts, 1, a.run_id, "conflicting-content"]))
+    sources = replace(old.sources, credits=(replace(old.sources.credits[0], closing_source=conflicting),))
+    report = reconcile(old.view, supplier(meter_id=METER, contract_id="synthetic-2027",
+                                         start_ts=MONTH_END_TS - 1800, end_ts=MONTH_END_TS,
+                                         rounding=e1b_rounding()), sources=sources)
+    assert any("source_mismatch" in component.reasons for component in report.components)
+    assert report.total.delta is None
+
+
+def e1c_corrupt(repo, callback, *, break_foreign_keys=False):
+    """Deliberate fixture corruption only; never weaken production FK handling."""
+    with repo.engine.connect() as connection:
+        dialect = repo.engine.dialect.name
+        commands = {
+            "sqlite": ("PRAGMA foreign_keys=OFF", "PRAGMA foreign_keys=ON"),
+            "mysql": ("SET SESSION FOREIGN_KEY_CHECKS=0", "SET SESSION FOREIGN_KEY_CHECKS=1"),
+            "mariadb": ("SET SESSION FOREIGN_KEY_CHECKS=0", "SET SESSION FOREIGN_KEY_CHECKS=1"),
+            "postgresql": ("SET session_replication_role=replica", "SET session_replication_role=origin"),
+        }
+        # Dedicated synthetic server cells need permission for this explicit corruption.
+        # Setup failure is a failure, not a skip or an unverified fallback.
+        if break_foreign_keys:
+            connection.exec_driver_sql(commands[dialect][0])
+        try:
+            callback(connection)
+            connection.commit()
+        finally:
+            connection.rollback()
+            if break_foreign_keys:
+                connection.exec_driver_sql(commands[dialect][1])
+                connection.commit()
+
+
+def test_e1c_credit_scope_tombstone_and_unknown(repo, terms, inputs, opening):
+    from dao.prog.settlement import repository as r
+
+    empty = e1c_read(repo)
+    assert empty.view.freshness == "unknown" and empty.view.net_cost is None
+    assert empty.sources.lines == empty.sources.credits == empty.sources.runs == ()
+    old, new = e1c_credit_history(repo, terms, inputs, opening)
+    left = e1c_read(repo, MONTH_END_TS - 1800, MONTH_END_TS - 900)
+    right = e1c_read(repo, MONTH_END_TS - 900, MONTH_END_TS)
+    after = e1c_read(repo, MONTH_END_TS, MONTH_END_TS + 900)
+    assert left.sources.credits == after.sources.credits == ()
+    assert right.sources.credits == new.sources.credits and len(right.sources.credits) == 1
+    e1c_corrupt(repo, lambda c: c.execute(r._ADJUSTMENT.update().values(tombstone=True, adjustment_json=None)))
+    assert e1c_read(repo, MONTH_END_TS - 1800, MONTH_END_TS).sources.credits == ()
+
+
+@pytest.mark.parametrize("case", ["input_missing", "snapshot_missing", "input_json", "input_hash",
+                                  "input_column", "input_meter", "input_end", "input_revision",
+                                  "snapshot_json", "snapshot_hash", "snapshot_coverage", "line_hash",
+                                  "line_column", "run_missing", "run_meter", "run_revision", "run_membership"])
+def test_e1c_missing_vs_mismatched_enrichment(repo, terms, inputs, calculate, case):
+    from dao.prog.settlement import repository as r
+
+    snapshots = [terms(rule_version="tariffs-v1")]
+    publish(repo, inputs(snapshots), snapshots, calculate)
+    publish(repo, inputs(snapshots, imports=("1", "2")), snapshots, calculate, revision=1, generation=1)
+    before = repo.read(METER, START_TS, START_TS + 1800)
+    clean = e1c_read(repo)
+    assert all(not s.issues and s.item is not None for s in clean.sources.lines)
+    source = rows(repo, "input")[0]
+    def corrupt(c):
+        target = r._INPUT.c.start_ts == START_TS
+        if case == "input_missing":
+            c.execute(r._INPUT.delete().where(target))
+        elif case == "snapshot_missing":
+            c.execute(r._TARIFF.delete())
+        elif case.startswith("input_"):
+            data = json.loads(source["input_json"])
+            fields = {"input_meter": ("meter_id", "wrong"), "input_end": ("end_ts", START_TS + 901),
+                      "input_revision": ("input_revision", 9)}
+            if case in fields:
+                key, value = fields[case]
+                data[key] = value
+            values = {"input_json": "{" if case == "input_json" else json.dumps(data)}
+            if case == "input_hash":
+                values = {"content_hash": "bad"}
+            if case == "input_column":
+                values = {"input_hash": "bad"}
+            c.execute(r._INPUT.update().where(target).values(**values))
+        elif case.startswith("snapshot_"):
+            data = asdict(snapshots[0])
+            if case == "snapshot_coverage":
+                data["valid_from_ts"] = START_TS + 900
+                del data["snapshot_hash"]
+                digest = r._hash(r._json(data))
+                data["snapshot_hash"] = digest
+                c.execute(r._TARIFF.insert().values(snapshot_hash=digest, snapshot_json=r._json(data)))
+                for row in c.execute(select(r._INTERVAL)).mappings().all():
+                    line = replace(r._load(r.SettlementLine, row["line_json"]), snapshot_hash=digest)
+                    c.execute(r._INTERVAL.update().where(
+                        r._INTERVAL.c.start_ts == row["start_ts"],
+                        r._INTERVAL.c.valid_from_generation == row["valid_from_generation"],
+                    ).values(snapshot_hash=digest, line_json=r._json(line), content_hash=r._hash(r._json(line))))
+                c.execute(r._RUN.update().values(snapshot_hashes_json=r._json([digest])))
+            else:
+                c.execute(r._TARIFF.update().values(snapshot_json="{" if case == "snapshot_json" else
+                                                   r._json({**data, "snapshot_hash": "bad"})))
+        elif case.startswith("line_"):
+            c.execute(r._INTERVAL.update().where(r._INTERVAL.c.start_ts == START_TS).values(
+                **({"content_hash": "bad"} if case == "line_hash" else {"import_cost": "999"})))
+        elif case == "run_missing":
+            c.execute(r._RUN.delete().where(r._RUN.c.generation == 1))
+        else:
+            values = {"run_meter": {"meter_id": "wrong"}, "run_revision": {"input_revision": 1},
+                      "run_membership": {"snapshot_hashes_json": "[]"}}[case]
+            c.execute(r._RUN.update().where(r._RUN.c.generation == (2 if case == "run_revision" else 1)).values(**values))
+    e1c_corrupt(repo, corrupt, break_foreign_keys=case in ("input_missing", "snapshot_missing", "run_missing"))
+    basis = e1c_read(repo)
+    if case == "snapshot_coverage":
+        assert basis.view == repo.read(METER, START_TS, START_TS + 1800)
+        assert basis.view.net_cost == before.net_cost
+        assert not basis.sources.lines[1].issues
+    else:
+        assert basis.view == before
+    affected = basis.sources.lines[-1] if case == "run_revision" else basis.sources.lines[0]
+    expected = "source_missing" if case in ("input_missing", "snapshot_missing", "run_missing") else "source_mismatch"
+    assert affected.issues == (expected,)
+    if case.startswith("input_"):
+        assert affected.item is None
+    if case.startswith("snapshot_"):
+        assert affected.snapshot is None
+
+
+@pytest.mark.parametrize("case", ["line_json", "line_nonfinite", "line_invariant", "line_shape", "line_float",
+                                  "adjustment_json", "adjustment_invariant", "selected_run_missing",
+                                  "selected_run_json", "header_json", "historical_line", "incomplete"])
+def test_e1c_unreadable_view_vs_historical_enrichment(repo, terms, inputs, opening, case):
+    from dao.prog.settlement import repository as r
+
+    old, new = e1c_credit_history(repo, terms, inputs, opening)
+    if case == "incomplete":
+        basis = e1c_read(repo, MONTH_END_TS - 2700, MONTH_END_TS)
+        assert not basis.view.complete and basis.view.net_cost is None
+        return
+    def corrupt(c):
+        if case == "selected_run_missing":
+            c.execute(r._RUN.delete().where(r._RUN.c.generation == 2))
+        elif case == "selected_run_json":
+            c.execute(r._RUN.update().where(r._RUN.c.generation == 2).values(snapshot_hashes_json="{}"))
+        elif case == "header_json":
+            c.execute(r._BOOK.update().values(snapshot_hashes_json="{"))
+        elif case.startswith("adjustment"):
+            data = asdict(new.view.adjustments[0])
+            data["period_end_ts"] = data["period_start_ts"]
+            c.execute(r._ADJUSTMENT.update().values(adjustment_json="{" if case == "adjustment_json" else r._json(data)))
+        else:
+            data = asdict(new.view.lines[-1])
+            if case == "line_nonfinite":
+                data["import_cost"] = "NaN"
+            if case == "line_invariant":
+                data["end_ts"] = data["start_ts"]
+            if case == "line_float":
+                data["import_cost"] = 1.0
+            if case == "line_shape":
+                data["after_state"] = []
+            c.execute(r._INTERVAL.update().where(r._INTERVAL.c.start_ts == MONTH_END_TS - 900,
+                                                r._INTERVAL.c.valid_from_generation == (1 if case == "historical_line" else 2))
+                      .values(line_json="{" if case in ("line_json", "historical_line") else r._json(data)))
+    e1c_corrupt(repo, corrupt, break_foreign_keys=case == "selected_run_missing")
+    if case == "historical_line":
+        basis = e1c_read(repo, MONTH_END_TS - 1800, MONTH_END_TS)
+        assert basis.view == new.view
+        assert basis.sources.credits[0].closing_line is None
+        assert basis.sources.credits[0].closing_source is None
+        assert "credit_identity_unproven" in basis.sources.credits[0].issues
+    else:
+        with pytest.raises(r.ReconciliationReadError, match="^book_view_unreadable$"):
+            e1c_read(repo, MONTH_END_TS - 1800, MONTH_END_TS)
+
+
+@pytest.mark.parametrize("field", ["dirty_from_ts", "source_watermark_ts"])
+@pytest.mark.parametrize("epoch", [-62135596801, 253402300800, -62135596800, 253402300799, None])
+def test_e1c_header_epoch_decode_boundary(repo, terms, inputs, calculate, field, epoch):
+    from dao.prog.settlement import repository as r
+
+    snapshots = [terms(rule_version="tariffs-v1")]
+    publish(repo, inputs(snapshots), snapshots, calculate)
+    e1c_corrupt(repo, lambda c: c.execute(r._BOOK.update().values(**{field: epoch})))
+    if epoch is not None and epoch in (-62135596801, 253402300800):
+        with pytest.raises(r.ReconciliationReadError, match="^book_view_unreadable$"):
+            e1c_read(repo)
+    else:
+        basis = e1c_read(repo)
+        assert basis.view.net_cost == Decimal("0.20")
+        if field == "dirty_from_ts":
+            assert basis.sources.pin.dirty_from_ts == epoch
+
+
+@pytest.mark.parametrize("kind", ["interval", "adjustment"])
+def test_e1c_duplicate_visible_versions(repo, terms, inputs, opening, kind):
+    from dao.prog.settlement import repository as r
+
+    e1c_credit_history(repo, terms, inputs, opening)
+    t = r._INTERVAL if kind == "interval" else r._ADJUSTMENT
+    def corrupt(c):
+        if kind == "interval":
+            c.execute(t.update().values(valid_to_generation=None))
+        else:
+            row = dict(c.execute(select(t)).mappings().first())
+            row["valid_from_generation"] = 2
+            row["content_hash"] = "conflicting-content"
+            c.execute(t.insert().values(**row))
+    e1c_corrupt(repo, corrupt)
+    with pytest.raises(r.ReconciliationReadError, match="^book_view_unreadable$"):
+        e1c_read(repo, MONTH_END_TS - 1800, MONTH_END_TS)
+
+
+@pytest.mark.parametrize("field", ["generation", "input_revision", "dirty_from_ts", "snapshot_hashes_json",
+                                   "source_watermark_ts", "registration", "publication"])
+def test_e1c_header_race_or_consistent_snapshot(repo, terms, inputs, calculate, field):
+    from dao.prog.settlement import repository as r
+
+    snapshots = [terms(rule_version="tariffs-v1")]
+    publish(repo, inputs(snapshots), snapshots, calculate)
+    if repo.engine.dialect.name == "sqlite":
+        with repo.engine.connect() as c:
+            c.exec_driver_sql("PRAGMA journal_mode=WAL")
+    gate = Barrier(2)
+    fired = False
+    def pause(c, cursor, statement, parameters, context, many):
+        nonlocal fired
+        if statement.startswith("SELECT") and "FROM settlement_interval" in statement and not fired:
+            fired = True
+            gate.wait(timeout=20)
+            gate.wait(timeout=20)
+    def writer():
+        gate.wait(timeout=20)
+        if field in ("registration", "publication"):
+            repo.register_inputs(METER, inputs(snapshots, imports=("1", "2")), snapshots, 1)
+            if field == "publication":
+                batch = repo.read_inputs(METER, START_TS, START_TS + 1800)
+                repo.commit(METER, calculate(batch), batch, 1, "race-publication")
+            gate.wait(timeout=20)
+            return
+        values = {"generation": 2, "input_revision": 2, "dirty_from_ts": START_TS,
+                  "snapshot_hashes_json": "[]", "source_watermark_ts": START_TS + 3600}
+        with repo.engine.begin() as c:
+            c.execute(r._BOOK.update().values(**{field: values[field]}))
+        gate.wait(timeout=20)
+    event.listen(repo.engine, "before_cursor_execute", pause)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(writer)
+            try:
+                basis = e1c_read(repo)
+            except r.ConcurrentSettlementError:
+                pass
+            else:
+                assert basis.sources.pin.current_generation == 1
+                assert basis.sources.pin.current_input_revision == 1
+                assert basis.view.net_cost == Decimal("0.20")
+                assert sum(s.item.import_kwh for s in basis.sources.lines) == 2
+            future.result(timeout=20)
+        assert fired
+    finally:
+        event.remove(repo.engine, "before_cursor_execute", pause)
+
+
+def test_e1c_read_is_select_only_and_preserves_book(repo, terms, inputs, calculate, monkeypatch):
+    from dao.prog.settlement import engine, tariffs
+    from dao.prog.settlement.reconciliation import _digest
+
+    snapshots = [terms(rule_version="tariffs-v1")]
+    publish(repo, inputs(snapshots), snapshots, calculate)
+    expected = repo.read(METER, START_TS, START_TS + 1800)
+    before = {name: rows(repo, name) for name in counts(repo)}
+    def forbidden(*args, **kwargs):
+        pytest.fail("producer called from reader")
+    for name in ("read_inputs", "read_prices", "register_inputs", "commit", "ensure_schema"):
+        monkeypatch.setattr(repo, name, forbidden)
+    for obj, name in ((engine, "settle_series"), (engine, "close_month"), (tariffs, "make_snapshot")):
+        monkeypatch.setattr(obj, name, forbidden)
+    connections = set()
+    def select_only(c, cursor, statement, parameters, context, many):
+        assert statement.lstrip().startswith("SELECT"), statement
+        connections.add(id(c))
+    event.listen(repo.engine, "before_cursor_execute", select_only)
+    try:
+        basis = e1c_read(repo)
+    finally:
+        event.remove(repo.engine, "before_cursor_execute", select_only)
+    assert len(connections) == 1
+    assert basis.view == expected and basis.sources.pin.view_digest == _digest(expected)
+    assert basis.sources.pin.read_ts >= basis.view.captured_ts
+    assert not basis.sources.issues and all(not s.issues for s in basis.sources.lines)
+    assert before == {name: rows(repo, name) for name in before}
+
+
+def test_e1c_reconciliation_read_does_not_query_per_book_line(repo, terms, inputs, calculate):
+    """De historische read haalt zijn bronbewijs in bulk op, niet per boekregel.
+
+    De lezer mag niet per regel een vaste aantal statements uitvoeren: dat
+    maakt de kosten van een groot boekvenster onbegrensd. De grens hieronder
+    is ruim boven het aantal vaste statements van de read en ruim onder het
+    oude gedrag (drie statements per boekregel).
+    """
+    count = 48
+    snapshots = [terms(rule_version="tariffs-v1")]
+    publish(repo, inputs(snapshots, imports=("1",) * count, exports=("0",) * count),
+           snapshots, calculate)
+    statements = []
+
+    def counted(connection, cursor, statement, parameters, context, many):
+        statements.append(statement)
+
+    event.listen(repo.engine, "before_cursor_execute", counted)
+    try:
+        basis = repo.read_reconciliation(METER, START_TS, START_TS + 900 * count)
+    finally:
+        event.remove(repo.engine, "before_cursor_execute", counted)
+    assert len(basis.view.lines) == count
+    assert not basis.sources.issues and all(not source.issues for source in basis.sources.lines)
+    assert len(statements) <= count // 4 + 12, (
+        f"{len(statements)} statements voor {count} boekregels")
+
+
 @pytest.fixture(params=["sqlite"] + [name for name in ("POSTGRESQL", "MARIADB")
                                    if os.getenv(f"SETTLEMENT_TEST_{name}_URL")])
 def repo(tmp_path, request):

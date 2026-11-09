@@ -2,6 +2,61 @@
 # Day Ahead Optimizer
 # Unreleased
 
+# 2026.11.9
+
+## Een factuur toetsen aan het afgerekende boek
+Er is een handmatige, alleen-lezen route bijgekomen om één leveranciersperiode
+te toetsen aan het boek dat DAO+ zelf afrekent. Vanuit `dao/prog`:
+
+```
+python3 da_settlement.py compare-invoice --supplier nota.json --config ../data/options.json --start 1798758000 --end 1798759800
+```
+
+De route opent de boekdatabase op een aparte, alleen-lezen verbinding, leest
+één gepinde boekgeneratie en drukt een rapport af met de status per component:
+energie, verbruik, teruglevering, bonus, credits en het totaal. Elk component
+krijgt zijn eigen status — `matched`, `different` of `not_comparable` — met het
+verschil, de kwaliteit van het materiaal en de reden waarom iets niet
+vergelijkbaar is. Het totaal volgt een vaste precedentie: `not_comparable` gaat
+boven `different`, en `different` gaat boven `matched`. Netto gelijk met
+verschillende componenten is dus géén "gelijk".
+
+De exitcode zegt wat er aan de hand is: `0` bij `matched`, `3` bij
+`different`, `4` bij `not_comparable`, `2` bij een ongeldig bestand, argument
+of configuratie — dat gebeurt vóór er een database wordt geopend — en `1` bij
+een operationele fout. Bij 2 en 1 krijg je geen financieel rapport, alleen een
+foutcategorie.
+
+Het leveranciersbestand is genormaliseerd: JSON met exacte sleutelsets, bedragen
+als tekst, en `null` op elke plek waar de leverancier niets aanlevert. De
+afronding moet gedeclareerd zijn, inclusief een `evidence_ref` die naar het
+afrondingsvoorschrift verwijst; zonder die verwijzing zijn de bedragen niet
+vergelijkbaar. De energie moet op een toegestaan quantum staan (een macht van
+tien tot en met 1e-9); DAO+ rondt nooit opnieuw af.
+
+Dit is een softwarefunctie, geen activering. De route schrijft niets: geen
+boek, geen tarief, geen publicatie, geen taakstatus. `prices.settlement.mode`
+blijft `off`, `shadow` of `active` zoals je het had ingesteld, er is geen
+nieuwe instelling bijgekomen, en er is geen leveranciersgoedkeuring. Een
+`matched` rapport betekent alleen dat het geboekte bedrag gelijk is aan wat de
+leverancier aanleverde binnen de afgesproken afronding — het is geen
+leveranciersfactuur, geen betalingsopdracht en geen vrijgave om te betalen.
+
+De vergelijkroute is iets anders dan de geplande `reconcile`: die berekent het
+boek en publiceert een nieuwe generatie, terwijl `compare-invoice` vergelijkt
+wat er al staat.
+
+Alle voorbeelden in de documentatie zijn synthetisch; er zit geen echte
+leverancier, geen echt contract en geen echte 2027-periode in. De `provenance`
+in het rapport is gevoelig: het beschrijft hoe de installatie is gemeten en
+afgerekend, en het is met andere gegevens uit de database te verbinden. Een
+digest is geen anonimisering — behandel `view_digest`, `input_hash`,
+`result_hash`, `snapshot_hash`, `line_content_hash` en `run_id` als interne
+identifiers.
+
+Het bewijs voor deze route is lokaal: alleen SQLite is gedraaid. De
+PostgreSQL- en MariaDB-cel staan nog open.
+
 # 2026.10.13
 
 ## Bonus op teruglevering (Budget Thuis ZonneBonus)
