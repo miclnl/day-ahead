@@ -57,6 +57,66 @@ identifiers.
 Het bewijs voor deze route is lokaal: alleen SQLite is gedraaid. De
 PostgreSQL- en MariaDB-cel staan nog open.
 
+## De snelle regellaag zegt nu dat zijn bedragen een raming zijn
+In het tabblad Snelle regellaag stond tot nu toe het voordeel als
+"Benefit" zonder aanduiding, en stond "Bespaard vandaag" alleen soms als
+schatting gemarkeerd. Die cijfers kwamen uit een eenvoudige
+kostenberekening per uur over het accusetpoint — leverings- en
+terugleveringstarief, opslagwaarde, rendement en cycluskosten — en niet
+uit de afrekening van DAO+ zelf. De weergave noemt ze nu een raming en
+zegt expliciet wanneer er niets te zeggen valt.
+
+- Komt het bedrag uit de berekening van de huidige versie, dan blijft het
+  staan met "(raming)" erbij: achter het voordeel per uur en voor het
+  dagvoorraade.
+- Is het een oud getal uit een vorige versie, dan staat er "onbekend" en
+  komt het getal apart te staan als "Historische raming" met het label
+  `legacy_estimate_unverified`. Zo'n getal wordt niet meer als actueel
+  voordeel getoond.
+- De reden staat erbij. `day_coverage_missing` betekent dat de metingen de
+  dag niet volledig dekken, `tick_gap_uncovered` dat er een gat van meer
+  dan tien minuten tussen twee metingen viel, `tick_plan_price_uncovered`
+  dat er een nieuw plan, een nieuwe prijs of een verlopen geldigheid van
+  het plan bij lag, en `tick_execution_unknown` dat de uitvoering
+  veranderde. De volledige lijst van redenen staat in de status van de
+  snelle regellaag.
+- Komt de diagnose zelf uit een oudere stand, dan zegt het tabblad dat
+  ook.
+- "Bespaard vandaag" volgt dezelfde regel: zolang de dag niet is gedekt
+  blijft het bedrag onbekend in plaats van een onderdeel als totaal te
+  tonen.
+
+Dit is een andere presentatie van dezelfde schatting, geen nieuwe
+berekening en geen vrijgave: er is geen nieuw financieel model
+ingeschakeld, en er is niets geactiveerd. Wie precies wil weten wat de
+batterij opleverde, moet de afrekenboek-routes gebruiken in plaats van
+deze raming.
+
+## De webinterface bewaart instellingen tegen conflicten
+Bij het opslaan van `options.json` of `secrets.json` wordt het bestand nu
+onder een exclusieve slot op een gedeeld slotbestand gelezen,
+gecontroleerd en weggeschreven. De editor stuurt de hash van de versie
+die je zag mee; is het bestand intussen veranderd, dan wordt je invoer
+niet overschreven en krijg je de melding dat je moet bewaren en herladen.
+Twee schermen kunnen elkaars wijziging dus niet meer laten botsten.
+
+Verder in de webinterface:
+
+- Afbreken is een POST met een CSRF-token en geldt voor precies de run
+  die je op dat moment ziet. Een oude pagina kan een lopende taak niet
+  meer treffen die inmiddels opnieuw is gestart.
+- Logbestanden worden alleen geleverd als het een gewoon bestand in de
+  eigen logmap is; een symlink of een fifo wordt niet gevolgd. In de
+  lijst met rapportbestanden worden alleen gewone bestanden opgenomen.
+- De data-api antwoordt bij een interne fout met een generieke melding
+  in plaats van de fout zelf. Wat in het log komt, bevat geen wachtwoord
+  of token meer en geen gebruikersgegevens die in een URL staan, en staat
+  op één regel.
+- De data-api controleert zijn vraag: zonder start en eind, met een
+  onbekend aggregatie-interval of met een lokale tijd die in de overgang
+  naar of vanaf de zomertijd niet eenduidig is, krijgt een 400 met
+  "Invalid data query" in plaats van een misleidend antwoord.
+
 # 2026.10.13
 
 ## Bonus op teruglevering (Budget Thuis ZonneBonus)
