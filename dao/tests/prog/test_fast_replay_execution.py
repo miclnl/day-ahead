@@ -97,6 +97,22 @@ def examples(api):
     )}
 
 
+def test_f3b6_replay_nullable_observation_preserves_strict_physics():
+    api = contract()
+    event = examples(api)["ProposalEvent"]
+    nullable = replace(event.decision, benefit_eur_h=None)
+    assert replace(event, decision=nullable).decision.benefit_eur_h is None
+    assert hasattr(nullable, "proposal_benefit_eur_h")
+    with pytest.raises((ValueError, TypeError)):
+        replace(event, decision=replace(nullable, setpoint_w=float("nan")))
+    with pytest.raises((ValueError, TypeError)):
+        replace(event, decision=replace(nullable, proposal_benefit_eur_h=float("nan")))
+    with pytest.raises((ValueError, TypeError)):
+        replace(event, timing="bad")
+    with pytest.raises((ValueError, TypeError)):
+        replace(event, command="bad")
+
+
 def test_f3a1_contract_is_explicit_and_detached():
     api = contract()
     expected = {

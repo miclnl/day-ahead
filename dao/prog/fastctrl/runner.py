@@ -12,13 +12,16 @@ the tests.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from inspect import getattr_static
 from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
@@ -59,11 +62,14 @@ from .policy import (
     ControllerState,
     Decision,
     FastControlPolicy,
+    LegacyBatteryValuation,
     Measurement,
     PolicyLimits,
     apply_accepted_command,
     apply_execution_outcome,
     current_execution_command,
+    estimate_effective_tick,
+    estimate_storage_value,
 )
 from .publication import (
     OWNER_CYCLE_NS,
@@ -84,6 +90,45 @@ from .publication import (
 )
 
 FAST_STATE_FILE = "../data/fast_state.json"
+
+
+@dataclass(frozen=True, slots=True)
+class TickEconomicContext:
+    at_ts: float
+    valid_until_ts: float
+    plan_identity: str
+    plan_format_version: int
+    price_identity: str
+    mode: str
+    house_w: float | None
+    price_import: float
+    price_export: float
+    batteries: tuple[LegacyBatteryValuation, ...]
+    execution_references: tuple[tuple[str, str | None], ...]
+    measurement_valid: bool
+    reasons: tuple[str, ...]
+
+    def __post_init__(self):
+        for name in ("at_ts", "valid_until_ts", "price_import", "price_export"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError("tick_context_number_invalid")
+        if self.house_w is not None and (type(self.house_w) not in (int, float)
+                                        or not math.isfinite(self.house_w)):
+            raise ValueError("tick_context_house_invalid")
+        if type(self.plan_format_version) is not int or type(self.measurement_valid) is not bool:
+            raise TypeError("tick_context_scalar_invalid")
+        if any(type(getattr(self, name)) is not str for name in ("plan_identity", "price_identity", "mode")):
+            raise TypeError("tick_context_identity_invalid")
+        if type(self.batteries) is not tuple or any(type(b) is not LegacyBatteryValuation for b in self.batteries):
+            raise TypeError("tick_context_batteries_invalid")
+        if type(self.reasons) is not tuple or any(type(r) is not str for r in self.reasons):
+            raise TypeError("tick_context_reasons_invalid")
+        if type(self.execution_references) is not tuple or any(
+            type(row) is not tuple or len(row) != 2 or type(row[0]) is not str
+            or (row[1] is not None and type(row[1]) is not str) for row in self.execution_references
+        ):
+            raise TypeError("tick_context_execution_invalid")
 
 #: How often the controller state is written to disk, in seconds.
 #:
@@ -375,6 +420,7 @@ class FastControlRunner:
         self.state_path = state_path
         self.gateway = gateway or HomeAssistantGateway(hass)
         self.state = load_state(state_path)
+        self._economic_context: TickEconomicContext | None = None
 
         self._plan: Optional[FastPlan] = None
         self._plan_mtime: float = 0.0
@@ -697,12 +743,14 @@ class FastControlRunner:
             reason = self.owner.pending_stop_reason
             self._request_fallback(reason, now_ts=int(now))
             if self.owner.pending_stop_reason is not None:
+                self._expire_economics(now=now, reason=reason)
                 return None
             if reason in ("plan_rebind_required", "owner_lease_expired") and self._owner_writer is not None:
                 self._owner_start_pending = True
         if self._owner_start_pending and not self._shutting_down:
             self.start_owner_session()
             if self._owner_start_pending or self.owner.binding is None:
+                self._expire_economics(now=now, reason="owner_start_pending")
                 return None
 
         # Geen mtime-/inodescache als autorisatie. Geen sensor-/sink-I/O onder dit slot.
@@ -710,6 +758,7 @@ class FastControlRunner:
             read, verdict = self._read_tick(now)
         except RecoveryRequired as exc:
             self.last_gate = GateVerdict(False, exc.reason)
+            self._expire_economics(now=now, reason=exc.reason)
             return None
         except PublicationLockBusy as exc:
             verdict = GateVerdict(False, "publication_busy" if self._financial_cadence
@@ -719,10 +768,12 @@ class FastControlRunner:
         self.last_gate = verdict
         if not verdict.allowed:
             self._consume_block(verdict, now_ts=int(now))
+            self._expire_economics(now=now, reason=verdict.reason)
             return None
         plan = read.plan
         self._plan = plan
         if plan is None:
+            self._expire_economics(now=now, reason="plan_missing")
             if not self._warned_stale_plan:
                 logging.warning(
                     f"Fast control: geen plan gevonden op {self.plan_path}, "
@@ -736,6 +787,7 @@ class FastControlRunner:
         if mode != self._last_mode:
             logging.info(f"Fast control: modus {mode}")
         if mode == MODE_OFF:
+            self._expire_economics(now=now, reason="mode_off")
             if plan.format_version == 2 and self.owner is not None:
                 self._request_fallback("mode_off", now_ts=int(now))
                 return None
@@ -743,6 +795,7 @@ class FastControlRunner:
             return None
 
         if not self.config.grid_power.configured:
+            self._expire_economics(now=now, reason="tick_measurement_missing")
             if not self._warned_no_grid:
                 logging.warning(
                     "Fast control: geen 'grid power' sensor geconfigureerd, "
@@ -795,7 +848,7 @@ class FastControlRunner:
         # Capture the previous tick timestamp BEFORE policy.account() resets
         # it. Without this saved_today_eur would always integrate over
         # elapsed_h = 0 (policy.account sets state.last_tick_ts = now).
-        previous_tick_ts = self.state.last_tick_ts
+        previous = self._economic_context
         # In-force setpoints before this tick, preserved as the event baseline
         # across both policy proposals and subsequent helper acceptance.
         previous_setpoints = tuple(
@@ -803,7 +856,9 @@ class FastControlRunner:
         )
 
         policy = FastControlPolicy(self.limits())
+        self._tick_economic_limits = policy.limits
         owner_binding = self._owner_binding(self.owner, now_ms=int(round(now * 1000)))
+        observed = self._capture_economic_context(plan, measurement, mode=mode, previous=previous)
         policy.account(
             self.state,
             plan,
@@ -822,57 +877,186 @@ class FastControlRunner:
         self._measure(now, plan, decision.house_w, pv_w,
                       measurement.grid_valid and decision.reason != "execution_unknown")
 
-        elapsed_h = (
-            min(now - previous_tick_ts, 600.0) / 3600.0
-            if previous_tick_ts
-            else 0.0
-        )
-        self._book_saving(decision, elapsed_h=elapsed_h, plan=plan, owner_binding=owner_binding,
-                          previous_tick_ts=previous_tick_ts)
-        if mode != MODE_ACTIVE:
-            # Nothing was actually written this tick, so this contribution
-            # (and therefore today's total) is a projection, not a measured
-            # saving.
-            self.state.saved_today_is_estimate = True
-
+        self._book_saving(previous=previous, observed=observed, now=now)
         self._actuate(decision, plan, mode)
+        current = self._capture_economic_context(plan, measurement, mode=mode,
+                                                 previous=observed, decision=decision)
+        self._set_decision_economics(decision, current)
+        self._economic_context = current
         self._publish(decision, mode, measurement)
         self._record_events(decision, mode, previous_setpoints)
         self.state.refresh_budget_aggregates()
         self._persist_state(now)
         return decision
 
-    def _book_saving(self, decision: Decision, *, elapsed_h: float,
-                     plan: FastPlan | None = None, owner_binding: OwnerBinding | None = None,
-                     previous_tick_ts: float | None = None) -> None:
-        """Book the proven saving of this tick into today's total.
+    def _capture_economic_context(self, plan: FastPlan, measurement: Measurement, *,
+                                  mode: str, previous: TickEconomicContext | None,
+                                  decision: Decision | None = None) -> TickEconomicContext:
+        now = measurement.timestamp
+        row = plan.interval_at(now)
+        identity = hashlib.sha256(json.dumps(plan.to_dict(), sort_keys=True,
+                                            separators=(",", ":")).encode()).hexdigest()
+        limits = getattr(self, "_tick_economic_limits", None)
+        if limits is None:
+            limits = self.limits()
+        valid = measurement.grid_valid and math.isfinite(measurement.grid_w) and row is not None
+        until = min(row.end_ts, plan.created_ts + self.config.max_plan_age) if row else now
+        for entity in self.config.grid_power.entity_ids:
+            until = min(until, self._batch.get(entity, (None, now))[1] + self.config.max_sensor_age)
+        house = measurement.grid_w if valid else None
+        valuations, references = [], []
+        # Read only: the existing control route owns invalidation and rights.
+        binding = self.owner.binding if self.owner is not None else None
+        if (binding is not None and (self.owner.phase != "owned" or self.owner.recovery_required
+                                     or now * 1000 >= binding.owner_not_after_ms)):
+            binding = None
+        digest = (execution_boundary.plan_digest(plan)
+                  if plan.format_version == 2 and plan.financial_context and binding is not None else "")
+        for index, spec in enumerate(plan.specs):
+            measured = measurement.battery(index)
+            controller = self.state.battery(index)
+            effective = None
+            reference = None
+            measured_power = (measured.power_w if measured.valid and measured.power_w is not None
+                              and math.isfinite(measured.power_w) else None)
+            link = self._links.get(spec.name)
+            if measured_power is not None and link is not None:
+                for entity in link.actual_power.entity_ids:
+                    until = min(until, self._batch.get(entity, (None, now))[1] + self.config.max_sensor_age)
+            if mode == MODE_ACTIVE:
+                if measured_power is not None:
+                    effective = measured_power
+                elif (previous is not None and index < len(previous.batteries)
+                      and now <= previous.valid_until_ts and previous.plan_identity == identity):
+                    effective = previous.batteries[index].effective_w
+                    # Reusing a response also reuses its evidence horizon;
+                    # a fresh grid sample cannot renew the battery evidence.
+                    until = min(until, previous.valid_until_ts)
+                if effective is not None:
+                    reference = f"legacy:{controller.last_command_ts}:{controller.last_command_w}"
+            if house is not None:
+                response = measured_power if measured_power is not None else effective
+                if response is None:
+                    house = None
+                else:
+                    house -= response
+            if decision is not None and index < len(decision.batteries):
+                proposed = decision.batteries[index]
+                # The measurement predates this receipt. Preserve its house
+                # reconstruction but value the confirmed command as a model.
+                if proposed.write:
+                    effective = (controller.last_command_w
+                                 if mode == MODE_ACTIVE and proposed.actuation_status == "confirmed" else None)
+                elif previous is not None:
+                    effective = previous.batteries[index].effective_w
+                reference = (f"legacy:{controller.last_command_ts}:{controller.last_command_w}"
+                             if effective is not None else None)
+            if plan.format_version == 2:
+                command = current_execution_command(controller, binding=binding,
+                                                    now_ms=int(round(now * 1000)), expected_digest=digest)
+                reference = command.command_id if command is not None else None
+                if decision is not None:
+                    effective = float(command.setpoint_w) if command is not None else None
+            baseline = row.battery(index).ac_power_w if row else 0.0
+            valuations.append(LegacyBatteryValuation(
+                spec.name, baseline, effective, estimate_storage_value(plan, now, index, limits),
+                spec.cycle_cost, max(.01, min(1.0, limits.round_trip_efficiency))))
+            references.append((spec.name, reference))
+        if decision is not None and previous is not None:
+            house = previous.house_w
+        reasons = ()
+        if plan.format_version == 2:
+            reasons = ("tick_settlement_basis_unavailable",)
+        elif not valid or house is None:
+            reasons = ("tick_measurement_missing",)
+        elif any(b.effective_w is None for b in valuations) or mode != MODE_ACTIVE:
+            reasons = ("tick_execution_unknown",)
+        return TickEconomicContext(now, until, identity, plan.format_version,
+                                   f"{row.start_ts}:{row.end_ts}:{row.price_import}:{row.price_export}" if row else "",
+                                   mode, house, row.price_import if row else 0.0,
+                                   row.price_export if row else 0.0, tuple(valuations),
+                                   tuple(references), valid, reasons)
 
-        The euro claim of a decision is only nonzero when the segment was
-        really executed: an unproven or ambiguous segment books nothing at
-        all, so this addition stays zero for a refused tick.
-        """
-        benefit = decision.benefit_eur_h
-        if plan is not None and plan.format_version == 2:
-            digest = execution_boundary.plan_digest(plan)
-            # Keep the legacy euro cap, but prove the entire previous-tick gap.
-            previous = (decision.timestamp - elapsed_h * 3600
-                        if previous_tick_ts is None else previous_tick_ts)
-            covered_benefit = 0.0
-            for battery in decision.batteries:
-                if not battery.override:
-                    continue
-                controller = self.state.battery(battery.index)
-                command = current_execution_command(
-                    controller, binding=owner_binding, now_ms=int(round(decision.timestamp * 1000)),
-                    expected_digest=digest)
-                if (command is None or command.issued_at_ms > int(round(previous * 1000))
-                        or controller.last_command_ts > previous):
-                    continue
-                # Filter existing per-battery claims; do not recalculate value
-                # or discard another battery's independently proven segment.
-                covered_benefit += max(0.0, battery.benefit_eur_h)
-            benefit = min(benefit, covered_benefit)
-        self.state.saved_today_eur += benefit * elapsed_h
+    def _set_decision_economics(self, decision: Decision, context: TickEconomicContext) -> None:
+        result = estimate_effective_tick(house_w=context.house_w, price_import=context.price_import,
+                                         price_export=context.price_export, batteries=context.batteries)
+        reasons = context.reasons or result.reasons
+        values = dict(result.by_battery)
+        for item in (decision, *decision.batteries):
+            item.benefit_eur_h = (None if reasons else result.benefit_eur_h if item is decision
+                                  else values[item.name])
+            item.economics_status = "unknown" if reasons else result.status
+            item.economics_kind = "unavailable" if reasons else result.kind
+            item.economics_reasons = reasons
+            item.economics_is_estimate = True
+
+    def _book_saving(self, *, previous: TickEconomicContext | None,
+                     observed: TickEconomicContext, now: float) -> None:
+        state = self.state
+        day = self._day_key(now)
+        zone = self._tz_info
+        midnight = datetime.datetime.combine(datetime.date.fromisoformat(day), datetime.time(), zone).timestamp()
+        if state.economics_day_key != day:
+            state.economics_day_key = day
+            state.saved_today_known_subtotal_eur = 0.0
+            state.economics_covered_from_ts = None
+            state.economics_covered_until_ts = None
+            state.economics_unknown_latched = not (now == midnight or previous is not None and previous.at_ts <= midnight)
+            state.economics_reasons = ("day_coverage_missing",) if state.economics_unknown_latched else ()
+        reasons = observed.reasons
+        amount = None
+        if previous is None:
+            if now != midnight:
+                reasons += ("day_coverage_missing",)
+            elif not reasons:
+                amount = 0.0
+        elif now <= previous.at_ts:
+            reasons += ("tick_time_nonpositive",)
+        elif now - previous.at_ts > 600:
+            reasons += ("tick_gap_uncovered",)
+        elif (now > previous.valid_until_ts or previous.plan_identity != observed.plan_identity
+              or (previous.price_identity != observed.price_identity and now != previous.valid_until_ts)):
+            # A new price at the exact covered endpoint does not change the
+            # price of the preceding halfopen span, which is valued below.
+            reasons += ("tick_plan_price_uncovered",)
+        elif previous.execution_references != observed.execution_references:
+            reasons += ("tick_execution_unknown",)
+        else:
+            reasons += previous.reasons
+            result = estimate_effective_tick(house_w=previous.house_w, price_import=previous.price_import,
+                                             price_export=previous.price_export, batteries=previous.batteries)
+            reasons += result.reasons
+            if not reasons:
+                amount = result.benefit_eur_h * (now - max(previous.at_ts, midnight)) / 3600
+        if reasons:
+            state.economics_unknown_latched = True
+            state.economics_reasons = tuple(dict.fromkeys((*state.economics_reasons, *reasons)))
+        if amount is not None:
+            state.saved_today_known_subtotal_eur += amount
+            if state.economics_covered_from_ts is None:
+                state.economics_covered_from_ts = max(previous.at_ts, midnight) if previous else now
+            state.economics_covered_until_ts = now
+        state.saved_today_eur = None if state.economics_unknown_latched else state.saved_today_known_subtotal_eur
+        state.saved_today_is_estimate = state.economics_is_estimate = True
+        state.economics_status = ("complete" if not state.economics_unknown_latched else
+                                  "partial" if state.economics_covered_from_ts is not None else "unknown")
+        state.economics_kind = "legacy_tick_estimate" if state.economics_covered_from_ts is not None else "unavailable"
+
+    def _expire_economics(self, *, now: float, reason: str) -> None:
+        self._economic_context = None
+        state = self.state
+        # An already unknown, empty claim remains idempotent. Expiry still
+        # withdraws its runtime context, including on silent shadow→off paths.
+        if state.saved_today_eur is None and state.economics_unknown_latched and state.economics_status == "unknown":
+            return
+        if state.saved_today_eur is not None:
+            state.historical_saved_today_eur = state.saved_today_eur
+            state.historical_economics_status = state.economics_status
+        state.saved_today_eur = None
+        state.saved_today_is_estimate = state.economics_is_estimate = True
+        state.economics_unknown_latched = True
+        state.economics_status = "unknown"
+        state.economics_reasons = tuple(dict.fromkeys((*state.economics_reasons, reason)))
 
     def _warn_if_plan_expired(self, decision, plan: FastPlan, now: float) -> None:
         """Keep saying so while the plan does not cover the current moment.
@@ -1082,7 +1266,7 @@ class FastControlRunner:
             message = (
                 f"Fast control {spec.name}: {battery.setpoint_w:.0f} W {arrow} "
                 f"(plan {battery.plan_w:.0f} W, {battery.reason}, "
-                f"{battery.benefit_eur_h:.3f} euro/uur)"
+                f"voorstel {battery.proposal_benefit_eur_h:.3f} euro/uur)"
             )
             if mode != MODE_ACTIVE:
                 logging.info(f"[schaduw] {message}")
@@ -1543,8 +1727,14 @@ class FastControlRunner:
         attributes["pv_w"] = (
             round(measurement.pv_w) if measurement.pv_w is not None else None
         )
-        attributes["saved_today_eur"] = round(self.state.saved_today_eur, 3)
+        attributes["saved_today_eur"] = (round(self.state.saved_today_eur, 3)
+                                          if self.state.saved_today_eur is not None else None)
         attributes["saved_today_is_estimate"] = self.state.saved_today_is_estimate
+        attributes["saved_today_status"] = self.state.economics_status
+        attributes["saved_today_reasons"] = list(self.state.economics_reasons)
+        attributes["diagnostic_numbers_may_be_stale"] = bool(
+            diagnostics.entity_benefit and decision.benefit_eur_h is None
+            or diagnostics.entity_saved_today and self.state.saved_today_eur is None)
         attributes["friendly_name"] = "DAO fast control"
         attributes["icon"] = "mdi:speedometer"
 
@@ -1568,11 +1758,11 @@ class FastControlRunner:
                 diagnostics.entity_setpoint,
                 sum(b.setpoint_w for b in decision.batteries),
             )
-        if diagnostics.entity_benefit:
+        if diagnostics.entity_benefit and decision.benefit_eur_h is not None:
             self.gateway.write_number(
                 diagnostics.entity_benefit, round(decision.benefit_eur_h, 4)
             )
-        if diagnostics.entity_saved_today:
+        if diagnostics.entity_saved_today and self.state.saved_today_eur is not None:
             self.gateway.write_number(
                 diagnostics.entity_saved_today, round(self.state.saved_today_eur, 3)
             )
@@ -1627,7 +1817,10 @@ class FastControlRunner:
             "battery": (battery.name if battery else None),
             "setpoint_w": battery.setpoint_w if battery else 0,
             "plan_w": battery.plan_w if battery else 0,
-            "benefit_eur_h": max((b.benefit_eur_h for b in decision.batteries), default=0.0),
+            "economics_reasons": list(decision.economics_reasons),
+            **{name: getattr(decision, name) for name in (
+                "benefit_eur_h", "proposal_benefit_eur_h", "economics_version", "economics_is_estimate",
+                "economics_status", "economics_kind")},
             "house_w": round(decision.house_w),
             "soc_pct": soc_pct,
             "price_import": round(decision.price_import, 4),

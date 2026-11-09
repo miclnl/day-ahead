@@ -21,6 +21,7 @@ from dao.prog.fastctrl.simulate import (
     simulate,
     synthetic_case,
 )
+from dao.tests.settlement.conftest import bonus_rules as bonus_rules
 
 T0 = 1_700_000_000
 
@@ -32,6 +33,254 @@ def modeled_case(scenario_id, *, hold=60, equal_initial_soc=False):
         initial_execution="stopped", default_effect="complete", prepare_delay_s=0,
         response_delay_s=0, application_delay_s=0,
     ), ReplayPhysics("battery_model_v1", hold, "ideal_programmed_stop", equal_initial_soc))
+
+
+def test_f3b4_public_nullable_reports_use_financial_days_budget_timezone(monkeypatch):
+    # B22-2: changing scenario timezone must still reset the physical day budget.
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from dao.prog.fastctrl.policy import FastControlPolicy
+    from dao.tests.settlement.test_fast_financial_replay import (
+        f3b4_limits,
+        f3b4_public_case,
+        f3b4_source,
+    )
+
+    start = int(datetime(2027, 7, 1, 21, 30, tzinfo=UTC).timestamp())
+    reset = start + 1800
+    plan, replay, samples = f3b4_public_case(edges=tuple(start + 900 * i for i in range(5)))
+    source = f3b4_source(plan, replay, samples)
+    observations = []
+    decide = FastControlPolicy.decide
+
+    def observe(self, actual_plan, measurement, state, **kwargs):
+        observations.append((measurement.timestamp, state.day_key, state.battery(0).daily_deviation_kwh))
+        return decide(self, actual_plan, measurement, state, **kwargs)
+
+    monkeypatch.setattr(FastControlPolicy, "decide", observe)
+    results, budgets = [], []
+    for zone in (UTC, ZoneInfo("Europe/Amsterdam")):
+        offset = len(observations)
+        results.append(compare(plan, samples, f3b4_limits(daily_extra_throughput=.1),
+            plan.specs[0].soc_min, timezone=zone, replay_basis=replay,
+            baseline_execution=modeled_case("budget-base", hold=900),
+            fast_execution=modeled_case("budget-fast", hold=900), source_evidence=source))
+        budgets.append(observations[offset:])
+    utc, amsterdam = results
+    assert budgets[0][1][0] == budgets[1][1][0] == reset - 900
+    assert budgets[0][1][2] >= .1 and budgets[1][1][2] >= .1
+    assert budgets[0][2][0] == budgets[1][2][0] == reset
+    assert budgets[0][2][2] >= .1 and budgets[1][2][2] == 0
+    assert utc.fast.segments != amsterdam.fast.segments
+    powers = [tuple((s.start_ts, s.batteries[0].command_w, s.batteries[0].modeled_ac_w)
+                    for s in result.fast.segments if s.start_ts >= reset) for result in results]
+    assert powers[0][0] == (reset, 3000, 3000)
+    # The preceding plan-charge quarter has created discharge headroom. After
+    # the reset the existing fixed-zero-storage policy chooses -2000 W; UTC
+    # retains its exhausted budget and must keep the 3000 W plan command.
+    assert powers[1][0] == (reset, -2000, -2000)
+    exports = [sum(s.export_kwh for s in result.fast.segments if s.start_ts >= reset) for result in results]
+    assert exports == [.5, 1.75]  # UTC .25+.25; Amsterdam 1.5+.25 kWh.
+    assert utc.fast.financial_result.projection.items != amsterdam.fast.financial_result.projection.items
+    assert list(utc.fast.days) == ["2027-07-01"]
+    assert list(amsterdam.fast.days) == ["2027-07-01", "2027-07-02"]
+
+
+def test_f3b4_public_nullable_reports_use_financial_days_fixed_run():
+    # Catches a presentation timezone sneaking into projection or settlement.
+    from datetime import UTC
+    from importlib import import_module
+    from zoneinfo import ZoneInfo
+
+    from dao.prog.fastctrl import replay_finance as finance
+    from dao.prog.fastctrl.replay_execution import validate_replay_input
+    from dao.tests.settlement.test_fast_financial_replay import (
+        f3b4_limits,
+        f3b4_public_case,
+        f3b4_source,
+    )
+
+    api = import_module("dao.prog.fastctrl.simulate")
+    plan, replay, samples = f3b4_public_case()
+    source = f3b4_source(plan, replay, samples)
+    inputs = validate_replay_input(plan=plan, sample_points=tuple((s.timestamp, s.house_w) for s in samples),
+        soc_start=plan.specs[0].soc_min, inverter_efficiency=.95, scenario=modeled_case("fixed-run", hold=900))
+    basis = api._prepare_replay_basis(plan, start_ts=samples[0].timestamp, replay_basis=replay, recorded=False)
+    binding = finance.bind_source_evidence(source, source_plan=basis.source_plan,
+                                           replay_basis=replay, replay_inputs=(inputs,))
+    validation = finance.validate_source_evidence(source, binding)
+    run = api._run_replay(basis=basis, replay_input=inputs, limits=f3b4_limits(), use_fast_layer=False, timezone=UTC)
+    results = tuple(api._summarize_replay(run=run, basis=basis, replay_input=inputs, label="fixed",
+        timezone=zone, source_binding=binding, source_validation=validation) for zone in (UTC, ZoneInfo("Europe/Amsterdam")))
+    left, right = (result.financial_result for result in results)
+    assert basis.replay_basis is replay
+    assert left.projection.items == right.projection.items
+    assert left.projection.slices == right.projection.slices
+    assert left.settlement == right.settlement
+    assert left.components == right.components and left.days == right.days
+    assert results[0].segments is results[1].segments is run.segments
+    assert list(results[0].days) == ["2026-12-31"] and list(results[1].days) == ["2027-01-01"]
+    assert results[0].days["2026-12-31"].financial_components is None
+    attached = results[1].days["2027-01-01"]
+    assert attached.financial_components is right.days[0].components
+    assert attached.total_cost == float(right.days[0].components.total_cost.value)
+
+
+def test_f3b4_source_changes_no_physics_or_execution():
+    # Missing or wrongly bound evidence must not change commands or physical flows.
+    from dataclasses import asdict, replace
+    from datetime import UTC
+
+    from dao.tests.settlement.test_fast_financial_replay import (
+        f3b4_limits,
+        f3b4_public_case,
+        f3b4_source,
+    )
+
+    plan, replay, samples = f3b4_public_case()
+    source = f3b4_source(plan, replay, samples)
+    scenario = modeled_case("source-independent", hold=900)
+    scenario = replace(scenario, execution=replace(scenario.execution, prepare_delay_s=.25))
+    results = tuple(simulate(plan, samples, f3b4_limits(), plan.specs[0].soc_min, "source", False,
+        timezone=UTC, replay_basis=replay, execution=scenario, source_evidence=evidence)
+        for evidence in (None, source, replace(source, meter_id="synthetic:wrong")))
+
+    def physical(side):
+        return {key: {name: value for name, value in asdict(day).items()
+            if name not in ("energy_cost", "wear_cost", "terminal_value", "total_cost", "financial_components")}
+            for key, day in side.days.items()}
+
+    for result in results[1:]:
+        for field in ("segments", "trace", "soc_start_by_battery", "soc_end_by_battery", "soc_series",
+                      "writes", "override_s", "import_kwh", "export_kwh", "throughput_kwh", "coverage_status"):
+            assert getattr(result, field) == getattr(results[0], field)
+        assert physical(result) == physical(results[0])
+    assert any(segment.start_ts % 1 == .25 for segment in results[0].segments)
+    assert results[-1].financial_status == "unknown" and results[-1].total_cost is None
+    assert "source_binding_mismatch" in results[-1].financial_reasons
+
+
+@pytest.mark.parametrize("fault", ["source", "second-input"])
+def test_f3b4_malformed_inputs_rejected_before_either_run(monkeypatch, fault):
+    from importlib import import_module
+
+    from dao.tests.settlement.test_fast_financial_replay import f3b4_limits, f3b4_public_case
+
+    api = import_module("dao.prog.fastctrl.simulate")
+    plan, replay, samples = f3b4_public_case()
+    runs = []
+    real_run = api._run_replay
+
+    def observe(**kwargs):
+        runs.append(kwargs)
+        return real_run(**kwargs)
+
+    monkeypatch.setattr(api, "_run_replay", observe)
+    with pytest.raises((TypeError, ValueError), match="^source_type_invalid$" if fault == "source" else None):
+        compare(plan, samples, f3b4_limits(), 50, replay_basis=replay,
+            baseline_execution=modeled_case("valid", hold=900),
+            fast_execution=object() if fault == "second-input" else modeled_case("other", hold=900),
+            **({"source_evidence": {"malformed": True}} if fault == "source" else {}))
+    assert runs == []
+
+
+@pytest.mark.parametrize("execution_kind", ["modeled", "recorded"])
+@pytest.mark.parametrize("source_kind", ["full", "partial", "mismatch"])
+def test_f3b7_public_source_execution_and_finance_are_separate(bonus_rules, execution_kind, source_kind):
+    from copy import deepcopy
+    from dataclasses import replace
+    from decimal import Decimal
+
+    from dao.prog.fastctrl import replay_execution as execution
+    from dao.prog.fastctrl.simulate import Comparison
+    from dao.tests.prog.test_fast_replay_execution import (
+        replay_command,
+        replay_receipt,
+        replay_timing,
+        send_event,
+    )
+    from dao.tests.settlement.test_fast_financial_replay import (
+        f3b4_limits,
+        f3b4_public_case,
+        f3b4_source,
+    )
+
+    plan, replay, samples = f3b4_public_case(bonus_rules)
+    start, end = samples[0].timestamp, samples[-1].timestamp
+    source = f3b4_source(plan, replay, samples)
+    evidence = {"full": source, "partial": None,
+                "mismatch": replace(source, meter_id="synthetic:wrong")}[source_kind]
+    limits = f3b4_limits()
+    if execution_kind == "modeled":
+        scenarios = (modeled_case("f3b7-base", hold=900), modeled_case("f3b7-fast", hold=900))
+    else:
+        events = []
+        for index, row in enumerate(plan.intervals):
+            at = row.start_ts
+            command = replay_command(plan, setpoint_w=3000, command_id=f"f3b7-{index}", sequence=index + 3,
+                issued_at_ms=at * 1000, execute_before_ms=(at + 2) * 1000, hold_until_ms=row.end_ts * 1000)
+            events.extend((send_event(execution, command, at, replay_timing(execution, command, anchor=at)),
+                replay_receipt(execution, command, at, apply_ts=at, anchor=at)))
+        sent = events[0]
+        recorded = _f3a5_recorded(plan, start, end, events)
+        recorded = replace(recorded, physics=replace(recorded.physics, house_hold_s=900))
+        scenarios = (recorded, replace(recorded, scenario_id="f3b7-recorded-peer"))
+    inputs = (plan, replay, samples, source, evidence, scenarios, limits)
+    before = deepcopy(inputs)
+    raw = replay.canonical_bytes(), source.canonical_bytes(), plan.to_dict()
+    result = compare(plan, samples, limits, plan.specs[0].soc_min, replay_basis=replay,
+        baseline_execution=scenarios[0], fast_execution=scenarios[1], source_evidence=evidence)
+    control = compare(plan, samples, limits, plan.specs[0].soc_min, replay_basis=replay,
+        baseline_execution=scenarios[0], fast_execution=scenarios[1], source_evidence=source)
+    for side, full in zip((result.baseline, result.fast), (control.baseline, control.fast), strict=True):
+        assert side.execution_kind == execution_kind and side.coverage_status == "complete", side.reasons
+        assert side.trace == full.trace and side.segments == full.segments
+        assert side.writes == full.writes and side.soc_end_by_battery == full.soc_end_by_battery
+        receipts = [event for event in side.trace if isinstance(event, execution.ReceiptEvent)]
+        assert receipts and all(event.receipt.status == "accepted" for event in receipts)
+        components = side.financial_result.components
+        if source_kind == "full":
+            assert side.financial_status == "complete" and components.total_cost.value is not None
+            assert components.base_export_revenue.value > 0 and components.bonus_revenue.value > 0
+            assert side.financial_result.source_trust == "caller_asserted"
+        elif source_kind == "partial":
+            # Even a complete ACK history cannot certify PV for the bonus book.
+            assert side.financial_status == "partial"
+            assert "unknown_bonus_source" in side.financial_reasons
+            assert components.base_export_revenue.value > 0
+            assert components.bonus_revenue.value is None
+            assert components.total_cost.value is None and side.total_cost is None
+        else:
+            assert side.financial_status == "unknown"
+            assert "source_binding_mismatch" in side.financial_reasons
+            assert components.base_export_revenue.value is components.total_cost.value is None
+    base, fast = control.baseline.financial_result, control.fast.financial_result
+    assert base.projection.items is not fast.projection.items
+    assert base.settlement.end_state is not fast.settlement.end_state
+    assert base.projection.source is fast.projection.source
+    if execution_kind == "modeled":
+        assert base.settlement.end_state.bonus.total_export_kwh == Decimal("4999")
+        assert fast.settlement.end_state.bonus.total_export_kwh == Decimal("5000.5")
+        assert control.financial_result.advantage_eur == Decimal(".36")
+        reverse = Comparison(control.fast, control.baseline)
+        assert reverse.financial_result.advantage_eur == Decimal("-.36") and reverse.saving < 0
+    else:
+        # Source evidence supplies neither acceptance nor recovery of a lost SoC.
+        unacked = replace(scenarios[0], execution=replace(scenarios[0].execution, events=(sent,)))
+        unknown = tuple(simulate(plan, samples, limits, plan.specs[0].soc_min, "unacked", False,
+            replay_basis=replay, execution=unacked, source_evidence=item) for item in (None, source))
+        assert unknown[0].trace == unknown[1].trace and unknown[0].segments == unknown[1].segments
+        for side in unknown:
+            assert side.coverage_status == "unknown"
+            assert side.soc_end_by_battery == ((plan.specs[0].name, None),)
+            assert side.total_cost is None
+            assert not any(isinstance(event, execution.ReceiptEvent) for event in side.trace)
+            assert all(segment.batteries[0].soc_end is None for segment in side.segments)
+    if source_kind != "full":
+        assert result.financial_result.advantage_eur is None
+    assert inputs == before
+    assert (replay.canonical_bytes(), source.canonical_bytes(), plan.to_dict()) == raw
 
 
 def _f3a8_recorded_timeline():

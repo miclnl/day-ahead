@@ -665,18 +665,18 @@ def test_i4_tick_does_not_book_a_gap_hidden_by_the_legacy_saving_cap(tmp_path, m
             "sensor.p1_power": ("5000", now), "sensor.soc": ("50", now),
             "sensor.battery_power": ("-5000", now)})
         decision = runner.tick(now)
-        assert decision.benefit_eur_h > 0
-        assert runner.state.saved_today_eur == 0.0
+        assert decision.benefit_eur_h is None
+        assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
+        assert runner.state.saved_today_eur is None
         assert controller.last_accepted_command is command
         assert abs(controller.interval_deviation_kwh) < runner.limits().energy_budget
         # The clipped +400..+1000s gap would book a positive amount; the real
         # +0..+1000s gap must still reject its unaccepted first 100 seconds.
         clipped = copy.copy(runner)
         clipped.state = copy.deepcopy(runner.state)
-        clipped._book_saving(decision, elapsed_h=600 / 3600, plan=plan,
-                             owner_binding=harness.owner.binding)
-        assert clipped.state.saved_today_eur > 0
-        assert runner.state.saved_today_eur == 0.0
+        clipped._book_saving(previous=None, observed=runner._economic_context, now=now)
+        assert clipped.state.saved_today_eur is None
+        assert runner.state.saved_today_eur is None
     finally:
         harness.lease.close()
 
@@ -810,6 +810,332 @@ def workspace(tmp_path):
         "plan_path": str(tmp_path / "fast_plan.json"),
         "state_path": str(tmp_path / "fast_state.json"),
     }
+
+
+def test_f3b6_previous_span_not_current_receipt(workspace):
+    """A new receipt must never revalue the preceding sixty seconds."""
+    from dataclasses import replace
+
+    plan = make_plan(workspace["plan_path"], house_w=3000)
+    plan = replace(plan, specs=[replace(plan.specs[0], cycle_cost=0)],
+                   intervals=[replace(row, price_export=0) for row in plan.intervals])
+    write_plan(plan, workspace["plan_path"])
+    hass = F2bHass(readback={"sensor.p1_power": "3000"})
+    config = make_config(**{"storage value mode": "fixed", "storage value": .40,
+                            "max grid import": 2000, "energy budget": 0,
+                            "daily extra throughput": 0})
+    runner = FastControlRunner(hass, config, **workspace)
+    first = runner.tick(T0 + 60)
+    assert first.batteries[0].setpoint_w == -1000
+    assert first.batteries[0].actuation_status == "confirmed"
+    assert first.benefit_eur_h == pytest.approx(-.10)
+    assert runner.state.saved_today_eur is None
+    assert runner.state.saved_today_known_subtotal_eur == 0
+    hass.states.update({"sensor.p1_power": "500", "sensor.battery_power": "-1000"})
+    config.storage_value = make_config(**{"storage value": .10}).storage_value
+    second = runner.tick(T0 + 120)
+    assert second.batteries[0].setpoint_w == -1500
+    assert second.batteries[0].actuation_status == "confirmed"
+    assert second.benefit_eur_h == pytest.approx(.30)
+    assert runner.state.saved_today_eur is None
+    assert runner.state.saved_today_known_subtotal_eur == pytest.approx(-.10 / 60)
+
+
+def test_f3b6_restart_history_and_unknown_day_latch(workspace):
+    old = ControllerState.from_dict({"saved_today_eur": 1.23, "saved_today_is_estimate": False})
+    assert old.saved_today_eur is None
+    assert old.saved_today_is_estimate is True
+    assert old.historical_saved_today_eur == 1.23
+    assert old.historical_economics_status == "legacy_estimate_unverified"
+    empty = ControllerState()
+    assert ControllerState.from_dict(empty.to_dict()).to_dict() == empty.to_dict()
+    runner = FastControlRunner(FakeHass(), make_config(), **workspace)
+    assert runner._economic_context is None
+    assert "_economic_context" not in runner.state.to_dict()
+
+
+def _f3b6_legacy_runner(workspace, monkeypatch, start, *, failures=None):
+    from dataclasses import replace
+
+    plan = make_plan(workspace["plan_path"], house_w=3000, created_ts=start)
+    plan = replace(plan, interval_s=3600, specs=[replace(plan.specs[0], cycle_cost=0)],
+                   intervals=[replace(plan.intervals[0], start_ts=start, end_ts=start + 3600,
+                                      price_export=0)])
+    write_plan(plan, workspace["plan_path"])
+    hass = F2bHass(failures=failures)
+    config = make_config(**{"storage value mode": "fixed", "storage value": .4,
+                            "max grid import": 2000, "energy budget": 0,
+                            "daily extra throughput": 0, "max sensor age": 3600})
+    runner = FastControlRunner(hass, config, **workspace)
+    sample = {"now": start, "grid": 3000, "battery": 0}
+    monkeypatch.setattr(runner.gateway, "read", lambda ids: {
+        "sensor.p1_power": (str(sample["grid"]), sample["now"]),
+        "sensor.battery_power": (str(sample["battery"]), sample["now"]),
+        "sensor.soc": ("60", sample["now"])})
+    return runner, hass, sample, plan
+
+
+@pytest.mark.parametrize("gap", [0, -1, 60, 600, 601])
+def test_f3b6_day_coverage_and_gap_boundary(workspace, monkeypatch, gap):
+    from zoneinfo import ZoneInfo
+
+    midnight = datetime.datetime(2026, 11, 7, tzinfo=ZoneInfo("Europe/Amsterdam")).timestamp()
+    runner, hass, sample, _ = _f3b6_legacy_runner(workspace, monkeypatch, midnight - 60)
+    sample["now"] = midnight
+    first = runner.tick(midnight)
+    assert first.batteries[0].setpoint_w == -1000
+    assert runner.state.saved_today_eur == 0
+    sample.update(now=midnight + gap, grid=2000, battery=-1000)
+    runner.tick(midnight + gap)
+    if 0 < gap <= 600:
+        assert runner.state.saved_today_eur == pytest.approx(-.1 * gap / 3600)
+        assert runner.state.economics_status == "complete"
+    else:
+        assert runner.state.saved_today_eur is None
+        assert runner.state.saved_today_known_subtotal_eur == 0
+        assert ("tick_gap_uncovered" if gap == 601 else "tick_time_nonpositive") in runner.state.economics_reasons
+    assert runner.state.saved_today_is_estimate is True
+    assert hass.values["input_number.feedin"] == -1000
+
+
+def test_f3b6_midnight_overlap_and_unknown_latch(workspace, monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    midnight = datetime.datetime(2026, 11, 7, tzinfo=ZoneInfo("Europe/Amsterdam")).timestamp()
+    runner, _, sample, _ = _f3b6_legacy_runner(workspace, monkeypatch, midnight - 30)
+    runner.tick(midnight - 30)
+    assert runner.state.saved_today_eur is None
+    sample.update(now=midnight + 30, grid=2000, battery=-1000)
+    runner.tick(midnight + 30)
+    assert runner.state.saved_today_eur == pytest.approx(-.1 * 30 / 3600)
+    assert runner.state.economics_covered_from_ts == midnight
+    sample.update(now=midnight + 631)
+    runner.tick(sample["now"])
+    assert runner.state.saved_today_eur is None
+    assert "tick_gap_uncovered" in runner.state.economics_reasons
+    sample.update(now=midnight + 691)
+    runner.tick(sample["now"])
+    assert runner.state.saved_today_eur is None
+    assert runner.state.saved_today_known_subtotal_eur == pytest.approx(-.1 * 90 / 3600)
+    restored = ControllerState.from_dict(runner.state.to_dict())
+    assert restored.saved_today_eur is None
+    assert restored.saved_today_known_subtotal_eur == runner.state.saved_today_known_subtotal_eur
+    assert restored.economics_reasons == ("restart_coverage_missing",)
+    assert restored.battery(0).daily_deviation_kwh == runner.state.battery(0).daily_deviation_kwh
+
+
+@pytest.mark.parametrize("limiter", ["deadband", "rate_limited"])
+def test_f3b6_write_false_values_old_effective_response(workspace, monkeypatch, limiter):
+    runner, hass, sample, _ = _f3b6_legacy_runner(workspace, monkeypatch, T0)
+    first = runner.tick(T0)
+    assert first.benefit_eur_h == pytest.approx(-.10)
+    runner.config.storage_value = make_config(**{"storage value": .1}).storage_value
+    if limiter == "deadband":
+        runner.config.deadband = 1000
+    else:
+        runner.config.min_command_interval = 120
+        runner.config.urgent_deviation = 10000
+    sample.update(now=T0 + 60, grid=500, battery=-1000)
+    second = runner.tick(T0 + 60)
+    battery, = second.batteries
+    assert battery.write is False
+    assert battery.setpoint_w == -1000
+    assert limiter in battery.reason
+    assert battery.mode is battery.stop_inverter is None
+    assert second.benefit_eur_h == pytest.approx(.20)
+    assert runner.state.saved_today_known_subtotal_eur == pytest.approx(-.10 / 60)
+    assert runner.state.battery(0).last_command_ts == T0
+    assert runner.state.battery(0).daily_deviation_kwh == pytest.approx(1 / 60)
+    assert hass.attempts == ["setpoint", "mode", "stop_inverter"]
+
+
+@pytest.mark.parametrize("failures", [{"mode": [False]},
+                                     {"setpoint": [False], "mode": [False], "stop_inverter": [False]}])
+def test_f3b6_unknown_receipt_never_books_old_span(workspace, monkeypatch, failures):
+    runner, _, sample, _ = _f3b6_legacy_runner(workspace, monkeypatch, T0, failures=failures)
+    decision = runner.tick(T0)
+    assert decision.benefit_eur_h is None
+    assert decision.batteries[0].actuation_status in ("unknown", "unconfirmed")
+    sample.update(now=T0 + 60)
+    runner.tick(T0 + 60)
+    assert runner.state.saved_today_eur is None
+    assert runner.state.saved_today_known_subtotal_eur == 0
+
+
+@pytest.mark.parametrize("mode", ["active", "shadow"])
+@pytest.mark.parametrize("amount", [None, -.10])
+def test_f3b6_html_and_number_unknown_contract(workspace, mode, amount):
+    from dao.prog.fastctrl.policy import Decision, Measurement
+
+    hass = FakeHass()
+    config = make_config(mode, diagnostics={"entity benefit": "input_number.benefit",
+                                           "entity saved today": "input_number.saved",
+                                           "entity status": "sensor.fast"})
+    runner = FastControlRunner(hass, config, **workspace)
+    hass.values.update({"input_number.benefit": 17, "input_number.saved": 23})
+    decision = Decision(T0, benefit_eur_h=amount)
+    runner._publish(decision, mode, Measurement(T0, 0))
+    assert hass.values["input_number.benefit"] == (17 if amount is None else -.10)
+    assert hass.values["input_number.saved"] == 23
+    attributes = hass.published["sensor.fast"][1]
+    assert attributes["benefit_eur_h"] == amount
+    assert attributes["saved_today_eur"] is None
+    assert attributes["saved_today_reasons"] == ["day_coverage_missing"]
+    assert attributes["diagnostic_numbers_may_be_stale"] is True
+
+
+@pytest.mark.parametrize("fault", ["measurement", "price", "plan", "context"])
+def test_f3b6_uncovered_span_latches_day(workspace, monkeypatch, fault):
+    from dataclasses import replace
+
+    runner, _, sample, plan = _f3b6_legacy_runner(workspace, monkeypatch, T0)
+    runner.tick(T0)
+    sample.update(now=T0 + 60, grid=2000, battery=-1000)
+    if fault == "measurement":
+        sample["grid"] = "unavailable"
+    elif fault == "context":
+        runner._economic_context = None
+    else:
+        if fault == "price":
+            plan = replace(plan, intervals=[replace(plan.intervals[0], price_import=.31)])
+        else:
+            plan = replace(plan, price_average=.31)
+        write_plan(plan, workspace["plan_path"])
+    runner.tick(sample["now"])
+    assert runner.state.saved_today_eur is None
+    assert runner.state.saved_today_known_subtotal_eur == 0
+    sample.update(now=T0 + 120, grid=2000)
+    runner.tick(sample["now"])
+    assert runner.state.saved_today_eur is None
+
+
+def test_f3b6_state_restore_forces_estimate_metadata():
+    state = ControllerState.from_dict({
+        "saved_today_eur": 1.23, "saved_today_is_estimate": False,
+        "last_decision": {"ts": 123, "benefit_eur_h": .7, "saved_today_is_estimate": False},
+        "events": [{"ts": 100, "reason": "original", "benefit_eur_h": -.1}]})
+    assert state.last_decision["saved_today_is_estimate"] is True
+    assert state.last_decision["legacy_benefit_eur_h"] == .7
+    assert state.events[0]["benefit_eur_h"] == -.1
+    assert state.events[0]["ts"] == 100
+    assert state.events[0]["reason"] == "original"
+    assert state.events[0]["historical_economics_status"] == "legacy_estimate_unverified"
+
+
+def test_f3b6_shadow_keeps_measurement_but_not_execution(workspace, monkeypatch):
+    runner, hass, _, _ = _f3b6_legacy_runner(workspace, monkeypatch, T0)
+    runner.config.mode = make_config("shadow").mode
+    decision = runner.tick(T0)
+    assert decision.benefit_eur_h is None
+    assert runner._economic_context.house_w == 3000
+    assert runner._economic_context.measurement_valid is True
+    assert "tick_execution_unknown" in decision.economics_reasons
+    assert hass.attempts == []
+
+
+def test_f3b6_empty_unknown_state_is_idempotent():
+    state = ControllerState()
+    state.economics_reasons = ("mode_off",)
+    assert ControllerState.from_dict(state.to_dict()).to_dict() == state.to_dict()
+
+
+def test_f3b6_previous_battery_measurement_bounds_coverage(workspace, monkeypatch):
+    runner, _, sample, _ = _f3b6_legacy_runner(workspace, monkeypatch, T0)
+    runner.config.max_sensor_age = 120
+    monkeypatch.setattr(runner.gateway, "read", lambda ids: {
+        "sensor.p1_power": (str(sample["grid"]), sample["now"]),
+        "sensor.battery_power": (str(sample["battery"]), T0 - 90 if sample["now"] == T0 else sample["now"]),
+        "sensor.soc": ("60", sample["now"])})
+    assert runner.tick(T0).benefit_eur_h == pytest.approx(-.10)
+    assert runner._economic_context.valid_until_ts == T0 + 30
+    sample.update(now=T0 + 60, grid=2000, battery=-1000)
+    runner.tick(T0 + 60)
+    assert runner.state.saved_today_eur is None
+    assert runner.state.saved_today_known_subtotal_eur == 0
+
+
+def test_f3b6_price_boundary_without_stored_coverage_is_unknown(workspace, monkeypatch):
+    from dataclasses import replace
+
+    runner, _, sample, plan = _f3b6_legacy_runner(workspace, monkeypatch, T0)
+    row = plan.intervals[0]
+    plan = replace(plan, intervals=[replace(row, end_ts=T0 + 30),
+                                    replace(row, start_ts=T0 + 30, price_import=.31)])
+    write_plan(plan, workspace["plan_path"])
+    runner.tick(T0)
+    assert runner._economic_context.valid_until_ts == T0 + 30
+    sample.update(now=T0 + 60, grid=2000, battery=-1000)
+    runner.tick(T0 + 60)
+    assert runner.state.saved_today_eur is None
+    assert runner.state.saved_today_known_subtotal_eur == 0
+    assert "tick_plan_price_uncovered" in runner.state.economics_reasons
+
+
+@pytest.mark.parametrize("fresh_at_20", [False, True])
+def test_f3b6_fix1_fallback_ticks_preserve_measurement_expiry(workspace, monkeypatch, fresh_at_20):
+    from zoneinfo import ZoneInfo
+
+    start = datetime.datetime(2026, 11, 7, tzinfo=ZoneInfo("Europe/Amsterdam")).timestamp()
+    runner, hass, sample, _ = _f3b6_legacy_runner(workspace, monkeypatch, start)
+    runner.config.max_sensor_age = 120
+    runner.config.deadband = 5000
+    sample.update(grid=2000, battery=-1000)
+    monkeypatch.setattr(runner.gateway, "read", lambda ids: {
+        "sensor.p1_power": ("2000", sample["now"]),
+        "sensor.battery_power": (
+            "-1000" if sample["now"] == start or fresh_at_20 and sample["now"] == start + 20 else "unavailable",
+            start - 90 if sample["now"] == start else sample["now"]),
+        "sensor.soc": ("60", sample["now"])})
+    contexts = []
+    for offset in (0, 10, 20, 29, 40):
+        sample["now"] = start + offset
+        decision = runner.tick(sample["now"])
+        assert decision.batteries[0].write is False
+        assert decision.batteries[0].actuation_status is None
+        assert decision.batteries[0].mode is decision.batteries[0].stop_inverter is None
+        assert runner.last_receipts == []
+        assert runner.state.battery(0).last_command_ts == 0
+        contexts.append(runner._economic_context)
+    assert hass.attempts == []
+    if fresh_at_20:
+        assert runner.state.saved_today_eur == pytest.approx(-.1 * 40 / 3600)
+        assert contexts[2].valid_until_ts == contexts[3].valid_until_ts == start + 140
+    else:
+        assert runner.state.saved_today_eur is None
+        assert runner.state.saved_today_known_subtotal_eur == pytest.approx(-.1 * 29 / 3600)
+        assert decision.benefit_eur_h is None
+        assert [context.valid_until_ts for context in contexts[:4]] == [start + 30] * 4
+
+
+def test_f3b6_fix1_exact_price_boundary_books_previous_halfopen_span(workspace, monkeypatch):
+    from dataclasses import replace
+    from zoneinfo import ZoneInfo
+
+    start = datetime.datetime(2026, 11, 7, tzinfo=ZoneInfo("Europe/Amsterdam")).timestamp()
+    runner, hass, sample, plan = _f3b6_legacy_runner(workspace, monkeypatch, start)
+    row = plan.intervals[0]
+    plan = replace(plan, intervals=[replace(row, end_ts=start + 30),
+                                    replace(row, start_ts=start + 30, price_import=.50)])
+    write_plan(plan, workspace["plan_path"])
+    first = runner.tick(start)
+    assert first.batteries[0].setpoint_w == -1000
+    assert first.batteries[0].actuation_status == "confirmed"
+    previous = runner._economic_context
+    assert previous.valid_until_ts == start + 30
+    sample.update(now=start + 30, grid=2000, battery=-1000)
+    boundary = runner.tick(sample["now"])
+    assert boundary.batteries[0].setpoint_w == -3000
+    assert boundary.batteries[0].actuation_status == "confirmed"
+    assert boundary.benefit_eur_h == pytest.approx(.30)
+    assert runner._economic_context.price_identity != previous.price_identity
+    assert runner.state.saved_today_known_subtotal_eur == pytest.approx(-.10 * 30 / 3600)
+    assert runner.state.saved_today_eur == pytest.approx(-.10 * 30 / 3600)
+    assert runner.state.economics_unknown_latched is False
+    sample.update(now=start + 60, grid=0, battery=-3000)
+    runner.tick(sample["now"])
+    assert runner.state.saved_today_eur == pytest.approx((-.10 + .30) * 30 / 3600)
+    assert runner.state.battery(0).daily_deviation_kwh == pytest.approx(4000 * 30 / 3_600_000)
+    assert hass.values["input_number.feedin"] == -3000
 
 
 class TestGateway:
@@ -990,9 +1316,9 @@ class TestTick:
         )
         runner = FastControlRunner(hass, make_config(mode="active"), **workspace)
         runner.tick(T0 + 60)
-        assert runner.state.saved_today_is_estimate is False
+        assert runner.state.saved_today_is_estimate is True
         _, attributes = hass.published["sensor.dao_fast_control"]
-        assert attributes["saved_today_is_estimate"] is False
+        assert attributes["saved_today_is_estimate"] is True
 
     def test_off_mode_does_nothing(self, workspace):
         make_plan(workspace["plan_path"])
@@ -1182,7 +1508,8 @@ class TestStatePersistence:
         save_state(state, path)
         restored = load_state(path)
         assert restored.day_key == "2024-05-01"
-        assert restored.saved_today_eur == 1.23
+        assert restored.saved_today_eur is None
+        assert restored.historical_saved_today_eur == 1.23
         assert restored.battery(0).last_command_w == -1234.0
         assert restored.battery(0).daily_deviation_kwh == 2.5
 
@@ -1192,7 +1519,7 @@ class TestStatePersistence:
         assert load_state(str(path)).day_key == ""
 
     def test_a_missing_file_starts_fresh(self, tmp_path):
-        assert load_state(str(tmp_path / "absent.json")).saved_today_eur == 0.0
+        assert load_state(str(tmp_path / "absent.json")).saved_today_eur is None
 
 
 class RecordingFallback:
@@ -1764,7 +2091,8 @@ def test_denial_never_restores_old_power_or_accounts_benefit(workspace, artifact
     assert runner.last_fallback.status == "requested"
     assert runner.fallback_pending is True
     assert runner.state.last_decision is None
-    assert runner.state.saved_today_eur == 1.25
+    assert runner.state.saved_today_eur is None
+    assert runner.state.historical_saved_today_eur == 1.25
     assert hass.values == hass.options == hass.switches == hass.published == {}
     assert hass.services == []
     assert hass.template_calls == hass.state_calls == 0
@@ -1995,7 +2323,8 @@ class TestFlashWear:
         runner.state.battery(0).daily_deviation_kwh = 2.5
         runner._persist_state(T0, force=True)
         restored = load_state(workspace["state_path"])
-        assert restored.saved_today_eur == 1.2345
+        assert restored.saved_today_eur is None
+        assert restored.historical_saved_today_eur == 1.2345
         assert restored.battery(0).daily_deviation_kwh == 2.5
 
 

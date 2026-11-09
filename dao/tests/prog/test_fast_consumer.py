@@ -663,8 +663,8 @@ def test_i4_stale_history_books_no_benefit_or_held_fallback(tmp_path, context, c
                        owner_binding=binding)
         decision = policy.decide(harness.plan, sample, harness.runner.state,
                                  owner_binding=binding)
-        harness.runner._book_saving(decision, elapsed_h=1 / 60, plan=harness.plan,
-                                    owner_binding=binding)
+        observed = harness.runner._capture_economic_context(harness.plan, sample, mode="active", previous=None)
+        harness.runner._book_saving(previous=None, observed=observed, now=sample.timestamp)
         controller = harness.runner.state.battery(0)
         if check == "account":
             assert (controller.daily_deviation_kwh > 0) is live
@@ -677,7 +677,8 @@ def test_i4_stale_history_books_no_benefit_or_held_fallback(tmp_path, context, c
                 assert decision.batteries[0].setpoint_w == PLAN_W
                 assert decision.override is False
         else:
-            assert (harness.runner.state.saved_today_eur > 0) is live
+            assert harness.runner.state.saved_today_eur is None
+            assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
     finally:
         harness.lease.close()
 
@@ -703,7 +704,8 @@ def test_i4_measurements_remain_evidence_after_acceptance_expires(tmp_path, meas
             assert decision.reason != "execution_unknown"
         else:
             assert decision.reason == "execution_unknown"
-        assert decision.benefit_eur_h == 0
+        assert decision.benefit_eur_h is None
+        assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
     finally:
         harness.lease.close()
 
@@ -751,10 +753,11 @@ def test_i4_accounting_requires_the_whole_acceptance_segment(tmp_path, boundary)
         sample = replace(sample, timestamp=NOW_TS + 60)
         policy.account(state, harness.plan, sample, "synthetic", owner_binding=harness.owner.binding)
         decision = policy.decide(harness.plan, sample, state, owner_binding=harness.owner.binding)
-        harness.runner._book_saving(decision, elapsed_h=1 / 60, plan=harness.plan,
-                                    owner_binding=harness.owner.binding)
+        observed = harness.runner._capture_economic_context(harness.plan, sample, mode="active", previous=None)
+        harness.runner._book_saving(previous=None, observed=observed, now=sample.timestamp)
         assert (controller.daily_deviation_kwh > 0) is (boundary == "full")
-        assert (state.saved_today_eur > 0) is (boundary == "full")
+        assert state.saved_today_eur is None
+        assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
     finally:
         harness.lease.close()
 
@@ -772,10 +775,13 @@ def test_i4_booking_keeps_the_other_batterys_proven_segment(tmp_path):
         decision = FastControlPolicy(PolicyLimits()).decide(
             harness.plan, sample, harness.runner.state, owner_binding=harness.owner.binding)
         assert [battery.override for battery in decision.batteries] == [True, True]
-        assert decision.benefit_eur_h == decision.batteries[0].benefit_eur_h > 0
-        harness.runner._book_saving(decision, elapsed_h=1 / 60, plan=harness.plan,
-                                    owner_binding=harness.owner.binding)
-        assert harness.runner.state.saved_today_eur == pytest.approx(decision.benefit_eur_h / 60)
+        assert decision.benefit_eur_h is decision.batteries[0].benefit_eur_h is None
+        assert harness.runner.state.battery(0)._current_accepted_command is not None
+        assert harness.runner.state.battery(1)._current_accepted_command is None
+        observed = harness.runner._capture_economic_context(harness.plan, sample, mode="active", previous=None)
+        harness.runner._book_saving(previous=None, observed=observed, now=sample.timestamp)
+        assert harness.runner.state.saved_today_eur is None
+        assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
     finally:
         harness.lease.close()
 
@@ -1217,14 +1223,16 @@ def test_08_only_an_accepted_segment_books_a_benefit(tmp_path):
     decision = propose(harness.plan, harness.runner.state, grid_w=5000.0)
     assert decision.batteries[0].override is True
     # Nothing is proven yet, so the deviation books no euro claim at all.
-    assert decision.benefit_eur_h == 0.0
+    assert decision.benefit_eur_h is None
+    assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
     receipts = consume(harness, decision)
     assert receipts[0].status == "accepted"
     harness.gateway.advance_clock(60_000)
     proven = propose(harness.plan, harness.runner.state, grid_w=5000.0,
                      timestamp=NOW_TS + 60, owner_binding=harness.owner.binding)
     assert proven.batteries[0].override is True
-    assert proven.benefit_eur_h > 0.0
+    assert proven.benefit_eur_h is None
+    assert proven.economics_reasons == ("tick_settlement_basis_unavailable",)
 
 
 def test_09_an_unaccepted_segment_books_nothing_at_all(tmp_path):
@@ -1237,11 +1245,12 @@ def test_09_an_unaccepted_segment_books_nothing_at_all(tmp_path):
     assert controller.execution_status == "unconfirmed"
     assert controller.recovery_required is True
     assert controller.last_command_w == 0.0
-    assert harness.runner.state.saved_today_eur == 0.0
+    assert harness.runner.state.saved_today_eur is None
     harness.gateway.advance_clock(60_000)
     again = propose(harness.plan, harness.runner.state, grid_w=5000.0,
                     timestamp=NOW_TS + 60)
-    assert again.benefit_eur_h == 0.0
+    assert again.benefit_eur_h is None
+    assert again.economics_reasons == ("tick_settlement_basis_unavailable",)
 
 
 def test_10_a_diagnostics_overlap_is_refused_without_any_command(tmp_path):
@@ -1721,23 +1730,65 @@ def test_23_one_writer_wins_and_the_second_one_is_refused(tmp_path):
     assert len(harness.gateway.effect_log) == 3
 
 
+@pytest.mark.parametrize("outcome", ["confirmed", "rejected", "unconfirmed", "stop", "restart"])
+def test_f3b6_policy_is_proposal_and_v2_tick_is_unknown(tmp_path, outcome):
+    harness = build(tmp_path)
+    try:
+        decision = propose(harness.plan, harness.runner.state, grid_w=5000)
+        assert decision.benefit_eur_h is None
+        assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
+        if outcome == "rejected":
+            harness.gateway.helper_ok["setpoint"] = False
+        elif outcome == "unconfirmed":
+            harness.gateway.lose_ack()
+        receipts = consume(harness, decision)
+        if outcome in ("confirmed", "stop", "restart"):
+            assert receipts[0].status == "accepted"
+            assert harness.runner.state.battery(0)._current_accepted_command is not None
+        if outcome == "stop":
+            barrier = stop(harness, reason="operator_stop")
+            harness.runner._apply_stop_barrier(barrier, now_ms=NOW)
+        elif outcome == "restart":
+            harness.runner.state = ControllerState.from_dict(harness.runner.state.to_dict())
+        if outcome != "confirmed":
+            assert harness.runner.state.battery(0)._current_accepted_command is None
+        sample = Measurement(NOW_TS, 5000, [BatteryMeasurement(soc=50, power_w=0)])
+        context = harness.runner._capture_economic_context(
+            harness.plan, sample, mode="active", previous=None, decision=decision)
+        if outcome == "confirmed":
+            command = harness.runner.state.battery(0)._current_accepted_command
+            assert context.execution_references == (("accu", command.command_id),)
+            assert context.batteries[0].effective_w == command.setpoint_w
+        else:
+            assert context.execution_references == (("accu", None),)
+        assert decision.benefit_eur_h is None
+        assert all(b.benefit_eur_h is None for b in decision.batteries)
+        assert harness.runner.state.saved_today_eur is None
+    finally:
+        harness.lease.close()
+
+
 def test_24_the_real_euro_bookkeeping_follows_the_acceptance(tmp_path):
     """The bookkeeping of the runner books a proven segment and nothing else."""
     harness = build(tmp_path)
     decision = propose(harness.plan, harness.runner.state, grid_w=5000.0)
     # Nothing is proven: the real booking books nothing.
-    harness.runner._book_saving(decision, elapsed_h=1.0)
-    assert decision.benefit_eur_h == 0.0
-    assert harness.runner.state.saved_today_eur == 0.0
+    sample = Measurement(NOW_TS, 5000, [BatteryMeasurement(soc=50, power_w=0)])
+    observed = harness.runner._capture_economic_context(harness.plan, sample, mode="active", previous=None)
+    harness.runner._book_saving(previous=None, observed=observed, now=NOW_TS)
+    assert decision.benefit_eur_h is None
+    assert harness.runner.state.saved_today_eur is None
     receipts = consume(harness, decision)
     assert receipts[0].status == "accepted"
     harness.gateway.advance_clock(60_000)
     proven = propose(harness.plan, harness.runner.state, grid_w=5000.0,
                      timestamp=NOW_TS + 60, owner_binding=harness.owner.binding)
-    assert proven.benefit_eur_h > 0.0
-    harness.runner._book_saving(proven, elapsed_h=1 / 60, plan=harness.plan,
-                                owner_binding=harness.owner.binding)
-    assert harness.runner.state.saved_today_eur == pytest.approx(proven.benefit_eur_h / 60)
+    assert proven.benefit_eur_h is None
+    current = harness.runner._capture_economic_context(
+        harness.plan, replace(sample, timestamp=NOW_TS + 60), mode="active", previous=observed)
+    harness.runner._book_saving(previous=observed, observed=current, now=NOW_TS + 60)
+    assert harness.runner.state.saved_today_eur is None
+    assert proven.economics_reasons == ("tick_settlement_basis_unavailable",)
 
 
 def test_25_the_barrier_is_compared_field_by_field(tmp_path):

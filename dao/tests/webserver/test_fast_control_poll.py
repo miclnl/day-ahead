@@ -62,6 +62,39 @@ def test_polling_the_state_endpoint_does_not_construct_a_loader(
     assert built == []
 
 
+@pytest.mark.parametrize("mode", ["active", "shadow"])
+@pytest.mark.parametrize("value,version", [(None, "fast_economics_v1"),
+                                           (-.10, "fast_economics_v1"),
+                                           (.25, "old"), ("missing", "old")])
+def test_f3b6_html_and_number_unknown_contract(client, v2_routes, monkeypatch, mode, value, version):
+    def forbidden(*args, **kwargs):
+        pytest.fail("render must not load config or run financial I/O")
+
+    decision = {"mode": mode, "state": "override", "economics_version": version,
+                "economics_reasons": ["tick_execution_unproven"],
+                "economics_status": "unknown" if value is None else "complete",
+                "saved_today_eur": None, "saved_today_is_estimate": True}
+    if value != "missing":
+        decision["benefit_eur_h"] = value
+    state = {"last_decision": decision, "saved_today_eur": None,
+             "events": [{"ts": 123, "kind": "override_start", "benefit_eur_h": .7,
+                         "setpoint_w": 0, "plan_w": 0, "price_import": .3, "price_export": 0}]}
+    monkeypatch.setattr(v2_routes, "_load_fast_state", lambda: state)
+    monkeypatch.setattr(v2_routes, "_load_config", forbidden)
+    monkeypatch.setattr(v2_routes, "_cached_config", lambda: None)
+    for url in ("/v2/fast-control/state", "/v2/fast-control"):
+        response = client.get(url, headers=INGRESS, environ_base=SUPERVISOR)
+        assert response.status_code == 200
+        text = response.get_data(as_text=True)
+        assert "Geraamd voordeel" in text
+        assert "onbekend" in text.lower()
+        assert "tick_execution_unproven" in text
+        if value == -.10:
+            assert "-0.1" in text
+        if url == "/v2/fast-control":
+            assert "legacy_estimate_unverified" in text
+
+
 def test_the_state_endpoint_renders_what_the_runner_wrote(
     client, v2_routes, monkeypatch
 ):

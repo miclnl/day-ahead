@@ -153,9 +153,19 @@ def _decision(value: BatteryDecision) -> None:
     if type(value.index) is not int or value.index < 0:
         raise ValueError("replay_battery_mapping_invalid")
     _text(value.name, "replay_battery_mapping_invalid")
-    for name in ("setpoint_w", "plan_w", "benefit_eur_h", "storage_value",
+    for name in ("setpoint_w", "plan_w", "storage_value",
                  "budget_used_kwh", "daily_used_kwh"):
         _number(getattr(value, name))
+    if value.benefit_eur_h is not None:
+        _number(value.benefit_eur_h)
+    _number(value.proposal_benefit_eur_h)
+    _typed(value.economics_version, str)
+    _boolean(value.economics_is_estimate)
+    _choice(value.economics_kind, ("legacy_tick_estimate", "settlement_counterfactual", "unavailable"))
+    _choice(value.economics_status, ("complete", "partial", "unknown"))
+    _typed(value.economics_reasons, tuple)
+    for reason in value.economics_reasons:
+        _typed(reason, str)
     _soc(value.soc)
     for name in ("write", "override", "restores"):
         _boolean(getattr(value, name))

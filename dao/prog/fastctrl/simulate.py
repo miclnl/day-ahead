@@ -28,7 +28,7 @@ import logging
 import math
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from decimal import Decimal, localcontext
 from typing import Callable, Literal, Optional, Sequence
 
@@ -63,6 +63,26 @@ from .replay_execution import (
     SocByBattery,
     model_namespace,
     validate_replay_input,
+)
+from .replay_finance import (
+    BatteryFinancialTotals,
+    FinancialReconciliation,
+    FinancialStatus,
+    PeriodStatus,
+    ReplayCostComponents,
+    ReplayFinancialComparison,
+    ReplayFinancialResult,
+    ReplayPhysicalTotals,
+    ReplaySourceBinding,
+    ReplaySourceEvidence,
+    SourceValidation,
+    bind_source_evidence,
+    compare_financial_results,
+    project_replay_inputs,
+    replay_scenario_digest,
+    settle_replay,
+    unknown_replay_financial,
+    validate_source_evidence,
 )
 
 #: Default AC/DC conversion efficiency used by the simulation battery model when
@@ -258,6 +278,7 @@ class _ReplayBasisView:
     opening: SettlementState | None
     terminal: TerminalValue | None
     reasons: Reasons
+    replay_basis: ReplayBasis | None = None
 
 
 def _prepare_replay_basis(
@@ -300,7 +321,7 @@ def _prepare_replay_basis(
     except (ValueError, TypeError, AttributeError):
         return _ReplayBasisView(source, execution, None, None, None, ("replay_basis_mismatch",))
     return _ReplayBasisView(source, execution, replay_basis.quotes,
-                            replay_basis.opening, replay_basis.terminal_value, ())
+                            replay_basis.opening, replay_basis.terminal_value, (), replay_basis)
 
 
 @dataclass(frozen=True)
@@ -513,6 +534,9 @@ class DayMetrics:
     peak_import_w: float | None = 0.0
     writes: int = 0
     override_s: float | None = 0.0
+    terminal_value: float | None = None
+    total_cost: float | None = None
+    financial_components: ReplayCostComponents | None = None
 
 
 @dataclass
@@ -548,10 +572,21 @@ class SimResult:
     soc_start_by_battery: SocByBattery = ()
     soc_end_by_battery: SocByBattery = ()
     settlement_comparison_pending: bool = False
+    financial_result: ReplayFinancialResult | None = None
+    financial_status: FinancialStatus = "unknown"
+    financial_reasons: tuple[str, ...] = ()
+    economics_is_estimate: bool = True
+    economics_kind: Literal["legacy_model", "settlement_counterfactual"] = "legacy_model"
+    period_status: PeriodStatus = "unknown"
 
     @property
     def total_cost(self) -> float | None:
         """Energy plus wear, corrected for the energy left in the battery."""
+        if self.financial_result is not None:
+            amount = self.financial_result.components.total_cost.value
+            return float(amount) if self.financial_result.financial_status == "complete" and amount is not None else None
+        if self.economics_kind == "settlement_counterfactual":
+            return None
         if self.energy_cost is None or self.wear_cost is None or self.terminal_value is None:
             return None
         return self.energy_cost + self.wear_cost - self.terminal_value
@@ -581,6 +616,8 @@ def _sum_known(values: Sequence[float | None]) -> float | None:
 def _summarize_replay(
     *, run: _ReplayRun, basis: _ReplayBasisView, replay_input: ReplayInput,
     label: str, timezone: datetime.tzinfo | None,
+    source_binding: ReplaySourceBinding | None = None,
+    source_validation: SourceValidation | None = None,
 ) -> SimResult:
     """Summarize complete quantities only; the segments retain known partials."""
     plan = basis.source_plan
@@ -602,13 +639,10 @@ def _summarize_replay(
         source_plan_digest=run.source_plan_digest, execution_plan_digest=run.execution_plan_digest,
         segments=run.segments, trace=run.trace, soc_start_by_battery=run.soc_start_by_battery,
         soc_end_by_battery=run.soc_end_by_battery, writes=run.writes, override_s=run.override_s,
-        settlement_comparison_pending=plan.format_version == 2, terminal_value=None)
+        terminal_value=None)
     result.soc_series.append((start, result.soc_start))
     reasons = [*basis.reasons, *run.reasons]
-    financial_basis_known = not basis.reasons and (
-        (basis.quotes is not None and basis.opening is not None and basis.terminal is not None)
-        if plan.format_version == 2 else run.execution_kind == "modeled")
-    quotes = {} if basis.quotes is None else {quote.start_ts: quote for quote in basis.quotes}
+    financial_basis_known = not basis.reasons and plan.format_version == 1 and run.execution_kind == "modeled"
     # Only a segment's current accepted command may contribute override time.
     proposals, overrides = {}, {}
     recipe = replay_input.scenario.execution if replay_input.scenario is not None else None
@@ -648,11 +682,13 @@ def _summarize_replay(
 
     complete, any_known = bool(run.segments), False
     day_energy: dict[str, Decimal | None] = {}
+    day_windows = {}
     with localcontext() as context:
         context.prec = 36
         for segment in run.segments:
             day = _day_key(segment.start_ts, timezone)
             metrics = result.days.setdefault(day, DayMetrics(day))
+            day_windows[day] = (day_windows.get(day, (segment.start_ts,))[0], segment.end_ts)
             dt_s = segment.end_ts - segment.start_ts
             batteries = segment.batteries
             site_known = segment.import_kwh is not None and segment.export_kwh is not None
@@ -679,18 +715,10 @@ def _summarize_replay(
             interval = basis.execution_plan.interval_at(segment.start_ts)
             energy_cost = wear_cost = None
             if segment_complete and financial_basis_known and interval is not None:
-                quote = quotes.get(interval.start_ts)
-                if plan.format_version == 1:
-                    import_rate, export_rate = Decimal(str(interval.price_import)), Decimal(str(interval.price_export))
-                elif quote is not None and quote.end_ts >= segment.end_ts:
-                    import_rate, export_rate = quote.import_rate, quote.export_rate
-                else:
-                    reasons.append("replay_quote_coverage_mismatch")
-                    import_rate = export_rate = None
-                if import_rate is not None:
-                    energy_cost = (Decimal(str(segment.import_kwh)) * import_rate
-                                   - Decimal(str(segment.export_kwh)) * export_rate)
-                    wear_cost = sum(specs[b.battery_name].cycle_cost * b.dc_throughput_kwh for b in batteries)
+                import_rate, export_rate = Decimal(str(interval.price_import)), Decimal(str(interval.price_export))
+                energy_cost = (Decimal(str(segment.import_kwh)) * import_rate
+                               - Decimal(str(segment.export_kwh)) * export_rate)
+                wear_cost = sum(specs[b.battery_name].cycle_cost * b.dc_throughput_kwh for b in batteries)
             previous = day_energy.get(day, Decimal(0))
             day_energy[day] = None if previous is None or energy_cost is None else previous + energy_cost
             metrics.wear_cost = _sum_known([metrics.wear_cost, wear_cost])
@@ -711,22 +739,61 @@ def _summarize_replay(
             result.energy_cost = float(sum(day_energy.values()))
             result.wear_cost = _sum_known([day.wear_cost for day in result.days.values()])
             opening, closing = dict(run.soc_start_by_battery), dict(run.soc_end_by_battery)
-            if basis.terminal is not None:
-                efficiencies = dict(basis.terminal.reference_efficiency_by_battery)
-                result.terminal_value = float(sum(
-                    (Decimal(str(closing[name])) - Decimal(str(opening[name])))
-                    * Decimal(str(spec.capacity_kwh)) / Decimal(100)
-                    * efficiencies[name] * basis.terminal.eur_per_ac_kwh for name, spec in specs.items()))
-                result.label = f"reconstruction_base_tariffs: {label}"
-            else:
-                efficiencies = dict(replay_input.inverter_efficiency_by_battery)
-                result.terminal_value = sum((closing[name] - opening[name]) * spec.kwh_per_percent
-                    * plan.price_average * max(.01, spec.discharge_efficiency * efficiencies[name])
-                    for name, spec in specs.items())
+            efficiencies = dict(replay_input.inverter_efficiency_by_battery)
+            result.terminal_value = sum((closing[name] - opening[name]) * spec.kwh_per_percent
+                * plan.price_average * max(.01, spec.discharge_efficiency * efficiencies[name])
+                for name, spec in specs.items())
         else:
             result.energy_cost = result.wear_cost = None
             result.label = "unknown_reconstruction: " + (", ".join(dict.fromkeys(reasons)) or "comparison_unavailable")
     result.reasons = tuple(dict.fromkeys(reasons))
+    if plan.format_version == 2:
+        if basis.replay_basis is None:
+            unavailable = basis.reasons or ("replay_basis_required",)
+            # A fractional opening can already fail the archive's exact opening
+            # check. Retain the financial-window reason without moving either edge.
+            if not all(type(edge) is int or edge.is_integer() for edge in (start, end)):
+                unavailable = (*unavailable, "projection_noninteger_window")
+            financial = unknown_replay_financial(reasons=unavailable)
+        elif run.source_plan_digest is None or run.execution_plan_digest is None:
+            financial = unknown_replay_financial(reasons=("execution_binding_mismatch",))
+        else:
+            if source_binding is None or source_validation is None:
+                source_binding, source_validation = _prepare_source(None, basis, (replay_input,))
+            scenario_digest = replay_scenario_digest(source_plan=basis.source_plan,
+                execution_plan=basis.execution_plan, replay_input=replay_input, trace=run.trace)
+            projection = project_replay_inputs(segments=run.segments, start_ts=start, end_ts=end,
+                replay_basis=basis.replay_basis, source=source_validation, scenario_digest=scenario_digest)
+            opening, closing = dict(run.soc_start_by_battery), dict(run.soc_end_by_battery)
+            totals = ReplayPhysicalTotals(tuple(BatteryFinancialTotals(name,
+                Decimal.from_float(spec.capacity_kwh), Decimal.from_float(spec.cycle_cost),
+                None if opening[name] is None else Decimal.from_float(opening[name]),
+                None if closing[name] is None else Decimal.from_float(closing[name])) for name, spec in specs.items()))
+            financial = settle_replay(projection, basis.replay_basis, totals)
+        result.financial_result = financial
+        result.financial_status, result.financial_reasons = financial.financial_status, financial.financial_reasons
+        result.economics_kind, result.period_status = financial.economics_kind, financial.period_status
+        result.energy_cost = result.wear_cost = result.terminal_value = None
+        if financial.financial_status == "complete":
+            result.energy_cost = float(financial.components.invoice_energy_cost.value)
+            result.wear_cost = float(financial.components.wear_cost.value)
+            result.terminal_value = float(financial.components.terminal_value.value)
+            result.label = f"settlement_counterfactual: {label}"
+        else:
+            result.label = "unknown_reconstruction: " + ", ".join(financial.financial_reasons)
+        # A physical date alone cannot identify a contract day. Attach only the
+        # unique full timezone/window/contract part; retain all physical grouping.
+        for day, metrics in result.days.items():
+            matches = [item for item in financial.days if item.key.local_date == day
+                       and timezone is not None and item.key.timezone == str(timezone)
+                       and (item.start_ts, item.end_ts) == day_windows[day]]
+            if len(matches) == 1:
+                components = matches[0].components
+                metrics.financial_components = components
+                for attribute, component in (("energy_cost", components.invoice_energy_cost),
+                    ("wear_cost", components.wear_cost), ("terminal_value", components.terminal_value),
+                    ("total_cost", components.total_cost)):
+                    setattr(metrics, attribute, None if component.value is None else float(component.value))
     return result
 
 
@@ -738,7 +805,20 @@ class Comparison:
     fast: SimResult
 
     @property
+    def financial_result(self) -> ReplayFinancialComparison | None:
+        if all(result.financial_result is None and result.economics_kind == "legacy_model"
+               for result in (self.baseline, self.fast)):
+            return None
+        return compare_financial_results(*(result.financial_result if result.financial_result is not None else
+            unknown_replay_financial(reasons=("comparison_basis_mismatch",)) for result in (self.baseline, self.fast)))
+
+    @property
     def saving(self) -> float | str:
+        financial = self.financial_result
+        if financial is not None:
+            if financial.advantage_eur is not None:
+                return float(financial.advantage_eur)
+            return "unknown_reconstruction: " + (", ".join(financial.reasons) or "comparison_unavailable")
         if self.baseline.settlement_comparison_pending or self.fast.settlement_comparison_pending:
             return "unknown_reconstruction: settlement_comparison_pending"
         base_cost, fast_cost = self.baseline.total_cost, self.fast.total_cost
@@ -759,29 +839,65 @@ class Comparison:
         base, fast = self.baseline.cycles, self.fast.cycles
         return None if base is None or fast is None else fast - base
 
+    def _metadata(self) -> list[str]:
+        return [f"{result.label}: execution_kind={result.execution_kind}; coverage_status={result.coverage_status}"
+                f"; economics_kind={result.economics_kind}; economics_is_estimate={result.economics_is_estimate}"
+                + (f"; financial_status={result.financial_status}; period_status={result.period_status}"
+                   f"; source_trust={result.financial_result.source_trust}" if result.financial_result is not None else "")
+                + "".join(f"; {key}={value}" for key, value in result.assumptions)
+                for result in (self.baseline, self.fast)]
+
+    def _financial_details(self) -> list[str]:
+        lines = []
+        for label, result in (("baseline", self.baseline), ("fast", self.fast)):
+            if result.financial_result is None:
+                continue
+            for component_field in fields(ReplayCostComponents):
+                metric = component_field.name
+                component = getattr(result.financial_result.components, metric)
+                amount = (f"{component.value} EUR (volledig component)" if component.value is not None else
+                          f"unknown; bekend subtotaal={component.known_subtotal} EUR (geen volledig componenttotaal)")
+                lines.append(f"{label} {metric}: {amount}; {component.status}"
+                             + ("; " + ", ".join(component.reasons) if component.reasons else ""))
+        return lines
+
+    def _diagnostics(self, financial: ReplayFinancialComparison) -> tuple[str, ...]:
+        return ("rekenprecisiediagnose — waargenomen verschil",
+            *_reconciliation_lines("baseline", () if self.baseline.financial_result is None else
+                                  self.baseline.financial_result.reconciliation),
+            *_reconciliation_lines("fast", () if self.fast.financial_result is None else
+                                  self.fast.financial_result.reconciliation),
+            *_reconciliation_lines("advantage", financial.reconciliation))
+
     def report(self) -> str:
         """Human readable summary, ready for the log or the console."""
         saving = self.saving
-        metadata = [f"{result.label}: execution_kind={result.execution_kind}; coverage_status={result.coverage_status}"
-                    + "".join(f"; {key}={value}" for key, value in result.assumptions)
-                    for result in (self.baseline, self.fast)]
+        financial = self.financial_result
+        metadata = self._metadata()
         if isinstance(saving, str):
-            return "\n".join([saving, *metadata])
+            return "\n".join([saving, *metadata, *([] if financial is None else [
+                *self._financial_details(),
+                _row("Afname net (kWh)", self.baseline.import_kwh, self.fast.import_kwh),
+                _row("Teruglevering (kWh)", self.baseline.export_kwh, self.fast.export_kwh),
+                *self._diagnostics(financial)])])
         base, fast = self.baseline, self.fast
+        base_energy, base_wear, base_terminal = _report_costs(base)
+        fast_energy, fast_wear, fast_terminal = _report_costs(fast)
         days = max(1.0, base.duration_h / 24.0)
         lines = [
             "",
             "=" * 72,
             *metadata,
+            *(self._financial_details() if financial is not None else []),
             f"Fast control backtest over {base.duration_h / 24.0:.1f} dagen",
             "=" * 72,
             f"{'':30}{'zonder':>12}{'met':>12}{'verschil':>14}",
             "-" * 72,
-            _row("Energiekosten (euro)", base.energy_cost, fast.energy_cost),
-            _row("Slijtagekosten (euro)", base.wear_cost, fast.wear_cost),
-            _row("Restwaarde accu (euro)",
-                 None if base.terminal_value is None else -base.terminal_value,
-                 None if fast.terminal_value is None else -fast.terminal_value),
+            _row("Energiekosten (euro)", base_energy, fast_energy),
+            _row("Slijtagekosten (euro)", base_wear, fast_wear),
+            _row("Eindcorrectie accu (euro)" if financial is not None else "Restwaarde accu (euro)",
+                 None if base_terminal is None else -base_terminal,
+                 None if fast_terminal is None else -fast_terminal),
             _row("Totale kosten (euro)", base.total_cost, fast.total_cost),
             "-" * 72,
             _row("Afname net (kWh)", base.import_kwh, fast.import_kwh),
@@ -798,7 +914,7 @@ class Comparison:
             f"{_number(None if fast.override_s is None else fast.override_s / 3600, '.1f'):>12}",
             "=" * 72,
             f"Besparing: {self.saving:.2f} euro over {days:.1f} dagen "
-            f"= {self.saving_per_day:.3f} euro/dag "
+            f"— geraamde extrapolatie: {self.saving_per_day:.3f} euro/dag "
             f"= {self.saving_per_day * 365:.0f} euro/jaar",
             f"Extra cycli: {_number(self.extra_cycles, '+.2f')} over de periode "
             f"({_number(None if self.extra_cycles is None else self.extra_cycles / days * 365, '+.0f')} per jaar)",
@@ -810,11 +926,44 @@ class Comparison:
                 f"{self.saving / extra:.3f} euro/kWh"
             )
         lines.append("=" * 72)
+        if financial is not None:
+            lines.extend(("Eindcorrectie: terminale modelwaarde, geen kasopbrengst.", *self._diagnostics(financial)))
         lines.append("")
         return "\n".join(lines)
 
     def daily_table(self) -> str:
         """Per day breakdown so outliers can be inspected."""
+        financial = self.financial_result
+        if financial is not None:
+            saving = self.saving
+            lines = ([saving] if isinstance(saving, str) else []) + self._metadata()
+            lines.extend(("Financiële contractdagen — settlement_counterfactual (raming)",
+                "datum [timezone; contract; contractstart] | zonder | met | voordeel | "
+                "eindcorrectie zonder/met | maandcredit zonder/met | cycli | piek W | writes"))
+            sides = tuple({day.key: day for day in result.financial_result.days}
+                          if result.financial_result is not None else {} for result in (self.baseline, self.fast))
+            for advantage in financial.days:
+                key = advantage.key
+                base, fast = (days.get(key) for days in sides)
+
+                def amount(day, metric):
+                    return None if day is None else getattr(day.components, metric).value
+
+                # Only the summarizer's proven full-window attachment can supply
+                # physical columns; equal date strings in other zones cannot.
+                metrics = next((day for day in self.fast.days.values() if fast is not None
+                                and day.financial_components is fast.components), None)
+                cycles = (None if metrics is None or metrics.throughput_kwh is None else
+                          metrics.throughput_kwh / (2 * self.fast.capacity_kwh) if self.fast.capacity_kwh else 0.0)
+                lines.append(f"{key.local_date} [{key.timezone}; {key.contract_id}; {key.contract_start_ts}] | "
+                    f"{_number(amount(base, 'total_cost'), '.2f')} | {_number(amount(fast, 'total_cost'), '.2f')} | "
+                    f"{_number(advantage.advantage_eur, '.3f')} | "
+                    f"{_number(amount(base, 'terminal_value'), '.2f')}/{_number(amount(fast, 'terminal_value'), '.2f')} | "
+                    f"{_number(amount(base, 'month_credit'), '.2f')}/{_number(amount(fast, 'month_credit'), '.2f')} | "
+                    f"{_number(cycles, '.2f')} | {_number(None if metrics is None else metrics.peak_import_w, '.0f')} | "
+                    f"{_number(None if metrics is None else metrics.writes, '.0f')}")
+            lines.extend(self._diagnostics(financial))
+            return "\n".join(lines)
         saving = self.saving
         if isinstance(saving, str):
             return saving
@@ -842,7 +991,38 @@ class Comparison:
         return "\n".join(lines)
 
 
-def _number(value: float | None, spec: str) -> str:
+def _report_costs(result: SimResult) -> tuple[float | None, float | None, float | None]:
+    """Rounded report columns share the wrapper authority, including old constructors."""
+    if result.financial_result is None:
+        return result.energy_cost, result.wear_cost, result.terminal_value
+    components = result.financial_result.components
+    return tuple(None if component.value is None else float(component.value) for component in (
+        components.invoice_energy_cost, components.wear_cost, components.terminal_value))
+
+
+def _reconciliation_lines(label: str, entries: tuple[FinancialReconciliation, ...]) -> tuple[str, ...]:
+    """Lossless producer diagnostics, never a booking or a new monetary sum."""
+    if not entries:
+        return (f"{label}: unknown/reconciliation_not_computed; totaal minus exacte dagsom; "
+                "T=unknown; S=unknown; Δ=unknown (geen boeking)",)
+    lines, equal = [], []
+    for entry in entries:
+        if entry.status == "equal":
+            equal.append(entry.metric)
+            continue
+        total = "unknown" if entry.authoritative_total is None else str(entry.authoritative_total)
+        day_sum = "unknown" if entry.day_sum is None else str(entry.day_sum)
+        difference = ("unknown" if entry.difference is None else
+                      ("+" if entry.difference > 0 else "") + str(entry.difference) + " EUR")
+        lines.append(f"{label} {entry.metric}: {entry.status}; totaal minus exacte dagsom; "
+                     f"T={total}; S={day_sum}; Δ={difference} (geen boeking)"
+                     + ("; " + ", ".join(entry.reasons) if entry.reasons else ""))
+    if equal:
+        lines.append(f"{label}: equal — exacte aansluiting ({', '.join(equal)}); geen boeking")
+    return tuple(lines)
+
+
+def _number(value: float | Decimal | None, spec: str) -> str:
     return "unknown" if value is None else format(value, spec)
 
 
@@ -881,6 +1061,30 @@ def aggregate_spec(specs: Sequence[BatterySpec], name: str = "totaal") -> Batter
     )
 
 
+def _prepare_source(
+    evidence: ReplaySourceEvidence | None, basis: _ReplayBasisView, inputs: tuple[ReplayInput, ...],
+) -> tuple[ReplaySourceBinding | None, SourceValidation | None]:
+    """Validate caller shape even without a usable archive, before physical runs."""
+    if evidence is not None and type(evidence) is not ReplaySourceEvidence:
+        raise TypeError("source_type_invalid")
+    if basis.replay_basis is None or _replay_digest(basis.source_plan) is None:
+        return None, None
+    binding = bind_source_evidence(evidence, source_plan=basis.source_plan,
+                                   replay_basis=basis.replay_basis, replay_inputs=inputs)
+    return binding, validate_source_evidence(evidence, binding)
+
+
+def _simulate_prepared(
+    *, basis: _ReplayBasisView, replay_input: ReplayInput, limits: PolicyLimits,
+    label: str, use_fast_layer: bool, timezone: datetime.tzinfo | None,
+    source_binding: ReplaySourceBinding | None, source_validation: SourceValidation | None,
+) -> SimResult:
+    run = _run_replay(basis=basis, replay_input=replay_input, limits=limits,
+                      use_fast_layer=use_fast_layer, timezone=timezone)
+    return _summarize_replay(run=run, basis=basis, replay_input=replay_input,
+        label=label, timezone=timezone, source_binding=source_binding, source_validation=source_validation)
+
+
 def simulate(
     plan: FastPlan,
     samples: Sequence[Sample],
@@ -893,11 +1097,12 @@ def simulate(
     *,
     replay_basis: ReplayBasis | None = None,
     execution: ReplayScenario | None = None,
+    source_evidence: ReplaySourceEvidence | None = None,
 ) -> SimResult:
     """Replay explicit execution and physical assumptions; absent execution is unknown.
 
-    Archived quotes/opening/terminal support base-tariff reconstruction only.
-    Settlement comparisons remain pending; this pure path performs no I/O.
+    A complete archived basis supports a normalized settlement counterfactual.
+    Source assertions confer no execution authority; this pure path performs no I/O.
     """
     replay_input = validate_replay_input(
         plan=plan, sample_points=tuple((sample.timestamp, sample.house_w) for sample in samples),
@@ -907,10 +1112,10 @@ def simulate(
         plan, start_ts=replay_input.sample_points[0][0], replay_basis=replay_basis,
         recorded=execution is not None and isinstance(execution.execution, RecordedExecution),
     )
-    run = _run_replay(basis=basis, replay_input=replay_input, limits=limits,
-                      use_fast_layer=use_fast_layer, timezone=timezone)
-    return _summarize_replay(run=run, basis=basis, replay_input=replay_input,
-                             label=label, timezone=timezone)
+    binding, validation = _prepare_source(source_evidence, basis, (replay_input,))
+    return _simulate_prepared(basis=basis, replay_input=replay_input, limits=limits,
+        label=label, use_fast_layer=use_fast_layer, timezone=timezone,
+        source_binding=binding, source_validation=validation)
 
 
 def compare(
@@ -924,34 +1129,21 @@ def compare(
     replay_basis: ReplayBasis | None = None,
     baseline_execution: ReplayScenario | None = None,
     fast_execution: ReplayScenario | None = None,
+    source_evidence: ReplaySourceEvidence | None = None,
 ) -> Comparison:
     """Run independent execution scenarios on identical plan/house/basis inputs."""
-    return Comparison(
-        baseline=simulate(
-            plan,
-            samples,
-            limits,
-            soc_start,
-            "day-ahead",
-            use_fast_layer=False,
-            inverter_efficiency=inverter_efficiency,
-            timezone=timezone,
-            replay_basis=replay_basis,
-            execution=baseline_execution,
-        ),
-        fast=simulate(
-            plan,
-            samples,
-            limits,
-            soc_start,
-            "day-ahead + fast",
-            use_fast_layer=True,
-            inverter_efficiency=inverter_efficiency,
-            timezone=timezone,
-            replay_basis=replay_basis,
-            execution=fast_execution,
-        ),
-    )
+    points = tuple((sample.timestamp, sample.house_w) for sample in samples)
+    inputs = tuple(validate_replay_input(plan=plan, sample_points=points, soc_start=soc_start,
+        inverter_efficiency=inverter_efficiency, scenario=scenario)
+        for scenario in (baseline_execution, fast_execution))
+    bases = tuple(_prepare_replay_basis(plan, start_ts=points[0][0], replay_basis=replay_basis,
+        recorded=item.scenario is not None and isinstance(item.scenario.execution, RecordedExecution))
+        for item in inputs)
+    binding, validation = _prepare_source(source_evidence, bases[0], inputs)
+    return Comparison(*(_simulate_prepared(basis=basis, replay_input=item, limits=limits,
+        label="day-ahead + fast" if fast else "day-ahead", use_fast_layer=fast, timezone=timezone,
+        source_binding=binding, source_validation=validation)
+        for basis, item, fast in zip(bases, inputs, (False, True), strict=True)))
 
 
 def _collapse(interval: PlanInterval) -> PlanInterval:

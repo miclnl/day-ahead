@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 from .command import ActuationReceipt, BatteryCommand, OwnerBinding, plan_digest
 from .plan import (
@@ -264,11 +264,9 @@ class ControllerState:
     #: Local date the daily budgets belong to, as ``YYYY-MM-DD``.
     day_key: str = ""
     #: Estimated saving accumulated since midnight, in euro.
-    saved_today_eur: float = 0.0
-    #: True once any part of today's saved_today_eur came from a tick where
-    #: the layer was not actually writing (shadow or off): the figure is
-    #: then a projection, not a measured saving, for at least part of today.
-    saved_today_is_estimate: bool = False
+    saved_today_eur: float | None = None
+    #: Money is a model estimate even when helpers confirm an active command.
+    saved_today_is_estimate: bool = True
     last_tick_ts: float = 0.0
     #: Snapshot of the most recent :class:`Decision` attributes, or ``None``
     #: before the first tick. Used to surface the layer's last verdict to the
@@ -286,6 +284,18 @@ class ControllerState:
     #: the charge and the discharge side of an override cycle so the budget
     #: cannot be silently exhausted by oscillating around zero.
     energy_budget_used: float = 0.0
+    saved_today_known_subtotal_eur: float = 0.0
+    economics_version: str = "fast_economics_v1"
+    economics_is_estimate: bool = True
+    economics_kind: Literal["legacy_tick_estimate", "settlement_counterfactual", "unavailable"] = "unavailable"
+    economics_status: Literal["complete", "partial", "unknown"] = "unknown"
+    economics_reasons: tuple[str, ...] = ("day_coverage_missing",)
+    economics_day_key: str = ""
+    economics_covered_from_ts: float | None = None
+    economics_covered_until_ts: float | None = None
+    economics_unknown_latched: bool = True
+    historical_saved_today_eur: float | None = None
+    historical_economics_status: str | None = None
 
     def battery(self, index: int) -> BatteryControllerState:
         while len(self.batteries) <= index:
@@ -321,20 +331,25 @@ class ControllerState:
             "events": list(self.events),
             "daily_extra_throughput_used": self.daily_extra_throughput_used,
             "energy_budget_used": self.energy_budget_used,
+            **{name: getattr(self, name) for name in (
+                "saved_today_known_subtotal_eur", "economics_version", "economics_is_estimate",
+                "economics_kind", "economics_status", "economics_reasons", "economics_day_key",
+                "economics_covered_from_ts", "economics_covered_until_ts", "economics_unknown_latched",
+                "historical_saved_today_eur", "historical_economics_status")},
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "ControllerState":
         data = data or {}
-        return cls(
+        result = cls(
             batteries=[
                 BatteryControllerState.from_dict(b) for b in data.get("batteries", [])
             ],
             plan_created_ts=int(data.get("plan_created_ts", 0)),
             interval_start_ts=int(data.get("interval_start_ts", 0)),
             day_key=str(data.get("day_key", "")),
-            saved_today_eur=float(data.get("saved_today_eur", 0.0)),
-            saved_today_is_estimate=bool(data.get("saved_today_is_estimate", False)),
+            saved_today_eur=None,
+            saved_today_is_estimate=True,
             last_tick_ts=float(data.get("last_tick_ts", 0.0)),
             last_decision=data.get("last_decision"),
             events=list(data.get("events", [])),
@@ -343,6 +358,38 @@ class ControllerState:
             ),
             energy_budget_used=float(data.get("energy_budget_used", 0.0)),
         )
+        new = data.get("economics_version") == "fast_economics_v1"
+        result.saved_today_known_subtotal_eur = data.get("saved_today_known_subtotal_eur", 0.0)
+        result.historical_saved_today_eur = data.get("historical_saved_today_eur")
+        result.historical_economics_status = data.get("historical_economics_status")
+        amount = data.get("saved_today_eur")
+        if amount is not None:
+            result.historical_saved_today_eur = amount
+            result.historical_economics_status = (data.get("economics_status", "unknown") if new
+                                                 else "legacy_estimate_unverified")
+        if new and (data.get("economics_day_key") or data.get("economics_covered_from_ts") is not None):
+            result.economics_day_key = data.get("economics_day_key", "")
+            result.economics_reasons = ("restart_coverage_missing",)
+        elif new and amount is None:
+            result.economics_reasons = tuple(data.get("economics_reasons", ("day_coverage_missing",)))
+        result.last_decision = _historical_economics(result.last_decision)
+        result.events = [_historical_economics(event) for event in result.events]
+        return result
+
+
+def _historical_economics(value: dict | None) -> dict | None:
+    if value is None:
+        return None
+    result = dict(value)
+    result["economics_is_estimate"] = True
+    if "saved_today_is_estimate" in result:
+        result["saved_today_is_estimate"] = True
+    if result.get("economics_version") != "fast_economics_v1":
+        result["historical_economics_status"] = "legacy_estimate_unverified"
+        if "benefit_eur_h" in result:
+            result["legacy_benefit_eur_h"] = result["benefit_eur_h"]
+        result["economics_status"] = "unknown"
+    return result
 
 
 @dataclass(frozen=True)
@@ -369,7 +416,7 @@ class BatteryDecision:
     #: True while the layer is deviating from the plan.
     override: bool
     reason: str
-    benefit_eur_h: float = 0.0
+    benefit_eur_h: float | None = None
     storage_value: float = 0.0
     #: Operating mode to write, None means leave alone.
     mode: Optional[str] = None
@@ -383,6 +430,12 @@ class BatteryDecision:
     actuation_status: str | None = None
     #: This command restores the optimizer's mode/stop, rather than clearing it.
     restores: bool = False
+    proposal_benefit_eur_h: float = 0.0
+    economics_version: str = "fast_economics_v1"
+    economics_is_estimate: bool = True
+    economics_kind: Literal["legacy_tick_estimate", "settlement_counterfactual", "unavailable"] = "unavailable"
+    economics_status: Literal["complete", "partial", "unknown"] = "unknown"
+    economics_reasons: tuple[str, ...] = ("tick_execution_unproven",)
 
 
 def apply_actuation_receipt(state: BatteryControllerState, receipt: ActuationReceipt) -> None:
@@ -498,7 +551,13 @@ class Decision:
     price_import: float = 0.0
     price_export: float = 0.0
     reason: str = "plan"
-    benefit_eur_h: float = 0.0
+    benefit_eur_h: float | None = None
+    proposal_benefit_eur_h: float = 0.0
+    economics_version: str = "fast_economics_v1"
+    economics_is_estimate: bool = True
+    economics_kind: Literal["legacy_tick_estimate", "settlement_counterfactual", "unavailable"] = "unavailable"
+    economics_status: Literal["complete", "partial", "unknown"] = "unknown"
+    economics_reasons: tuple[str, ...] = ("tick_execution_unproven",)
 
     @property
     def override(self) -> bool:
@@ -519,7 +578,7 @@ class Decision:
             "deviation_w": round(self.deviation_w),
             "price_import": round(self.price_import, 4),
             "price_export": round(self.price_export, 4),
-            "benefit_eur_h": round(self.benefit_eur_h, 4),
+            **_economic_attributes(self),
             "batteries": [
                 {
                     "name": b.name,
@@ -532,10 +591,20 @@ class Decision:
                     "budget_used_kwh": round(b.budget_used_kwh, 3),
                     "daily_used_kwh": round(b.daily_used_kwh, 3),
                     "actuation_status": b.actuation_status,
+                    **_economic_attributes(b),
                 }
                 for b in self.batteries
             ],
         }
+
+
+def _economic_attributes(value: Decision | BatteryDecision) -> dict:
+    return {"benefit_eur_h": (round(value.benefit_eur_h, 4)
+                              if value.benefit_eur_h is not None else None),
+            "economics_reasons": list(value.economics_reasons),
+            **{name: getattr(value, name) for name in (
+                "proposal_benefit_eur_h", "economics_version", "economics_is_estimate",
+                "economics_kind", "economics_status")}}
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +647,128 @@ class CostModel:
             return low
         candidates = {low, high, _clamp(0.0, low, high), _clamp(-self.house_w, low, high)}
         return min(candidates, key=lambda p: (self(p), abs(p)))
+
+
+# ---------------------------------------------------------------------------
+# effective legacy tick valuation
+# ---------------------------------------------------------------------------
+
+
+def _validate_tick_number(value: float | None, *, nullable: bool = False) -> None:
+    """Accept only immutable built-in numbers, with explicit missingness."""
+    if value is None and nullable:
+        return
+    if type(value) not in (int, float):
+        raise TypeError("tick_number_required")
+    if not math.isfinite(value):
+        raise ValueError("tick_nonfinite_input")
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyBatteryValuation:
+    """Legacy parameters and effective response, in configuration order."""
+
+    name: str
+    baseline_w: float
+    effective_w: float | None
+    storage_value: float
+    cycle_cost: float
+    round_trip_efficiency: float
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str:
+            raise TypeError("tick_battery_name_required")
+        for value in (self.baseline_w, self.storage_value, self.cycle_cost, self.round_trip_efficiency):
+            _validate_tick_number(value)
+        _validate_tick_number(self.effective_w, nullable=True)
+
+
+@dataclass(frozen=True, slots=True)
+class TickEconomics:
+    """Economic observation only; this record conveys no execution right."""
+
+    benefit_eur_h: float | None
+    by_battery: tuple[tuple[str, float | None], ...]
+    status: Literal["complete", "partial", "unknown"]
+    kind: Literal["legacy_tick_estimate", "settlement_counterfactual", "unavailable"]
+    reasons: tuple[str, ...]
+    is_estimate: bool = True
+
+    def __post_init__(self) -> None:
+        _validate_tick_number(self.benefit_eur_h, nullable=True)
+        if type(self.by_battery) is not tuple:
+            raise TypeError("tick_battery_tuple_required")
+        for row in self.by_battery:
+            if type(row) is not tuple or len(row) != 2 or type(row[0]) is not str:
+                raise TypeError("tick_battery_row_required")
+            _validate_tick_number(row[1], nullable=True)
+        if type(self.reasons) is not tuple or any(type(reason) is not str for reason in self.reasons):
+            raise TypeError("tick_reasons_tuple_required")
+        if type(self.status) is not str or self.status not in ("complete", "partial", "unknown"):
+            raise ValueError("tick_status_invalid")
+        if type(self.kind) is not str or self.kind not in (
+            "legacy_tick_estimate", "settlement_counterfactual", "unavailable"
+        ):
+            raise ValueError("tick_kind_invalid")
+        if type(self.is_estimate) is not bool:
+            raise TypeError("tick_estimate_bool_required")
+
+
+def estimate_effective_tick(
+    *,
+    house_w: float | None,
+    price_import: float,
+    price_export: float,
+    batteries: tuple[LegacyBatteryValuation, ...],
+) -> TickEconomics:
+    """Telescope baseline to effective powers using the legacy heuristic.
+
+    Each delta shares one residual for its before/after comparison. Other
+    batteries' local storage/wear costs cancel, so only this battery's own
+    parameters enter its CostModel. Unknown site inputs invalidate every
+    allocation; neither a proposal nor an acceptance can fill that gap here.
+    """
+    names: set[str] = set()
+    values = [price_import, price_export]
+    if house_w is not None:
+        values.append(house_w)
+    for battery in batteries:
+        if not isinstance(battery.name, str) or not battery.name.strip() or battery.name in names:
+            raise ValueError("tick_battery_identity_invalid")
+        names.add(battery.name)
+        values.extend((battery.baseline_w, battery.storage_value, battery.cycle_cost,
+                       battery.round_trip_efficiency))
+        if battery.effective_w is not None:
+            values.append(battery.effective_w)
+    # Validate even when another input is unknown: malformed is not missing.
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError("tick_nonfinite_input")
+    reasons = ()
+    if house_w is None:
+        reasons += ("tick_measurement_missing",)
+    if any(battery.effective_w is None for battery in batteries):
+        reasons += ("tick_execution_unknown",)
+    if reasons:
+        return TickEconomics(None, tuple((battery.name, None) for battery in batteries),
+                             "unknown", "unavailable", reasons)
+
+    residual = house_w + sum(battery.baseline_w for battery in batteries)
+    by_battery = []
+    for battery in batteries:
+        others_w = residual - battery.baseline_w
+        cost = CostModel(
+            house_w=others_w,
+            price_import=price_import,
+            price_export=min(price_export, price_import),
+            storage_value=battery.storage_value,
+            cycle_cost=battery.cycle_cost,
+            round_trip_efficiency=battery.round_trip_efficiency,
+        )
+        benefit = cost(battery.baseline_w) - cost(battery.effective_w)
+        by_battery.append((battery.name, benefit))
+        residual = others_w + battery.effective_w
+    return TickEconomics(sum(value for _, value in by_battery), tuple(by_battery),
+                         "complete", "legacy_tick_estimate", ())
 
 
 # ---------------------------------------------------------------------------
@@ -701,8 +892,8 @@ class FastControlPolicy:
 
         if state.day_key != day_key:
             state.day_key = day_key
-            state.saved_today_eur = 0.0
-            state.saved_today_is_estimate = False
+            state.saved_today_eur = None
+            state.saved_today_is_estimate = True
             for battery in state.batteries:
                 battery.daily_deviation_kwh = 0.0
 
@@ -1051,7 +1242,11 @@ class FastControlPolicy:
             any_override = any_override or battery_decision.override
             residual = others_w + battery_decision.setpoint_w
 
-        decision.benefit_eur_h = total_benefit
+        decision.proposal_benefit_eur_h = total_benefit
+        if plan.format_version == 2:
+            decision.economics_reasons = ("tick_settlement_basis_unavailable",)
+            for battery in decision.batteries:
+                battery.economics_reasons = decision.economics_reasons
         decision.reason = "override" if any_override else "plan"
         return decision
 
@@ -1244,7 +1439,7 @@ class FastControlPolicy:
             write=write,
             override=override,
             reason="+".join(dict.fromkeys(reasons)),
-            benefit_eur_h=benefit,
+            proposal_benefit_eur_h=benefit,
             storage_value=storage_value,
             mode=mode,
             stop_inverter=stop_inverter,
@@ -1378,4 +1573,8 @@ class FastControlPolicy:
                     if plan.format_version == 2 else controller.held_setpoint_w,
                 )
             )
+        if plan.format_version == 2:
+            decision.economics_reasons = ("tick_settlement_basis_unavailable",)
+            for battery in decision.batteries:
+                battery.economics_reasons = decision.economics_reasons
         return decision

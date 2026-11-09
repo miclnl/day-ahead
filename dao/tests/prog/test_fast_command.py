@@ -414,7 +414,8 @@ def test_load_state_recovers_fresh_state_from_corrupt_pending_command_file(tmp_p
     assert restored.batteries == []
     assert restored.battery(0).pending_command is None
     assert restored.battery(0).last_command_w == 0.0
-    assert restored.saved_today_eur == restored.last_tick_ts == 0.0
+    assert restored.saved_today_eur is None
+    assert restored.last_tick_ts == 0.0
 
 
 @pytest.mark.parametrize("kind", ["write", "write_false", "missing_spec", "missing_helpers", "shadow"])

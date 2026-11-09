@@ -6,18 +6,20 @@ import json
 import logging
 import os
 import stat
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from decimal import Decimal, localcontext
 from hashlib import sha256
 
 import pytest
 
+from dao.prog.fastctrl.plan import FastPlan
 from dao.prog.fastctrl.policy import PolicyLimits
 from dao.prog.fastctrl.publication import following_verdict, read_publication
 from dao.prog.fastctrl.simulate import Comparison, HistoryLoader, Sample, log_comparison, simulate
 from dao.prog.settlement.publication import FinancialPlanBlocked
+from dao.prog.settlement.replay import ReplayBasis, _canonical_bytes
 from dao.prog.settlement.tariffs import make_snapshot, quote
-from dao.prog.settlement.types import SettlementState
+from dao.prog.settlement.types import RegisteredSpot, SettlementState, SpotInterval, TariffSnapshot
 from dao.tests.prog.test_fast_simulate import modeled_case
 from dao.tests.settlement.test_fast_contract import ready_plan
 from dao.tests.settlement.test_publication import NOW, START_TS, pricing_config, replay_for_plan
@@ -35,11 +37,444 @@ def synthetic_replay():
     pricing = pricing_config()
     snapshot = make_snapshot(pricing, pricing.settlement.contracts[0])
     plan = ready_plan(hashes=(snapshot.snapshot_hash,))
-    return plan, replay_for_plan(plan, (snapshot,))
+    replay = replay_for_plan(plan, (snapshot,))
+    # A native hour contract needs raw hour prices, even for a quarter replay.
+    spots = tuple(SpotInterval(at, at + 3600, D(".1"), "synthetic-replay", "estimated")
+                  for at in range(NOW // 3600 * 3600, plan.horizon_end_ts, 3600))
+    items = tuple(RegisteredSpot(spot, replay.basis.input_revision,
+                  sha256(_canonical_bytes(asdict(spot))).hexdigest()) for spot in spots)
+    return plan, replace(replay, price_batch=replace(replay.price_batch, items=items,
+        start_ts=spots[0].start_ts, end_ts=spots[-1].end_ts))
 
 
 def bind_replay(plan, replay):
     return replace(plan, financial_context=replace(plan.financial_context, replay_basis_hash=replay.content_hash))
+
+
+def canonical_snapshot(snapshot: TariffSnapshot, **changes) -> TariffSnapshot:
+    """Rehash an explicitly synthetic snapshot using the archive's canonical form."""
+    candidate = replace(snapshot, **changes)
+    content = asdict(candidate)
+    del content["snapshot_hash"]
+    return replace(candidate, snapshot_hash=sha256(_canonical_bytes(content)).hexdigest())
+
+
+def finance_case(*, edges: tuple[int, ...] = (NOW, NOW + 900),
+                  snapshots: tuple[TariffSnapshot, ...] | None = None,
+                  spots: tuple[SpotInterval, ...] | None = None,
+                  opening: SettlementState | None = None,
+                  battery_names: tuple[str, ...] = ("accu",)) -> tuple[FastPlan, ReplayBasis]:
+    """Synthetic archive with exact plan edges and complete native price windows.
+
+    Explicitly missing raw prices retain the synthetic .1 archived quote, so
+    consumers can test missing price evidence without fabricating a raw source.
+    """
+    from dao.prog.settlement.metering import _spot_window, resolve_spot
+
+    if (len(edges) < 2 or any(type(edge) is not int for edge in edges)
+            or any(end <= start for start, end in zip(edges[:-1], edges[1:], strict=True))):
+        raise ValueError("Synthetic finance edges must be ordered integer UTC bounds")
+    plan, replay = synthetic_replay()
+    terminal = replace(replay.terminal_value, reference_efficiency_by_battery=tuple(
+        (name, replay.terminal_value.reference_efficiency_by_battery[0][1]) for name in battery_names))
+    replay = replace(replay, terminal_value=terminal)
+    plan = replace(plan, specs=[replace(plan.specs[0], name=name) for name in battery_names],
+                   financial_context=replace(plan.financial_context, terminal_value=terminal))
+    snapshots = replay.snapshots if snapshots is None else tuple(snapshots)
+    selections = tuple(next(snapshot for snapshot in snapshots if snapshot.valid_from_ts <= start
+                           and (snapshot.valid_to_ts is None or end <= snapshot.valid_to_ts))
+                       for start, end in zip(edges[:-1], edges[1:], strict=True))
+    if spots is None:
+        raw = {}
+        for start, end, snapshot in zip(edges[:-1], edges[1:], selections, strict=True):
+            window_start, window_end, step = _spot_window(snapshot, start, end)
+            for at in range(window_start, window_end, step):
+                raw[(at, at + step)] = SpotInterval(at, at + step, D("0.1"), "synthetic-finance", "estimated")
+        spots = tuple(raw[key] for key in sorted(raw))
+    else:
+        spots = tuple(spots)
+    quotes = []
+    rows = []
+    for start, end, snapshot in zip(edges[:-1], edges[1:], selections, strict=True):
+        resolved = resolve_spot(snapshot, start, end, spots)
+        price = quote(snapshot, start, end, D("0.1") if resolved.price_ex_vat is None else resolved.price_ex_vat)
+        quotes.append(price)
+        rows.append(replace(plan.intervals[0], start_ts=start, end_ts=end,
+                             price_import=float(price.import_rate), price_export=float(price.export_rate),
+                             batteries=[replace(plan.intervals[0].batteries[0], active_from_ts=start, stop_ts=None)
+                                        for _ in battery_names]))
+    basis = replace(replay.basis, snapshot_hashes=tuple(snapshot.snapshot_hash for snapshot in snapshots),
+                    prefix_start_ts=min(replay.basis.prefix_start_ts, edges[0]), planning_start_ts=edges[0],
+                    horizon_end_ts=edges[-1], captured_ts=edges[0], source_watermark_ts=edges[0])
+    items = tuple(RegisteredSpot(spot, 1, sha256(_canonical_bytes(asdict(spot))).hexdigest()) for spot in spots)
+    batch = replace(replay.price_batch, start_ts=min((edges[0], *(spot.start_ts for spot in spots))),
+                    end_ts=max((edges[-1], *(spot.end_ts for spot in spots))), items=items, snapshots=snapshots,
+                    captured_ts=basis.captured_ts, source_watermark_ts=basis.source_watermark_ts)
+    replay = replace(replay, basis=basis, opening=SettlementState(edges[0], None, None) if opening is None else opening,
+                     quotes=tuple(quotes), price_batch=batch)
+    plan = replace(plan, created_ts=edges[0],
+                   interval_s=max(end - start for start, end in zip(edges[:-1], edges[1:], strict=True)),
+                   intervals=rows, price_average=sum(row.price_import for row in rows) / len(rows),
+                   financial_context=replace(plan.financial_context, basis=basis, not_after_ts=edges[-1],
+                                             price_interval_s=snapshots[0].price_interval_seconds))
+    return bind_replay(plan, replay), replay
+
+
+def f3b4_limits(**changes):
+    return PolicyLimits(**(dict(storage_value_mode="fixed", storage_value_fixed=0,
+        min_benefit=0, deadband=0, min_command_interval=0, release_time=0,
+        energy_budget=0, daily_extra_throughput=0, soc_margin=0) | changes))
+
+
+def f3b4_public_case(bonus_rules=None, *, edges=(NOW, NOW + 900, NOW + 1800)):
+    from dao.prog.settlement.types import BonusState
+    from dao.tests.settlement.conftest import YEAR_END_TS
+    from dao.tests.settlement.test_fast_replay_finance import terminal_case
+
+    _, seed = finance_case()
+    snapshot = seed.snapshots[0]
+    if bonus_rules is not None:
+        snapshot = canonical_snapshot(snapshot, bonus=replace(bonus_rules,
+            windows=tuple((month, (0, 24)) for month in range(1, 13))))
+    opening = SettlementState(edges[0], None if bonus_rules is None else
+        BonusState(START_TS, YEAR_END_TS, edges[0], D("4998.5")), None)
+    spots = tuple(SpotInterval(at, at + 3600, D(".20"), "synthetic:f3b4", "estimated")
+                  for at in range(edges[0] // 3600 * 3600, edges[-1], 3600))
+    plan, replay = finance_case(edges=edges, snapshots=(snapshot,), spots=spots, opening=opening)
+    plan, replay = terminal_case(plan, replay, price="0")
+    plan.specs = [replace(plan.specs[0], cycle_cost=0)]
+    for row in plan.intervals:
+        row.batteries = [replace(row.batteries[0], ac_power_w=3000,
+                                mean_ac_power_w=3000, on_power_w=3000)]
+    plan = FastPlan.from_dict(plan.to_dict())
+    return plan, replay, [Sample(at, -4000) for at in edges]
+
+
+def f3b4_source(plan, replay, samples, *, hold=900):
+    from dao.prog.fastctrl import replay_finance as api
+    from dao.prog.fastctrl.command import plan_digest
+
+    reference = api.SourceReference("synthetic:f3b4-topology", "v1", "b" * 64)
+    start, end = replay.basis.planning_start_ts, replay.basis.horizon_end_ts
+    return api.ReplaySourceEvidence(
+        "replay_source_v1", replay.basis.meter_id, replay.basis.meter_id, replay.content_hash,
+        plan_digest(plan), api.replay_environment_digest(
+            tuple((s.timestamp, s.house_w) for s in samples), house_hold_s=hold),
+        tuple(spec.name for spec in plan.specs), ("synthetic:pv",), reference, "synthetic:caller",
+        start, (reference,), start, end,
+        (api.ReplaySourceSpan(start, end, "pv_only_nonbattery_generation", (reference,)),),
+        "both_alternatives")
+
+
+@pytest.mark.parametrize("quarters, advantage", [(1, D(".195")), (2, D(".36"))])
+def test_f3b4_public_compare_uses_two_real_books_and_one_source(monkeypatch, bonus_rules, quarters, advantage):
+    # Catches quote-only valuation, a reused cap book, and clipping a negative saving.
+    from copy import deepcopy
+    from datetime import UTC
+
+    from dao.prog.fastctrl import replay_finance as api
+    from dao.prog.fastctrl.simulate import compare
+
+    plan, replay, samples = f3b4_public_case(bonus_rules, edges=tuple(NOW + 900 * i for i in range(quarters + 1)))
+    source = f3b4_source(plan, replay, samples)
+    baseline, fast = modeled_case("f3b4-base", hold=900), modeled_case("f3b4-fast", hold=900)
+    limits = f3b4_limits()
+    inputs = (plan, replay, samples, source, baseline, fast, limits)
+    before, raw = deepcopy(inputs), (replay.canonical_bytes(), source.canonical_bytes(), json.dumps(plan.to_dict()))
+    calls = []
+    settle = api.settle_series
+
+    def observe(items, snapshots, opening):
+        book = settle(items, snapshots, opening)
+        calls.append((items, snapshots, opening, book))
+        return book
+
+    monkeypatch.setattr(api, "settle_series", observe)
+    result = compare(plan, samples, limits, plan.specs[0].soc_min, timezone=UTC,
+        replay_basis=replay, baseline_execution=baseline, fast_execution=fast, source_evidence=source)
+    assert len(calls) == 2
+    base, fast = result.baseline.financial_result, result.fast.financial_result
+    assert base.projection.source is fast.projection.source
+    assert base.projection.source.binding is fast.projection.source.binding
+    assert base.projection.source.evidence is source
+    assert calls[0][0] is not calls[1][0]
+    assert base.settlement.end_state is not fast.settlement.end_state
+    assert base.settlement == calls[0][3] and fast.settlement == calls[1][3]
+    assert all(pinned is replay.snapshots and opening is replay.opening for _, pinned, opening, _ in calls)
+    assert tuple(item.export_kwh for item in base.projection.items) == (D(".25"),) * quarters
+    assert tuple(item.export_kwh for item in fast.projection.items) == (D("1"),) * quarters
+    if quarters == 2:
+        assert base.settlement.end_state.bonus.total_export_kwh == D("4999")
+        assert fast.settlement.end_state.bonus.total_export_kwh == D("5000.5")
+    for side in (result.baseline, result.fast):
+        wrapper = side.financial_result
+        assert side.coverage_status == side.financial_status == "complete"
+        assert side.economics_is_estimate and side.economics_kind == "settlement_counterfactual"
+        assert wrapper.source_trust == "caller_asserted"
+        assert side.energy_cost == float(wrapper.settlement.net_cost)
+        assert side.total_cost == float(wrapper.components.total_cost.value)
+        assert not side.settlement_comparison_pending
+        assert all(item.input_revision == 0 and item.quality == "estimated"
+                   and "source_trust:caller_asserted" in item.sources for item in wrapper.projection.items)
+    assert result.financial_result.advantage_eur == advantage
+    assert result.saving == float(advantage)
+    reverse = Comparison(result.fast, result.baseline)
+    assert reverse.financial_result.advantage_eur == (D("-.195") if quarters == 1 else D("-.36"))
+    assert reverse.saving < 0
+    for comparison in (result, reverse):
+        assert "caller_asserted" in comparison.report()
+        assert "rekenprecisiediagnose — waargenomen verschil" in comparison.daily_table()
+    assert len(calls) == 2  # Neither comparison nor either report opens another book.
+    assert inputs == before
+    assert (replay.canonical_bytes(), source.canonical_bytes(), json.dumps(plan.to_dict())) == raw
+
+
+@pytest.mark.parametrize("fault, reason", [
+    ("complete", None), ("source", "unknown_bonus_source"), ("basis", "replay_basis_required"),
+    ("mismatch", "source_binding_mismatch"), ("fractional", "projection_noninteger_window"),
+    ("fractional-start", "projection_noninteger_window"),
+])
+def test_f3b4_public_nullable_reports_use_financial_days(bonus_rules, fault, reason):
+    # Catches totals from partial components and joining physical/financial dates.
+    from datetime import UTC
+
+    from dao.prog.fastctrl.simulate import compare
+
+    plan, replay, samples = f3b4_public_case(bonus_rules)
+    if fault == "fractional":
+        samples[-1] = replace(samples[-1], timestamp=samples[-1].timestamp - .25)
+    elif fault == "fractional-start":
+        samples[0] = replace(samples[0], timestamp=samples[0].timestamp + .25)
+    source = f3b4_source(plan, replay, samples)
+    if fault == "mismatch":
+        source = replace(source, meter_id="synthetic:wrong")
+    result = compare(plan, samples, f3b4_limits(), plan.specs[0].soc_min, timezone=UTC,
+        replay_basis=None if fault == "basis" else replay,
+        baseline_execution=modeled_case("nullable-base", hold=900),
+        fast_execution=modeled_case("nullable-fast", hold=900),
+        source_evidence=None if fault == "source" else source)
+    for side in (result.baseline, result.fast):
+        assert side.coverage_status == "complete"
+        assert list(side.days) == ["2026-12-31"]
+        assert all(day.financial_components is day.terminal_value is day.total_cost is None
+                   and day.energy_cost is day.wear_cost is None for day in side.days.values())
+        if reason is not None:
+            assert side.energy_cost is side.wear_cost is side.terminal_value is side.total_cost is None
+            assert reason in side.financial_reasons
+    if fault == "source":
+        assert result.fast.financial_status == "partial"
+        assert result.fast.financial_result.components.base_export_revenue.value == D(".4")
+    outputs = result.report(), result.daily_table()
+    for output in outputs:
+        assert "rekenprecisiediagnose — waargenomen verschil" in output
+        assert "financial_status=" in output
+        if reason is not None:
+            assert output.startswith("unknown_reconstruction:") and reason in output
+            assert "Besparing:" not in output and "euro/jaar" not in output
+        else:
+            assert "settlement_counterfactual" in output
+            assert "eindcorrectie" in output.lower()
+    if reason is None:
+        assert result.financial_result.advantage_eur == D(".36")
+        assert tuple(day.key.local_date for day in result.fast.financial_result.days) == ("2027-01-01",)
+        assert "2027-01-01" in outputs[1] and "Europe/Amsterdam" in outputs[1]
+        assert "2026-12-31" not in outputs[1]
+        assert "geraamde extrapolatie" in outputs[0].lower()
+        assert "euro/dag" in outputs[0] and "euro/jaar" in outputs[0]
+    else:
+        assert result.financial_result.advantage_eur is None
+        assert reason in result.saving
+
+
+def f3b4_report_books(kind):
+    """Real F3b3 books; the report must preserve their independent §24.1 pins."""
+    from datetime import date
+
+    from dao.prog.fastctrl import replay_finance as api
+    from dao.tests.settlement.conftest import MONTH_END_TS
+    from dao.tests.settlement.test_fast_replay_finance import (
+        idle_totals,
+        physical_battery,
+        physical_segment,
+        project_case,
+    )
+
+    start = MONTH_END_TS - 900 if kind == "invoice" else START_TS + 86400 - 900
+    edges = tuple(start + 900 * i for i in range(3 if kind == "invoice" else 4))
+    plan, replay = finance_case(edges=edges)
+    if kind == "invoice":
+        snapshot = canonical_snapshot(replay.snapshots[0],
+            multiplier_consumption=((date(2020, 1, 1), D("1.123456789012")),),
+            vat_consumption=((date(2020, 1, 1), D("21.123456789012")),))
+        spots = tuple(SpotInterval(at, at + 3600, D(".234567890123"), "synthetic:f3b4-report", "estimated")
+                      for at in range(start // 3600 * 3600, edges[-1], 3600))
+        plan, replay = finance_case(edges=edges, snapshots=(snapshot,), spots=spots)
+        runs = tuple(tuple(physical_segment(a, b, imported=amount)
+                     for a, b, amount in zip(edges, edges[1:], amounts, strict=False))
+                     for amounts in ((.125, .125), (.125, .25)))
+        totals = idle_totals(api)
+    else:
+        directions = ("charge", "discharge", "charge") if kind == "mixed" else ("charge",) * 3
+        segments = tuple(physical_segment(a, b, batteries=(physical_battery(
+            charge=amount if direction == "charge" else 0.0,
+            discharge=amount if direction == "discharge" else 0.0, dc=amount,
+            modeled=4000 * amount * (1 if direction == "charge" else -1)),))
+            for a, b, amount, direction in zip(edges, edges[1:], (.125, .125, .5), directions, strict=False))
+        runs = ((physical_segment(edges[0], edges[-1]),), segments)
+        totals = api.ReplayPhysicalTotals((api.BatteryFinancialTotals(
+            "accu", D("10"), D.from_float(.03), D("50"), D("50")),))
+    return tuple(api.settle_replay(project_case(api, plan, replay, segments), replay, totals) for segments in runs)
+
+
+def f3b4_report_comparison(base, fast):
+    from dao.prog.fastctrl.simulate import SimResult
+
+    # Assign additively so pre-implementation RED reaches the real formatter,
+    # rather than stopping at an unsupported constructor keyword.
+    sides = []
+    for label, book in (("baseline", base), ("fast", fast)):
+        result = SimResult(label)
+        result.financial_result = book
+        result.financial_status = book.financial_status
+        result.financial_reasons = book.financial_reasons
+        result.economics_kind = "settlement_counterfactual"
+        result.period_status = book.period_status
+        sides.append(result)
+    return Comparison(*sides)
+
+
+@pytest.mark.parametrize("kind", ["invoice", "charge", "mixed"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_f3b4_reconciliation_reports_exact_text(kind, reverse):
+    # Catches float/cent rendering, hidden small negatives, and rebooked diagnostics.
+    from copy import deepcopy
+    from fractions import Fraction
+
+    from dao.prog.fastctrl import replay_finance as api
+
+    base, fast = f3b4_report_books(kind)
+    if kind == "invoice":
+        totals = (D(".0797982192732042658615844001783507642"), D(".119697328909806398792376600267526146"))
+        fast_days = (D(".0398991096366021329307922000891753821"), D(".0797982192732042658615844001783507642"))
+        delta, advantage_delta = D("-3E-37"), D("3E-37")
+        advantage = D("-.0398991096366021329307922000891753818")
+    else:
+        totals = (D(0), D(".0224999999999999991673327315311325947"))
+        fast_days = (D(".00374999999999999986122212192185543245"), D(".0187499999999999993061106096092771622"))
+        delta, advantage_delta = D("5E-38"), D("-5E-38")
+        advantage = D("-.0224999999999999991673327315311325947")
+    assert (base.components.total_cost.value, fast.components.total_cost.value) == totals
+    assert tuple(day.components.total_cost.value for day in fast.days) == fast_days
+    assert fast.reconciliation[-1].difference == delta
+    assert Fraction(totals[1]) == sum(map(Fraction, fast_days)) + Fraction(delta)
+    comparison = f3b4_report_comparison(fast, base) if reverse else f3b4_report_comparison(base, fast)
+    expected_advantage = advantage.copy_negate() if reverse else advantage
+    expected_delta = advantage_delta.copy_negate() if reverse else advantage_delta
+    financial = api.compare_financial_results(fast, base) if reverse else api.compare_financial_results(base, fast)
+    assert financial.advantage_eur == expected_advantage
+    assert financial.reconciliation[0].difference == expected_delta
+    before = deepcopy((base, fast, financial))
+    report = comparison.report()
+    # Wrapper authority also applies to the existing rounded money columns,
+    # even if an old constructor left compatibility money fields at zero.
+    metric = "Energiekosten" if kind == "invoice" else "Slijtagekosten"
+    row = next(line for line in report.splitlines() if line.startswith(metric))
+    amounts = (("0.12", "0.08", "-0.040") if reverse else ("0.08", "0.12", "+0.040")) if kind == "invoice" else (
+        ("0.02", "0.00", "-0.022") if reverse else ("0.00", "0.02", "+0.022"))
+    assert tuple(row.rsplit(maxsplit=3)[-3:]) == amounts
+    for output in (report, comparison.daily_table()):
+        table, marker, diagnostic = output.partition("rekenprecisiediagnose — waargenomen verschil")
+        assert marker and "totaal minus exacte dagsom" in diagnostic and "geen boeking" in diagnostic
+        assert "€0.00" not in diagnostic
+        for label in ("baseline", "fast", "advantage"):
+            assert label in diagnostic
+        for label, entries in (("baseline", comparison.baseline.financial_result.reconciliation),
+                               ("fast", comparison.fast.financial_result.reconciliation),
+                               ("advantage", comparison.financial_result.reconciliation)):
+            for entry in entries:
+                if entry.status == "equal":
+                    assert "exacte aansluiting" in diagnostic
+                    continue
+                line = next(line for line in diagnostic.splitlines()
+                            if label in line and f"{entry.metric}:" in line)
+                assert "difference" in line
+                assert f"T={entry.authoritative_total}" in line and f"S={entry.day_sum}" in line
+                signed = ("+" if entry.difference > 0 else "") + str(entry.difference)
+                assert f"Δ={signed} EUR" in line
+        assert "Δ=" not in table
+    daily = comparison.daily_table().split("rekenprecisiediagnose — waargenomen verschil")[0]
+    assert len([line for line in daily.splitlines() if line.startswith("2027-")]) == 2
+    for day in base.days:
+        assert daily.count(day.key.local_date) == 1
+    assert (base, fast, comparison.financial_result) == before
+    assert comparison.saving == float(expected_advantage)
+
+
+@pytest.mark.parametrize("fault", ["partial", "basis", "mismatch", "coverage", "defaults", "structure", "mixed"])
+def test_f3b4_reconciliation_reports_unknown_and_defaults(bonus_rules, fault):
+    from dao.prog.fastctrl import replay_finance as api
+    from dao.prog.fastctrl.simulate import SimResult
+
+    base, fast = f3b4_report_books("invoice")
+    reason = None
+    if fault in ("basis", "mismatch"):
+        reason = "replay_basis_required" if fault == "basis" else "source_binding_mismatch"
+        fast = api.unknown_replay_financial(reasons=(reason,))
+    elif fault == "partial":
+        from dao.prog.fastctrl.simulate import compare
+
+        plan, replay, samples = f3b4_public_case(bonus_rules)
+        partial = compare(plan, samples, f3b4_limits(), plan.specs[0].soc_min, replay_basis=replay,
+            baseline_execution=modeled_case("partial-base", hold=900),
+            fast_execution=modeled_case("partial-fast", hold=900))
+        base, fast = partial.baseline.financial_result, partial.fast.financial_result
+        reason = "unknown_bonus_source"
+    elif fault in ("coverage", "structure"):
+        fast = replace(fast, days=fast.days[:-1] if fault == "coverage" else (*fast.days, fast.days[0]))
+        reason = "replay_comparison_coverage_mismatch"
+    else:
+        base, fast = replace(base, reconciliation=()), replace(fast, reconciliation=())
+    comparison = f3b4_report_comparison(base, fast)
+    if fault == "mixed":
+        comparison.baseline = SimResult("legacy model")
+        reason = "comparison_basis_mismatch"
+    if fault == "structure":
+        for method in (comparison.report, comparison.daily_table):
+            with pytest.raises(ValueError, match="^replay_reconciliation_structure_invalid$"):
+                method()
+        return
+    for output in (comparison.report(), comparison.daily_table()):
+        assert "rekenprecisiediagnose — waargenomen verschil" in output
+        diagnostic = output.split("rekenprecisiediagnose — waargenomen verschil", 1)[1]
+        for label, entries in (("baseline", () if comparison.baseline.financial_result is None else
+                                comparison.baseline.financial_result.reconciliation),
+                               ("fast", fast.reconciliation),
+                               ("advantage", comparison.financial_result.reconciliation)):
+            for entry in entries:
+                if entry.status != "unknown":
+                    continue
+                line = next(line for line in diagnostic.splitlines()
+                            if label in line and f"{entry.metric}: unknown" in line)
+                assert "S=unknown; Δ=unknown (geen boeking)" in line
+                assert f"T={'unknown' if entry.authoritative_total is None else entry.authoritative_total}" in line
+                assert all(reason in line for reason in entry.reasons)
+        if reason:
+            assert reason in output and "unknown" in output
+            assert "Besparing:" not in output and "euro/jaar" not in output
+            assert comparison.financial_result.advantage_eur is None
+        if fault in ("defaults", "mixed"):
+            assert "unknown/reconciliation_not_computed" in output
+    if fault == "defaults":
+        simulation = importlib.import_module("dao.prog.fastctrl.simulate")
+        old = api.ReplayFinancialComparison(None, "unknown", ("synthetic:unavailable",), ())
+        text = "\n".join(simulation._reconciliation_lines("advantage", old.reconciliation))
+        assert "unknown/reconciliation_not_computed" in text
+        assert "T=0" not in text and "Δ=0" not in text
+    legacy = Comparison(SimResult("legacy model"), SimResult("legacy model"))
+    assert legacy.financial_result is None
+    for output in (legacy.report(), legacy.daily_table()):
+        assert "settlement_counterfactual" not in output
+        assert "rekenprecisiediagnose" not in output
 
 
 def _f3a8_profile_replay():
@@ -146,13 +581,15 @@ def test_f3a8_public_model_profile_and_terminal_are_independent_per_scenario(mon
         assert result.terminal_value == pytest.approx(float(D("-0.38") * replay.terminal_value.eur_per_ac_kwh) * fraction)
         assert result.energy_cost == pytest.approx(0, abs=1e-12)
         assert result.total_cost == pytest.approx(result.wear_cost - result.terminal_value)
-        assert result.settlement_comparison_pending
+        assert not result.settlement_comparison_pending
+        assert result.financial_status == "complete"
+        assert result.financial_result.settlement.net_cost == D(0)
     assert command_ids[0].isdisjoint(command_ids[1])
     assert comparison.baseline.soc_end_by_battery != comparison.fast.soc_end_by_battery
     assert comparison.baseline.terminal_value != comparison.fast.terminal_value
-    assert comparison.saving == comparison.saving_per_day == "unknown_reconstruction: settlement_comparison_pending"
+    assert comparison.saving == comparison.saving_per_day == float(comparison.financial_result.advantage_eur)
     for output in (comparison.report(), comparison.daily_table()):
-        assert output.startswith(comparison.saving) and "Besparing:" not in output
+        assert "settlement_counterfactual" in output and "settlement_comparison_pending" not in output
     changed = compare(plan, samples, limits, socs, inverter_efficiency=efficiencies, replay_basis=replay,
                       baseline_execution=replace(baseline, execution=replace(baseline.execution, prepare_delay_s=.125)),
                       fast_execution=fast)
@@ -161,7 +598,7 @@ def test_f3a8_public_model_profile_and_terminal_are_independent_per_scenario(mon
     assert (plan, replay, samples, socs, efficiencies, baseline, fast, limits) == before
 
 
-def test_f3a8_replay_has_no_io_or_test_imports(monkeypatch):
+def test_f3a8_replay_has_no_io_or_test_imports(monkeypatch, bonus_rules):
     import ast
     import builtins
     import sys
@@ -176,7 +613,7 @@ def test_f3a8_replay_has_no_io_or_test_imports(monkeypatch):
     import dao.prog.day_ahead as day_ahead
     from dao.prog import da_fast
     from dao.prog.da_base import DaBase
-    from dao.prog.fastctrl import ownership, publication, replay_execution
+    from dao.prog.fastctrl import ownership, publication, replay_execution, replay_finance
     from dao.prog.fastctrl.simulate import compare
     from dao.prog.settlement.publication import SettlementPublication
     from dao.prog.settlement.repository import SettlementRepository
@@ -189,7 +626,7 @@ def test_f3a8_replay_has_no_io_or_test_imports(monkeypatch):
         return any(part in ("tests", "fakes") or part.startswith(("test_", "fake_"))
                    for part in name.split("."))
 
-    for module in (simulation, replay_execution, da_fast):
+    for module in (simulation, replay_execution, replay_finance, da_fast):
         tree = ast.parse(Path(module.__file__).read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -205,10 +642,15 @@ def test_f3a8_replay_has_no_io_or_test_imports(monkeypatch):
     socs, efficiencies = {"accu": 40, "B": 80}, {"accu": .5, "B": 1}
     baseline, fast = modeled_case("pure-base", hold=900), modeled_case("pure-fast", hold=900)
     recorded_plan, recorded_samples, recorded = _f3a8_recorded_timeline()
+    source_plan, source_replay, source_samples = f3b4_public_case(bonus_rules)
+    source = f3b4_source(source_plan, source_replay, source_samples)
+    source_scenarios = modeled_case("pure-source-base", hold=900), modeled_case("pure-source-fast", hold=900)
     limits = PolicyLimits(min_benefit=1e9)
     inputs = (plan, replay, samples, socs, efficiencies, baseline, fast, limits,
-              recorded_plan, recorded_samples, recorded)
+              recorded_plan, recorded_samples, recorded,
+              source_plan, source_replay, source_samples, source, source_scenarios)
     before, archive_bytes = deepcopy(inputs), replay.canonical_bytes()
+    source_bytes = source_replay.canonical_bytes(), source.canonical_bytes(), json.dumps(source_plan.to_dict())
     forbidden_calls = []
 
     def forbid(boundary):
@@ -252,14 +694,28 @@ def test_f3a8_replay_has_no_io_or_test_imports(monkeypatch):
                          replay_basis=replay, baseline_execution=baseline, fast_execution=fast)
     result = simulate(recorded_plan, recorded_samples, limits, socs, "pure recorded", True,
                       inverter_efficiency=efficiencies, execution=recorded)
+    source_comparison = compare(source_plan, source_samples, limits, source_plan.specs[0].soc_min,
+        replay_basis=source_replay, source_evidence=source,
+        baseline_execution=source_scenarios[0], fast_execution=source_scenarios[1])
+    for side in (source_comparison.baseline, source_comparison.fast):
+        assert side.financial_status == "complete"
+        assert side.financial_result.projection.source.evidence is source
+        assert side.financial_result.settlement is not None
+        assert side.financial_result.components.bonus_revenue.value > 0
+    assert source_comparison.baseline.financial_result.settlement is not source_comparison.fast.financial_result.settlement
+    source_comparison.report()
+    source_comparison.daily_table()
     assert comparison.baseline.coverage_status == comparison.fast.coverage_status == "complete"
     assert comparison.baseline.throughput_kwh == comparison.fast.throughput_kwh == pytest.approx(.375)
     assert comparison.baseline.trace and comparison.fast.trace
     assert result.execution_kind == "recorded" and result.writes == 3 and result.trace
     assert result.coverage_status == "partial" and result.soc_end_by_battery[0] == ("accu", None)
     assert result.soc_end_by_battery[1][1] is not None
+    comparison.report()
+    comparison.daily_table()
     assert forbidden_calls == []
     assert inputs == before and replay.canonical_bytes() == archive_bytes
+    assert (source_replay.canonical_bytes(), source.canonical_bytes(), json.dumps(source_plan.to_dict())) == source_bytes
 
 
 def test_archive_is_canonical_content_addressed_immutable_and_opening_sensitive(tmp_path):
@@ -447,7 +903,7 @@ def test_simulate_uses_explicit_archived_quotes_opening_terminal_without_io(monk
     samples = [Sample(NOW, 1000), Sample(NOW + 900, 1000)]
     result = simulate(plan, samples, PolicyLimits(), 50, "sandbox", False, replay_basis=replay,
                       execution=modeled_case("archived-quotes", hold=900))
-    assert result.label.startswith("reconstruction_base_tariffs")
+    assert result.label.startswith("settlement_counterfactual")
     assert result.energy_cost == pytest.approx(0.025)  # 0.25 kWh * archived EUR 0.10, not 999.
     assert result.opening_state is replay.opening
     assert result.replay_terminal_value is replay.terminal_value
@@ -464,7 +920,8 @@ def test_simulate_uses_explicit_archived_quotes_opening_terminal_without_io(monk
     for side in (comparison.baseline, comparison.fast):
         assert side.opening_state is replay.opening
         assert side.replay_terminal_value is replay.terminal_value
-    assert comparison.saving == "unknown_reconstruction: settlement_comparison_pending"
+    assert comparison.saving == float(comparison.financial_result.advantage_eur)
+    assert comparison.baseline.financial_result.settlement.net_cost == D(".025")
 
 
 def test_simulate_terminal_uses_archived_ac_reference_once_not_new_tariff_or_inverter():
@@ -551,12 +1008,11 @@ def test_fix1_valid_replay_policy_uses_average_of_exactly_paired_quotes(monkeypa
 
     plan, replay = synthetic_replay()
     rates = (D("0.1"), D("0.2"), D("0.6"))
-    quotes = tuple(quote(q.snapshot, q.start_ts, q.end_ts, rate)
-                   for q, rate in zip(replay.quotes, rates, strict=True))
-    items = tuple(replace(item, spot=replace(item.spot, price_ex_vat=rate))
-                  for item, rate in zip(replay.price_batch.items, rates, strict=True))
-    replay = replace(replay, quotes=quotes, price_batch=replace(replay.price_batch, items=items))
-    plan = bind_replay(plan, replay)
+    snapshot = canonical_snapshot(replay.snapshots[0], price_interval_seconds=900)
+    edges = (NOW, NOW + 900, NOW + 1800, NOW + 2700)
+    spots = tuple(SpotInterval(start, end, rate, "synthetic:quarter-policy", "estimated")
+                  for start, end, rate in zip(edges[:-1], edges[1:], rates, strict=True))
+    plan, replay = finance_case(edges=edges, snapshots=(snapshot,), spots=spots)
     plan.price_average = 999
     observed = []
     decide = FastControlPolicy.decide
@@ -569,7 +1025,7 @@ def test_fix1_valid_replay_policy_uses_average_of_exactly_paired_quotes(monkeypa
     samples = [Sample(NOW + i * 900, 1000) for i in range(4)]
     result = simulate(plan, samples, PolicyLimits(), 50, "sandbox", True, replay_basis=replay,
                       execution=modeled_case("quote-projection", hold=900))
-    assert result.label.startswith("reconstruction_base_tariffs:")
+    assert result.label.startswith("settlement_counterfactual:")
     assert observed == [(0.3, [0.1, 0.2, 0.6])] * 3
     assert plan.price_average == 999  # The mutable caller plan is not relabelled.
 
@@ -597,7 +1053,7 @@ def test_fix1_comparison_consumers_label_unknown_without_money_or_typeerror(unkn
     if callable(output):
         output = output()
     assert isinstance(output, str) and output.startswith("unknown_reconstruction:")
-    assert "euro" not in output.lower() and "besparing" not in output.lower()
+    assert "Besparing:" not in output and "euro/jaar" not in output
 
 
 @pytest.mark.parametrize("unknown_side", ["baseline", "fast", "both"])
@@ -606,7 +1062,7 @@ def test_fix1_log_comparison_labels_unknown_without_money_or_typeerror(unknown_s
     with caplog.at_level(logging.INFO):
         log_comparison(comparison)
     assert "unknown_reconstruction:" in caplog.text
-    assert "euro" not in caplog.text.lower() and "besparing" not in caplog.text.lower()
+    assert "Besparing:" not in caplog.text and "euro/jaar" not in caplog.text
 
 
 @pytest.mark.parametrize("with_replay", [False, True])
@@ -662,7 +1118,7 @@ def test_f3a6_archived_terminal_per_battery_once():
 
 
 @pytest.mark.parametrize("fault", [None, "missing", "hash"])
-def test_f3a6_v2_comparison_waits_for_settlement(fault, caplog):
+def test_f3a6_v2_comparison_uses_settlement_or_concrete_unknown(fault, caplog):
     from dao.tests.prog.test_fast_simulate import _f3a5_case, _f3a6_result
 
     plan, replay = synthetic_replay()
@@ -674,9 +1130,11 @@ def test_f3a6_v2_comparison_waits_for_settlement(fault, caplog):
     result = _f3a6_result(plan, ((NOW, 1000), (NOW + 900, 1000)), case=_f3a5_case(),
                           replay_basis=None if fault == "missing" else replay)
     assert result.coverage_status == "complete" and result.import_kwh == .25
-    assert result.settlement_comparison_pending is True
+    assert result.settlement_comparison_pending is False
     if fault is None:
-        assert result.label == "reconstruction_base_tariffs: f3a6"
+        assert result.label == "settlement_counterfactual: f3a6"
+        assert result.financial_status == "complete"
+        assert result.financial_result.settlement.net_cost == D(".025")
         assert result.energy_cost == pytest.approx(.025)
         assert result.opening_state is replay.opening
         assert result.replay_terminal_value is replay.terminal_value
@@ -686,10 +1144,15 @@ def test_f3a6_v2_comparison_waits_for_settlement(fault, caplog):
         assert ("replay_basis_required" if fault == "missing" else "replay_basis_mismatch") in result.reasons
         assert result.energy_cost is result.wear_cost is result.terminal_value is result.total_cost is None
     comparison = Comparison(result, result)
-    assert comparison.saving == comparison.saving_per_day == "unknown_reconstruction: settlement_comparison_pending"
-    assert comparison.report().startswith(comparison.saving)
-    assert comparison.daily_table().startswith(comparison.saving)
+    if fault is None:
+        assert comparison.saving == comparison.saving_per_day == 0
+    else:
+        reason = "replay_basis_required" if fault == "missing" else "replay_basis_mismatch"
+        assert reason in comparison.saving and comparison.saving == comparison.saving_per_day
+        assert comparison.report().startswith(comparison.saving)
+        assert comparison.daily_table().startswith(comparison.saving)
     with caplog.at_level(logging.INFO):
         log_comparison(comparison)
-    assert "settlement_comparison_pending" in caplog.text
-    assert "Besparing:" not in caplog.text and "euro" not in caplog.text
+    assert "settlement_comparison_pending" not in caplog.text
+    if fault is not None:
+        assert "Besparing:" not in caplog.text and "euro/jaar" not in caplog.text

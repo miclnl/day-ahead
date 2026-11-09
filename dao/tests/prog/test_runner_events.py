@@ -32,6 +32,26 @@ def workspace(tmp_path):
     }
 
 
+@pytest.mark.parametrize("site", [.15, -.10, None])
+def test_f3b6_event_uses_site_estimate_and_nullable_attributes(workspace, site):
+    runner = _make_runner("active", **workspace)
+    batteries = [BatteryDecision(i, name, power, 0, True, True, "override",
+                                 benefit_eur_h=value)
+                 for i, name, power, value in ((0, "A", -1500, .35), (1, "B", 1000, -.20))]
+    decision = Decision(123, batteries=batteries, benefit_eur_h=site)
+    runner._record_events(decision, "active", (0, 0))
+    assert runner.state.events
+    for event in runner.state.events:
+        assert event["benefit_eur_h"] == site
+        assert event["ts"] == 123
+        assert event["economics_version"] == "fast_economics_v1"
+        assert "economics_status" in event and "economics_kind" in event
+        assert event["proposal_benefit_eur_h"] == 0
+    attributes = decision.as_attributes()
+    assert attributes["benefit_eur_h"] == site
+    assert [b["benefit_eur_h"] for b in attributes["batteries"]] == [.35, -.20]
+
+
 def test_controller_state_roundtrip_includes_new_fields():
     state = ControllerState()
     state.last_decision = {"ts": 1.0, "reason": "plan", "override": False}
@@ -47,8 +67,11 @@ def test_controller_state_roundtrip_includes_new_fields():
     assert serialised["energy_budget_used"] == 0.3
 
     restored = ControllerState.from_dict(serialised)
-    assert restored.last_decision == {"ts": 1.0, "reason": "plan", "override": False}
-    assert restored.events == [{"ts": 1.0, "kind": "override_start"}]
+    assert {"ts": 1.0, "reason": "plan", "override": False}.items() <= restored.last_decision.items()
+    assert {"ts": 1.0, "kind": "override_start"}.items() <= restored.events[0].items()
+    assert len(restored.events) == 1
+    assert restored.events[0]["historical_economics_status"] == "legacy_estimate_unverified"
+    assert restored.last_decision["historical_economics_status"] == "legacy_estimate_unverified"
     assert restored.daily_extra_throughput_used == 1.7
     assert restored.energy_budget_used == 0.3
 

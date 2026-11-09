@@ -41,7 +41,7 @@
 <h2 class="mt-4">Triggers (laatste 50)</h2>
 <table class="table table-sm">
   <thead>
-    <tr><th>tijd</th><th>kind</th><th>reden</th><th>setpoint</th><th>plan</th><th>benefit €/h</th><th>verbruik W</th><th>SoC %</th><th>prijs in/uit</th></tr>
+    <tr><th>tijd</th><th>kind</th><th>reden</th><th>setpoint</th><th>plan</th><th>Geraamd voordeel €/h</th><th>verbruik W</th><th>SoC %</th><th>prijs in/uit</th></tr>
   </thead>
   <tbody>
     {% for event in events %}
@@ -51,7 +51,7 @@
       <td>{{ event.reason }}</td>
       <td>{{ event.setpoint_w | round(0, 'floor') }} W</td>
       <td>{{ event.plan_w | round(0, 'floor') }} W</td>
-      <td>{{ event.benefit_eur_h | round(3) }}</td>
+      <td>{% if event.benefit_eur_h is defined and event.benefit_eur_h is not none %}{% if event.economics_version == 'fast_economics_v1' %}{{ event.benefit_eur_h | round(3) }} (raming){% else %}Historische raming: {{ event.benefit_eur_h | round(3) }} (legacy_estimate_unverified){% endif %}{% else %}onbekend{% endif %} {{ event.economics_reasons | default([]) | join(', ') }}</td>
       <td>{{ event.house_w }}</td>
       <td>{{ event.soc_pct if event.soc_pct is not none else '—' }}</td>
       <td>{{ event.price_import | round(4) }} / {{ event.price_export | round(4) }}</td>

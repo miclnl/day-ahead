@@ -28,6 +28,160 @@ from dao.prog.fastctrl.policy import (
 T0 = 1_700_000_000
 
 
+@pytest.mark.parametrize("field,value", [
+    ("by_battery", [["A", 1.0]]),
+    ("by_battery", (["A", 1.0],)),
+    ("by_battery", (("A", [1.0]),)),
+    ("by_battery", ((["A"], 1.0),)),
+    ("by_battery", (("A",),)),
+    ("by_battery", (("A", 1.0, 2.0),)),
+    ("by_battery", "A"),
+    ("reasons", []),
+    ("reasons", (["missing"],)),
+    ("reasons", (1,)),
+    ("reasons", "missing"),
+    ("benefit_eur_h", []),
+    ("benefit_eur_h", "1.0"),
+    ("benefit_eur_h", True),
+    ("benefit_eur_h", float("nan")),
+    ("by_battery", (("A", float("inf")),)),
+    ("by_battery", (("A", False),)),
+    ("status", ["complete"]),
+    ("status", "invalid"),
+    ("kind", ["legacy_tick_estimate"]),
+    ("kind", "invalid"),
+    ("is_estimate", []),
+    ("is_estimate", 1),
+])
+def test_f3b5_fix1_tick_constructor_rejects_mutable_or_untyped_values(field, value):
+    from dao.prog.fastctrl.policy import TickEconomics
+
+    kwargs = dict(benefit_eur_h=1.0, by_battery=(("A", 1.0),), status="complete",
+                  kind="legacy_tick_estimate", reasons=())
+    kwargs[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        TickEconomics(**kwargs)
+
+
+@pytest.mark.parametrize("field", [
+    "baseline_w", "effective_w", "storage_value", "cycle_cost", "round_trip_efficiency",
+])
+@pytest.mark.parametrize("value", [[], {}, "1.0", True, float("nan"), float("inf"), -float("inf")])
+def test_f3b5_fix1_battery_constructor_rejects_invalid_numbers(field, value):
+    from dao.prog.fastctrl.policy import LegacyBatteryValuation
+
+    kwargs = dict(name="A", baseline_w=0, effective_w=None, storage_value=.2,
+                  cycle_cost=0, round_trip_efficiency=1)
+    kwargs[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        LegacyBatteryValuation(**kwargs)
+
+
+@pytest.mark.parametrize("name", [[], {}, 1, None])
+def test_f3b5_fix1_battery_constructor_rejects_untyped_identity(name):
+    from dao.prog.fastctrl.policy import LegacyBatteryValuation
+
+    with pytest.raises(TypeError):
+        LegacyBatteryValuation(name, 0, None, .2, 0, 1)
+
+
+def test_f3b5_fix1_valid_direct_constructors_are_recursively_immutable():
+    from dao.prog.fastctrl.policy import LegacyBatteryValuation, TickEconomics
+
+    battery = LegacyBatteryValuation("A", 0, None, .2, 0, 1)
+    assert hash(battery)
+    for status in ("complete", "partial", "unknown"):
+        for kind in ("legacy_tick_estimate", "settlement_counterfactual", "unavailable"):
+            result = TickEconomics(None, (("A", None), ("B", -.1)), status, kind, ("missing",), False)
+            assert hash(result)
+            assert result.by_battery[1] == ("B", -.1)
+            assert result.is_estimate is False
+
+
+def _f3b5_api():
+    from dao.prog.fastctrl import policy
+
+    # Keep the pre-implementation RED an assertion, not a collection error.
+    for name in ("LegacyBatteryValuation", "TickEconomics", "estimate_effective_tick"):
+        assert callable(getattr(policy, name, None)), f"Missing F3b5 API: {name}"
+    return policy.LegacyBatteryValuation, policy.estimate_effective_tick
+
+
+def test_f3b5_telescoping_effective_tick_keeps_loss():
+    battery, estimate = _f3b5_api()
+    loss = estimate(house_w=0, price_import=.30, price_export=.10,
+                    batteries=(battery("A", 0, 1000, .20, 0, 1),))
+    assert loss.benefit_eur_h == pytest.approx(-.10)
+    assert loss.by_battery == (("A", pytest.approx(-.10)),)
+    assert (loss.status, loss.kind, loss.reasons, loss.is_estimate) == (
+        "complete", "legacy_tick_estimate", (), True)
+    inputs = (battery("Z", 0, -1500, 0, 0, 1), battery("A", 0, 1000, 0, 0, 1))
+    result = estimate(house_w=1000, price_import=.30, price_export=.10, batteries=inputs)
+    assert result.by_battery == (("Z", pytest.approx(.35)), ("A", pytest.approx(-.20)))
+    assert result.benefit_eur_h == pytest.approx(.15)
+    assert sum(value for _, value in result.by_battery) == pytest.approx(.15)
+    # Allocation depends on configuration order; the site total does not.
+    reverse = estimate(house_w=1000, price_import=.30, price_export=.10,
+                       batteries=inputs[::-1])
+    assert reverse.by_battery == (("A", pytest.approx(-.30)), ("Z", pytest.approx(.45)))
+    assert reverse.benefit_eur_h == pytest.approx(.15)
+
+
+def test_f3b5_unknown_effective_response_is_not_proposal_or_zero():
+    from dataclasses import FrozenInstanceError, replace
+
+    battery, estimate = _f3b5_api()
+    known = battery("Z", -500, -500, .20, .01, .8)
+    inputs = (known, battery("A", 0, None, .10, .02, .9))
+    snapshot = tuple(inputs)
+    for house, vector, reasons in (
+        (1000, inputs, ("tick_execution_unknown",)),
+        (None, (known,), ("tick_measurement_missing",)),
+        (None, inputs, ("tick_measurement_missing", "tick_execution_unknown")),
+    ):
+        result = estimate(house_w=house, price_import=.30, price_export=.10, batteries=vector)
+        assert result.benefit_eur_h is None
+        assert result.by_battery == tuple((item.name, None) for item in vector)
+        assert (result.status, result.kind) == ("unknown", "unavailable")
+        assert result.reasons == reasons
+        assert result.is_estimate is True
+    zero = estimate(house_w=1000, price_import=.30, price_export=.10, batteries=(known,))
+    assert zero.benefit_eur_h == 0.0
+    assert zero.by_battery == (("Z", 0.0),)
+    assert zero.status == "complete"
+    assert inputs == snapshot
+    for obj, field, value in ((known, "effective_w", 0), (zero, "benefit_eur_h", 1)):
+        assert not hasattr(obj, "__dict__")
+        with pytest.raises(FrozenInstanceError):
+            setattr(obj, field, value)
+    for invalid in (float("nan"), float("inf"), -float("inf")):
+        for field in ("house_w", "price_import", "price_export"):
+            kwargs = dict(house_w=1000, price_import=.30, price_export=.10, batteries=inputs)
+            kwargs[field] = invalid
+            with pytest.raises(ValueError):
+                estimate(**kwargs)
+        for field in ("baseline_w", "effective_w", "storage_value", "cycle_cost", "round_trip_efficiency"):
+            with pytest.raises(ValueError):
+                estimate(house_w=1000, price_import=.30, price_export=.10,
+                         batteries=(replace(known, **{field: invalid}),))
+    for vector in ((known, known), (replace(known, name=""),), (replace(known, name="  "),)):
+        with pytest.raises(ValueError):
+            estimate(house_w=1000, price_import=.30, price_export=.10, batteries=vector)
+
+
+def test_f3b5_own_storage_wear_efficiency_and_export_cap():
+    battery, estimate = _f3b5_api()
+    # Nonzero baselines, both directions, and distinct local parameters.
+    inputs = (battery("Z", 500, -1000, .20, .01, .8),
+              battery("A", -200, 700, .40, .03, .9))
+    result = estimate(house_w=0, price_import=.30, price_export=.50, batteries=inputs)
+    # Grid saving .18; storage difference +.052; wear difference -.020.
+    assert result.benefit_eur_h == pytest.approx(.212)
+    assert result.by_battery == (("Z", pytest.approx(.165)), ("A", pytest.approx(.047)))
+    assert inputs[0].baseline_w == 500
+    assert inputs[1].effective_w == 700
+
+
 @pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("limiter", ["deadband", "rate_limited"])
 def test_fix1_local_stop_affects_only_legacy_decisions(version, limiter):
@@ -188,6 +342,16 @@ def measure(grid_w, soc=50.0, battery_w=0.0, timestamp=T0 + 60, count=1, **kwarg
         ],
         **kwargs,
     )
+
+
+def test_f3b6_policy_is_proposal_and_v2_tick_is_unknown():
+    plan = make_plan([.30], [0])
+    decision = FastControlPolicy(PolicyLimits(min_benefit=0, deadband=0)).decide(
+        plan, measure(3000), ControllerState())
+    assert decision.benefit_eur_h is None
+    assert decision.proposal_benefit_eur_h > 0
+    assert decision.batteries[0].benefit_eur_h is None
+    assert decision.economics_reasons == ("tick_execution_unproven",)
 
 
 def run(plan, measurement, limits=None, state=None, enabled=None):
@@ -826,7 +990,8 @@ class TestAccounting:
         state.battery(0).daily_deviation_kwh = 3.0
         policy.account(state, plan, measure(grid_w=0.0), "2024-01-02")
         assert state.battery(0).daily_deviation_kwh == 0.0
-        assert state.saved_today_eur == 0.0
+        assert state.saved_today_eur is None
+        assert state.saved_today_is_estimate is True
 
 
 class TestInvariants:
@@ -851,7 +1016,8 @@ class TestInvariants:
         battery = decision.batteries[0]
         # The benefit is measured against doing nothing, so it may never be
         # negative: the plan is always inside the feasible set.
-        assert battery.benefit_eur_h >= -1e-9
+        assert battery.proposal_benefit_eur_h >= -1e-9
+        assert battery.benefit_eur_h is None
 
 
 class TestInverterRestore:
@@ -1145,17 +1311,20 @@ def test_g2_unbound_aggregate_needs_no_execution_digest(route):
         assert controller.interval_deviation_kwh == pytest.approx(expected)
         assert controller.daily_deviation_kwh == pytest.approx(expected)
         return
-    assert decision.benefit_eur_h == 0.0
+    assert decision.benefit_eur_h is None
+    assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
     battery = decision.batteries[0]
     assert battery.write is (route != "expired")
     if route == "decide_measured":
         assert decision.house_w == 5000.0
-        assert battery.override is True and battery.benefit_eur_h > 0
+        assert battery.override is True and battery.proposal_benefit_eur_h > 0
+        assert battery.benefit_eur_h is None
         # The simulator's existing virtual acceptance still grants no live right.
         apply_accepted_command(controller, battery)
         again = policy.decide(plan, replace(sample, timestamp=start + 61), state)
         assert again.batteries[0].write is True
-        assert again.benefit_eur_h == 0.0
+        assert again.benefit_eur_h is None
+        assert again.economics_reasons == ("tick_settlement_basis_unavailable",)
         assert controller._current_accepted_command is None
         assert controller.last_accepted_command is None
         assert controller.execution_status == "unknown"
@@ -1307,12 +1476,15 @@ def test_f2c5_only_an_accepted_v2_segment_books_a_benefit():
     decision = policy.decide(plan, measure(grid_w=5000.0, timestamp=now), state)
     assert decision.batteries[0].override is True
     # Nothing is proven yet, so the deviation books no euro claim.
-    assert decision.benefit_eur_h == 0.0
+    assert decision.benefit_eur_h is None
+    assert decision.economics_reasons == ("tick_settlement_basis_unavailable",)
     binding = accept_policy_command(plan, state, -5000, now)
     proven = policy.decide(plan, measure(grid_w=5000.0, timestamp=now + 60), state,
                            owner_binding=binding)
     assert proven.batteries[0].override is True
-    assert proven.benefit_eur_h > 0.0
+    assert proven.benefit_eur_h is None
+    assert proven.proposal_benefit_eur_h > 0
+    assert proven.economics_reasons == ("tick_settlement_basis_unavailable",)
 
 
 def test_f2c5_a_v2_segment_without_an_accepted_command_books_no_deviation():
