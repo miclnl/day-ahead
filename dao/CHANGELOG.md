@@ -2,6 +2,26 @@
 # Day Ahead Optimizer
 # Unreleased
 
+## Een dagplanning die op haar nominale vermogen struikelde
+Op 10 november 2026 mislukte een dagplanning opnieuw met
+`battery_direction_solution_invalid`, ditmaal interval 19 — en nu met de
+herstelstap van de vorige release al in de installatie. Ook hier was er geen
+fysieke tegenspraak. De batterij ontlaadde op haar nominale vermogen van 1,7
+kW, en CBC las dat vermogen in dubbeleprecisie als 1,7000000000000002 terug:
+één ulp boven de eigen grens. De strikte eindcontrole eiste dat elke
+celrichting exact binnen haar grenzen ligt en weigerde daarmee een
+fysisch perfecte oplossing.
+
+De eindcontrole vergelijkt de grenzen nu zoals de solver dat zelf doet: binnen
+de eigen primal tolerantie van de solver mag een celhandle haar nominale
+vermogen overschrijden, precies de maat waarmee CBC zijn eigen oplossing
+primaal feasible verklaart. De richtingssemantiek blijft ongewijzigd streng:
+de uitgeschakelde richting moet exact 0 lezen, een celhandle onder nul
+betekent nog steeds dat de andere richting stroom voert, en een overschrijding
+buiten de tolerantie van de solver blijft onherstelbaar en wordt geweigerd
+zonder extra poging en zonder dat er iets aan de afnemers wordt doorgegeven.
+De financiële route hanteerde deze maat al; nu geldt zij ook in de legacyroute.
+
 # 2026.11.10
 
 ## Een dagplanning die op een afleesrest struikelde

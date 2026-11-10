@@ -395,6 +395,25 @@ def _cell_direction_choice(
     return tuple(rows)
 
 
+def _within_cell_bounds(value: float, lb: float, ub: float, tolerance: Decimal) -> bool:
+    """De afgelezen waarde van een celhandle binnen haar eigen grenzen.
+
+    De ondergrens van een celhandle is 0 en draagt de richtingssemantiek: een
+    waarde onder nul betekent dat de andere richting stroom voert, en die
+    grens blijft exact. De bovengrens is het nominale vermogen van de batterij;
+    een variabele die op die grens staat, leest in dubbeleprecisie soms één ulp
+    erboven uit. Dat is een afrondingsartefact van de solver en geen fysieke
+    overschrijving, en mag daarom binnen de eigen primal tolerantie van de
+    solver overschrijden — dezelfde grens waarmee mip zelf zijn oplossing
+    primaal feasible verklaart.
+    """
+    if value is None or not math.isfinite(value):
+        return False
+    if not math.isfinite(lb) or not math.isfinite(ub):
+        return False
+    return Decimal(str(lb)) <= Decimal(str(value)) <= Decimal(str(ub)) + tolerance
+
+
 @dataclass(frozen=True)
 class _DirectionRecovery:
     """Herstelde celrichting: verse CBC-log en de herbonden brondomeincel."""
@@ -447,10 +466,11 @@ def _recover_battery_cell_direction(
                 value = disabled.x
                 if (value is None or not math.isfinite(value)
                     or enabled.x is None or not math.isfinite(enabled.x)
-                    or not enabled.lb <= enabled.x <= enabled.ub
+                    or not _within_cell_bounds(enabled.x, enabled.lb, enabled.ub, residual)
                     or not disabled.lb <= 0 <= disabled.ub):
-                    # Een toegestane richting buiten haar eigen grenzen is een echte
-                    # afwijking, geen afleesrest; die wordt niet hersteld.
+                    # Een toegestane richting buiten haar eigen grenzen (op de
+                    # primal tolerantie van de solver na) is een echte afwijking,
+                    # geen afleesrest; die wordt niet hersteld.
                     return None
                 if value != 0:
                     # Binnen de eigen primal tolerantie van de solver is dit een
@@ -498,7 +518,9 @@ def _audit_battery_cell_direction(
         used = _battery_cell_power_binding(model, dc_to_bat, dc_from_bat,
                                           installation_battery_count, interval_count)
         tolerance = Decimal(str(model.integer_tol))
+        primal = Decimal(str(model.infeas_tol))
         if (not tolerance.is_finite() or not 0 <= tolerance < Decimal("0.5")
+            or not primal.is_finite() or primal < 0
             or len(cell_charge_on) != installation_battery_count):
             raise ValueError(code)
         for b, row in enumerate(cell_charge_on):
@@ -519,7 +541,7 @@ def _audit_battery_cell_direction(
                 if len(choices) != 1:
                     raise ValueError(code)
                 charge, discharge = dc_to_bat[b][index], dc_from_bat[b][index]
-                if (any(var.x is None or not math.isfinite(var.x) or not var.lb <= var.x <= var.ub
+                if (any(not _within_cell_bounds(var.x, var.lb, var.ub, primal)
                         for var in (charge, discharge))
                     or (discharge.x if choices[0] else charge.x) != 0):
                     raise ValueError(code)

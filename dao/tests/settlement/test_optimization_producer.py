@@ -4,6 +4,7 @@ import ast
 import datetime as dt
 import inspect
 import logging
+import math
 import socket
 import sys
 import textwrap
@@ -1861,6 +1862,68 @@ def test_cell_direction_residual_survives_no_source_domain_repair(capture, snaps
     # Zonder de herstelstap faalt de planning; mét herstelstap slaagt zij.
     namespace["_recover_battery_cell_direction"] = da._recover_battery_cell_direction
     state["injected"] = True
+    exec(post_strategy_consumers(), namespace)
+    assert len(solves) == 1
+    assert disabled.x == 0
+    assert len(namespace["accu_in_sum"]) == len(namespace["org_l"]) == local["U"]
+
+
+def test_cell_direction_rating_overshoot_within_primal_tolerance_is_accepted(capture, monkeypatch):
+    """Eén ulp boven het nominale vermogen is een afrondingsartefact van de solver."""
+    model, local = _frozen_cell_directions(capture, charge_on=0)  # ontladen: laden is uitgeschakeld
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled, enabled = local["dc_to_bat"][0][0], local["dc_from_bat"][0][0]
+    assert enabled.x > 0
+    enabled.ub = enabled.x  # de toegestane richting staat op haar nominale vermogen
+    overshoot = enabled.ub + math.ulp(enabled.ub)
+    solves, _ = _direction_readback_residual(monkeypatch, model, {disabled: 0.0, enabled: overshoot})
+    namespace.update(native={"cbc_log": ""})
+    exec(post_strategy_consumers(), namespace)
+    # Er viel niets te herstellen: de uitgeschakelde richting las al exact 0.
+    assert solves == []
+    assert len(namespace["accu_in_sum"]) == len(namespace["org_l"]) == local["U"]
+
+
+def test_cell_direction_overshoot_beyond_primal_tolerance_is_refused(capture, monkeypatch):
+    """Een overschrijding boven de primal tolerantie van de solver is een echte afwijking."""
+    model, local = _frozen_cell_directions(capture, charge_on=0)  # ontladen: laden is uitgeschakeld
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled, enabled = local["dc_to_bat"][0][0], local["dc_from_bat"][0][0]
+    assert enabled.x > 0
+    enabled.ub = enabled.x  # de toegestane richting staat op haar nominale vermogen
+    solves, _ = _direction_readback_residual(monkeypatch, model, {disabled: 0.0, enabled: enabled.ub + 1e-3})
+    namespace.update(native={"cbc_log": ""})
+    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+        exec(post_strategy_consumers(), namespace)
+    assert solves == []
+    assert not {"accu_in_sum", "org_l", "org_t"} & namespace.keys()
+
+
+def test_cell_direction_residual_and_rating_overshoot_share_one_bounded_solve(capture, monkeypatch):
+    """De afleesrest en de overschrijving delen één herstelsolve."""
+    model, local = _frozen_cell_directions(capture, charge_on=0)  # ontladen: laden is uitgeschakeld
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled, enabled = local["dc_to_bat"][0][0], local["dc_from_bat"][0][0]
+    assert enabled.x > 0
+    enabled.ub = enabled.x  # de toegestane richting staat op haar nominale vermogen
+    solves, _ = _direction_readback_residual(monkeypatch, model, {
+        disabled: 5.869589611243531e-17, enabled: enabled.ub + math.ulp(enabled.ub)})
+    namespace.update(native={"cbc_log": ""})
     exec(post_strategy_consumers(), namespace)
     assert len(solves) == 1
     assert disabled.x == 0
