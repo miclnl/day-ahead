@@ -2,6 +2,8 @@
 # Day Ahead Optimizer
 # Unreleased
 
+# 2026.11.10
+
 ## Een dagplanning die op een afleesrest struikelde
 Op 10 november 2026 mislukte een dagplanning volledig met
 `battery_direction_solution_invalid`, interval 25. Er was geen fysieke
