@@ -2,6 +2,30 @@
 # Day Ahead Optimizer
 # Unreleased
 
+## Een dagplanning die op een afleesrest struikelde
+Op 10 november 2026 mislukte een dagplanning volledig met
+`battery_direction_solution_invalid`, interval 25. Er was geen fysieke
+tegenspraak: CBC gaf de uitgeschakelde celrichting met ongeveer 1e-17 kW
+terug, omdat die variabele uit de basis wordt berekend en de SoC- en
+energiebalansrijen slecht geschaald zijn. De strikte eindcontrole op de
+celrichting weigerde die rest terecht — een uitgeschakelde richting hoort
+exact 0 te zijn — en daarmee de hele planning.
+
+De producent herstelt dit nu zelf, vóór de financiële afronding en zonder de
+controle te versoepelen. Hij leest de richtingskeuze uit de solver, herstelt
+alleen wanneer de afwijking binnen de eigen tolerantie van de solver valt en
+alleen wanneer elke toegestane richting binnen haar eigen grenzen ligt, legt
+die keuze en elke uitgeschakelde celrichting vast en lost één keer opnieuw op.
+Daarna leest de uitgeschakelde richting exact 0 en blijft de eindcontrole
+ongewijzigd streng: een echte tegenspraak, een afwijking buiten de tolerantie,
+een toegestane richting buiten haar grenzen, een ongeldige keuze of een
+niet-eindige waarde wordt nog steeds geweigerd, zonder extra poging en zonder
+dat er iets aan de afnemers wordt doorgegeven.
+
+De berekening kan daardoor één extra herberekening bevatten; samen met een
+bronfout zijn het er twee, elk over de hele horizon. Het financiële bewijs,
+de digests en alle afnemers steunen daarna op de herstelde oplossing.
+
 ## Het tabblad Accuracy zei dat er geen prognoses waren
 Gemeld vanaf een draaiende installatie: het tabblad stond leeg. Bovenaan
 "Nog geen prognoses gearchiveerd", daaronder een tabel zonder regels en twee

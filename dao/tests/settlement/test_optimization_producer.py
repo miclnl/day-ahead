@@ -1154,9 +1154,8 @@ def post_strategy_consumers():
     return compile(ast.Module(body=body[start:end], type_ignores=[]), da.__file__, "exec")
 
 
-@pytest.mark.parametrize("outcome", ["success", "new_residual", "missing_evidence", "infeasible"])
-def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rules, monkeypatch, caplog, outcome):
-    """Moving finalization after any array extraction must expose stale device/PV data."""
+def _finalization_case(snapshot, bonus_rules, monkeypatch, outcome):
+    """Bouw de echte A8-finalisatie op een synthetische bron met één cel."""
     model, terms = financial_case(snapshot, bonus_rules)
     device = model.add_var(ub=1, name="continuous_device_flow")
     cell = terms.bonus.source.cell_discharge.bus_power_vars[0][0]
@@ -1199,6 +1198,16 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
         kwh_cycle_cost=[0.01], cycle_cost=[wear_cost],
         ac_to_dc=[[device]], ac_from_dc=[[device]], c_ev=[[device]], c_ma_u=[[device]],
         pv_ac=[[device]], solar_prod=[[0.5]], b_l=[0.0], c_b=[device], c_hp=[device], pl=[0.1], pt=[0.1])
+    return namespace, calls, instance
+
+
+@pytest.mark.parametrize("outcome", ["success", "new_residual", "missing_evidence", "infeasible"])
+def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rules, monkeypatch, caplog, outcome):
+    """Moving finalization after any array extraction must expose stale device/PV data."""
+    namespace, calls, instance = _finalization_case(snapshot, bonus_rules, monkeypatch, outcome)
+    # Deze test dekt uitsluitend de N4-bronherstelsolve; de G2m-richtingsherstelstap
+    # heeft een eigen, afzonderlijk beproeven contract.
+    namespace["_recover_battery_cell_direction"] = lambda *args, **kwargs: None
     if outcome != "success":
         with pytest.raises(PlanningSolutionRejected):
             exec(post_strategy_consumers(), da.__dict__, namespace)
@@ -1226,6 +1235,17 @@ def test_finalization_reextracts_baseline_and_all_consumers(snapshot, bonus_rule
     assert "A8 energiecomponent: -0.13" in caplog.text
     assert "A8 referentie-energiecomponent: 0.05" in caplog.text
     assert "A8 besparing energiecomponent: 0.18" in caplog.text
+
+
+def test_direction_and_source_fault_share_two_bounded_solves(snapshot, bonus_rules, monkeypatch):
+    """Een richtingsrest én een bronfout krijgen elk één begrensde herstelsolve."""
+    namespace, calls, instance = _finalization_case(snapshot, bonus_rules, monkeypatch, "new_residual")
+    with pytest.raises(PlanningSolutionRejected):
+        exec(post_strategy_consumers(), da.__dict__, namespace)
+    # De richtingsherstelsolve en de eigen N4-bronherstelsolve, elk één keer.
+    assert calls == [True, True]
+    assert not {"accu_in_sum", "c_ev_sum", "c_ma_sum", "org_l", "org_t", "financial_audit"} & namespace.keys()
+    assert not hasattr(instance, "_debug_planning_audit")
 
 
 def pre_strategy_cost_binding():
@@ -1567,22 +1587,35 @@ def test_final_cell_direction_audit_precedes_every_consumer(capture, snapshot, b
     assert model.optimize() == mip.OptimizationStatus.OPTIMAL
     # Inject only at the direction audit boundary, after genuine financial finalization.
     audit = da._audit_battery_cell_direction
+    in_audit = []
 
     def inspect_direction(*args, **kwargs):
-        if fault == "valid":
+        in_audit.append(True)
+        try:
+            if fault == "valid":
+                return audit(*args, **kwargs)
+            if fault in ("off_charge", "negative", "nonfinite"):
+                var = local["dc_to_bat"][0][0]
+                value = {"off_charge": 1e-12, "negative": -1e-12, "nonfinite": float("nan")}[fault]
+            elif fault == "off_discharge":
+                var, value = local["dc_from_bat"][0][0], 1e-12
+            else:
+                var, value = y, 2 if fault == "wrong_y" else 0.5
+            override_solution(monkeypatch, model, {var.idx: value})
             return audit(*args, **kwargs)
-        if fault in ("off_charge", "negative", "nonfinite"):
-            var = local["dc_to_bat"][0][0]
-            value = {"off_charge": 1e-12, "negative": -1e-12, "nonfinite": float("nan")}[fault]
-        elif fault == "off_discharge":
-            var, value = local["dc_from_bat"][0][0], 1e-12
-        else:
-            var, value = y, 2 if fault == "wrong_y" else 0.5
-        override_solution(monkeypatch, model, {var.idx: value})
-        return audit(*args, **kwargs)
+        finally:
+            in_audit.pop()
 
     namespace.update(_audit_battery_cell_direction=inspect_direction, native={"cbc_log": ""})
-    monkeypatch.setattr(model, "optimize", lambda: pytest.fail("Direction audit must not solve"))
+    raw_optimize = model.optimize
+
+    def optimize():
+        # De begrensde richtingsherstel vóór de audit mag oplossen; de audit zelf nooit.
+        if in_audit:
+            pytest.fail("Direction audit must not solve")
+        return raw_optimize()
+
+    monkeypatch.setattr(model, "optimize", optimize)
     if fault == "valid":
         exec(post_strategy_consumers(), namespace)
         assert (namespace["finalized_solution"] is not None) == financial
@@ -1596,6 +1629,242 @@ def test_final_cell_direction_audit_precedes_every_consumer(capture, snapshot, b
     else:
         assert instance._debug_finalized_solution is previous_solution
         assert instance._debug_financial_terms is previous_terms
+
+
+def _direction_readback_residual(monkeypatch, model, values):
+    """Injecteer alleen solver-readbacks; de modelsemantiek blijft ongewijzigd."""
+    raw_get = model.solver.var_get_x
+    injected = {var.idx: value for var, value in values.items()}
+    state = {"injected": True}
+    solves = []
+
+    def injected_get(var):
+        if state["injected"] and var.idx in injected:
+            return injected[var.idx]
+        return raw_get(var)
+
+    optimize = model.optimize
+
+    def solve():
+        solves.append(True)
+        state["injected"] = False
+        return optimize()
+
+    monkeypatch.setattr(model.solver, "var_get_x", injected_get)
+    monkeypatch.setattr(model, "optimize", solve)
+    return solves, state
+
+
+def _frozen_cell_directions(capture, *, charge_on, free=((0, 0),)):
+    """Leg de fysieke celrichting vast; alleen de genoemde paren blijven vrij."""
+    model, local = capture["model"], capture["locals"]
+    for key in ("dc_to_bat", "dc_from_bat"):
+        for b, row in enumerate(local[key]):
+            for i, var in enumerate(row):
+                if (b, i) not in free:
+                    var.ub = 0
+    for b, i in free:
+        model += local["cell_charge_on"][b][i] == charge_on
+    return model, local
+
+
+@pytest.mark.parametrize("financial", [False, True])
+def test_cell_direction_readback_residual_is_repaired_by_one_bounded_solve(capture, snapshot, bonus_rules,
+                                                                        monkeypatch, financial):
+    """Een afleesrest in de uitgeschakelde richting is geen fysieke tegenspraak."""
+    model, local = _frozen_cell_directions(capture, charge_on=1)  # laden: ontladen is uitgeschakeld
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = new_route_cost_namespace(capture, snapshot, bonus_rules) if financial else {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled = local["dc_from_bat"][0][0]
+    solves, _ = _direction_readback_residual(monkeypatch, model, {disabled: 5.869589611243531e-17})
+    namespace.update(native={"cbc_log": ""})
+    exec(post_strategy_consumers(), namespace)
+    assert len(solves) == 1
+    assert disabled.x == 0
+    assert len(namespace["accu_in_sum"]) == len(namespace["org_l"]) == local["U"]
+
+
+@pytest.mark.parametrize("financial", [False, True])
+def test_cell_direction_recovery_shares_one_solve_over_the_whole_horizon(capture, snapshot, bonus_rules,
+                                                                         monkeypatch, financial):
+    """Meerdere resten in verschillende batterijen en stappen delen één herstelsolve."""
+    model, local = _frozen_cell_directions(capture, charge_on=1, free=((0, 0), (1, 0), (0, 1)))
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = new_route_cost_namespace(capture, snapshot, bonus_rules) if financial else {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    involved = (local["dc_from_bat"][0][0], local["dc_from_bat"][1][0], local["dc_from_bat"][0][1])
+    solves, _ = _direction_readback_residual(monkeypatch, model, {
+        involved[0]: 5.869589611243531e-17, involved[1]: -5.869589611243531e-17, involved[2]: 1e-13})
+    namespace.update(native={"cbc_log": ""})
+    exec(post_strategy_consumers(), namespace)
+    assert len(solves) == 1
+    assert all(var.x == 0 for var in involved)
+
+
+@pytest.mark.parametrize("financial", [False, True])
+def test_cell_direction_recovery_pins_every_disabled_handle(capture, snapshot, bonus_rules, monkeypatch, financial):
+    """Elke uitgeschakelde richting wordt een vaste variabele, ook zonder eigen rest."""
+    model, local = _frozen_cell_directions(capture, charge_on=1, free=((0, 0), (1, 0)))
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = new_route_cost_namespace(capture, snapshot, bonus_rules) if financial else {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    residual = local["dc_from_bat"][0][0]
+    quiet = local["dc_from_bat"][1][0]  # ruime grenzen, aanvankelijk exact nul
+    assert quiet.ub > 0 and quiet.x == 0
+    solves, _ = _direction_readback_residual(monkeypatch, model, {residual: 5.869589611243531e-17})
+    optimize = model.optimize
+    seen = []
+
+    def snapshot():
+        seen.append([(var.lb, var.ub) for var in (residual, quiet)])
+        return optimize()
+
+    monkeypatch.setattr(model, "optimize", snapshot)
+    namespace.update(native={"cbc_log": ""})
+    exec(post_strategy_consumers(), namespace)
+    assert len(solves) == 1
+    # Bij binnenkomst van de ene herstelsolve ligt élke uitgeschakelde handle vast.
+    assert seen == [[(0.0, 0.0), (0.0, 0.0)]]
+    for row in local["dc_from_bat"]:
+        assert all(var.x == 0 for var in row)
+    assert len(namespace["accu_in_sum"]) == len(namespace["org_l"]) == local["U"]
+
+
+def test_cell_direction_recovery_rebinds_a_quiet_discharge_handle(capture, snapshot, bonus_rules, monkeypatch):
+    """Een laadrest elders herbindt de brondomeincel, ook zonder eigen ontlaadrest."""
+    model, local = capture["model"], capture["locals"]
+    for key in ("dc_to_bat", "dc_from_bat"):
+        for b, row in enumerate(local[key]):
+            for i, var in enumerate(row):
+                if (b, i) not in ((0, 0), (1, 0)):
+                    var.ub = 0
+    model += local["cell_charge_on"][0][0] == 0  # laden uitgeschakeld: de laadrest zit hier
+    model += local["cell_charge_on"][1][0] == 1  # ontladen uitgeschakeld: stille ontlaadhandle
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = new_route_cost_namespace(capture, snapshot, bonus_rules)
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    charge, quiet = local["dc_to_bat"][0][0], local["dc_from_bat"][1][0]
+    assert quiet.ub > 0 and quiet.x == 0
+    solves, _ = _direction_readback_residual(monkeypatch, model, {charge: 5.869589611243531e-17})
+    namespace.update(native={"cbc_log": ""})
+    exec(post_strategy_consumers(), namespace)
+    assert len(solves) == 1
+    # De stille ontlaadhandle is vastgezet; de brondomeincel volgt diezelfde grenzen.
+    assert (quiet.lb, quiet.ub) == (0.0, 0.0)
+    cell = namespace["financial_terms"].bonus.source.cell_discharge
+    for b, row in enumerate(cell.bus_power_vars):
+        for index, var in enumerate(row):
+            assert cell.bus_lower_bounds_kw[b][index] == D(str(var.lb))
+            assert cell.bus_upper_bounds_kw[b][index] == D(str(var.ub))
+    assert len(namespace["accu_in_sum"]) == len(namespace["org_l"]) == local["U"]
+
+
+@pytest.mark.parametrize("fault", ["too_large", "enabled_direction", "ambiguous_choice", "nonfinite"])
+def test_cell_direction_recovery_refuses_everything_but_a_readback_residual(capture, monkeypatch, fault):
+    """Alleen een afleesrest binnen de eigen primal tolerantie is herstelbaar."""
+    model, local = _frozen_cell_directions(capture, charge_on=1)  # laden: ontladen is uitgeschakeld
+    namespace = {**da.__dict__, **local}
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled, enabled = local["dc_from_bat"][0][0], local["dc_to_bat"][0][0]
+    choice = local["cell_charge_on"][0][0]
+    if fault == "too_large":
+        solves, _ = _direction_readback_residual(monkeypatch, model, {disabled: 1e-3})
+    elif fault == "enabled_direction":
+        # Een rest in de toegestane richting is geen afleesrest van de uitgeschakelde richting.
+        solves, _ = _direction_readback_residual(monkeypatch, model, {enabled: -1e-12})
+    elif fault == "ambiguous_choice":
+        solves, _ = _direction_readback_residual(monkeypatch, model, {choice: 0.5})
+    else:
+        solves, _ = _direction_readback_residual(monkeypatch, model, {disabled: float("nan")})
+    namespace.update(native={"cbc_log": ""})
+    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+        exec(post_strategy_consumers(), namespace)
+    assert not {"accu_in_sum", "org_l", "org_t"} & namespace.keys()
+    assert solves == []
+    if fault == "enabled_direction":
+        # De toegestane richting blijft ongemoeid; het herstel is geen vrije ruimte.
+        assert enabled.x == -1e-12
+
+
+@pytest.mark.parametrize("fault", ["same_interval", "other_battery"])
+def test_cell_direction_recovery_refuses_a_combined_fault(capture, monkeypatch, fault):
+    """Een echte afwijking elders blijft onherstelbaar; een afleesrest maskeert haar niet."""
+    model, local = _frozen_cell_directions(capture, charge_on=1, free=((0, 0), (1, 0)))
+    namespace = {**da.__dict__, **local}
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled = local["dc_from_bat"][0][0]
+    enabled = local["dc_to_bat"][0][0] if fault == "same_interval" else local["dc_to_bat"][1][0]
+    solves, _ = _direction_readback_residual(monkeypatch, model, {disabled: 1e-17, enabled: -1e-3})
+    namespace.update(native={"cbc_log": ""})
+    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+        exec(post_strategy_consumers(), namespace)
+    assert not {"accu_in_sum", "org_l", "org_t"} & namespace.keys()
+    assert solves == []
+
+
+def test_cell_direction_recovery_without_a_solution_is_rejected(capture, monkeypatch):
+    """Een herstelsolve zonder oplossing weigert de planning; er volgt geen tweede poging."""
+    model, local = _frozen_cell_directions(capture, charge_on=1)
+    namespace = {**da.__dict__, **local}
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled = local["dc_from_bat"][0][0]
+    solves, _ = _direction_readback_residual(monkeypatch, model, {disabled: 1e-17})
+    optimize = model.optimize
+
+    def failing():
+        monkeypatch.setattr(model.solver, "get_num_solutions", lambda: 0)
+        return optimize()
+
+    monkeypatch.setattr(model, "optimize", failing)
+    namespace.update(native={"cbc_log": ""})
+    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+        exec(post_strategy_consumers(), namespace)
+    assert len(solves) == 1
+    assert not {"accu_in_sum", "org_l", "org_t"} & namespace.keys()
+
+
+@pytest.mark.parametrize("financial", [False, True])
+def test_cell_direction_residual_survives_no_source_domain_repair(capture, snapshot, bonus_rules,
+                                                                  monkeypatch, financial):
+    """De ladingsrest is onzichtbaar voor het brondomein; de herstelstap beslist."""
+    model, local = _frozen_cell_directions(capture, charge_on=0)  # ontladen: laden is uitgeschakeld
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = new_route_cost_namespace(capture, snapshot, bonus_rules) if financial else {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled = local["dc_to_bat"][0][0]
+    solves, state = _direction_readback_residual(monkeypatch, model, {disabled: 5.869589611243531e-17})
+    namespace.update(native={"cbc_log": ""})
+    namespace["_recover_battery_cell_direction"] = lambda *args, **kwargs: None
+    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+        exec(post_strategy_consumers(), namespace)
+    assert solves == []
+    assert not {"accu_in_sum", "org_l", "org_t"} & namespace.keys()
+    # Zonder de herstelstap faalt de planning; mét herstelstap slaagt zij.
+    namespace["_recover_battery_cell_direction"] = da._recover_battery_cell_direction
+    state["injected"] = True
+    exec(post_strategy_consumers(), namespace)
+    assert len(solves) == 1
+    assert disabled.x == 0
+    assert len(namespace["accu_in_sum"]) == len(namespace["org_l"]) == local["U"]
 
 
 def test_f2c5_the_device_intents_are_published_and_never_consumed():

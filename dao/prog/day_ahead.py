@@ -362,6 +362,131 @@ def _bind_battery_cell_direction(
     return direction
 
 
+def _cell_direction_choice(
+    model: Model, *, cell_charge_on: Sequence[Sequence[Var]],
+    installation_battery_count: int, interval_count: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Lees de eenduidige richtingskeuze per batterij/stap uit de binary-readback."""
+    code = "battery_direction_solution_invalid"
+    tolerance = Decimal(str(model.integer_tol))
+    if (not tolerance.is_finite() or not 0 <= tolerance < Decimal("0.5")
+        or len(cell_charge_on) != installation_battery_count):
+        raise ValueError(code)
+    rows = []
+    for row in cell_charge_on:
+        if len(row) != interval_count:
+            raise ValueError(code)
+        choices = []
+        for on in row:
+            if (not isinstance(on, Var) or on.model is not model or on.idx < 0
+                or on.idx >= len(model.vars) or model.vars[on.idx] is not on
+                or not ((on.var_type == BINARY and on.lb == 0 and on.ub == 1)
+                        or (on.var_type == INTEGER and on.lb == on.ub and on.lb in (0, 1)))):
+                raise ValueError(code)
+            value = Decimal(str(on.x))
+            if not value.is_finite():
+                raise ValueError(code)
+            unique = [n for n in (0, 1) if on.lb <= n <= on.ub
+                      and abs(Fraction(value) - n) <= Fraction(tolerance)]
+            if len(unique) != 1:
+                raise ValueError(code)
+            choices.append(unique[0])
+        rows.append(tuple(choices))
+    return tuple(rows)
+
+
+@dataclass(frozen=True)
+class _DirectionRecovery:
+    """Herstelde celrichting: verse CBC-log en de herbonden brondomeincel."""
+
+    terms: FinancialModelTerms | None
+    cbc_log: str
+
+
+def _rebind_cell_discharge(terms: FinancialModelTerms) -> FinancialModelTerms:
+    """Herbind de brondomeincel na een eigen vernauwing van de ontlaadgrenzen."""
+    cell = terms.bonus.source.cell_discharge
+    rebound = make_cell_discharge_input(
+        cell.model, cell.bus_power_vars, meter_id=cell.meter_id,
+        installation_battery_count=cell.installation_battery_count, battery_indices=cell.battery_indices,
+        no_battery_evidence=cell.no_battery_evidence, hour_fractions=cell.hour_fractions,
+        discharge_efficiencies=cell.discharge_efficiencies)
+    return replace(terms, bonus=replace(terms.bonus, source=replace(terms.bonus.source, cell_discharge=rebound)))
+
+
+def _recover_battery_cell_direction(
+    model: Model, *, dc_to_bat: Sequence[Sequence[Var]], dc_from_bat: Sequence[Sequence[Var]],
+    cell_charge_on: Sequence[Sequence[Var]], installation_battery_count: int, interval_count: int,
+    financial_terms: FinancialModelTerms | None,
+) -> _DirectionRecovery | None:
+    """Eén herstelsolve voor een afleesrest in de uitgeschakelde celrichting.
+
+    CBC kan de uitgeschakelde richting met ~1e-17 kW aflezen; dat is een
+    afrondingsartefact van de slecht geschaalde SoC-/energiebalansrijen, geen
+    fysieke tegenspraak. Het recept legt dezelfde richtingskeuzes vast en zet
+    elke uitgeschakelde handle op 0, zodat elke richtingsrij een dwingende rij
+    wordt en elke uitgeschakelde richting exact 0 afleest, en lost één keer
+    opnieuw op. Geeft de verse CBC-log en de herbonden brondomeincel terug, of
+    None zonder herstel.
+    """
+    code = "battery_direction_solution_invalid"
+    try:
+        _battery_cell_power_binding(model, dc_to_bat, dc_from_bat,
+                                    installation_battery_count, interval_count)
+        residual = Decimal(str(model.infeas_tol))
+        if not residual.is_finite() or residual < 0:
+            return None
+        choices = _cell_direction_choice(model, cell_charge_on=cell_charge_on,
+                                         installation_battery_count=installation_battery_count,
+                                         interval_count=interval_count)
+        involved = []
+        for b, row in enumerate(choices):
+            for index, choice in enumerate(row):
+                disabled = dc_from_bat[b][index] if choice == 1 else dc_to_bat[b][index]
+                enabled = dc_to_bat[b][index] if choice == 1 else dc_from_bat[b][index]
+                value = disabled.x
+                if (value is None or not math.isfinite(value)
+                    or enabled.x is None or not math.isfinite(enabled.x)
+                    or not enabled.lb <= enabled.x <= enabled.ub
+                    or not disabled.lb <= 0 <= disabled.ub):
+                    # Een toegestane richting buiten haar eigen grenzen is een echte
+                    # afwijking, geen afleesrest; die wordt niet hersteld.
+                    return None
+                if value != 0:
+                    # Binnen de eigen primal tolerantie van de solver is dit een
+                    # afleesrest; daarbuiten is het een echte afwijking.
+                    if abs(Decimal(str(value))) > residual:
+                        return None
+                    involved.append((b, index))
+        if not involved:
+            return None
+    except (OptimizationInputError, TypeError, ValueError, AttributeError, ArithmeticError):
+        return None
+    # De mutatie ligt buiten de afscherming: een half vastgezet model is onbruikbaar.
+    for b, row in enumerate(cell_charge_on):
+        for index, on in enumerate(row):
+            on.lb = float(choices[b][index])
+            on.ub = float(choices[b][index])
+    for b, row in enumerate(choices):
+        for index, choice in enumerate(row):
+            # Elke uitgeschakelde handle wordt een vaste variabele. De richtingsrij
+            # dwingt haar toch al tot 0, maar alleen zo leest zij per definitie
+            # exact 0 in plaats van een afleesrest van de solver.
+            disabled = dc_from_bat[b][index] if choice == 1 else dc_to_bat[b][index]
+            disabled.lb = 0.0
+            disabled.ub = 0.0
+    with _capture_native_stdout() as native:
+        model.optimize()
+    if model.num_solutions == 0:
+        raise PlanningSolutionRejected(code)
+    terms = financial_terms
+    if financial_terms is not None and any(choice == 1 for row in choices for choice in row):
+        # De ontlaadgrenzen zijn vernauwd; de brondomeincel moet dezelfde grenzen
+        # blijven afleiden, anders is de gebonden brondomeinbinding ongeldig.
+        terms = _rebind_cell_discharge(financial_terms)
+    return _DirectionRecovery(terms, native["cbc_log"])
+
+
 def _audit_battery_cell_direction(
     model: Model, *, dc_to_bat: Sequence[Sequence[Var]], dc_from_bat: Sequence[Sequence[Var]],
     cell_charge_on: Sequence[Sequence[Var]], installation_battery_count: int, interval_count: int,
@@ -3876,6 +4001,21 @@ class DaCalc(DaBase):
         # Finaliseer vóór iedere .x-afgeleide resultaatarray en baseline.
         # Deze lokale stap bezit het model; na selectie volgen geen solves meer.
         finalized_solution = None
+        # Eén herstelsolve voor een afleesrest in de uitgeschakelde celrichting.
+        # De herstelstap staat vóór de A8-finalisatie, zodat financiële evidence,
+        # digests en alle consumers op de herstelde oplossing steunen.
+        recovery = _recover_battery_cell_direction(
+            model, dc_to_bat=dc_to_bat, dc_from_bat=dc_from_bat, cell_charge_on=cell_charge_on,
+            installation_battery_count=B, interval_count=U, financial_terms=financial_terms,
+        )
+        if recovery is not None:
+            financial_terms = recovery.terms
+            native["cbc_log"] = recovery.cbc_log
+            logging.info("G2m celrichtingherstel: één extra solve; status=%s, oplossingen=%s",
+                         model.status.name, model.num_solutions)
+            if getattr(self, "debug", False) or getattr(self, "log_level", logging.INFO) <= logging.DEBUG:
+                _log_native_output(recovery.cbc_log)
+
         if financial_terms is not None:
             finalized_solution = finalize_day_ahead_finance(financial_terms, cbc_log=native["cbc_log"])
             financial_terms = finalized_solution.terms
