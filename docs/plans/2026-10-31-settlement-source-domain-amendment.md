@@ -2740,3 +2740,27 @@ Nieuwe c/d-tests moeten op de bestaande serverfixtureselectie aansluiten (`test_
 **Concrete externe verificatieblocker:** huidige verplichte prefix verwijdert `SETTLEMENT_TEST_POSTGRESQL_URL` en `SETTLEMENT_TEST_MARIADB_URL`, terwijl bestaande matrixfixtures juist die variabelen voor celactivatie gebruiken. Daarom kan geen honest server-GREENcommand met die prefix worden geclaimd. Controller moet voor de afzonderlijke externe gate een expliciet geautoriseerde runner/runtime met dedicated test-DB's leveren én toestemming geven voor een afzonderlijk servercommand dat de bedoelde URL-variabele behoudt. Tot dan worden de servertests geleverd maar deze cellen **niet uitgevoerd/open** gerapporteerd, niet skipped=succes. Geen alternatieve credentials-/envdoorvoer verzinnen om de prefix te omzeilen. Dit blokkeert serveracceptatie, niet a–e of het lokale SQLitebewijs; D1–D3 behoeven geen nieuw besluit.
 
 **Overdracht:** E1-software kan uitsluitend “lokaal bewezen, servergates open” heten zolang deze cellen ontbreken. Werkelijke supplierafronding/contract-/2027-feiten, productiebackup/restore, shadowretentie/meetkwaliteit, E2-hardware/receiving-fencing/stop/exclusiviteit en R1-images/push/merge/tag/release blijven afzonderlijk open. Geen groenverklaring of vrijgave uit een synthetisch matched rapport. Vijfdelige plannerzelfreview staat in `.superpowers/sdd/2026-10-31-settlement-source-domain-amendment/exec-26-planning-report.md`.
+
+## 27. Verificatiediscipline — de volledige suite is een poort, geen prijs per wijziging
+
+Op 10 november 2026 gaf de gebruiker aan dat het telkens opnieuw draaien van de volledige suite te lang duurt (circa 40 minuten). De eerdere checklistregels ("daarna de volledige suite op dezelfde HEAD", §12.4 en §12.5) worden vanaf nu gelezen als **poort**, niet als perwijzigingsprijs: een taak is klaar met een groene gerichte tier, en de volledige suite is het bewijs dat bij een ronde of een release hoort.
+
+**Tiers, goedkoopste eerst.**
+
+| Tier | Omvang | Wanneer |
+|---|---|---|
+| `file` | de testbestanden die het gewijzigde modulegedeelte dekken | na elke wijziging |
+| `area` | het hele testdossier van het gewijzigde gebied (`dao/tests/settlement`, `dao/tests/prog`, `dao/tests/webserver`, …) | na elke taak |
+| `full` | de volledige suite (`pytest -q`) | eenmaal per ronde, vóór het reviewoordeel, en op de exacte releasebytes |
+
+`scripts/verify_changed.py` bepaalt de selectie en drukt het commando af: `--tier file|area|full`, `--base <commit>`, `--list`, `--no-slow`. De selectie is een **voorstel, geen bewijs**: zij volgt de imports in de testboom plus een curate map voor de kernmodules (`day_ahead.py`, `da_base.py`, `da_debug.py`). Een wijziging die een ander gebied raakt, blijkt daarom in de `full`-tier in plaats van in de `file`-tier — dat is de reden dat de poort blijft bestaan.
+
+**Regels voor de uitvoerende ronde.**
+
+1. Een taak rond met een groene `file`- of `area`-tier, plus de tests die de taak zelf noemt. De `full`-tier is géén voorwaarde per taak.
+2. De `full`-tier draait **eenmaal per ronde**, op de achtergrond, vóór het oordeel van de reviewer; die uitkomst is het bewijs dat bij het plan hoort.
+3. Vóór publicatie draait de `full`-tier opnieuw als er sinds de vorige `full`-run iets in de werkboom is veranderd; anders volstaat die vorige uitkomst.
+4. Eén pytest-run tegelijk (gedeelde `.pytest_tmp`) en geen bronwijziging tijdens een run. Beide hebben in deze ronde een schijnfoutreeks veroorzaakt: 67 failures waarvan 64 `AttributeError: 'Expr' object has no attribute 'body'` uit de AST-snijharnassen, doordat `dao/prog/day_ahead.py` om 18:30:04 werd herschreven terwijl pytest het las. Sindsdien loopt elke volledige run met een SHA-256-snapshot van de bronbestanden vóór en ná.
+5. Een gerichte tier bewijst nooit de *afwezigheid* van een regressie elders; de uitspraak "de suite is groen" hoort bij de `full`-tier, en een andere uitspraak is: "de tests die deze wijziging dekken, zijn groen".
+
+**Besparing op de G2m-wijziging (10 november 2026).** De `file`-tier selecteert 14 testbestanden voor de volledige G2m-wijziging (`day_ahead.py` plus de gewijzigde test- en webbestanden): **89 seconden** tegenover **39 minuten** voor de `full`-tier op dezelfde wijziging. De `area`-tier selecteert 69 bestanden.
