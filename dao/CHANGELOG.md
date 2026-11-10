@@ -2,6 +2,8 @@
 # Day Ahead Optimizer
 # Unreleased
 
+# 2026.11.11
+
 ## Een dagplanning die op haar nominale vermogen struikelde
 Op 10 november 2026 mislukte een dagplanning opnieuw met
 `battery_direction_solution_invalid`, ditmaal interval 19 — en nu met de
