@@ -1909,6 +1909,49 @@ def test_cell_direction_overshoot_beyond_primal_tolerance_is_refused(capture, mo
     assert not {"accu_in_sum", "org_l", "org_t"} & namespace.keys()
 
 
+def test_cell_direction_overshoot_beyond_tolerance_blocks_the_recovery(capture, monkeypatch):
+    """Een overschrijding van de toegestane richting blokkeert de herstelsolve."""
+    model, local = _frozen_cell_directions(capture, charge_on=0, free=((0, 0), (1, 0)))
+    instance = capture["instance"]
+    instance._debug_capture_vars = True
+    namespace = {**da.__dict__, **local}
+    exec(pre_strategy_cost_binding(), namespace)
+    model.verbose = 0
+    assert model.optimize() == mip.OptimizationStatus.OPTIMAL
+    disabled = local["dc_to_bat"][0][0]
+    other = local["dc_from_bat"][1][0]
+    other.ub = other.x  # de toegestane richting staat op haar nominale vermogen
+    bounds = [(var.lb, var.ub) for var in (disabled, other)]
+    choices = [(on.lb, on.ub) for row in local["cell_charge_on"] for on in row]
+    solves, _ = _direction_readback_residual(monkeypatch, model, {
+        disabled: 5.869589611243531e-17, other: other.ub + 1e-3})
+    namespace.update(native={"cbc_log": ""})
+    with pytest.raises(PlanningSolutionRejected, match="battery_direction_solution_invalid"):
+        exec(post_strategy_consumers(), namespace)
+    # De herstelstap weigerde: geen solve, geen modelmutatie, geen afnemers.
+    assert solves == []
+    assert [(var.lb, var.ub) for var in (disabled, other)] == bounds
+    assert [(on.lb, on.ub) for row in local["cell_charge_on"] for on in row] == choices
+    assert not {"accu_in_sum", "org_l", "org_t"} & namespace.keys()
+
+
+def test_cell_bounds_comparison_follows_the_primal_tolerance():
+    """De grensvergelijking: de ondergrens exact, de bovengrens op de primal tolerantie."""
+    tolerance = Decimal("1e-6")
+    assert da._within_cell_bounds(1.7, 0.0, 1.7, tolerance)
+    assert da._within_cell_bounds(1.7000000000000002, 0.0, 1.7, tolerance)
+    assert not da._within_cell_bounds(1.7 + 1e-3, 0.0, 1.7, tolerance)
+    assert not da._within_cell_bounds(-1e-17, 0.0, 1.7, tolerance)
+    # Een tolerantie van nul maakt de vergelijking exact.
+    assert da._within_cell_bounds(1.7, 0.0, 1.7, Decimal(0))
+    assert not da._within_cell_bounds(1.7000000000000002, 0.0, 1.7, Decimal(0))
+    # Niet-eindige waarden of grenzen worden afgekeurd.
+    assert not da._within_cell_bounds(None, 0.0, 1.7, tolerance)
+    assert not da._within_cell_bounds(float("nan"), 0.0, 1.7, tolerance)
+    assert not da._within_cell_bounds(float("inf"), 0.0, 1.7, tolerance)
+    assert not da._within_cell_bounds(1.0, 0.0, float("inf"), tolerance)
+
+
 def test_cell_direction_residual_and_rating_overshoot_share_one_bounded_solve(capture, monkeypatch):
     """De afleesrest en de overschrijving delen één herstelsolve."""
     model, local = _frozen_cell_directions(capture, charge_on=0)  # ontladen: laden is uitgeschakeld
